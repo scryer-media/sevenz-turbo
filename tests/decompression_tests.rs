@@ -499,3 +499,42 @@ fn malformed_coder_stream_counts_are_rejected() {
         "malformed archive must be rejected, got: {result:?}"
     );
 }
+
+/// The BCJ2 reader is asked for its output in windows far smaller than the
+/// four sub-streams it buffers, so the decoder is stopped by a full window
+/// and by a dry stream in every combination, and what comes out must be the
+/// bytes a single read produces.
+#[test]
+fn bcj2_read_in_small_windows_matches_one_read() {
+    let mut file = File::open("tests/resources/7za433_7zip_lzma2_bcj2.7z").unwrap();
+    let archive = Archive::read(&mut file, &Password::empty()).unwrap();
+    let password = Password::empty();
+    let whole = {
+        let mut out = Vec::new();
+        BlockDecoder::new(1, 0, &archive, &password, &mut file)
+            .for_each_entries(&mut |_, reader| {
+                std::io::copy(reader, &mut out)?;
+                Ok(true)
+            })
+            .unwrap();
+        out
+    };
+    assert!(!whole.is_empty());
+    for window in [1usize, 3, 7, 64] {
+        let mut out = Vec::new();
+        BlockDecoder::new(1, 0, &archive, &password, &mut file)
+            .for_each_entries(&mut |_, reader| {
+                let mut buf = vec![0u8; window];
+                loop {
+                    let n = reader.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                }
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(out, whole, "window {window}");
+    }
+}

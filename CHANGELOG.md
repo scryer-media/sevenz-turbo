@@ -403,11 +403,54 @@ Everything here is new surface; no upstream signature changed meaning.
   both encoders: the table `lzma-rust2` and xz use, 256 KiB at level 0 to
   64 MiB at level 9, rather than the SDK's own level defaults. The public
   API does not change.
-- Requires `lzma-turbo` 0.4.0 with its `enc` feature.
+- Requires `lzma-turbo` 0.5.0 with its `enc` feature.
 - Fixed: the LZMA2 property byte for a dictionary that is not a power of
   two or three times one was rounded down (5 MiB was written as 4 MiB) while
   the encoder used the full window, so a reader could hit a match beyond its
   dictionary. It is now rounded up, as `Lzma2Enc_WriteProperties` does.
+- BCJ2 is `lzma-turbo`'s too. Its 0.5.0 ports the SDK's `Bcj2.c` and
+  `Bcj2Enc.c`, bit-exact against them, so the last conversion vendored from
+  `lzma-rust2` is gone: `src/codec/filter/bcj2.rs` is now a `Read` over
+  `lzma_turbo::filters::bcj2::Bcj2Dec` that buffers the folder's four
+  sub-streams and refills whichever the decoder runs dry. Decoded bytes are
+  unchanged; `Bcj2Reader::new` keeps its signature.
+- Extraction is confined to the destination. `decompress` and every
+  convenience around it open the destination once as a directory handle
+  (`cap-std`, under the default `util` feature, native targets only) and
+  create every entry relative to it, so a symbolic link anywhere below the
+  destination, whether it points outside or back inside, is refused instead
+  of followed, and a destination renamed mid-extraction keeps receiving the
+  files. An existing file is replaced rather than truncated in place, so a
+  hard link to it is left alone. `default_entry_extract_fn` keeps its
+  signature but now requires its `dest` to end in the validated entry name,
+  which it uses to find the root; a callback that renames entries on the way
+  out must do its own writing. Names that are empty, only dots, carry a NUL,
+  a drive letter or a root are refused before any path is built, on wasm too.
+- Every convenience function has a `_with_limits` form taking an
+  `ArchiveLimits`, checked when the archive is opened and before any output
+  or callback: `decompress_with_limits`, `decompress_file_with_limits`,
+  `decompress_with_extract_fn_and_limits`,
+  `decompress_file_with_extract_fn_and_limits` and the `_with_password`
+  variants. The wasm entry point gains `decompress_with_limits` and
+  `default_archive_limits`, and `ArchiveLimits` is a `wasm_bindgen` class
+  there.
+- `ArchiveLimits::max_aes_kdf_rounds`, a new public field, default 2^28:
+  the SHA-256 rounds one `Password` will spend deriving keys, across the
+  encoded header and every block, charged before hashing. A derivation the
+  password's cache already holds costs nothing, so an archive whose blocks
+  all share one salt and work factor, which is what 7-Zip writes, costs one
+  derivation however many entries it has. `Limit::AesKdfRounds` names it.
+  Building a struct literal without `..Default::default()` needs the new
+  field.
+- The derived-key cache belongs to the `Password` rather than the process:
+  it is dropped with it, and a clone starts with none. `Password`'s `Debug`
+  prints `Password([REDACTED])`. The password bytes, the cached key, the
+  AES key schedule (RustCrypto's `zeroize` feature) and the decoder's
+  plaintext buffer are cleared on drop.
+- Sub-stream and digest counts are summed with overflow checks and held to
+  `max_entries`, as `CInArchive::ReadSubStreamsInfo` holds them.
+- An AES work factor over `max_aes_cycles_power` is refused when the archive
+  is opened, not when its block is first decoded.
 
 ## 0.24.0 - 2026-09-18
 
