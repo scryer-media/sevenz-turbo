@@ -426,6 +426,12 @@ Everything here is new surface; no upstream signature changed meaning.
   which it uses to find the root; a callback that renames entries on the way
   out must do its own writing. Names that are empty, only dots, carry a NUL,
   a drive letter or a root are refused before any path is built, on wasm too.
+  No entry is ever created as a symbolic or hard link, so an archive cannot
+  plant a link for a later entry to be written through. That is the 7-Zip
+  class fixed in 25.01 as CVE-2025-55188 (a link back inside the extraction
+  root, then a write through it, escalating to an arbitrary file write), the
+  same technique in its ZIP reader as CVE-2025-11001 and CVE-2025-11002, and
+  p7zip's original CVE-2015-1038; none of them has a path through this crate.
 - Every convenience function has a `_with_limits` form taking an
   `ArchiveLimits`, checked when the archive is opened and before any output
   or callback: `decompress_with_limits`, `decompress_file_with_limits`,
