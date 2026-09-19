@@ -55,8 +55,9 @@ with a version bump and a changelog entry like any other.
   swap is confined to `src/encoder.rs`.
 - The BCJ and delta filters are `lzma-turbo`'s (`lzma_turbo::filters`, behind
   its `filters` feature); `src/codec/filter/bcj.rs` and `delta.rs` are handles
-  on them. BCJ2 is a 7z filter with no .xz equivalent and stays vendored from
-  `lzma-rust2` (Apache-2.0, see `src/codec/filter/mod.rs`).
+  on them, and `bcj2.rs` is this crate's `Read` over `lzma_turbo::filters::bcj2`.
+  No conversion is vendored from `lzma-rust2` any more; what is left of it
+  under `src/codec/filter/` is the readers and writers of `bcj` and `delta`.
 - Crypto goes through `src/crypto_backend.rs` — SHA-256 *and* AES-256-CBC:
   `aws-lc-rs` by default, RustCrypto when the `native-crypto` feature is on.
   Never call a backend crate directly from anywhere else. The one exception is

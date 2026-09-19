@@ -9,20 +9,20 @@
 //! is what lets `lzma-rust2` leave the runtime dependency graph entirely
 //! rather than being carried for three filters.
 //!
-//! Two of the three no longer carry a converter of their own. `lzma-turbo`
-//! ports the same branch converters and the same delta filter from the same
-//! public-domain C, and is tested against the SDK's own harness for them, so
-//! `bcj` and `delta` keep only `lzma-rust2`'s readers and writers and put
-//! `lzma-turbo`'s filters underneath. BCJ2 is still vendored whole: it is a
-//! 7z filter with no .xz equivalent, so `lzma-turbo` has none.
+//! None of the three carries a converter of its own any more. `lzma-turbo`
+//! ports the same branch converters, the same delta filter and, since its
+//! 0.5.0, BCJ2 from the same public-domain C, and is tested against the SDK's
+//! own harness for them, so `bcj` and `delta` keep only `lzma-rust2`'s readers
+//! and writers and put `lzma-turbo`'s filters underneath, and `bcj2` is a
+//! `Read` of this crate's own over `lzma_turbo::filters::bcj2`.
 //!
 //! The only changes are mechanical, so a future re-sync stays a diff:
 //!
 //! - `crate::Read` / `crate::Write` / `crate::Result` become the `std::io`
 //!   items they alias there;
 //! - the `encoder` feature becomes this crate's `compress`;
-//! - `error_invalid_data` and the big-endian `u32` read become the local
-//!   helpers below instead of crate-wide ones.
+//! - `error_invalid_data` becomes the local helper below instead of a
+//!   crate-wide one.
 //!
 //! Fixes belong upstream in `lzma-rust2` as well as here.
 //!
@@ -33,31 +33,14 @@
 // diff rather than a merge.
 #[allow(dead_code)]
 pub(crate) mod bcj;
-#[allow(dead_code)]
 pub(crate) mod bcj2;
 #[allow(dead_code)]
 pub(crate) mod delta;
 
-use std::io::{self, Read};
+use std::io;
 
 /// `lzma-rust2`'s crate-level helper of the same name.
 #[inline(always)]
 pub(crate) fn error_invalid_data(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
-}
-
-/// The one method the BCJ2 range decoder needs from `lzma-rust2`'s crate-wide
-/// `ByteReader` trait.
-pub(crate) trait ByteReaderBe {
-    /// Reads a big-endian `u32`.
-    fn read_u32_be(&mut self) -> io::Result<u32>;
-}
-
-impl<T: Read> ByteReaderBe for T {
-    #[inline(always)]
-    fn read_u32_be(&mut self) -> io::Result<u32> {
-        let mut buf = [0; 4];
-        self.read_exact(&mut buf)?;
-        Ok(u32::from_be_bytes(buf))
-    }
 }

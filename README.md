@@ -385,10 +385,10 @@ named before the licence is.
   [`sevenz-rust2`](https://github.com/hasenbanck/sevenz-rust2), which is the
   code in this repository: the archive reader and writer, the coders, the
   encryption, the tests and the examples. He also wrote
-  [`lzma-rust2`](https://github.com/hasenbanck/lzma-rust2), from which the
-  BCJ2 filter is vendored and whose encoders are the `lzma-rust2-encoder`
-  alternative. This fork is his work with two changes bolted on, and if you
-  are not sure you need those changes, his crate is the one to use.
+  [`lzma-rust2`](https://github.com/hasenbanck/lzma-rust2), whose encoders
+  are the `lzma-rust2-encoder` alternative. This fork is his work with two
+  changes bolted on, and if you are not sure you need those changes, his
+  crate is the one to use.
 - **dyz1990** wrote the original
   [`sevenz-rust`](https://github.com/dyz1990/sevenz-rust) that `sevenz-rust2`
   continued, and with it the first 7z implementation in pure Rust.
