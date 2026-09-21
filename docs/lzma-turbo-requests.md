@@ -171,6 +171,61 @@ few bytes at a time — are what would catch losing it.
 
 ## Outstanding
 
+### Somewhere to wait for a worker — asked for, and this fork is written against it
+
+```rust
+impl Lzma2AdaptiveDecoder {
+    /// Blocks until a worker hands back a finished run, and takes it in.
+    /// Returns false at once when no run is outstanding.
+    pub fn wait_for_worker(&mut self) -> bool
+}
+```
+
+`drain` hands control back as soon as it cannot go on without more input, even
+with workers still decoding, so that the caller can feed the next run rather
+than wait for the last one. A caller whose read-ahead is already satisfied has
+nothing to feed and nothing else to do, and without somewhere to wait it called
+drain again, and again, for as long as the workers took: fifteen million drains
+over one 828 MiB archive at four threads, which is a core the workers are not
+getting. With the wait it is about three thousand, and the decode costs 20-25%
+less CPU.
+
+**Work-around until then.** `std::thread::yield_now`, which hands the slot over
+but comes straight back. It is still what this reader does when the wait says
+there is no worker to wait for.
+
+### A limit the decoder holds to, or an account of what it does not — outstanding
+
+A caller limit is enforced against `in_flight_bytes`, and two things sit
+outside it:
+
+* a run inside a worker is counted while the worker holds it *and* while the
+  input it was copied from is still in the buffer, so every run out costs its
+  packed bytes twice until it lands; and
+* the streaming path decodes what it is holding whether or not there is room
+  for the output, which is up to one run of it.
+
+Neither grows with the archive, so a limit still bounds the decode; but a
+caller that says 512 MiB is handed rather more than 512 MiB, and cannot be told
+how much more without knowing the stream's run size. What is wanted is either
+an `in_flight_bytes` that counts everything held, or a documented bound on what
+it leaves out.
+
+**Work-around until then.** `Lzma2MtReader` feeds against the same count, so it
+inherits the same gap; the stall tests in `src/codec/lzma_turbo.rs` assert the
+bound that does hold, which is the limit plus those two terms.
+
+### Room to dispatch is the caller's to leave — noted, no change asked for
+
+A run is dispatched only if what is held *plus that run* fits under the limit,
+so a reader that feeds right up to a limit leaves no room to hand anybody the
+run it has just fed, and with no worker out the decoder takes it back and
+streams it on the calling thread. A 512 MiB limit turned a four-thread decode
+into a single-threaded one and cost 3.4x before `feed_target` here started
+leaving a run's worth of the limit unspent. It is written down because it is
+not discoverable from the signatures: a limit is not all of itself to spend.
+
+
 ### A run index over a stream this crate has not started decoding
 
 `Lzma2RunScanner` is public and answers this, but it has to be fed the bytes.
