@@ -1056,15 +1056,19 @@ impl<R: Read> Lzma2MtReader<R> {
 ///
 /// The caller's limit is the ceiling and always wins — but it is not all of it
 /// to spend, because a run is dispatched only if what is already held *plus
-/// that run* fits. A feed that goes right up to a limit therefore leaves no
-/// room to hand anybody the run it just fed, and with no worker out the
-/// decoder takes it back and streams it on the calling thread: a 512 MiB limit
-/// turned a four-thread decode into a single-threaded one and cost 3.4x, which
-/// is the shape of a stall even though bytes keep coming. So a run's worth of
-/// the limit is left unspent. Under a limit smaller than one run nothing can be
-/// dispatched however much is left free, so there half of it is spent and the
-/// streaming path does the work, which is what a limit that small is asking
-/// for.
+/// that run* fits. Read-ahead that goes right up to a limit leaves no room to
+/// hand anybody the run it just fed, and with no worker out the decoder takes
+/// it back and streams it on the calling thread: a 512 MiB limit turned a
+/// four-thread decode into a single-threaded one, which is the shape of a
+/// stall even though bytes keep coming. Room for one run is not enough either
+/// — that dispatches one worker and leaves the rest of the threads queued
+/// behind it, and a 512 MiB limit was measured at 58 s against 38 s for the
+/// gigabyte-ahead read it replaced, on a tenth of a core less than two. So
+/// what the limit buys first is a run in hand for every thread it can afford
+/// to have decoding at once, and only what is left over is read-ahead. Under a
+/// limit smaller than a single run nothing can be dispatched however much is
+/// left free, so there the feed falls to one chunk at a time and the streaming
+/// path does the work, which is what a limit that small is asking for.
 ///
 /// A stream that cannot be parallelised at all is not handled here but in
 /// [`Lzma2MtReader::pump_input`], which can see — from the run boundaries it
@@ -1079,11 +1083,15 @@ fn feed_target(threads: u32, run_packed: u64, run_unpacked: u64, memory_limit: u
             .saturating_add(run_packed)
             .max(MT_FEED_MIN_PER_THREAD_BYTES)
     };
+    let threads = u64::from(threads.max(1));
     let run_cost = run_unpacked.saturating_add(run_packed);
-    let spendable = memory_limit.saturating_sub(run_cost).max(memory_limit / 2);
-    u64::from(threads.max(1))
-        .saturating_mul(per_thread)
-        .min(spendable)
+    let dispatchable = memory_limit
+        .checked_div(run_cost)
+        .map_or(threads, |fits| fits.clamp(1, threads));
+    let spendable = memory_limit
+        .saturating_sub(run_cost.saturating_mul(dispatchable))
+        .max(MT_INPUT_CHUNK as u64);
+    threads.saturating_mul(per_thread).min(spendable)
 }
 
 impl<R: Read> Drop for Lzma2MtReader<R> {
@@ -1775,9 +1783,8 @@ mod feed_tests {
     /// — and room for one decoded run waiting its turn behind an earlier one.
     #[test]
     fn a_thread_is_given_the_run_it_decodes_and_one_waiting_behind_it() {
-        let backstop = 16 * MT_BACKSTOP_PER_THREAD_BYTES;
         assert_eq!(
-            feed_target(16, PACKED, UNPACKED, backstop),
+            feed_target(16, PACKED, UNPACKED, u64::MAX),
             16 * (2 * UNPACKED + PACKED)
         );
     }
@@ -1786,9 +1793,8 @@ mod feed_tests {
     /// halve the runs and the decode holds half as much.
     #[test]
     fn a_stream_of_smaller_runs_holds_less() {
-        let backstop = 4 * MT_BACKSTOP_PER_THREAD_BYTES;
-        let big = feed_target(4, PACKED, UNPACKED, backstop);
-        let small = feed_target(4, PACKED / 2, UNPACKED / 2, backstop);
+        let big = feed_target(4, PACKED, UNPACKED, u64::MAX);
+        let small = feed_target(4, PACKED / 2, UNPACKED / 2, u64::MAX);
         assert_eq!(small * 2, big);
     }
 
@@ -1812,14 +1818,19 @@ mod feed_tests {
         );
     }
 
-    /// The caller's limit is the ceiling and wins over everything the runs
-    /// ask for, however many threads are asking — less a run's worth, which is
-    /// the room the decoder needs to be able to hand a run to a worker at all.
+    /// The caller's limit is the ceiling and wins over everything the runs ask
+    /// for, however many threads are asking — less a run in hand for every
+    /// thread the limit can afford to have decoding at once, which is the room
+    /// the decoder needs before it will hand a run to a worker at all.
     #[test]
     fn the_callers_limit_is_the_ceiling_less_the_room_to_dispatch() {
         let limit = 512 << 20;
-        let spendable = limit - (PACKED + UNPACKED);
-        assert_eq!(feed_target(8, PACKED, UNPACKED, limit), spendable);
+        // Eight threads ask for more than the limit holds, and three runs at a
+        // time is all it can afford, so three runs' worth is kept back.
+        assert_eq!(
+            feed_target(8, PACKED, UNPACKED, limit),
+            limit - 3 * (PACKED + UNPACKED)
+        );
         // One thread asks for less than the limit leaves, and gets what it
         // asked for: the ceiling only ever takes away.
         assert_eq!(
@@ -1829,11 +1840,15 @@ mod feed_tests {
     }
 
     /// A limit too small to hold a run at all cannot dispatch one however much
-    /// is left free, so leaving room for a dispatch would leave nothing for
-    /// anything. Half of it is spent and the streaming path decodes it.
+    /// is left free, so there is nothing to keep back for a worker and nothing
+    /// to read ahead for. The feed falls to a chunk at a time and the
+    /// streaming path decodes the stream.
     #[test]
-    fn a_limit_smaller_than_a_run_spends_half_of_itself() {
+    fn a_limit_smaller_than_a_run_feeds_a_chunk_at_a_time() {
         let limit = 64 << 20;
-        assert_eq!(feed_target(8, PACKED, UNPACKED, limit), limit / 2);
+        assert_eq!(
+            feed_target(8, PACKED, UNPACKED, limit),
+            super::MT_INPUT_CHUNK as u64
+        );
     }
 }
