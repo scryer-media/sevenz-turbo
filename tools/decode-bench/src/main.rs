@@ -34,6 +34,7 @@ usage: decode-bench [--runs N] [--no-oracle] [--threads LIST] [--password P] <ar
   --only NAME     run only `7zz`, `upstream` or `fork`
   --threads LIST  fork thread counts, comma separated (default 1,2,8,all)
   --password P    password for an AES-256 archive, passed to every lane
+  --memory-limit MIB  decode the fork lanes under a caller memory limit
   --cipher-only   time AES-256-CBC alone over 1 GiB in memory and exit
   --cipher-chunk KIB  chunk size for --cipher-only, repeatable (default 1024)
   --floor         time reading <archive.7z> and digesting it, and exit
@@ -50,6 +51,7 @@ fn main() {
     let mut floor = false;
     let mut cipher_chunks: Vec<usize> = Vec::new();
     let mut io_profile = false;
+    let mut memory_limit = u64::MAX;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -79,6 +81,13 @@ fn main() {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| fail("--cipher-chunk needs a size in KiB"));
                 cipher_chunks.push(kib * 1024);
+            }
+            "--memory-limit" => {
+                let mib: u64 = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| fail("--memory-limit needs a size in MiB"));
+                memory_limit = mib * (1 << 20);
             }
             "--password" => {
                 password = Some(
@@ -135,7 +144,15 @@ fn main() {
     );
 
     for file in &files {
-        bench_one(file, runs, oracle, &only, &threads, password.as_deref());
+        bench_one(
+            file,
+            runs,
+            oracle,
+            &only,
+            &threads,
+            password.as_deref(),
+            memory_limit,
+        );
     }
 }
 
@@ -456,8 +473,8 @@ fn drain<R: Read + ?Sized>(reader: &mut R, sink: &mut Sink, buf: &mut [u8]) -> s
     }
 }
 
-fn extract_fork(path: &Path, threads: u32, password: Option<&str>) -> Sink {
-    extract_fork_with(path, threads, true, password)
+fn extract_fork(path: &Path, threads: u32, password: Option<&str>, memory_limit: u64) -> Sink {
+    extract_fork_with(path, threads, true, password, memory_limit)
 }
 
 /// The password each lane gets, or an empty one for an unencrypted archive.
@@ -468,10 +485,27 @@ fn fork_password(password: Option<&str>) -> sevenz_turbo::Password {
 /// The fork, with the header's checksums either checked or not. The unchecked
 /// lane is there to price the checking: under the parallel path it is done by
 /// the workers and folded, so the two should differ by noise.
-fn extract_fork_with(path: &Path, threads: u32, verify: bool, password: Option<&str>) -> Sink {
+fn extract_fork_with(
+    path: &Path,
+    threads: u32,
+    verify: bool,
+    password: Option<&str>,
+    memory_limit: u64,
+) -> Sink {
     let file = std::fs::File::open(path).expect("open archive");
-    let mut reader =
-        sevenz_turbo::ArchiveReader::new(file, fork_password(password)).expect("fork: read header");
+    // A limit is what the consumer this is measured for always sets, so the
+    // lane that sets one is the lane that matters; with none the reader is
+    // built exactly as it was before the option existed.
+    let mut reader = if memory_limit == u64::MAX {
+        sevenz_turbo::ArchiveReader::new(file, fork_password(password)).expect("fork: read header")
+    } else {
+        let limits = sevenz_turbo::ArchiveLimits {
+            memory_limit_bytes: memory_limit,
+            ..sevenz_turbo::ArchiveLimits::default()
+        };
+        sevenz_turbo::ArchiveReader::with_limits(file, fork_password(password), limits)
+            .expect("fork: read header")
+    };
     reader.set_threads(threads);
     reader.set_verify_checksums(verify);
     let mut sink = Sink::default();
@@ -549,6 +583,7 @@ fn bench_one(
     only: &str,
     threads: &[u32],
     password: Option<&str>,
+    memory_limit: u64,
 ) {
     let wanted = |name: &str| only.is_empty() || only == name;
     let compressed = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -615,13 +650,13 @@ fn bench_one(
         for &count in threads {
             rows.push(time_it(
                 format!("sevenz-turbo @{count}"),
-                Box::new(move || extract_fork(path, count, password)),
+                Box::new(move || extract_fork(path, count, password, memory_limit)),
             ));
         }
         if let Some(&count) = threads.last() {
             rows.push(time_it(
                 format!("sevenz-turbo @{count} no crc"),
-                Box::new(move || extract_fork_with(path, count, false, password)),
+                Box::new(move || extract_fork_with(path, count, false, password, memory_limit)),
             ));
         }
     }
