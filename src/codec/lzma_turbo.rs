@@ -146,6 +146,12 @@ const MT_INPUT_CHUNK: usize = 1 << 20;
 /// The size of one piece of buffered output. See [`Lzma2MtReader::out`].
 const MT_OUTPUT_CHUNK: usize = 1 << 20;
 
+/// Pieces of buffered output kept for refilling. See [`Lzma2MtReader::spare`].
+const MT_OUTPUT_SPARE_PIECES: usize = 8;
+
+/// Capacity [`Lzma2MtReader::inbuf`] keeps once it has held a long run.
+const MT_INPUT_KEEP_BYTES: usize = 8 * MT_INPUT_CHUNK;
+
 /// Smallest in-flight budget a parallel LZMA2 decode is given. Below this the
 /// coder decodes single-threaded instead: see [`Lzma2Plan::for_block`].
 const MT_MIN_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
@@ -161,51 +167,34 @@ const MT_MIN_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
 /// what it is.
 const MT_BUDGET_PER_THREAD_BYTES: u64 = 512 * 1024 * 1024;
 
-/// How much packed input to get ahead by, per thread, before decoding what has
-/// been fed. One run per thread is the point of diminishing returns: a worker
-/// takes a run only once it has arrived whole, and a run that no idle worker
-/// is waiting for is memory spent for nothing. 128 MiB is the run size
-/// `7zz -mmt=on` writes, and packed runs are smaller than that.
+/// How much to get ahead by, per thread, before decoding what has been fed.
+///
+/// A run in flight costs its packed *and* its unpacked bytes, and this is
+/// measured against what the decoder is holding rather than against packed
+/// bytes alone, so one of `7zz -mmt=on`'s 128 MiB runs already accounts for
+/// most of it: a worker that finishes finds the next run waiting, and the one
+/// after that is being read while it decodes.
+///
+/// Past that there is nothing to buy. A worker takes a run only once it has
+/// arrived whole, and a run no idle worker is waiting for is memory spent for
+/// nothing. This is also where a decode settles rather than a ceiling it
+/// rarely reaches - a decoder that is not chasing stops once it is this far
+/// ahead and stays there - so the number is the decode's footprint, which is
+/// what it was chosen against.
 const MT_FEED_PER_THREAD_BYTES: u64 = 128 * 1024 * 1024;
-
-/// The floor under the read-ahead, and with it the size of a feed batch.
-///
-/// The batch is what the decoder is given before it is asked to decode, and
-/// its last run is always one whose end the decoder has not seen — a run's end
-/// is announced by the chunk header after it — so the decoder hands that run
-/// to its chase path, which decodes it on this thread with dispatch switched
-/// off until it is done. One run per batch is a fixed cost: what decides
-/// whether it is visible is how many rounds of worker-work the rest of the
-/// batch is. A batch of two runs at two threads spent as long chasing the
-/// third run as the workers spent on the other two, 1.50x off a bare parallel
-/// decode; a batch of eight put the fork within 2% of it at every thread
-/// count measured.
-///
-/// The cost of that is memory: a batch is buffered packed on the way in and
-/// decoded on the way out, so a gigabyte of read-ahead is about two of peak.
-/// `docs/lzma-turbo-requests.md` carries the request that would make it
-/// unnecessary — refusing to chase a run while a worker is free would let this
-/// be a run or two per thread again.
-const MT_MIN_FEED_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Complete runs to keep waiting in the decoder, per thread.
 ///
 /// The read-ahead above is a ceiling on bytes, and reaching it in one go is
 /// wrong when runs are small: `7zz -mx1` writes 1 MiB runs for data that does
-/// not compress, a gigabyte of read-ahead is then a thousand runs, and every
-/// worker sat idle while this thread read and copied all of them - 0.2 s of a
-/// 1.3 s decode. So a feed stops once there are this many runs per thread
+/// not compress, the byte ceiling is then hundreds of runs, and every worker
+/// sat idle while this thread read and copied all of them - 0.2 s of a 1.3 s
+/// decode. So a feed stops once there are this many runs per thread
 /// waiting, and is topped up before every drain instead, while the workers are
 /// busy. Two per thread means a worker that finishes always finds a run there
 /// even if the top-up is a whole read behind. With 128 MiB runs the byte
 /// ceiling is reached first and nothing changes.
 const MT_BACKLOG_RUNS_PER_THREAD: u64 = 2;
-
-/// The floor under the in-flight budget, so that [`MT_MIN_FEED_BYTES`] of
-/// read-ahead is affordable at any thread count: the read-ahead is never given
-/// more than half of what the decoder may hold, the other half being the runs
-/// in flight.
-const MT_MIN_BUDGET_FLOOR_BYTES: u64 = 2 * MT_MIN_FEED_BYTES;
 
 /// How much may be read ahead without a single worker having been spawned
 /// before the reader concludes that reading ahead is buying nothing.
@@ -223,10 +212,10 @@ const MT_NO_WORKER_GIVE_UP_BYTES: u64 = 256 * 1024 * 1024;
 /// decoder, because they are part of a run whose end has not been seen yet.
 ///
 /// The bound matters only for a stream whose runs are larger than it. There the
-/// decoder runs out of work, the chase path takes over, and these bytes are fed
-/// as they come; the cap is what stops this reader from reading an entire
-/// single-run archive into memory while it waits for a boundary that is not
-/// coming.
+/// decoder runs out of work, the reader switches the chase path on and feeds
+/// these bytes as they come; the cap is what stops this reader from reading an
+/// entire single-run archive into memory while it waits for a boundary that is
+/// not coming.
 const MT_INPUT_HOLD_BYTES: usize = 192 * 1024 * 1024;
 
 /// The live link between an [`ArchiveReader`] and the LZMA2 coder that is
@@ -533,9 +522,7 @@ impl Lzma2Plan {
     /// engaging the parallel path.
     fn mt_budget(threads: u32, memory_limit_bytes: u64, dict_size: u32) -> Option<u64> {
         let budget = if memory_limit_bytes == u64::MAX {
-            u64::from(threads)
-                .saturating_mul(MT_BUDGET_PER_THREAD_BYTES)
-                .max(MT_MIN_BUDGET_FLOOR_BYTES)
+            u64::from(threads).saturating_mul(MT_BUDGET_PER_THREAD_BYTES)
         } else {
             let own = u64::from(dict_size).saturating_add(LZ_STATE_BYTES);
             memory_limit_bytes.saturating_sub(own)
@@ -591,9 +578,24 @@ pub(crate) struct Lzma2MtReader<R: Read> {
     /// Set once bytes have been fed that do not end on a run boundary, which
     /// puts the decoder's chase path inside a run until that run is over.
     chasing: bool,
+    /// Whether the decoder's chase path is currently switched on, so that a
+    /// steady-state feed costs no calls into it. See [`Self::set_chase`].
+    chase: bool,
+    /// Where the runs [`Self::scanner`] has closed end, in stream offsets, for
+    /// those the feed has not yet reached. See [`Self::fed_at_boundary`].
+    run_ends: VecDeque<u64>,
+    /// The last run end the feed has reached, so that where it has got to can
+    /// be compared against where a run ends without keeping every boundary the
+    /// stream ever had.
+    last_boundary: u64,
     /// Set if the chunk headers could not be walked, which hands the steering
     /// back to the decoder and its error reporting.
     scan_broken: bool,
+    /// [`MT_NO_WORKER_GIVE_UP_BYTES`], as a field so that a test can reach the
+    /// single-run path without a quarter-gigabyte fixture.
+    give_up_bytes: u64,
+    /// [`MT_INPUT_HOLD_BYTES`], a field for the same reason.
+    hold_bytes: usize,
     input_done: bool,
     /// Decoded output not yet handed to the caller, in fixed-size pieces.
     ///
@@ -603,7 +605,9 @@ pub(crate) struct Lzma2MtReader<R: Read> {
     /// doubling; a queue of same-sized pieces, recycled through `spare`, never
     /// reallocates and never copies twice.
     out: VecDeque<Vec<u8>>,
-    /// Pieces already read out, kept to be filled again.
+    /// Pieces already read out, kept to be filled again. Capped at
+    /// [`MT_OUTPUT_SPARE_PIECES`]: past a handful the recycling has stopped
+    /// paying for itself and the rest is only held memory.
     spare: Vec<Vec<u8>>,
     out_pos: usize,
     finished: bool,
@@ -643,6 +647,11 @@ impl<R: Read> Lzma2MtReader<R> {
             memory_limit,
         };
         let mut decoder = Lzma2AdaptiveDecoder::new(dict_prop, &options).map_err(decode_error)?;
+        // This reader hands over whole runs and nothing else, so the run at
+        // the decoder's cursor is incomplete only because the rest of it has
+        // not been fed yet. Feeding it is cheaper than decoding it here with
+        // the workers stood down; see [`Self::set_chase`].
+        decoder.set_chase(false);
         let checksums = !splits.is_empty();
         if checksums {
             // The worker that produced the bytes checksums them, before it
@@ -667,7 +676,12 @@ impl<R: Read> Lzma2MtReader<R> {
             scanner: Lzma2RunScanner::new(),
             runs_seen: 0,
             chasing: false,
+            chase: false,
+            run_ends: VecDeque::new(),
+            last_boundary: 0,
             scan_broken: false,
+            give_up_bytes: MT_NO_WORKER_GIVE_UP_BYTES,
+            hold_bytes: MT_INPUT_HOLD_BYTES,
             input_done: false,
             out: VecDeque::new(),
             spare: Vec::new(),
@@ -719,6 +733,56 @@ impl<R: Read> Lzma2MtReader<R> {
         }
     }
 
+    /// Switches the decoder's chase path on or off.
+    ///
+    /// The chase path decodes the run at the decoder's cursor on this thread,
+    /// a chunk at a time, without waiting for the whole of it — and while it
+    /// holds the cursor no worker may claim a run, so a decoder that chases is
+    /// a decoder that is not threading.
+    ///
+    /// Which of those is wanted is this reader's business and not the
+    /// decoder's, because this reader is the one deciding what to hand over.
+    /// While it is feeding whole runs, a run that is incomplete at the cursor
+    /// is incomplete only because the rest of it has not been fed yet, and
+    /// reading it is cheaper than decoding it here: chasing off. The reader
+    /// also has three modes in which it feeds the front of a run on purpose —
+    /// a stream written as one run, a run larger than what it will hold, and a
+    /// stream whose headers it could not walk — and there the decoder must
+    /// chase or nothing would decode at all.
+    ///
+    /// Off is not never: a run too large for the memory limit, a run the chase
+    /// has already begun, a decoder narrowed to one thread, and anything at
+    /// all once the input is over are decoded here whatever this says.
+    fn set_chase(&mut self, chase: bool) {
+        if self.chase != chase {
+            self.decoder.set_chase(chase);
+            self.chase = chase;
+        }
+    }
+
+    /// Whether what has been handed to the decoder stops where a run does.
+    ///
+    /// Getting no further ahead is only safe there. A decoder that is not
+    /// chasing and has been given the front of a run will wait for the rest
+    /// rather than decode it, so a reader that stopped part way through one
+    /// and then decided it was far enough ahead would be waiting for a decoder
+    /// that was waiting for it.
+    ///
+    /// The three modes that feed the front of a run on purpose all have the
+    /// decoder chasing, and a decoder that has been told the input is over
+    /// decodes what it holds whatever else it has been told, so each of them
+    /// is a place it is safe to stop.
+    fn fed_at_boundary(&mut self) -> bool {
+        if self.chasing || self.input_done || self.scan_broken {
+            return true;
+        }
+        let fed_to = self.base + self.in_pos as u64;
+        while self.run_ends.front().is_some_and(|&end| end <= fed_to) {
+            self.last_boundary = self.run_ends.pop_front().expect("just looked");
+        }
+        fed_to == self.last_boundary
+    }
+
     /// How many more complete runs the decoder should be holding than it is.
     fn backlog_wanted(&self) -> u64 {
         let full = u64::from(self.applied_threads.max(1)) * MT_BACKLOG_RUNS_PER_THREAD;
@@ -756,6 +820,18 @@ impl<R: Read> Lzma2MtReader<R> {
             self.base += self.in_pos as u64;
             self.scan_pos -= self.in_pos;
             self.in_pos = 0;
+            // A run longer than [`MT_INPUT_HOLD_BYTES`] grows this buffer to
+            // hold what has been read of it, and a `Vec` never gives room
+            // back. Once the stream is past such a run the extra is dead
+            // weight. Releasing it here rather than on every refill, and only
+            // once what is left is a small part of what is held, keeps an
+            // ordinary feed — where the buffer is a couple of chunks and stays
+            // that way — from reallocating at all.
+            if self.inbuf.capacity() > MT_INPUT_KEEP_BYTES
+                && self.inbuf.len() <= self.inbuf.capacity() / 4
+            {
+                self.inbuf.shrink_to(MT_INPUT_KEEP_BYTES);
+            }
         }
         let was = self.inbuf.len();
         self.inbuf.resize(was + MT_INPUT_CHUNK, 0);
@@ -780,8 +856,9 @@ impl<R: Read> Lzma2MtReader<R> {
                 Err(_) => self.scan_broken = true,
                 Ok(n) => {
                     self.scan_pos += n;
-                    while self.scanner.next_run().is_some() {
+                    while let Some(run) = self.scanner.next_run() {
                         self.runs_seen += 1;
+                        self.run_ends.push_back(run.in_offset + run.packed_len);
                     }
                 }
             }
@@ -813,8 +890,12 @@ impl<R: Read> Lzma2MtReader<R> {
     /// What is fed always ends on a run boundary while one is in reach; see
     /// [`Self::safe_limit`]. Only when no boundary is in reach and the decoder
     /// has nothing left to do — a block written as a single run, or the tail
-    /// of one still arriving — is the chase path handed a partial run, which
-    /// is the case it exists for.
+    /// of one still arriving — is the chase path switched on and handed a
+    /// partial run, which is the case it exists for; see [`Self::set_chase`].
+    ///
+    /// Stopping is the other half of that bargain: everywhere this loop
+    /// decides it has got far enough ahead it must first have got as far as
+    /// the end of a run. See [`Self::fed_at_boundary`].
     ///
     /// `want_runs` ends the call early, once that many more runs have been
     /// seen and something has been fed: see [`MT_BACKLOG_RUNS_PER_THREAD`].
@@ -822,7 +903,11 @@ impl<R: Read> Lzma2MtReader<R> {
         let mut fed = false;
         let runs_at_start = self.runs_seen;
         loop {
-            if fed && self.runs_seen - runs_at_start >= want_runs {
+            // Both ways out of this loop that are a choice rather than a
+            // necessity ask [`Self::fed_at_boundary`] first, and ask it last,
+            // so that a decode that is going to stop anyway does not pay for
+            // the question.
+            if fed && self.runs_seen - runs_at_start >= want_runs && self.fed_at_boundary() {
                 break;
             }
             // A stream whose first run has not ended within a good look at it
@@ -834,8 +919,17 @@ impl<R: Read> Lzma2MtReader<R> {
             // is made again every time round because it only becomes true part
             // way through a batch this loop would otherwise finish.
             let one_run = self.runs_seen == 0
-                && self.scanner.in_position() > MT_NO_WORKER_GIVE_UP_BYTES
+                && self.scanner.in_position() > self.give_up_bytes
                 && !self.input_done;
+            // Two of the three modes in which the front of a run is handed
+            // over deliberately: a stream that is one run from beginning to
+            // end, and a stream whose headers could not be walked, where the
+            // decoder is steering and is given everything. The third is the
+            // long run below. In all three the decoder has to chase or nothing
+            // would decode at all.
+            if one_run || self.scan_broken {
+                self.set_chase(true);
+            }
             let target = if one_run {
                 MT_INPUT_CHUNK as u64
             } else {
@@ -844,9 +938,9 @@ impl<R: Read> Lzma2MtReader<R> {
             let hold = if one_run {
                 2 * MT_INPUT_CHUNK
             } else {
-                MT_INPUT_HOLD_BYTES
+                self.hold_bytes
             };
-            if self.decoder.in_flight_bytes() >= target {
+            if self.decoder.in_flight_bytes() >= target && self.fed_at_boundary() {
                 break;
             }
             let limit = self.safe_limit().saturating_sub(self.base);
@@ -862,6 +956,7 @@ impl<R: Read> Lzma2MtReader<R> {
                 let idle = self.decoder.in_flight_bytes() == 0;
                 if (self.chasing || idle) && self.in_pos < self.inbuf.len() {
                     self.chasing = true;
+                    self.set_chase(true);
                     end = self.inbuf.len().min(self.in_pos + MT_INPUT_CHUNK);
                     if let Some(t) = self.trace.as_mut() {
                         t.chased += (end - self.in_pos) as u64;
@@ -871,6 +966,9 @@ impl<R: Read> Lzma2MtReader<R> {
                 }
             } else {
                 self.chasing = false;
+                if !self.scan_broken {
+                    self.set_chase(false);
+                }
             }
             let offered = end - self.in_pos;
             let taken = self
@@ -889,13 +987,19 @@ impl<R: Read> Lzma2MtReader<R> {
     }
 }
 
-/// How far ahead of the decoder to read, in packed bytes.
+/// How far ahead of the decoder to get, measured in what it is holding.
 ///
-/// A run per thread is what a worker per thread needs, and never less than
-/// [`MT_MIN_FEED_BYTES`], which is what keeps the run the decoder chases at
-/// the end of every batch from being a third of the batch. Half the budget is
-/// the ceiling: the other half is for the runs in flight, and read-ahead that
-/// crowds those out is read-ahead that idles a worker.
+/// [`MT_FEED_PER_THREAD_BYTES`] per thread is what keeps a worker per thread
+/// busy. Half the budget is the ceiling: the other half is for the runs in
+/// flight, and read-ahead that crowds those out is read-ahead that idles a
+/// worker.
+///
+/// There is no floor under it. There was one, of a gigabyte, and it bought
+/// nothing but cover for the run at the end of every batch, which the decoder
+/// used to decode on this thread with dispatch switched off while the workers
+/// idled. The decoder is now told not to do that — see
+/// [`Lzma2MtReader::set_chase`] — so a batch is worth only the work it gives
+/// the workers, and the memory a larger one costs is memory for nothing.
 ///
 /// A stream that cannot be parallelised at all is not handled here but in
 /// [`Lzma2MtReader::pump_input`], which can see — from the run boundaries it
@@ -904,7 +1008,6 @@ impl<R: Read> Lzma2MtReader<R> {
 fn feed_target(threads: u32, memory_limit: u64) -> u64 {
     u64::from(threads.max(1))
         .saturating_mul(MT_FEED_PER_THREAD_BYTES)
-        .max(MT_MIN_FEED_BYTES)
         .min(memory_limit / 2)
 }
 
@@ -941,8 +1044,10 @@ impl<R: Read> Read for Lzma2MtReader<R> {
                     return Ok(n);
                 }
                 let mut done = self.out.pop_front().expect("front");
-                done.clear();
-                self.spare.push(done);
+                if self.spare.len() < MT_OUTPUT_SPARE_PIECES {
+                    done.clear();
+                    self.spare.push(done);
+                }
                 self.out_pos = 0;
                 continue;
             }
@@ -1072,6 +1177,17 @@ impl<R: Read> Read for Lzma2MtReader<R> {
             if direct > 0 {
                 return Ok(direct);
             }
+            if !self.finished && self.out.is_empty() {
+                // Nothing came out of the drain and nothing more could be
+                // fed, so every byte still owed is inside a worker and the
+                // only thing left for this thread to do is ask again. The
+                // decoder offers no way to wait on a worker, and asking in a
+                // tight loop is not free: it is a core the workers are not
+                // getting, which at two threads was half the machine's
+                // useful capacity. So the wait is handed to the scheduler
+                // instead of spun.
+                std::thread::yield_now();
+            }
         }
     }
 }
@@ -1193,11 +1309,16 @@ mod tests {
 
     /// With no caller budget the in-flight ceiling scales with the threads
     /// asked for, so eight threads can hold eight of `7zz`'s 128 MiB runs.
+    /// Nothing floors it: two threads are budgeted for two threads.
     #[test]
     fn an_unset_budget_scales_with_the_thread_count() {
         assert_eq!(
             Lzma2Plan::mt_budget(8, u64::MAX, 32 << 20),
             Some(8 * MT_BUDGET_PER_THREAD_BYTES)
+        );
+        assert_eq!(
+            Lzma2Plan::mt_budget(2, u64::MAX, 32 << 20),
+            Some(2 * MT_BUDGET_PER_THREAD_BYTES)
         );
     }
 
@@ -1210,29 +1331,221 @@ mod tests {
     }
 }
 
+/// The reader against streams whose run layout is chosen rather than coaxed
+/// out of an encoder, which is what the paths that hand the decoder a partial
+/// run turn on.
+///
+/// Every test here decodes to the end. That is the assertion: a reader that
+/// stops feeding a decoder that has been told not to chase, or switches
+/// chasing off where nothing else can make progress, does not produce wrong
+/// bytes — it produces no more bytes at all, and the test never returns.
+#[cfg(test)]
+mod stall_tests {
+    use std::io::{Cursor, ErrorKind, Read};
+    use std::sync::Arc;
+
+    use super::{Lzma2Control, Lzma2MtReader};
+
+    /// 512 KiB, comfortably more than one run of the streams below.
+    const DICT_PROP: u8 = 14;
+    /// Small enough that the read-ahead ceiling is reached inside a stream of
+    /// a few megabytes, rather than never.
+    const LIMIT: u64 = 8 << 20;
+    const CHUNK: usize = 64 << 10;
+
+    /// Deterministic bytes, so that a run decoded in the wrong place shows up
+    /// as a mismatch rather than as more of the same.
+    fn payload(len: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// An LZMA2 stream of `runs` runs of `chunks` chunks each, and the bytes
+    /// it decodes to.
+    ///
+    /// The chunks copy their payload out verbatim — control byte, the
+    /// payload's length less one as a big-endian `u16`, the payload — and the
+    /// first chunk of each run asks for the dictionary reset that makes it a
+    /// run. Built rather than compressed because the run layout is the whole
+    /// point: an encoder has to be talked into one, and then only
+    /// approximately.
+    fn stream(runs: usize, chunks: usize) -> (Vec<u8>, Vec<u8>) {
+        let mut packed = Vec::new();
+        let mut plain = Vec::new();
+        for run in 0..runs {
+            for chunk in 0..chunks {
+                let bytes = payload(CHUNK, (run * chunks + chunk) as u64 + 1);
+                packed.push(if chunk == 0 { 0x01 } else { 0x02 });
+                packed.extend_from_slice(&((CHUNK - 1) as u16).to_be_bytes());
+                packed.extend_from_slice(&bytes);
+                plain.extend_from_slice(&bytes);
+            }
+        }
+        // The end marker.
+        packed.push(0x00);
+        (packed, plain)
+    }
+
+    fn reader<R: Read>(input: R, threads: u32) -> (Lzma2MtReader<R>, Arc<Lzma2Control>) {
+        let control = Arc::new(Lzma2Control::new(threads));
+        let rd = Lzma2MtReader::new(input, DICT_PROP, threads, LIMIT, Arc::clone(&control), &[])
+            .expect("build the reader");
+        (rd, control)
+    }
+
+    /// A source that hands over a few bytes at a time, as a socket would.
+    struct Trickle<R> {
+        inner: R,
+        most: usize,
+    }
+
+    impl<R: Read> Read for Trickle<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.most);
+            self.inner.read(&mut buf[..n])
+        }
+    }
+
+    /// The ordinary path: whole runs handed over, the decoder told not to
+    /// chase them, and the same bytes out of it at every thread count.
+    #[test]
+    fn a_multi_run_stream_decodes_the_same_at_every_thread_count() {
+        let (packed, plain) = stream(48, 4);
+        for threads in [1, 2, 4, 8] {
+            let (mut rd, _control) = reader(Cursor::new(packed.clone()), threads);
+            let mut out = Vec::new();
+            rd.read_to_end(&mut out).expect("decode");
+            assert_eq!(out, plain, "threads={threads}");
+            assert!(rd.runs_seen > 1, "threads={threads}");
+        }
+    }
+
+    /// The same stream arriving a few bytes per read, which is what puts a
+    /// run boundary out of reach for call after call.
+    #[test]
+    fn a_stream_that_arrives_in_small_pieces_decodes() {
+        let (packed, plain) = stream(8, 4);
+        let (mut rd, _control) = reader(
+            Trickle {
+                inner: Cursor::new(packed),
+                most: 17,
+            },
+            4,
+        );
+        let mut out = Vec::new();
+        rd.read_to_end(&mut out).expect("decode");
+        assert_eq!(out, plain);
+    }
+
+    /// A stream written as one run from beginning to end. No boundary is ever
+    /// in reach, so the reader gives up reading ahead and switches the chase
+    /// path on; with it left off nothing would decode at all.
+    #[test]
+    fn a_single_run_stream_decodes_once_reading_ahead_is_given_up_on() {
+        let (packed, plain) = stream(1, 64);
+        let (mut rd, _control) = reader(Cursor::new(packed), 4);
+        // The thresholds the give-up is made at, brought down to the size of
+        // a stream a test can hold: a quarter of a gigabyte of one run says
+        // nothing that four megabytes of it does not.
+        rd.give_up_bytes = 64 << 10;
+        rd.hold_bytes = 256 << 10;
+
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 32 << 10];
+        let mut chased = false;
+        loop {
+            let n = rd.read(&mut buf).expect("decode");
+            if n == 0 {
+                break;
+            }
+            chased |= rd.chasing;
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert!(
+            chased,
+            "a stream with one run in it is decoded by chasing it"
+        );
+        // One, and only once the end marker closed it: for the whole of the
+        // decode there was no boundary to feed up to.
+        assert_eq!(rd.runs_seen, 1);
+        assert_eq!(out, plain);
+    }
+
+    /// A stream cut part way through a run: the decoder is owed input that is
+    /// not coming, and must say so rather than wait for it.
+    #[test]
+    fn a_truncated_stream_is_refused_rather_than_waited_on() {
+        let (packed, _) = stream(8, 4);
+        let cut = packed.len() - (100 << 10);
+        for threads in [1, 2, 4] {
+            let (mut rd, _control) = reader(Cursor::new(packed[..cut].to_vec()), threads);
+            let mut out = Vec::new();
+            let err = rd
+                .read_to_end(&mut out)
+                .expect_err("a cut stream is corrupt");
+            assert!(
+                matches!(
+                    err.kind(),
+                    ErrorKind::UnexpectedEof | ErrorKind::InvalidData
+                ),
+                "threads={threads}: {err}"
+            );
+        }
+    }
+
+    /// The adaptive narrowing a consumer following an arriving stream does:
+    /// one thread through the middle of the block and several either side.
+    /// A decoder narrowed to one thread decodes on the calling thread whatever
+    /// it has been told about chasing, so output has to keep coming.
+    #[test]
+    fn narrowing_to_one_thread_mid_stream_keeps_producing() {
+        let (packed, plain) = stream(32, 4);
+        let (mut rd, control) = reader(Cursor::new(packed), 4);
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 32 << 10];
+        loop {
+            let narrow = out.len() > (2 << 20) && out.len() < (6 << 20);
+            control.set_threads(if narrow { 1 } else { 4 });
+            let n = rd.read(&mut buf).expect("decode");
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(out, plain);
+    }
+}
+
 #[cfg(test)]
 mod feed_tests {
-    use super::{
-        MT_BUDGET_PER_THREAD_BYTES, MT_FEED_PER_THREAD_BYTES, MT_MIN_BUDGET_FLOOR_BYTES,
-        MT_MIN_FEED_BYTES, feed_target,
-    };
+    use super::{MT_BUDGET_PER_THREAD_BYTES, MT_FEED_PER_THREAD_BYTES, feed_target};
 
     #[test]
-    fn it_reads_one_run_ahead_per_thread() {
+    fn it_reads_ahead_for_the_threads_it_has_and_no_further() {
         let budget = 16 * MT_BUDGET_PER_THREAD_BYTES;
         assert_eq!(
             feed_target(16, budget),
             16 * MT_FEED_PER_THREAD_BYTES,
-            "a run per thread is what a worker per thread needs"
+            "read-ahead is what keeps a worker per thread busy"
         );
     }
 
     #[test]
-    fn it_reads_a_whole_batch_ahead_even_at_two_threads() {
-        // Not for the two workers' sake — for the run at the end of the batch,
-        // which the decoder decodes on this thread whatever the thread count.
-        let budget = (2 * MT_BUDGET_PER_THREAD_BYTES).max(MT_MIN_BUDGET_FLOOR_BYTES);
-        assert_eq!(feed_target(2, budget), MT_MIN_FEED_BYTES);
+    fn there_is_no_floor_under_the_read_ahead() {
+        // There was one, of a gigabyte, and every batch it bought was cover
+        // for a run the decoder would otherwise have decoded on the calling
+        // thread. It does not chase any more, so two threads read ahead for
+        // two threads.
+        let budget = 2 * MT_BUDGET_PER_THREAD_BYTES;
+        assert_eq!(feed_target(2, budget), 2 * MT_FEED_PER_THREAD_BYTES);
+        assert!(feed_target(2, budget) < 1024 * 1024 * 1024);
     }
 
     #[test]

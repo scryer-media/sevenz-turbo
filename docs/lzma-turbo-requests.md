@@ -142,18 +142,32 @@ and copied out of it again. On x86 at eight threads that took a gigabyte from
 4.82 s to 4.59 s; the spill path stays in the reader as a safety net that is
 never taken.
 
-### A chase decoder that stands aside while a worker is free — landed, not yet taken up
+### A chase decoder that stands aside while a worker is free — landed, and this fork is on it
 
 `Lzma2AdaptiveDecoder::set_chase(false)` (lzma-turbo 0.3.0) makes the
 decoder wait for a worker instead of decoding the run at its cursor on the
 calling thread when that run's chunk header has not arrived. That was the
 request: for a stream already on disk, chasing happened once per batch of fed
 bytes and cost, at two threads, as long as the two workers spent on the other
-two runs. This fork still uses its own work-around — it walks the chunk
-headers itself (`Lzma2RunScanner`) and feeds only whole runs, sized so the
-one run the chase does take is overlapped by several rounds of worker work —
-which costs a gigabyte of read-ahead to hide the chase. Switching the reader
-to `set_chase(false)` and a smaller batch is the open item.
+two runs. The work-around was to hide it rather than to stop it — walk the
+chunk headers here (`Lzma2RunScanner`), feed only whole runs, and make the
+batch large enough that the one run the chase took was overlapped by several
+rounds of worker work. That took a gigabyte of read-ahead, and about two of
+peak memory to hold it.
+
+The reader now switches chasing off for that path instead, and reads ahead
+about a run per thread. It switches it back on for the three cases where the
+front of a run is handed over deliberately and nothing else would decode it: a
+stream written as a single run, a run longer than the reader will hold, and a
+stream whose headers the reader could not walk.
+
+**What the reader owes in return.** A decoder that is not chasing waits for
+input rather than decoding what it has, so everywhere the reader decides it is
+far enough ahead it must first have fed up to the end of a run: stopping part
+way through one leaves a decoder waiting for a reader that has stopped. That
+is `Lzma2MtReader::fed_at_boundary`, and the tests in `src/codec/lzma_turbo.rs`
+that decode a stream to its end — one run, many runs, truncated, arriving a
+few bytes at a time — are what would catch losing it.
 
 ## Outstanding
 
