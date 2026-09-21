@@ -1263,15 +1263,13 @@ impl<R: Read> Read for Lzma2MtReader<R> {
                 // the worker, once, with nothing to poll and no deadline.
                 //
                 // `wait_for_worker` says at once that there is no worker to
-                // wait for, which is the state where the caller is owed
-                // bytes, nothing is outstanding, and the next feed is what
-                // will produce them. Waiting there would be waiting for
-                // nobody, so this goes round instead — after handing the slot
-                // over, because going round is only useful once whoever this
-                // thread is waiting on has run.
-                if !self.decoder.wait_for_worker() {
-                    std::thread::yield_now();
-                }
+                // wait for, which is the state where the caller is owed bytes,
+                // nothing is outstanding, and the next feed is what will
+                // produce them. Waiting there would be waiting for nobody, so
+                // this goes round instead, and going round is not a spin: the
+                // next turn either feeds and decodes on this thread, or is
+                // told the packed stream has run out and fails it above.
+                self.decoder.wait_for_worker();
             }
         }
     }
