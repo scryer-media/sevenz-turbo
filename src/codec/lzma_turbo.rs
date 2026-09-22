@@ -947,6 +947,20 @@ impl<R: Read> Lzma2MtReader<R> {
         pending >= self.backlog_target() || self.backlog_packed() >= self.byte_cap()
     }
 
+    /// Whether the decode has nothing to get on with but the run at the
+    /// cursor.
+    ///
+    /// A complete run waiting for a worker, or one a worker already has, is
+    /// work that will finish and be drained, and draining it is what frees the
+    /// allowance the next boundary needs. So while either exists, a boundary
+    /// can still come into reach and the chase path would only be taking a
+    /// run away from the workers. It is the counts that are asked and not the
+    /// bytes the decoder holds: bytes move with every drain, and a decode is
+    /// briefly holding none between finishing one run and reading the next.
+    fn nothing_left_to_decode(&self) -> bool {
+        self.decoder.pending_runs() == 0 && self.busy_workers() == 0
+    }
+
     /// Whether what the decoder is already holding leaves room to decode one
     /// more run of this stream.
     ///
@@ -1202,28 +1216,32 @@ impl<R: Read> Lzma2MtReader<R> {
                     self.refill()?;
                     continue;
                 }
-                // An empty decoder with a boundary out of reach: the run at the
-                // cursor is longer than the hold allowance, so waiting for its
-                // end would wait forever and the chase path is the only way it
-                // gets decoded at all.
+                // A boundary out of reach with nothing else to decode: the run
+                // at the cursor is longer than the hold allowance, so waiting
+                // for its end would wait forever and the chase path is the
+                // only way it gets decoded at all.
                 //
-                // Beware that being empty is a property of an instant, not of
-                // the stream. A decode of runs near the size of the allowance
-                // can be empty just after one run is handed over and before the
-                // next boundary is read, with whole runs still to come — and
-                // entering the chase there gives the calling thread a run the
-                // workers should have had, for that run's whole length. It was
-                // measured doing exactly that: a stream of 128 MiB runs decoded
-                // 1280 MiB of 1536 on this thread with two runs of twelve ever
-                // reaching a worker. What made that reachable was a decoder
-                // that emptied between runs; it does not empty there now, so
-                // the case is latent rather than gone. If it returns, the test
-                // is not whether the decoder is empty but whether a boundary
-                // can still come into reach: no complete run pending or
-                // outstanding, and the allowance spent, the give-up fired, the
-                // scan broken, or the input over.
-                let idle = self.decoder.in_flight_bytes() == 0;
-                if (self.chasing || idle) && self.in_pos < self.inbuf.len() {
+                // What must not be asked here is whether the decoder happens
+                // to be empty. Empty is a property of an instant, not of the
+                // stream: a decode of runs near the size of the allowance is
+                // empty for a moment after one run is handed over and before
+                // the next boundary is read, with whole runs still to come,
+                // and a chase entered there takes a run the workers should
+                // have had and keeps it to the end. Measured before the rule
+                // below replaced it, a stream of 128 MiB runs decoded 1280 MiB
+                // of 1536 on this thread, with two runs of twelve ever
+                // reaching a worker.
+                //
+                // The question is instead whether a boundary can still come
+                // into reach. Reaching this point has already answered half of
+                // it: the allowance is spent, or the input is over, or the
+                // give-up fired, or the scan broke. The other half is that
+                // nothing else can decode — no complete run waiting for a
+                // worker and none out with one — because a run in either of
+                // those places will be drained, which frees the allowance,
+                // which reads the boundary. See [`Self::nothing_left_to_decode`].
+                if (self.chasing || self.nothing_left_to_decode()) && self.in_pos < self.inbuf.len()
+                {
                     self.chasing = true;
                     self.set_chase(true);
                     end = self.inbuf.len().min(self.in_pos + MT_INPUT_CHUNK);
@@ -2189,6 +2207,89 @@ mod stall_tests {
             }
         }
         assert_eq!(got, plain);
+    }
+
+    /// An allowance smaller than one run still gets every run to a worker.
+    ///
+    /// This is the shape the chase rule is decided in, and it is arrived at
+    /// without any dependence on how the threads are scheduled: the hold is a
+    /// third of a run, so no run boundary is ever within reach of what is
+    /// held, and the feed arrives at the decision every turn with the next
+    /// run's header one turn behind the decoder going quiet. Asking whether
+    /// the decoder was empty was wrong here — it holds the front of the run at
+    /// the cursor, so it never looked empty, the chase never armed, no
+    /// boundary could come into reach and the decode stopped for want of
+    /// progress with two runs of twelve ever dispatched. Asking what is left
+    /// to decode arms it exactly when nothing else can make progress.
+    #[test]
+    fn an_allowance_below_one_run_still_decodes_on_the_workers() {
+        const RUNS: u64 = 12;
+        let (packed, plain) = stream(RUNS as usize, 4);
+        let (mut rd, _control) = reader(Cursor::new(packed), 4);
+        rd.hold_bytes = (run_packed(4) / 3) as usize;
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            match rd
+                .read(&mut buf)
+                .expect("the decode should keep making progress")
+            {
+                0 => break,
+                n => got.extend_from_slice(&buf[..n]),
+            }
+        }
+        assert_eq!(got, plain, "the bytes out must be the bytes in");
+        assert_eq!(
+            rd.decoder.runs_claimed(),
+            RUNS,
+            "every run should have gone to a worker"
+        );
+        assert_eq!(
+            rd.decoder.chase_decoded_bytes(),
+            0,
+            "the calling thread should have decoded nothing"
+        );
+    }
+
+    /// Every run of a stream the allowance can hold goes to a worker, and the
+    /// calling thread decodes none of it.
+    ///
+    /// The read is one run's worth of output at a time, so the decode is
+    /// looked at between runs — the moment at which the decoder has handed
+    /// one over and not yet read the next boundary, and the moment the chase
+    /// used to be armed in. Whenever this reader is deciding whether to chase,
+    /// the rule it decides by is checked against the counts it is made of.
+    #[test]
+    fn a_run_waiting_or_out_with_a_worker_keeps_the_chase_off() {
+        const RUNS: u64 = 12;
+        let (packed, plain) = stream(RUNS as usize, 4);
+        let (mut rd, _control) = reader(Cursor::new(packed), 4);
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; run_unpacked(4) as usize];
+        loop {
+            let waiting = rd.decoder.pending_runs() as u64 + rd.busy_workers();
+            assert_eq!(
+                rd.nothing_left_to_decode(),
+                waiting == 0,
+                "{waiting} runs waiting or out, and the chase rule says {}",
+                rd.nothing_left_to_decode()
+            );
+            match rd.read(&mut buf).expect("decode") {
+                0 => break,
+                n => got.extend_from_slice(&buf[..n]),
+            }
+        }
+        assert_eq!(got, plain, "the bytes out must be the bytes in");
+        assert_eq!(
+            rd.decoder.runs_claimed(),
+            RUNS,
+            "every run should have gone to a worker"
+        );
+        assert_eq!(
+            rd.decoder.chase_decoded_bytes(),
+            0,
+            "the calling thread should have decoded nothing"
+        );
     }
 
     /// A budget with no room left for another run stops the read-ahead even
