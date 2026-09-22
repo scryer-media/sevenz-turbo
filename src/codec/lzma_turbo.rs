@@ -143,6 +143,16 @@ pub(crate) fn lzma_decoder<R: Read>(
 /// bookkeeping off the profile.
 const MT_INPUT_CHUNK: usize = 1 << 20;
 
+/// Bytes read from the coder below in one go, and so the size of a piece this
+/// reader hands over.
+///
+/// A piece is taken or refused whole, so this is also the granularity the
+/// decoder's input budget is spent in: too small and the decode pays a read
+/// and a queue entry per fraction of a run, too large and a piece is refused
+/// for a want the next drain would have covered. Measured on an incompressible
+/// archive at four threads, where the input path is most of the decode.
+const MT_INPUT_READ_BYTES: usize = 4 << 20;
+
 /// The size of one piece of buffered output. See [`Lzma2MtReader::out`].
 const MT_OUTPUT_CHUNK: usize = 1 << 20;
 
@@ -703,6 +713,10 @@ pub(crate) struct MtTrace {
     /// whole cost of the input path beyond the read itself.
     moved: u64,
     resizes: u64,
+    /// Reads that refilled a buffer the decoder handed back instead of
+    /// allocating one. In the steady state this is every read but the first
+    /// few, and a shortfall means pieces are being held, not leaked.
+    reclaimed: u64,
     /// Pieces the decoder handed back for want of room, each of which ended
     /// that feed and was offered again after the next drain. See
     /// [`Lzma2MtReader::hand_over`].
@@ -1068,14 +1082,34 @@ impl<R: Read> Lzma2MtReader<R> {
     /// Scanning is header arithmetic — the compressed payload is stepped over,
     /// never read — so this costs nothing measurable next to decoding it.
     fn refill(&mut self) -> std::io::Result<()> {
+        // A piece is given away for good, so without asking for one back this
+        // loop allocates a buffer per read and frees one per decoded run, from
+        // two different threads, which the allocator answers by holding on to
+        // the difference. `reclaim_piece` hands back an allocation the decode
+        // has finished with, emptied and with its capacity intact, and reusing
+        // it keeps the reader's footprint to the pieces actually in flight.
+        //
         // The piece starts with whatever the scanner could not finish last
         // time, so that it walks one unbroken stream, and the rest of it is
         // read from the input in place. Nothing else ever writes here: once
         // the piece is queued its bytes are only ever given away.
-        let carried = self.carry.len();
-        let mut seg = std::mem::take(&mut self.carry);
-        seg.reserve_exact(MT_INPUT_CHUNK);
-        seg.resize(carried + MT_INPUT_CHUNK, 0);
+        let mut seg = match self.decoder.reclaim_piece() {
+            Some(mut spare) => {
+                if let Some(t) = self.trace.as_mut() {
+                    t.reclaimed += 1;
+                }
+                spare.clear();
+                spare.extend_from_slice(&self.carry);
+                self.carry.clear();
+                spare
+            }
+            None => std::mem::take(&mut self.carry),
+        };
+        let carried = seg.len();
+        // A no-op when the reclaimed buffer is already big enough, which is the
+        // steady state; exact so that a piece never grows past one read.
+        seg.reserve_exact(MT_INPUT_READ_BYTES);
+        seg.resize(carried + MT_INPUT_READ_BYTES, 0);
         let mut filled = carried;
         while filled < seg.len() {
             match self.input.read(&mut seg[filled..])? {
@@ -1213,6 +1247,15 @@ impl<R: Read> Lzma2MtReader<R> {
     /// refused for being a piece while there is room for part of one. Offered
     /// by reference the same bytes are taken in part, which is the one place
     /// this reader copies its input and the price of a limit that small.
+    ///
+    /// The decoder now takes a whole piece a little larger than what its
+    /// budget leaves, rather than refusing it into a stall, and it has a test
+    /// of its own for that. A little larger is not the case kept here: a read
+    /// is several megabytes and a caller may set a limit smaller than one, and
+    /// then no amount of taking pieces whole gets the first byte in. So this
+    /// stays, and the counter that says it never runs on a real archive —
+    /// `copied_feeds`, zero on every lane measured — is what says it costs
+    /// nothing to keep.
     ///
     /// Or there can be no room at all, because what the decoder holds is a run
     /// it cannot claim — a run is complete only once the header after it has
@@ -1415,7 +1458,7 @@ impl<R: Read> Drop for Lzma2MtReader<R> {
     fn drop(&mut self) {
         if let Some(t) = self.trace.as_ref() {
             eprintln!(
-                "mt-trace: threads={} spawned={} drains={} drain={:.3}s sink={:.3}s/{} small={} MiB pump={:.3}s fed={} MiB fed_partial={} MiB st_decoded={} MiB out={} MiB runs={} moved={} MiB resizes={} refused={} copied_feeds={}",
+                "mt-trace: threads={} spawned={} drains={} drain={:.3}s sink={:.3}s/{} small={} MiB pump={:.3}s fed={} MiB fed_partial={} MiB st_decoded={} MiB out={} MiB runs={} moved={} MiB resizes={} refused={} copied_feeds={} reclaimed={}",
                 self.applied_threads,
                 self.decoder.spawned_threads(),
                 t.drains,
@@ -1433,6 +1476,7 @@ impl<R: Read> Drop for Lzma2MtReader<R> {
                 t.resizes,
                 t.refusals,
                 t.copied_feeds,
+                t.reclaimed,
             );
         }
     }
@@ -1962,6 +2006,30 @@ mod stall_tests {
         }
     }
 
+    /// Buffers come back from the decode and are read into again, so a long
+    /// stream does not allocate a piece per read.
+    ///
+    /// The count is compared against the reads rather than pinned: the first
+    /// reads have nothing to reclaim, and a piece the decode is still holding
+    /// is not spare. What would be wrong is refilling nothing, which is what
+    /// handing every allocation away one-way looks like.
+    #[test]
+    fn read_buffers_come_back_from_the_decode() {
+        let (packed, plain) = stream(48, 4);
+        let reads = packed.len().div_ceil(super::MT_INPUT_READ_BYTES);
+        for threads in [2, 4, 8] {
+            let (mut rd, control) = reader(Cursor::new(packed.clone()), threads);
+            rd.trace = Some(Box::default());
+            let (out, _peak, _widest) = drain_watching(&mut rd, &control);
+            assert_eq!(out, plain, "threads={threads}");
+            let t = rd.trace.as_ref().expect("the trace this test turned on");
+            assert!(
+                t.reclaimed > 0,
+                "threads={threads}: nothing reclaimed in {reads} reads",
+            );
+        }
+    }
+
     /// The input reaches the decoder as the pieces it was read in, and the
     /// only copy on the way is the cut that ends a piece at a run boundary.
     ///
@@ -1976,7 +2044,7 @@ mod stall_tests {
     fn the_input_is_never_copied_more_than_once_per_read() {
         for (runs, chunks) in [(48, 4), (12, 16), (96, 2)] {
             let (packed, plain) = stream(runs, chunks);
-            let reads = packed.len().div_ceil(super::MT_INPUT_CHUNK);
+            let reads = packed.len().div_ceil(super::MT_INPUT_READ_BYTES);
             for threads in [2, 4, 8] {
                 let (mut rd, control) = reader(Cursor::new(packed.clone()), threads);
                 rd.trace = Some(Box::default());

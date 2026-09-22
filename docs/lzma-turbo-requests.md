@@ -229,9 +229,7 @@ against forty, with the workers idle for most of the difference. The rule this
 reader keeps is that it waits only once it has established there is nothing
 else it can do at all.
 
-## Outstanding
-
-### A parked allocation the reader can refill into — asked for
+### A parked allocation the reader can refill into — landed, and this fork refills into it
 
 ```rust
 impl Lzma2AdaptiveDecoder {
@@ -244,16 +242,13 @@ impl Lzma2AdaptiveDecoder {
 Feeding by value means the reader gives an allocation away on every read and
 asks the allocator for another one. Nothing is copied, which is the point, but
 the pieces are large and the decode frees them at the far end, so the process
-keeps the high-water mark of everything in flight: measured against the same
+kept the high-water mark of everything in flight: measured against the same
 reader feeding by copy, wall time fell 4-50% and minor faults 25-75% on every
-lane, while peak resident memory rose 8-21%. Handing the finished allocation
-back closes that: the reader refills into the buffer the decoder has done with,
-and the two of them pass one set of pieces round.
+lane, while peak resident memory rose 8-21%. The refill now starts from
+whatever piece is handed back, and on an incompressible archive at four threads
+that took peak resident memory from 1.75 GB to 1.40 GB for the same wall time.
 
-**Work-around until then.** None that keeps the ownership transfer - a reader
-that kept its buffers would have to copy into them, which is the cost being
-removed. The reader is written so that the refill takes whatever buffer it is
-given, so wiring this is a line at the top of the refill.
+## Outstanding
 
 ### A limit the decoder holds to, or an account of what it does not — outstanding
 
