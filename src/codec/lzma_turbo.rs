@@ -1177,6 +1177,26 @@ impl<R: Read> Lzma2MtReader<R> {
                     self.refill()?;
                     continue;
                 }
+                // An empty decoder with a boundary out of reach: the run at the
+                // cursor is longer than the hold allowance, so waiting for its
+                // end would wait forever and the chase path is the only way it
+                // gets decoded at all.
+                //
+                // Beware that being empty is a property of an instant, not of
+                // the stream. A decode of runs near the size of the allowance
+                // can be empty just after one run is handed over and before the
+                // next boundary is read, with whole runs still to come — and
+                // entering the chase there gives the calling thread a run the
+                // workers should have had, for that run's whole length. It was
+                // measured doing exactly that: a stream of 128 MiB runs decoded
+                // 1280 MiB of 1536 on this thread with two runs of twelve ever
+                // reaching a worker. What made that reachable was a decoder
+                // that emptied between runs; it does not empty there now, so
+                // the case is latent rather than gone. If it returns, the test
+                // is not whether the decoder is empty but whether a boundary
+                // can still come into reach: no complete run pending or
+                // outstanding, and the allowance spent, the give-up fired, the
+                // scan broken, or the input over.
                 let idle = self.decoder.in_flight_bytes() == 0;
                 if (self.chasing || idle) && self.in_pos < self.inbuf.len() {
                     self.chasing = true;
