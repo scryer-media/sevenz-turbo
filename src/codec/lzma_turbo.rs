@@ -926,12 +926,37 @@ impl<R: Read> Lzma2MtReader<R> {
     /// reach, or [`MT_BACKLOG_BYTES_PER_THREAD`] of packed backlog per thread,
     /// which is what large ones reach long before the count. Neither ceiling is
     /// allowed to exceed what the caller's limit leaves room for.
+    ///
+    /// Under all of that sits the budget itself. The floor asks for runs a free
+    /// worker could take, and a worker can only take one if the budget has room
+    /// to decode it; where it has not, reading further ahead buys no thread and
+    /// spends the very bytes a running thread needs in order to finish and
+    /// hand its own back. That was measured: at eight threads under a gigabyte
+    /// the packed read-ahead the floor asked for grew the decoder's input
+    /// buffer to half the whole allowance, leaving room for three runs at once
+    /// where the allowance should have paid for six. So the budget is asked
+    /// first, and a budget with no room for another run is itself the answer.
     fn backlog_full(&self) -> bool {
+        if !self.room_for_a_run() {
+            return true;
+        }
         let pending = self.decoder.pending_runs() as u64;
         if pending < self.demand_floor() {
             return false;
         }
         pending >= self.backlog_target() || self.backlog_packed() >= self.byte_cap()
+    }
+
+    /// Whether what the decoder is already holding leaves room to decode one
+    /// more run of this stream.
+    ///
+    /// True while the run size is still unknown, and true always for a caller
+    /// that set no limit: an unlimited decode is never held back here and
+    /// reads ahead exactly as it did before.
+    fn room_for_a_run(&self) -> bool {
+        let (packed, unpacked) = self.run_size();
+        let cost = packed.saturating_add(unpacked);
+        cost == 0 || self.decoder.held_bytes().saturating_add(cost) <= self.decoder.memory_limit()
     }
 
     /// Complete runs a worker that is free right now would need to find.
@@ -2135,8 +2160,8 @@ mod stall_tests {
     }
 
     /// The floor is a floor: however large the runs are, and whatever the byte
-    /// ceiling says, the feed does not stop while a worker could come free and
-    /// find nothing to take.
+    /// ceiling says, the feed does not stop while a worker could come free,
+    /// find nothing to take, and have room to decode it.
     #[test]
     fn a_free_worker_always_finds_a_run_waiting() {
         let (packed, plain) = stream(48, 16);
@@ -2147,9 +2172,10 @@ mod stall_tests {
         let mut got = Vec::new();
         let mut buf = vec![0u8; 64 << 10];
         loop {
-            // Whenever the read-ahead calls itself finished, it is holding at
-            // least what a worker coming free would need.
-            if rd.backlog_full() {
+            // Whenever the read-ahead calls itself finished with the budget
+            // still able to pay for a run, it is holding at least what a
+            // worker coming free would need.
+            if rd.backlog_full() && rd.room_for_a_run() {
                 let pending = rd.decoder.pending_runs() as u64;
                 assert!(
                     pending >= rd.demand_floor(),
@@ -2163,5 +2189,30 @@ mod stall_tests {
             }
         }
         assert_eq!(got, plain);
+    }
+
+    /// A budget with no room left for another run stops the read-ahead even
+    /// below the floor: more packed input cannot be decoded by anybody, and
+    /// the bytes it would take are the ones a running worker needs in order to
+    /// finish and give its own back.
+    #[test]
+    fn a_spent_budget_stops_the_read_ahead_below_the_floor() {
+        let (packed, _plain) = stream(8, 16);
+        let (mut rd, _control) = reader(Cursor::new(packed), 4);
+        // Nothing has been fed, so a free worker would find nothing: without
+        // the budget rule this is the state the floor holds the feed open in.
+        assert_eq!(rd.decoder.pending_runs(), 0);
+        assert!(rd.demand_floor() > 0);
+        // A run of this stream costs more than the whole allowance. Whatever
+        // is read, no worker can be given one, so reading further ahead is
+        // only spending.
+        rd.recent_runs[0] = (LIMIT, LIMIT);
+        assert!(!rd.room_for_a_run());
+        assert!(rd.backlog_full(), "a spent budget is a full backlog");
+        // The control: a run the allowance can pay for leaves the floor in
+        // charge, and the floor keeps the feed open.
+        rd.recent_runs[0] = (run_packed(16), run_unpacked(16));
+        assert!(rd.room_for_a_run());
+        assert!(!rd.backlog_full(), "the floor should hold the feed open");
     }
 }
