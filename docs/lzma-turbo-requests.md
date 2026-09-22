@@ -142,6 +142,38 @@ and copied out of it again. On x86 at eight threads that took a gigabyte from
 4.82 s to 4.59 s; the spill path stays in the reader as a safety net that is
 never taken.
 
+### Input the decoder takes ownership of — landed, and this fork is on it
+
+```rust
+impl Lzma2AdaptiveDecoder {
+    pub fn feed_owned(&mut self, seg: Vec<u8>) -> Result<Option<Vec<u8>>, Error>;
+    pub fn feed_shared(&mut self, seg: &Arc<Vec<u8>>, range: Range<usize>)
+        -> Result<Option<Range<usize>>, Error>;
+}
+```
+
+`feed` copies what it is given into the decoder's own buffer, so a reader that
+held the packed stream in one buffer paid for every byte twice: once copying
+the unconsumed tail down over itself to make room for the next read, and again
+feeding it. The first cost grows with how much is held, so on a stream that is
+refused often it grows with the square of it.
+
+Both new entry points take the bytes as they are. The reader keeps its reads as
+the pieces they arrived in, queues them in order, and hands a piece over whole
+and by value; the decoder holds that allocation until the cursor and every
+worker are past it. The only copy left on the input path is the cut that ends a
+piece at a run boundary, which happens at most once per read whatever the
+stream's length: on a 1.6 GiB incompressible archive at four threads the cuts
+went from 76 to 11 and the decode from 5.8 s to 2.9 s, with half the minor
+faults.
+
+A whole piece is taken or refused, never split, so that the path that accepts
+never copies. **What the reader owes in return** is to treat a refusal as the
+budget being spent for now rather than for good: the piece stays at the front
+of its queue, the caller drains, and the same piece is the first thing offered
+on the way back in. Dropping the read-ahead on a refusal, or waiting for the
+room instead of returning, both cost more than the copy did.
+
 ### A chase decoder that stands aside while a worker is free — landed, and this fork is on it
 
 `Lzma2AdaptiveDecoder::set_chase(false)` (lzma-turbo 0.3.0) makes the
@@ -169,9 +201,7 @@ is `Lzma2MtReader::fed_at_boundary`, and the tests in `src/codec/lzma_turbo.rs`
 that decode a stream to its end — one run, many runs, truncated, arriving a
 few bytes at a time — are what would catch losing it.
 
-## Outstanding
-
-### Somewhere to wait for a worker — asked for, and this fork is written against it
+### Somewhere to wait for a worker — landed, and this fork is on it
 
 ```rust
 impl Lzma2AdaptiveDecoder {
@@ -190,9 +220,40 @@ over one 828 MiB archive at four threads, which is a core the workers are not
 getting. With the wait it is about three thousand, and the decode costs 20-25%
 less CPU.
 
-**Work-around until then.** `std::thread::yield_now`, which hands the slot over
-but comes straight back. It is still what this reader does when the wait says
-there is no worker to wait for.
+`wait_for_worker` (lzma-turbo 0.5.0) is what the reader waits on when it is
+owed bytes, has nothing left to feed and nothing to drain. Where it must *not*
+be called is anywhere the reader could instead deliver: waiting is the one
+thread that hands output to the caller going to sleep, and a wait on every
+refused feed cost a three-gigabyte decode at eight threads seventeen seconds
+against forty, with the workers idle for most of the difference. The rule this
+reader keeps is that it waits only once it has established there is nothing
+else it can do at all.
+
+## Outstanding
+
+### A parked allocation the reader can refill into — asked for
+
+```rust
+impl Lzma2AdaptiveDecoder {
+    /// Hands back an owned piece the decode has finished with, cleared and
+    /// with its capacity intact, or `None` when it is holding none.
+    pub fn reclaim_piece(&mut self) -> Option<Vec<u8>>;
+}
+```
+
+Feeding by value means the reader gives an allocation away on every read and
+asks the allocator for another one. Nothing is copied, which is the point, but
+the pieces are large and the decode frees them at the far end, so the process
+keeps the high-water mark of everything in flight: measured against the same
+reader feeding by copy, wall time fell 4-50% and minor faults 25-75% on every
+lane, while peak resident memory rose 8-21%. Handing the finished allocation
+back closes that: the reader refills into the buffer the decoder has done with,
+and the two of them pass one set of pieces round.
+
+**Work-around until then.** None that keeps the ownership transfer - a reader
+that kept its buffers would have to copy into them, which is the cost being
+removed. The reader is written so that the refill takes whatever buffer it is
+given, so wiring this is a line at the top of the refill.
 
 ### A limit the decoder holds to, or an account of what it does not — outstanding
 
