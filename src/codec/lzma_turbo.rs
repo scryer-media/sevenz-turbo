@@ -703,12 +703,10 @@ pub(crate) struct MtTrace {
     /// whole cost of the input path beyond the read itself.
     moved: u64,
     resizes: u64,
-    /// Pieces the decoder handed back for want of room, and how many of those
-    /// refusals were followed by a worker to wait for rather than ending the
-    /// feed. The gap between the two is the number of times the budget was
-    /// really spent. See [`Lzma2MtReader::hand_over`].
+    /// Pieces the decoder handed back for want of room, each of which ended
+    /// that feed and was offered again after the next drain. See
+    /// [`Lzma2MtReader::hand_over`].
     refusals: u64,
-    refusal_waits: u64,
     /// Feeds that copied because a whole piece would not fit at all. Zero for
     /// every decode whose allowance holds one read; see
     /// [`Lzma2MtReader::offer_part_of_the_front`].
@@ -1146,23 +1144,22 @@ impl<R: Read> Lzma2MtReader<R> {
     /// falls inside it. That cut moves at most a chunk, and a stream of long
     /// runs pays it about once per run.
     ///
-    /// A decoder whose budget is spent hands the piece back unchanged, and it
-    /// goes to the front of the queue to be offered again. What must not
-    /// happen then is to stop feeding: a whole piece is refused for the want
-    /// of its last byte, so a refusal is not by itself the budget being spent
-    /// — it can equally be a piece that is a little too big for the room a
-    /// worker is about to free. Leaving on the first refusal reads less far
-    /// ahead than a partial take used to, because the room below one piece is
-    /// then never used at all, and the decode arrives at the next dispatch
-    /// with fewer runs in hand than it has threads.
+    /// A decoder whose budget is spent hands the piece back unchanged, and the
+    /// piece goes to the front of the queue, where it is the first thing
+    /// offered next time. Stopping short is what tells the feed loop the
+    /// budget is spent, exactly as a short take used to, and no read-ahead is
+    /// lost by stopping: the bytes are still read, still in order, and still
+    /// the next thing to go over.
     ///
-    /// So the piece is offered again, once a worker has handed its run back
-    /// and the input it was holding with it. Only when there is no worker to
-    /// wait for is the budget really spent: nothing outstanding means nothing
-    /// is going to free anything, and stopping short is what tells the feed
-    /// loop so — exactly as a short take used to. Waiting cannot repeat
-    /// without end, because each wait takes in a run that was outstanding and
-    /// there is a finite number of them.
+    /// What this must not do is wait here for the room. A refusal means the
+    /// decoder is full, which on a stream of long runs means a worker is
+    /// holding a run this thread has not drained yet — so the thing to do is
+    /// return, drain it, and offer the piece again with the room that drain
+    /// freed. Waiting instead puts the one thread that can deliver output to
+    /// sleep until a worker lands, and it was measured costing about a run's
+    /// decode per refusal: a three-gigabyte decode at eight threads went from
+    /// seventeen seconds to forty, using *less* processor time, because the
+    /// workers spent most of it with nothing to hand back to.
     fn hand_over(&mut self, want: usize, last_resort: bool) -> std::io::Result<usize> {
         let mut given = 0;
         while given < want {
@@ -1195,15 +1192,10 @@ impl<R: Read> Lzma2MtReader<R> {
                     if let Some(t) = self.trace.as_mut() {
                         t.refusals += 1;
                     }
-                    if !self.decoder.wait_for_worker() {
-                        if given == 0 && last_resort {
-                            given += self.starve(take)?;
-                        }
-                        break;
+                    if given == 0 && last_resort {
+                        given += self.starve(take)?;
                     }
-                    if let Some(t) = self.trace.as_mut() {
-                        t.refusal_waits += 1;
-                    }
+                    break;
                 }
             }
         }
@@ -1423,7 +1415,7 @@ impl<R: Read> Drop for Lzma2MtReader<R> {
     fn drop(&mut self) {
         if let Some(t) = self.trace.as_ref() {
             eprintln!(
-                "mt-trace: threads={} spawned={} drains={} drain={:.3}s sink={:.3}s/{} small={} MiB pump={:.3}s fed={} MiB fed_partial={} MiB st_decoded={} MiB out={} MiB runs={} moved={} MiB resizes={} refused={} refused_waited={} copied_feeds={}",
+                "mt-trace: threads={} spawned={} drains={} drain={:.3}s sink={:.3}s/{} small={} MiB pump={:.3}s fed={} MiB fed_partial={} MiB st_decoded={} MiB out={} MiB runs={} moved={} MiB resizes={} refused={} copied_feeds={}",
                 self.applied_threads,
                 self.decoder.spawned_threads(),
                 t.drains,
@@ -1440,7 +1432,6 @@ impl<R: Read> Drop for Lzma2MtReader<R> {
                 t.moved >> 20,
                 t.resizes,
                 t.refusals,
-                t.refusal_waits,
                 t.copied_feeds,
             );
         }
@@ -1944,7 +1935,6 @@ mod stall_tests {
             self.inner.read(&mut buf[..n])
         }
     }
-
 
     /// A stream longer than the allowance is refused somewhere, and every
     /// piece refused is handed over later instead of being dropped or cut up.
