@@ -384,6 +384,51 @@ Everything here is new surface; no upstream signature changed meaning.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.26.0 - 2026-09-22
+
+- The parallel LZMA2 reader sizes itself from the stream in front of it. It
+  walks the chunk headers with `Lzma2RunScanner` as they arrive, so it knows
+  where every dictionary-reset run ends, and what it costs packed and
+  unpacked, before it hands anything over. What it reads ahead is then a
+  number of complete runs per thread rather than a fixed number of bytes: a
+  decode of an archive with large runs no longer pulls a gigabyte of packed
+  input in behind itself, and one with small runs no longer starves its
+  workers a megabyte at a time. Decoded bytes are unchanged; a caller that
+  sets no thread count and no memory limit sees the same API it always did.
+- A caller's memory limit is spent on decoding before it is spent on reading
+  ahead. The limit decides how many runs can be inside the decoder at once,
+  and so how many threads can actually be decoding; the read-ahead is sized
+  by that count, and a budget with no room for another run stops the feed
+  even where the backlog looks thin. Feeding right up to a limit used to
+  leave no room to dispatch what had just been fed, which turned a
+  four-thread decode under 512 MiB into a single-threaded one.
+- An incompressible archive is decoded narrow. Runs whose packed size is
+  within a tenth of their unpacked size hold data an encoder could not beat;
+  such a stream is read-bound rather than decode-bound, so the reader caps it
+  at two threads, and reads ahead for those two rather than for the count the
+  caller asked for. Two runs in a row settle the question either way, so an
+  archive that is a film beside a text file narrows for the one and widens
+  again for the other. Measured on 1.5 GiB of incompressible payload at eight
+  threads: 3.06 GB resident and 1.72 s becomes 0.90 GB and 1.42 s. Archives
+  whose runs compress are untouched.
+- The packed input reaches the decoder as the pieces it was read in, handed
+  over by value and never copied down over itself, and each read refills the
+  piece the decode hands back rather than asking the allocator for another.
+- Fixed: the calling thread's chase decoder was re-armed on an empty decoder
+  rather than on what was left to decode, so a stream whose last run was
+  still arriving could sit with the workers idle. It is now armed from the
+  three cases that need it — a stream written as one run, a run larger than
+  the allowance, and a stream whose headers could not be walked — and a
+  decode that has runs waiting or out with a worker leaves it off.
+- Fixed: a feed the decoder refused for want of room is offered again after
+  the next drain instead of waited on. Waiting put the one thread that hands
+  output to the caller to sleep; on a three-gigabyte archive at eight threads
+  that cost 42 s against 18 s, with the workers idle for most of it. A decode
+  that genuinely cannot proceed is still given up on rather than hung: the
+  reader waits only once it has established there is nothing else it can do,
+  and reports a stall rather than blocking for ever.
+- Requires `lzma-turbo` 0.6.0.
+
 ## 0.25.0 - 2026-09-19
 
 - LZMA and LZMA2 are encoded by `lzma-turbo`'s port of the SDK encoder.

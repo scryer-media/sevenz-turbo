@@ -199,7 +199,7 @@ What each phase of a decode costs, and the rest of the fixtures, are in
 
 ```toml
 [dependencies]
-sevenz-turbo = "0.23"
+sevenz-turbo = "0.26"
 ```
 
 Decompress "data/sample.7z" to "data/sample":
