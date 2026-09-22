@@ -212,6 +212,12 @@ const MT_DENSE_PERCENT: u128 = 90;
 /// decoded no faster at eight threads than at two — while each of them holds a
 /// run of its own, which on that archive was the difference between three
 /// quarters of a gigabyte resident and three gigabytes.
+///
+/// It also sets what such a stream costs: the read-ahead an incompressible
+/// decode may spend is this many threads' worth of
+/// [`MT_BACKSTOP_PER_THREAD_BYTES`] — 768 MiB as both stand today — or the
+/// caller's limit where that is lower, so changing either constant moves the
+/// incompressible lane's footprint.
 const MT_DENSE_THREADS: u32 = 2;
 
 /// Runs in a row that must disagree with the shape in hand before it changes.
@@ -714,7 +720,12 @@ pub(crate) struct Lzma2MtReader<R: Read> {
     /// run-size regimes it sorts streams into are reachable in a test by moving
     /// the ceiling rather than by building runs of a hundred megabytes.
     backlog_bytes: u64,
+    /// Set once the source has no more bytes to give. Not the same thing as
+    /// the decoder having been told: see [`Self::told_end`].
     input_done: bool,
+    /// Set once the decoder has been told the input is over, which is only
+    /// after the last piece read has been taken. See [`Self::settle_end`].
+    told_end: bool,
     /// Decoded output not yet handed to the caller, in fixed-size pieces.
     ///
     /// One `drain` can deliver everything the fed bytes allow — a gigabyte,
@@ -770,6 +781,10 @@ pub(crate) struct MtTrace {
     /// every decode whose allowance holds one read; see
     /// [`Lzma2MtReader::offer_part_of_the_front`].
     copied_feeds: u64,
+    /// Turns on which the source had run dry with bytes still queued here, so
+    /// the end of the input was held back rather than announced over the top
+    /// of a tail the decoder had not taken. See [`Lzma2MtReader::settle_end`].
+    end_deferred: u64,
 }
 
 impl<R: Read> Lzma2MtReader<R> {
@@ -832,6 +847,7 @@ impl<R: Read> Lzma2MtReader<R> {
             hold_bytes: MT_INPUT_HOLD_BYTES,
             backlog_bytes: MT_BACKLOG_BYTES_PER_THREAD,
             input_done: false,
+            told_end: false,
             out: VecDeque::new(),
             spare: Vec::new(),
             out_pos: 0,
@@ -1217,7 +1233,7 @@ impl<R: Read> Lzma2MtReader<R> {
             // else.
             self.queue(seg);
             self.input_done = true;
-            self.decoder.end_of_input();
+            self.settle_end();
             return Ok(());
         }
         if !self.scan_broken && !self.scanner.finished() {
@@ -1267,6 +1283,39 @@ impl<R: Read> Lzma2MtReader<R> {
         }
         self.queue(seg);
         Ok(())
+    }
+
+    /// Tells the decoder the input is over, once it actually is.
+    ///
+    /// A source with nothing left to give is not the end of the input as far
+    /// as the decoder is concerned. Pieces already read can still be queued
+    /// here, and a decoder whose budget is spent hands a piece back rather
+    /// than taking it, so the last bytes of an archive can be sitting in this
+    /// reader waiting for a drain to make room for them.
+    ///
+    /// Told the input is over, the decoder takes itself to have everything,
+    /// and a drain that then finds a stream it cannot complete and nothing to
+    /// get on with calls the archive corrupt. A tail this reader is still
+    /// holding would be reported as a truncated stream that is nothing of the
+    /// kind. So the announcement waits for the queue to empty: the source
+    /// being over and every byte of it taken are two conditions, and both are
+    /// asked here.
+    ///
+    /// A stream that really is short still says so. Its last bytes are taken
+    /// like any others — they are what is left of a header, far smaller than
+    /// any budget — and the decoder is told immediately afterwards, which is
+    /// what turns the next empty drain into the missing-end-marker error.
+    fn settle_end(&mut self) {
+        if self.input_done && !self.told_end {
+            if self.fed_to == self.read_to() {
+                self.told_end = true;
+                self.decoder.end_of_input();
+            } else if let Some(t) = self.trace.as_mut() {
+                // The source is over and the decoder has not been told,
+                // because bytes it has not taken are still queued here.
+                t.end_deferred += 1;
+            }
+        }
     }
 
     /// Adds a read piece to the back of the queue.
@@ -1348,6 +1397,8 @@ impl<R: Read> Lzma2MtReader<R> {
                 }
             }
         }
+        // Whatever went over may have been the last of it.
+        self.settle_end();
         Ok(given)
     }
 
@@ -1573,7 +1624,7 @@ impl<R: Read> Drop for Lzma2MtReader<R> {
     fn drop(&mut self) {
         if let Some(t) = self.trace.as_ref() {
             eprintln!(
-                "mt-trace: threads={} spawned={} drains={} drain={:.3}s sink={:.3}s/{} small={} MiB pump={:.3}s fed={} MiB fed_partial={} MiB st_decoded={} MiB out={} MiB runs={} moved={} MiB resizes={} refused={} copied_feeds={} reclaimed={} dense={}",
+                "mt-trace: threads={} spawned={} drains={} drain={:.3}s sink={:.3}s/{} small={} MiB pump={:.3}s fed={} MiB fed_partial={} MiB st_decoded={} MiB out={} MiB runs={} moved={} MiB resizes={} refused={} copied_feeds={} reclaimed={} end_deferred={} dense={}",
                 self.applied_threads,
                 self.decoder.spawned_threads(),
                 t.drains,
@@ -1592,6 +1643,7 @@ impl<R: Read> Drop for Lzma2MtReader<R> {
                 t.refusals,
                 t.copied_feeds,
                 t.reclaimed,
+                t.end_deferred,
                 self.dense,
             );
         }
@@ -1653,8 +1705,11 @@ impl<R: Read> Read for Lzma2MtReader<R> {
             // spill buffer, so the buffer is lent to the call and taken back.
             let mut direct = 0usize;
             // Whether the decoder knew, going into this drain, that it had
-            // been given everything.
-            let told_the_end = self.input_done;
+            // been given everything. A source that has run dry is not enough:
+            // a piece it read can still be queued here, refused for want of
+            // room, and a decode holding output it has not yet handed back is
+            // not a short stream. See [`Lzma2MtReader::settle_end`].
+            let told_the_end = self.told_end;
             let t0 = std::time::Instant::now();
             let mut out = std::mem::take(&mut self.out);
             let mut spare = std::mem::take(&mut self.spare);
@@ -2240,6 +2295,83 @@ mod stall_tests {
         // decode there was no boundary to feed up to.
         assert_eq!(rd.runs_seen, 1);
         assert_eq!(out, plain);
+    }
+
+    /// The end of the source is not the end of the input: bytes already read
+    /// can still be queued here while the source has nothing more to give.
+    ///
+    /// A decoder told the input is over takes itself to have everything, and
+    /// a drain that then finds a stream it cannot complete and nothing to get
+    /// on with calls the archive corrupt. A tail this reader is still holding
+    /// — a piece the budget has no room for, or the part of a read the header
+    /// walk could not use — is not that, and announcing the end over the top
+    /// of it would turn a decode that had further to go into a corrupt one.
+    ///
+    /// The state the queue has to survive is the one where the source runs
+    /// dry while bytes sit here unfed, which happens when the last run this
+    /// reader scanned is still open: nothing past the start of an open run
+    /// may be handed over, so those bytes wait, and the read that would have
+    /// closed the run returns nothing instead. `end_deferred` counts the
+    /// turns on which the end was held back for that reason, and this asserts
+    /// the state is reached, that the end is announced once the tail has been
+    /// taken, and — since a run that never closes is a stream that really is
+    /// short — that the decode still says so rather than waiting on it.
+    #[test]
+    fn a_tail_still_queued_is_not_the_end_of_the_input() {
+        let (packed, _plain) = stream(8, 4);
+        let cut = packed.len() - (100 << 10);
+        for threads in [1, 2, 4] {
+            let (mut rd, _control) = reader(Cursor::new(packed[..cut].to_vec()), threads);
+            rd.trace = Some(Box::default());
+            let mut buf = vec![0u8; 8 << 10];
+            let err = loop {
+                match rd.read(&mut buf) {
+                    Ok(0) => panic!("threads={threads}: a cut stream is not a clean end"),
+                    Ok(_) => {}
+                    Err(err) => break err,
+                }
+            };
+            assert!(
+                matches!(
+                    err.kind(),
+                    ErrorKind::UnexpectedEof | ErrorKind::InvalidData
+                ),
+                "threads={threads}: {err}"
+            );
+            let t = rd.trace.as_ref().expect("the trace this test turned on");
+            assert!(
+                t.end_deferred > 0,
+                "threads={threads}: the source never ran out with a tail still queued",
+            );
+            assert!(
+                rd.told_end,
+                "threads={threads}: the end should be announced once the tail is taken",
+            );
+        }
+    }
+
+    /// The same rule from the other side: a decode whose allowance is smaller
+    /// than what it is holding refuses pieces all the way to the end of the
+    /// stream, and the end is announced once — after the last of them has
+    /// been taken — so the decode finishes byte-exact instead of being called
+    /// corrupt.
+    #[test]
+    fn a_refused_piece_at_the_end_of_the_stream_still_finishes() {
+        let (packed, plain) = stream(24, 4);
+        for threads in [1, 2, 4] {
+            let (mut rd, control) =
+                reader_limited(Cursor::new(packed.clone()), threads, 2 * run_cost(4));
+            rd.trace = Some(Box::default());
+            let (out, _peak, _widest) = drain_watching(&mut rd, &control);
+            assert_eq!(out, plain, "threads={threads}");
+            assert!(rd.told_end, "threads={threads}");
+            assert_eq!(rd.held, 0, "threads={threads}: bytes left over");
+            let t = rd.trace.as_ref().expect("the trace this test turned on");
+            assert!(
+                t.refusals > 0,
+                "threads={threads}: the allowance was never reached",
+            );
+        }
     }
 
     /// A stream cut part way through a run: the decoder is owed input that is

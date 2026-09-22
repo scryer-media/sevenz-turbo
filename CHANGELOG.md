@@ -427,6 +427,12 @@ Everything here is new surface; no upstream signature changed meaning.
   that genuinely cannot proceed is still given up on rather than hung: the
   reader waits only once it has established there is nothing else it can do,
   and reports a stall rather than blocking for ever.
+- Fixed: the end of the input is announced to the decoder only once the last
+  piece read has been taken, rather than the moment the source runs dry. A
+  decoder told the input is over treats a stream it cannot then finish as a
+  corrupt archive, so a tail still queued in the reader — bytes beyond a run
+  that has not closed, or a piece the allowance had no room for — could have
+  been reported as damage. A stream that really is short still says so.
 - Requires `lzma-turbo` 0.6.0.
 
 ## 0.25.0 - 2026-09-19
