@@ -191,6 +191,39 @@ const MT_BACKSTOP_PER_THREAD_BYTES: u64 = 384 * 1024 * 1024;
 /// for the gigabytes after it.
 const MT_RUN_WINDOW: usize = 8;
 
+/// Packed bytes per hundred unpacked at or above which a run is taken to hold
+/// data that did not compress.
+///
+/// An encoder that cannot beat the data writes it out as it stands — LZMA2
+/// uncompressed chunks, packed a shade *larger* than unpacked — or shaves a
+/// percent or two off it and writes that. Either way the ratio sits against 1,
+/// nowhere near what even barely compressible data reaches, so the line
+/// between the two shapes is a wide one and exactly where it is drawn inside
+/// the gap does not matter.
+const MT_DENSE_PERCENT: u128 = 90;
+
+/// Threads an incompressible stream is decoded with, however many the caller
+/// asked for.
+///
+/// Such a stream is read-bound rather than decode-bound: its runs are large,
+/// every byte of them has to be moved, and the decoding between the reads is
+/// almost nothing. Threads beyond a couple therefore buy no wall at all —
+/// measured, an archive of a gigabyte and a half of incompressible payload
+/// decoded no faster at eight threads than at two — while each of them holds a
+/// run of its own, which on that archive was the difference between three
+/// quarters of a gigabyte resident and three gigabytes.
+const MT_DENSE_THREADS: u32 = 2;
+
+/// Runs in a row that must disagree with the shape in hand before it changes.
+///
+/// An archive is not all one thing: a film beside a text file gives a stream
+/// whose runs change shape part way through, and the decode should narrow for
+/// the one and widen again for the other. What it must not do is follow every
+/// single run, because an encoder that meets one compressible megabyte in the
+/// middle of a film writes one compressible run, and a thread count that went
+/// wide there and narrow again would cost more than either shape saves.
+const MT_SHAPE_RUNS: u32 = 2;
+
 /// Complete runs to keep waiting in the decoder, per thread.
 ///
 /// The read-ahead above is a ceiling on bytes, and reaching it in one go is
@@ -593,8 +626,9 @@ pub(crate) struct Lzma2MtReader<R: Read> {
     decoder: Lzma2AdaptiveDecoder,
     input: R,
     control: Arc<Lzma2Control>,
-    /// The ceiling currently applied to `decoder`, so that a caller that does
-    /// not change it costs one relaxed load per block of output.
+    /// The ceiling currently applied to `decoder` — what the caller asked for,
+    /// narrowed by what the stream's shape is worth — so that a caller that
+    /// does not change it costs one relaxed load per block of output.
     applied_threads: u32,
     /// Packed bytes read but not yet handed to the decoder, in the pieces they
     /// were read in and in stream order. Feeding gives a whole piece away by
@@ -625,6 +659,17 @@ pub(crate) struct Lzma2MtReader<R: Read> {
     /// decode: see [`Lzma2MtReader::affordable_threads`].
     recent_runs: [(u64, u64); MT_RUN_WINDOW],
     recent_at: usize,
+    /// Whether the runs going past are holding data that did not compress,
+    /// which is what decides how wide this decode is allowed to be. See
+    /// [`MT_DENSE_THREADS`].
+    dense: bool,
+    /// Closed runs in a row that disagreed with [`Self::dense`]. Reset by any
+    /// run that agrees, so it counts a run of disagreement and not a total.
+    shape_streak: u32,
+    /// [`MT_DENSE_THREADS`], as a field so that a test can lift the shape
+    /// ceiling and look at what the memory limit affords on its own: every
+    /// stream a test writes by hand is an incompressible one.
+    dense_threads: u32,
     /// Set once bytes have been fed that do not end on a run boundary, which
     /// puts the decoder's chase path inside a run until that run is over.
     chasing: bool,
@@ -771,6 +816,9 @@ impl<R: Read> Lzma2MtReader<R> {
             runs_seen: 0,
             recent_runs: [(0, 0); MT_RUN_WINDOW],
             recent_at: 0,
+            dense: false,
+            shape_streak: 0,
+            dense_threads: MT_DENSE_THREADS,
             chasing: false,
             chase: false,
             run_ends: VecDeque::new(),
@@ -824,13 +872,33 @@ impl<R: Read> Lzma2MtReader<R> {
         );
     }
 
-    /// Applies a thread count the caller changed since the last look. The
-    /// decoder itself defers it to the next run boundary.
+    /// Applies a thread count the caller changed since the last look, and the
+    /// ceiling the shape of the stream puts on it. The decoder itself defers
+    /// the change to the next run boundary.
+    ///
+    /// The narrowed count is what the read-ahead is then sized from as well,
+    /// because a thread the decode will not run is a thread there is no point
+    /// reading a run ahead for: see [`Self::affordable_threads`].
     fn sync_threads(&mut self) {
-        let want = self.control.threads();
+        let want = self.control.threads().min(self.shape_threads());
         if want != self.applied_threads {
             self.decoder.set_threads(want as usize);
             self.applied_threads = want;
+        }
+    }
+
+    /// The most threads the stream in hand is worth decoding with.
+    ///
+    /// Unlimited until enough runs have gone past to say what shape the stream
+    /// is, so a decode of an archive whose first run has not closed yet is as
+    /// wide as it was asked to be; the runs of an incompressible stream are
+    /// large enough that nothing has been handed to a worker by then in any
+    /// case.
+    fn shape_threads(&self) -> u32 {
+        if self.dense {
+            self.dense_threads
+        } else {
+            u32::MAX
         }
     }
 
@@ -917,10 +985,34 @@ impl<R: Read> Lzma2MtReader<R> {
     fn affordable_threads(&self) -> u64 {
         let threads = u64::from(self.applied_threads.max(1));
         let (packed, unpacked) = self.run_size();
-        self.decoder
-            .memory_limit()
+        self.budget()
             .checked_div(packed.saturating_add(unpacked))
             .map_or(threads, |fits| fits.clamp(1, threads))
+    }
+
+    /// The in-flight bytes this decode will actually put to work, which is
+    /// what the read-ahead is measured against.
+    ///
+    /// It is the caller's limit, except for a decode the shape of the stream
+    /// has narrowed. A limit is a ceiling and not a target, and the bytes a
+    /// thread that will never run would have held buy nothing at all: they
+    /// are read ahead, held, and handed to the same two workers a great deal
+    /// later than they were read. So a narrowed decode is given what a decode
+    /// of that width would have been given had the caller asked for it — the
+    /// same per-thread figure the unlimited path sizes itself by — and the
+    /// bytes above it are simply never read. Measured on an archive of
+    /// incompressible payload asked for at eight threads: three gigabytes
+    /// resident against two threads' worth of work, where narrowing the
+    /// thread count alone had left the reading-ahead untouched.
+    fn budget(&self) -> u64 {
+        let limit = self.decoder.memory_limit();
+        if self.dense {
+            limit.min(
+                MT_BACKSTOP_PER_THREAD_BYTES.saturating_mul(u64::from(self.applied_threads.max(1))),
+            )
+        } else {
+            limit
+        }
     }
 
     /// Complete runs the decoder should have waiting once this reader has read
@@ -1000,7 +1092,7 @@ impl<R: Read> Lzma2MtReader<R> {
     fn room_for_a_run(&self) -> bool {
         let (packed, unpacked) = self.run_size();
         let cost = packed.saturating_add(unpacked);
-        cost == 0 || self.decoder.held_bytes().saturating_add(cost) <= self.decoder.memory_limit()
+        cost == 0 || self.decoder.held_bytes().saturating_add(cost) <= self.budget()
     }
 
     /// Complete runs a worker that is free right now would need to find.
@@ -1053,7 +1145,7 @@ impl<R: Read> Lzma2MtReader<R> {
     fn byte_cap(&self) -> u64 {
         self.backlog_bytes
             .saturating_mul(self.affordable_threads())
-            .min(self.decoder.memory_limit())
+            .min(self.budget())
     }
 
     /// The stream offset past which feeding would put the decoder's chase
@@ -1129,6 +1221,7 @@ impl<R: Read> Lzma2MtReader<R> {
             return Ok(());
         }
         if !self.scan_broken && !self.scanner.finished() {
+            let was_dense = self.dense;
             match self.scanner.feed(&seg) {
                 // A stream this reader cannot walk is still a stream the
                 // decoder may be able to decode, and it is the decoder's job
@@ -1142,12 +1235,34 @@ impl<R: Read> Lzma2MtReader<R> {
                         self.unpacked_ends.push_back(self.unpacked_seen);
                         self.recent_runs[self.recent_at] = (run.packed_len, run.unpacked_len);
                         self.recent_at = (self.recent_at + 1) % MT_RUN_WINDOW;
+                        // What shape this run is, and whether enough of them
+                        // in a row have been that shape to change the decode.
+                        let dense = u128::from(run.packed_len) * 100
+                            >= u128::from(run.unpacked_len) * MT_DENSE_PERCENT;
+                        if dense == self.dense {
+                            self.shape_streak = 0;
+                        } else {
+                            self.shape_streak += 1;
+                            if self.shape_streak >= MT_SHAPE_RUNS {
+                                self.dense = dense;
+                                self.shape_streak = 0;
+                            }
+                        }
                     }
                     if n < seg.len() {
                         self.carry.extend_from_slice(&seg[n..]);
                         seg.truncate(n);
                     }
                 }
+            }
+            if self.dense != was_dense {
+                // What these bytes said about the shape of the stream has to
+                // reach the decoder before they are handed to it, because a
+                // feed is also a dispatch: a narrowing left until the next
+                // turn would have given the runs just scanned to as many
+                // workers as the caller asked for, and the point of narrowing
+                // is that those workers never start.
+                self.sync_threads();
             }
         }
         self.queue(seg);
@@ -1458,7 +1573,7 @@ impl<R: Read> Drop for Lzma2MtReader<R> {
     fn drop(&mut self) {
         if let Some(t) = self.trace.as_ref() {
             eprintln!(
-                "mt-trace: threads={} spawned={} drains={} drain={:.3}s sink={:.3}s/{} small={} MiB pump={:.3}s fed={} MiB fed_partial={} MiB st_decoded={} MiB out={} MiB runs={} moved={} MiB resizes={} refused={} copied_feeds={} reclaimed={}",
+                "mt-trace: threads={} spawned={} drains={} drain={:.3}s sink={:.3}s/{} small={} MiB pump={:.3}s fed={} MiB fed_partial={} MiB st_decoded={} MiB out={} MiB runs={} moved={} MiB resizes={} refused={} copied_feeds={} reclaimed={} dense={}",
                 self.applied_threads,
                 self.decoder.spawned_threads(),
                 t.drains,
@@ -1477,6 +1592,7 @@ impl<R: Read> Drop for Lzma2MtReader<R> {
                 t.refusals,
                 t.copied_feeds,
                 t.reclaimed,
+                self.dense,
             );
         }
     }
@@ -2318,6 +2434,11 @@ mod stall_tests {
             // still looks affordable.
             assert_eq!(rd.affordable_threads(), 8, "limit={limit} before any run");
             let mut rd = rd;
+            // What a hand-written stream's runs hold is data that did not
+            // compress, so the decode of one narrows itself on shape as well.
+            // This test is about the other rule, so the shape ceiling is
+            // lifted and the limit left to answer on its own.
+            rd.dense_threads = u32::MAX;
             rd.pump_input(1, false).expect("feed");
             assert_eq!(
                 rd.affordable_threads(),
@@ -2579,5 +2700,206 @@ mod stall_tests {
         rd.recent_runs[0] = (run_packed(16), run_unpacked(16));
         assert!(rd.room_for_a_run());
         assert!(!rd.backlog_full(), "the floor should hold the feed open");
+    }
+
+    /// The chunks `stream` writes copy their payload out verbatim, which is
+    /// exactly what an encoder does with data it cannot beat, so every stream
+    /// above is an incompressible one: the decode of it should narrow itself
+    /// however many threads it was given, and give back the same bytes.
+    ///
+    /// The runs here are small enough that the whole stream is scanned in one
+    /// read, so the narrowing lands before anything is handed over and the
+    /// count of workers ever started stays under the ceiling rather than
+    /// merely coming back down to it.
+    #[test]
+    fn an_incompressible_stream_is_decoded_narrow() {
+        let (packed, plain) = stream(48, 4);
+        for threads in [4, 8] {
+            let (mut rd, control) = reader(Cursor::new(packed.clone()), threads);
+            let (out, _peak, widest) = drain_watching(&mut rd, &control);
+            assert_eq!(out, plain, "threads={threads}");
+            assert!(rd.dense, "threads={threads}: the shape was not noticed");
+            assert!(
+                widest <= super::MT_DENSE_THREADS,
+                "threads={threads}: {widest} workers started",
+            );
+            assert_eq!(
+                rd.applied_threads,
+                super::MT_DENSE_THREADS,
+                "threads={threads}",
+            );
+        }
+    }
+
+    /// A decode the shape rule narrowed reads ahead as narrowly as it
+    /// decodes. Narrowing the thread count alone leaves the caller's whole
+    /// allowance to read ahead into, and a decode fills whatever it is given:
+    /// what those bytes buy there is a queue in front of two workers.
+    #[test]
+    fn a_narrowed_decode_reads_ahead_for_the_threads_it_will_run() {
+        let (packed, _plain) = stream(8, 4);
+        let generous = 8 << 30;
+        let (mut rd, _control) = reader_limited(Cursor::new(packed), 8, generous);
+        assert_eq!(
+            rd.budget(),
+            generous,
+            "the caller's limit, until a run says"
+        );
+        rd.pump_input(1, false).expect("feed");
+        assert!(rd.dense, "the fixture is incompressible");
+        assert_eq!(
+            rd.budget(),
+            super::MT_BACKSTOP_PER_THREAD_BYTES * u64::from(super::MT_DENSE_THREADS),
+            "a narrowed decode should hold what its own threads can use",
+        );
+    }
+
+    /// The shape rule against streams an encoder actually produced, which is
+    /// the only way to get a run that is genuinely smaller than what it
+    /// decodes to.
+    #[cfg(all(feature = "compress", not(feature = "lzma-rust2-encoder")))]
+    mod shape {
+        use std::io::{Cursor, Read, Write};
+
+        use lzma_turbo::{BLOCK_SIZE_SOLID, LzmaEncProps};
+
+        use super::{drain_watching, reader_limited, stream};
+        use crate::codec::lzma_turbo::writer::{Coder, LzmaTurboWriter};
+        use crate::codec::lzma_turbo::{MT_DENSE_THREADS, MT_SHAPE_RUNS};
+
+        /// Room for every run of these streams at once, so that nothing but the
+        /// shape rule narrows the decode.
+        const LIMIT: u64 = 256 << 20;
+
+        /// One run of data that compresses, and the bytes it decodes to.
+        ///
+        /// One encode per run: an encoder opens a stream by resetting the
+        /// dictionary, which is what a run boundary is, so encodes laid end to end
+        /// are runs without the encoder having to be talked into a block size. The
+        /// end marker each one finishes with is cut off, and one put back after
+        /// the last.
+        fn compressible_run(len: usize) -> (Vec<u8>, Vec<u8>) {
+            let plain: Vec<u8> = (0..len).map(|i| (i % 41) as u8).collect();
+            let props = LzmaEncProps::new().with_level(1).with_dict_size(1 << 16);
+            let mut w = LzmaTurboWriter::new(
+                Vec::new(),
+                &props,
+                Coder::Lzma2 {
+                    block_size: BLOCK_SIZE_SOLID,
+                    threads: 1,
+                },
+            )
+            .expect("build the encoder");
+            w.write_all(&plain).expect("encode");
+            let mut packed = w.finish().expect("finish the encode");
+            assert_eq!(packed.pop(), Some(0x00), "an encode ends in its end marker");
+            assert!(
+                (packed.len() as u64) * 2 < len as u64,
+                "the fixture has to compress for this to be testing anything",
+            );
+            (packed, plain)
+        }
+
+        /// `runs` runs of compressible data, as one stream.
+        fn compressible_stream(runs: usize, len: usize) -> (Vec<u8>, Vec<u8>) {
+            let (one, its_plain) = compressible_run(len);
+            let mut packed = Vec::new();
+            let mut plain = Vec::new();
+            for _ in 0..runs {
+                packed.extend_from_slice(&one);
+                plain.extend_from_slice(&its_plain);
+            }
+            packed.push(0x00);
+            (packed, plain)
+        }
+
+        /// A stream whose runs compress is decoded with everything the caller
+        /// asked for: the rule is about the payload and not about the thread
+        /// count, and a decode that narrowed here would be giving away the
+        /// parallelism this reader exists for.
+        #[test]
+        fn a_compressible_stream_keeps_every_thread() {
+            let (packed, plain) = compressible_stream(24, 512 << 10);
+            for threads in [2, 4, 8] {
+                let (mut rd, control) = reader_limited(Cursor::new(packed.clone()), threads, LIMIT);
+                let (out, _peak, widest) = drain_watching(&mut rd, &control);
+                assert_eq!(out, plain, "threads={threads}");
+                assert!(
+                    !rd.dense,
+                    "threads={threads}: narrowed on compressible runs"
+                );
+                assert_eq!(rd.applied_threads, threads, "threads={threads}");
+                assert_eq!(widest, threads, "threads={threads}: {widest} workers");
+            }
+        }
+
+        /// An archive of a film beside a text file: compressible runs, then a span
+        /// of runs that did not compress, then compressible ones again. The decode
+        /// should narrow for the middle and widen again after it, and hand back
+        /// every byte either way.
+        #[test]
+        fn a_mixed_stream_widens_again_after_the_incompressible_span() {
+            let (head, head_plain) = compressible_stream(8, 512 << 10);
+            // Large enough that the span is still being decoded after the
+            // read that scanned it, so the narrowing can be seen from here
+            // rather than having come and gone inside one refill.
+            let (middle, middle_plain) = stream(24, 16);
+            let (tail, tail_plain) = compressible_stream(8, 512 << 10);
+            let mut packed = Vec::new();
+            let mut plain = Vec::new();
+            for (part, part_plain) in [
+                (head, head_plain),
+                (middle, middle_plain),
+                (tail, tail_plain),
+            ] {
+                // Each part carries its own end marker, which is only the end
+                // where the last one is.
+                packed.extend_from_slice(&part[..part.len() - 1]);
+                plain.extend_from_slice(&part_plain);
+            }
+            packed.push(0x00);
+
+            let threads = 8;
+            let (mut rd, _control) = reader_limited(Cursor::new(packed), threads, LIMIT);
+            let mut out = Vec::new();
+            let mut buf = vec![0u8; 16 << 10];
+            let mut narrowed = false;
+            loop {
+                let n = rd.read(&mut buf).expect("decode");
+                if n == 0 {
+                    break;
+                }
+                narrowed |= rd.applied_threads == MT_DENSE_THREADS;
+                out.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(out, plain);
+            assert!(narrowed, "the incompressible span should have narrowed it");
+            assert!(!rd.dense, "the tail should have widened it again");
+            assert_eq!(rd.applied_threads, threads);
+        }
+
+        /// One run of the other shape does not move the decode: an encoder that
+        /// meets a compressible megabyte in the middle of a film writes one such
+        /// run, and a thread count that followed it would be changed twice for
+        /// nothing.
+        #[test]
+        fn a_single_odd_run_does_not_change_the_shape() {
+            let (odd, odd_plain) = compressible_run(512 << 10);
+            let (dense_head, dense_head_plain) = stream(8, 4);
+            let (dense_tail, dense_tail_plain) = stream(8, 4);
+            let mut packed = dense_head[..dense_head.len() - 1].to_vec();
+            packed.extend_from_slice(&odd);
+            packed.extend_from_slice(&dense_tail);
+            let mut plain = dense_head_plain;
+            plain.extend_from_slice(&odd_plain);
+            plain.extend_from_slice(&dense_tail_plain);
+
+            let (mut rd, control) = reader_limited(Cursor::new(packed), 8, LIMIT);
+            let (out, _peak, widest) = drain_watching(&mut rd, &control);
+            assert_eq!(out, plain);
+            assert!(rd.dense, "one compressible run should not have widened it");
+            assert!(widest <= MT_DENSE_THREADS, "{widest} workers");
+            assert!(MT_SHAPE_RUNS > 1, "one run in a row would flap the count");
+        }
     }
 }
