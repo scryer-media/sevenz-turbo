@@ -2949,6 +2949,12 @@ mod stall_tests {
         /// asked for: the rule is about the payload and not about the thread
         /// count, and a decode that narrowed here would be giving away the
         /// parallelism this reader exists for.
+        ///
+        /// What is asserted is the ceiling the reader applied, not how many
+        /// workers came to exist under it: the decoder spawns a worker only
+        /// when every one it has is busy, so on a machine whose workers
+        /// finish runs faster than the reader hands them out the count stops
+        /// short of the ceiling. That is scheduling, not narrowing.
         #[test]
         fn a_compressible_stream_keeps_every_thread() {
             let (packed, plain) = compressible_stream(24, 512 << 10);
@@ -2961,7 +2967,7 @@ mod stall_tests {
                     "threads={threads}: narrowed on compressible runs"
                 );
                 assert_eq!(rd.applied_threads, threads, "threads={threads}");
-                assert_eq!(widest, threads, "threads={threads}: {widest} workers");
+                assert!(widest <= threads, "threads={threads}: {widest} workers");
             }
         }
 
