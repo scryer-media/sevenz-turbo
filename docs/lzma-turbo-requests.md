@@ -142,20 +142,145 @@ and copied out of it again. On x86 at eight threads that took a gigabyte from
 4.82 s to 4.59 s; the spill path stays in the reader as a safety net that is
 never taken.
 
-### A chase decoder that stands aside while a worker is free — landed, not yet taken up
+### Input the decoder takes ownership of — landed, and this fork is on it
+
+```rust
+impl Lzma2AdaptiveDecoder {
+    pub fn feed_owned(&mut self, seg: Vec<u8>) -> Result<Option<Vec<u8>>, Error>;
+    pub fn feed_shared(&mut self, seg: &Arc<Vec<u8>>, range: Range<usize>)
+        -> Result<Option<Range<usize>>, Error>;
+}
+```
+
+`feed` copies what it is given into the decoder's own buffer, so a reader that
+held the packed stream in one buffer paid for every byte twice: once copying
+the unconsumed tail down over itself to make room for the next read, and again
+feeding it. The first cost grows with how much is held, so on a stream that is
+refused often it grows with the square of it.
+
+Both new entry points take the bytes as they are. The reader keeps its reads as
+the pieces they arrived in, queues them in order, and hands a piece over whole
+and by value; the decoder holds that allocation until the cursor and every
+worker are past it. The only copy left on the input path is the cut that ends a
+piece at a run boundary, which happens at most once per read whatever the
+stream's length: on a 1.6 GiB incompressible archive at four threads the cuts
+went from 76 to 11 and the decode from 5.8 s to 2.9 s, with half the minor
+faults.
+
+A whole piece is taken or refused, never split, so that the path that accepts
+never copies. **What the reader owes in return** is to treat a refusal as the
+budget being spent for now rather than for good: the piece stays at the front
+of its queue, the caller drains, and the same piece is the first thing offered
+on the way back in. Dropping the read-ahead on a refusal, or waiting for the
+room instead of returning, both cost more than the copy did.
+
+### A chase decoder that stands aside while a worker is free — landed, and this fork is on it
 
 `Lzma2AdaptiveDecoder::set_chase(false)` (lzma-turbo 0.3.0) makes the
 decoder wait for a worker instead of decoding the run at its cursor on the
 calling thread when that run's chunk header has not arrived. That was the
 request: for a stream already on disk, chasing happened once per batch of fed
 bytes and cost, at two threads, as long as the two workers spent on the other
-two runs. This fork still uses its own work-around — it walks the chunk
-headers itself (`Lzma2RunScanner`) and feeds only whole runs, sized so the
-one run the chase does take is overlapped by several rounds of worker work —
-which costs a gigabyte of read-ahead to hide the chase. Switching the reader
-to `set_chase(false)` and a smaller batch is the open item.
+two runs. The work-around was to hide it rather than to stop it — walk the
+chunk headers here (`Lzma2RunScanner`), feed only whole runs, and make the
+batch large enough that the one run the chase took was overlapped by several
+rounds of worker work. That took a gigabyte of read-ahead, and about two of
+peak memory to hold it.
+
+The reader now switches chasing off for that path instead, and reads ahead
+about a run per thread. It switches it back on for the three cases where the
+front of a run is handed over deliberately and nothing else would decode it: a
+stream written as a single run, a run longer than the reader will hold, and a
+stream whose headers the reader could not walk.
+
+**What the reader owes in return.** A decoder that is not chasing waits for
+input rather than decoding what it has, so everywhere the reader decides it is
+far enough ahead it must first have fed up to the end of a run: stopping part
+way through one leaves a decoder waiting for a reader that has stopped. That
+is `Lzma2MtReader::fed_at_boundary`, and the tests in `src/codec/lzma_turbo.rs`
+that decode a stream to its end — one run, many runs, truncated, arriving a
+few bytes at a time — are what would catch losing it.
+
+### Somewhere to wait for a worker — landed, and this fork is on it
+
+```rust
+impl Lzma2AdaptiveDecoder {
+    /// Blocks until a worker hands back a finished run, and takes it in.
+    /// Returns false at once when no run is outstanding.
+    pub fn wait_for_worker(&mut self) -> bool
+}
+```
+
+`drain` hands control back as soon as it cannot go on without more input, even
+with workers still decoding, so that the caller can feed the next run rather
+than wait for the last one. A caller whose read-ahead is already satisfied has
+nothing to feed and nothing else to do, and without somewhere to wait it called
+drain again, and again, for as long as the workers took: fifteen million drains
+over one 828 MiB archive at four threads, which is a core the workers are not
+getting. With the wait it is about three thousand, and the decode costs 20-25%
+less CPU.
+
+`wait_for_worker` (lzma-turbo 0.5.0) is what the reader waits on when it is
+owed bytes, has nothing left to feed and nothing to drain. Where it must *not*
+be called is anywhere the reader could instead deliver: waiting is the one
+thread that hands output to the caller going to sleep, and a wait on every
+refused feed cost a three-gigabyte decode at eight threads seventeen seconds
+against forty, with the workers idle for most of the difference. The rule this
+reader keeps is that it waits only once it has established there is nothing
+else it can do at all.
+
+### A parked allocation the reader can refill into — landed, and this fork refills into it
+
+```rust
+impl Lzma2AdaptiveDecoder {
+    /// Hands back an owned piece the decode has finished with, cleared and
+    /// with its capacity intact, or `None` when it is holding none.
+    pub fn reclaim_piece(&mut self) -> Option<Vec<u8>>;
+}
+```
+
+Feeding by value means the reader gives an allocation away on every read and
+asks the allocator for another one. Nothing is copied, which is the point, but
+the pieces are large and the decode frees them at the far end, so the process
+kept the high-water mark of everything in flight: measured against the same
+reader feeding by copy, wall time fell 4-50% and minor faults 25-75% on every
+lane, while peak resident memory rose 8-21%. The refill now starts from
+whatever piece is handed back, and on an incompressible archive at four threads
+that took peak resident memory from 1.75 GB to 1.40 GB for the same wall time.
 
 ## Outstanding
+
+### A limit the decoder holds to, or an account of what it does not — outstanding
+
+A caller limit is enforced against `in_flight_bytes`, and two things sit
+outside it:
+
+* a run inside a worker is counted while the worker holds it *and* while the
+  input it was copied from is still in the buffer, so every run out costs its
+  packed bytes twice until it lands; and
+* the streaming path decodes what it is holding whether or not there is room
+  for the output, which is up to one run of it.
+
+Neither grows with the archive, so a limit still bounds the decode; but a
+caller that says 512 MiB is handed rather more than 512 MiB, and cannot be told
+how much more without knowing the stream's run size. What is wanted is either
+an `in_flight_bytes` that counts everything held, or a documented bound on what
+it leaves out.
+
+**Work-around until then.** `Lzma2MtReader` feeds against the same count, so it
+inherits the same gap; the stall tests in `src/codec/lzma_turbo.rs` assert the
+bound that does hold, which is the limit plus those two terms.
+
+### Room to dispatch is the caller's to leave — noted, no change asked for
+
+A run is dispatched only if what is held *plus that run* fits under the limit,
+so a reader that feeds right up to a limit leaves no room to hand anybody the
+run it has just fed, and with no worker out the decoder takes it back and
+streams it on the calling thread. A 512 MiB limit turned a four-thread decode
+into a single-threaded one and cost 3.4x before `feed_target` here started
+leaving a run's worth of the limit unspent. It is written down because it is
+not discoverable from the signatures: a limit is not all of itself to spend.
+
 
 ### A run index over a stream this crate has not started decoding
 
