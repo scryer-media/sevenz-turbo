@@ -668,7 +668,7 @@ mod tests {
     /// exercised here without a wasm runtime: registry lookup, the fresh
     /// buffer the hook returns, the copy back, and above all the guest-tracked
     /// CBC IV threading across chunk boundaries. The wasm harness in
-    /// `tests/wasm_host_extract_conformance.rs` separately proves the same
+    /// `tools/wasm-conformance/tests/wasm_host_extract_conformance.rs` separately proves the same
     /// path links and extracts a real archive inside a guest.
     ///
     /// Needs `native-crypto` only for the reference hook's own AES.

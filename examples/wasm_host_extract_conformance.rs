@@ -15,7 +15,7 @@
 //! to this example, not to `sevenz-turbo`, which only ever sees the hook.
 //!
 //! It prints one `name<TAB>hex(contents)` line per archive entry, so the
-//! native harness (`tests/wasm_host_extract_conformance.rs`) can compare the
+//! native harness (`tools/wasm-conformance/tests/wasm_host_extract_conformance.rs`) can compare the
 //! guest's extraction byte-for-byte against the same archive decoded by the
 //! native decoder. With `--skip-hook-install` it deliberately does NOT install
 //! the hook, which is how the harness proves that a guest missing its wiring
@@ -31,7 +31,7 @@
 //!     --no-default-features --features aes256,crypto-host \
 //!     --target wasm32-wasip1
 //!   # then run under the harness, which provides the host function:
-//!   cargo test --test wasm_host_extract_conformance
+//!   cargo test -p wasm-conformance
 //!
 //! Running the raw module under a plain `wasmtime` CLI traps at instantiation
 //! because the `host_aes_cbc_decrypt` import is unsatisfied — that is

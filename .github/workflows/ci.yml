@@ -170,7 +170,9 @@ jobs:
       # and runs it under `wasmtime` with a reference host AES, comparing the
       # guest's extraction with the native decoder's.
       - name: Run the wasm host-AES conformance harness
-        run: cargo test --locked --test wasm_host_extract_conformance
+        run: |
+          cargo clippy --locked -p wasm-conformance --all-targets -- -D warnings
+          cargo test --locked -p wasm-conformance
 
   msrv:
     name: msrv
