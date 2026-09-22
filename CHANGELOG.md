@@ -354,13 +354,14 @@ Everything here is new surface; no upstream signature changed meaning.
   through the real hook (a `fn` pointer links on any target) and compared with
   the RustCrypto lane's one-shot answer at 1/2/3/5/13/64 blocks per call, which
   is what pins the guest-tracked IV threading. In a real guest,
-  `tests/wasm_host_extract_conformance.rs` builds
+  `tools/wasm-conformance` builds
   `examples/wasm_host_extract_conformance.rs` for `wasm32-wasip1`, runs it
   under `wasmtime` with a reference host AES, and asserts that its extraction
   of a freshly written encrypted archive is byte-identical to the native
   decoder's — and that a guest which never installs a hook panics with the
-  documented message. `wasmtime` is a dev-dependency of that harness only and
-  never enters the crate's dependency graph.
+  documented message. The harness is a workspace member of its own, so
+  `wasmtime` is a dev-dependency of that member only and never enters the
+  crate's dependency graph.
 
 ### Testing
 
@@ -434,6 +435,12 @@ Everything here is new surface; no upstream signature changed meaning.
   that has not closed, or a piece the allowance had no room for — could have
   been reported as damage. A stream that really is short still says so.
 - Requires `lzma-turbo` 0.6.0.
+- The wasm host-AES conformance harness moved out of `tests/` into
+  `tools/wasm-conformance`, a workspace member excluded from every
+  workspace-wide `cargo test` and `cargo clippy` (CI, release, `cargo xtask
+  release`). `wasmtime` was a dev-dependency of the crate itself, so every
+  `cargo test` built it; now only the harness's own CI job does. No change to
+  the crate or its features.
 
 ## 0.25.0 - 2026-09-19
 

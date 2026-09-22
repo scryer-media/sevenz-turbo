@@ -140,6 +140,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-unknown-unknown, wasm32-wasip1
+          components: clippy
       # The browser feature set: no C toolchain there, so RustCrypto for
       # SHA-256 and AES alike. This is the command the README documents.
       - name: Check the wasm feature set
