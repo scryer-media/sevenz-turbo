@@ -149,9 +149,6 @@ const MT_OUTPUT_CHUNK: usize = 1 << 20;
 /// Pieces of buffered output kept for refilling. See [`Lzma2MtReader::spare`].
 const MT_OUTPUT_SPARE_PIECES: usize = 8;
 
-/// Capacity [`Lzma2MtReader::inbuf`] keeps once it has held a long run.
-const MT_INPUT_KEEP_BYTES: usize = 8 * MT_INPUT_CHUNK;
-
 /// Smallest in-flight budget a parallel LZMA2 decode is given. Below this the
 /// coder decodes single-threaded instead: see [`Lzma2Plan::for_block`].
 const MT_MIN_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
@@ -589,12 +586,24 @@ pub(crate) struct Lzma2MtReader<R: Read> {
     /// The ceiling currently applied to `decoder`, so that a caller that does
     /// not change it costs one relaxed load per block of output.
     applied_threads: u32,
-    inbuf: Vec<u8>,
-    in_pos: usize,
-    /// Stream offset of `inbuf[0]`.
-    base: u64,
-    /// Index into `inbuf` of the first byte this reader has not scanned.
-    scan_pos: usize,
+    /// Packed bytes read but not yet handed to the decoder, in the pieces they
+    /// were read in and in stream order. Feeding gives a whole piece away by
+    /// value, so nothing is copied out of here and nothing is copied down over
+    /// itself: the queue is the buffer, and its bytes leave it for good.
+    segs: VecDeque<Vec<u8>>,
+    /// Bytes across [`Self::segs`], which is what the read-ahead allowance is
+    /// measured against.
+    held: usize,
+    /// Stream offset of the first byte of `segs.front()`, and so of the first
+    /// byte the decoder has not been given.
+    fed_to: u64,
+    /// Bytes read past the last chunk header [`Self::scanner`] could finish.
+    ///
+    /// A header can straddle two reads. The few bytes of the tail that the
+    /// scanner could not walk are cut off the piece before it is queued and
+    /// put at the head of the next one, so every queued piece is walked and
+    /// the scanner sees one unbroken stream.
+    carry: Vec<u8>,
     /// This reader's own walk of the chunk headers, which is how it knows
     /// where a run ends without decoding anything. See [`Self::safe_limit`].
     scanner: Lzma2RunScanner,
@@ -689,12 +698,21 @@ pub(crate) struct MtTrace {
     sink: std::time::Duration,
     blocks: u64,
     small_bytes: u64,
-    /// Bytes the input buffer has copied down over itself to make room, and
-    /// the number of times its capacity changed either way. Both are the cost
-    /// of holding the packed stream in one buffer rather than a queue of
-    /// pieces, and both are invisible in a profile that only counts decoding.
+    /// Bytes copied to cut a queued piece at a run boundary, and the number of
+    /// cuts. A piece is cut at most once and holds a chunk, so this is the
+    /// whole cost of the input path beyond the read itself.
     moved: u64,
     resizes: u64,
+    /// Pieces the decoder handed back for want of room, and how many of those
+    /// refusals were followed by a worker to wait for rather than ending the
+    /// feed. The gap between the two is the number of times the budget was
+    /// really spent. See [`Lzma2MtReader::hand_over`].
+    refusals: u64,
+    refusal_waits: u64,
+    /// Feeds that copied because a whole piece would not fit at all. Zero for
+    /// every decode whose allowance holds one read; see
+    /// [`Lzma2MtReader::offer_part_of_the_front`].
+    copied_feeds: u64,
 }
 
 impl<R: Read> Lzma2MtReader<R> {
@@ -733,10 +751,10 @@ impl<R: Read> Lzma2MtReader<R> {
             input,
             control,
             applied_threads: threads,
-            inbuf: Vec::new(),
-            in_pos: 0,
-            base: 0,
-            scan_pos: 0,
+            segs: VecDeque::new(),
+            held: 0,
+            fed_to: 0,
+            carry: Vec::new(),
             scanner: Lzma2RunScanner::new(),
             runs_seen: 0,
             recent_runs: [(0, 0); MT_RUN_WINDOW],
@@ -847,7 +865,7 @@ impl<R: Read> Lzma2MtReader<R> {
         if self.chasing || self.input_done || self.scan_broken {
             return true;
         }
-        let fed_to = self.base + self.in_pos as u64;
+        let fed_to = self.fed_to;
         while self.run_ends.front().is_some_and(|&end| end <= fed_to) {
             self.last_boundary = self.run_ends.pop_front().expect("just looked");
         }
@@ -1040,7 +1058,7 @@ impl<R: Read> Lzma2MtReader<R> {
     /// decode came from.
     fn safe_limit(&self) -> u64 {
         if self.input_done || self.scan_broken {
-            return self.base + self.inbuf.len() as u64;
+            return self.read_to();
         }
         self.scanner
             .open_run_offset()
@@ -1052,54 +1070,39 @@ impl<R: Read> Lzma2MtReader<R> {
     /// Scanning is header arithmetic — the compressed payload is stepped over,
     /// never read — so this costs nothing measurable next to decoding it.
     fn refill(&mut self) -> std::io::Result<()> {
-        let capacity_was = self.inbuf.capacity();
-        if self.in_pos >= MT_INPUT_CHUNK {
-            if let Some(t) = self.trace.as_mut() {
-                t.moved += (self.inbuf.len() - self.in_pos) as u64;
-            }
-            self.inbuf.drain(..self.in_pos);
-            self.base += self.in_pos as u64;
-            self.scan_pos -= self.in_pos;
-            self.in_pos = 0;
-            // A run longer than [`MT_INPUT_HOLD_BYTES`] grows this buffer to
-            // hold what has been read of it, and a `Vec` never gives room
-            // back. Once the stream is past such a run the extra is dead
-            // weight. Releasing it here rather than on every refill, and only
-            // once what is left is a small part of what is held, keeps an
-            // ordinary feed — where the buffer is a couple of chunks and stays
-            // that way — from reallocating at all.
-            if self.inbuf.capacity() > MT_INPUT_KEEP_BYTES
-                && self.inbuf.len() <= self.inbuf.capacity() / 4
-            {
-                self.inbuf.shrink_to(MT_INPUT_KEEP_BYTES);
-            }
-        }
-        let was = self.inbuf.len();
-        self.inbuf.resize(was + MT_INPUT_CHUNK, 0);
-        if let Some(t) = self.trace.as_mut() {
-            t.resizes += u64::from(self.inbuf.capacity() != capacity_was);
-        }
-        let mut filled = was;
-        while filled < self.inbuf.len() {
-            match self.input.read(&mut self.inbuf[filled..])? {
+        // The piece starts with whatever the scanner could not finish last
+        // time, so that it walks one unbroken stream, and the rest of it is
+        // read from the input in place. Nothing else ever writes here: once
+        // the piece is queued its bytes are only ever given away.
+        let carried = self.carry.len();
+        let mut seg = std::mem::take(&mut self.carry);
+        seg.reserve_exact(MT_INPUT_CHUNK);
+        seg.resize(carried + MT_INPUT_CHUNK, 0);
+        let mut filled = carried;
+        while filled < seg.len() {
+            match self.input.read(&mut seg[filled..])? {
                 0 => break,
                 n => filled += n,
             }
         }
-        self.inbuf.truncate(filled);
-        if filled == was {
+        seg.truncate(filled);
+        if filled == carried {
+            // Nothing new arrived. The carried bytes are the tail of a header
+            // the stream ended in the middle of; the decoder is the one that
+            // gets to call that an error, so they go over with everything
+            // else.
+            self.queue(seg);
             self.input_done = true;
             self.decoder.end_of_input();
             return Ok(());
         }
         if !self.scan_broken && !self.scanner.finished() {
-            match self.scanner.feed(&self.inbuf[self.scan_pos..]) {
+            match self.scanner.feed(&seg) {
                 // A stream this reader cannot walk is still a stream the
                 // decoder may be able to decode, and it is the decoder's job
                 // to say so. Stop steering and feed it everything.
                 Err(_) => self.scan_broken = true,
                 Ok(n) => {
-                    self.scan_pos += n;
                     while let Some(run) = self.scanner.next_run() {
                         self.runs_seen += 1;
                         self.run_ends.push_back(run.in_offset + run.packed_len);
@@ -1108,13 +1111,164 @@ impl<R: Read> Lzma2MtReader<R> {
                         self.recent_runs[self.recent_at] = (run.packed_len, run.unpacked_len);
                         self.recent_at = (self.recent_at + 1) % MT_RUN_WINDOW;
                     }
+                    if n < seg.len() {
+                        self.carry.extend_from_slice(&seg[n..]);
+                        seg.truncate(n);
+                    }
                 }
             }
         }
-        if self.scan_broken || self.scanner.finished() {
-            self.scan_pos = self.inbuf.len();
-        }
+        self.queue(seg);
         Ok(())
+    }
+
+    /// Adds a read piece to the back of the queue.
+    fn queue(&mut self, seg: Vec<u8>) {
+        if seg.is_empty() {
+            return;
+        }
+        self.held += seg.len();
+        self.segs.push_back(seg);
+    }
+
+    /// Stream offset one past the last byte read, counting what is queued but
+    /// not the header tail waiting for its next read.
+    fn read_to(&self) -> u64 {
+        self.fed_to + self.held as u64
+    }
+
+    /// Hands the first `want` queued bytes to the decoder, whole pieces at a
+    /// time, and returns how many it took.
+    ///
+    /// A piece is given away by value: the bytes are the decoder's from here,
+    /// and the only copy on this path is the one that cuts a piece when the
+    /// point to stop at — a run boundary, or the end of the chase's ration —
+    /// falls inside it. That cut moves at most a chunk, and a stream of long
+    /// runs pays it about once per run.
+    ///
+    /// A decoder whose budget is spent hands the piece back unchanged, and it
+    /// goes to the front of the queue to be offered again. What must not
+    /// happen then is to stop feeding: a whole piece is refused for the want
+    /// of its last byte, so a refusal is not by itself the budget being spent
+    /// — it can equally be a piece that is a little too big for the room a
+    /// worker is about to free. Leaving on the first refusal reads less far
+    /// ahead than a partial take used to, because the room below one piece is
+    /// then never used at all, and the decode arrives at the next dispatch
+    /// with fewer runs in hand than it has threads.
+    ///
+    /// So the piece is offered again, once a worker has handed its run back
+    /// and the input it was holding with it. Only when there is no worker to
+    /// wait for is the budget really spent: nothing outstanding means nothing
+    /// is going to free anything, and stopping short is what tells the feed
+    /// loop so — exactly as a short take used to. Waiting cannot repeat
+    /// without end, because each wait takes in a run that was outstanding and
+    /// there is a finite number of them.
+    fn hand_over(&mut self, want: usize, last_resort: bool) -> std::io::Result<usize> {
+        let mut given = 0;
+        while given < want {
+            let front_len = self.segs.front().map_or(0, Vec::len);
+            let take = (want - given).min(front_len);
+            if take == 0 {
+                break;
+            }
+            let seg = if take == front_len {
+                self.segs.pop_front().expect("not empty, it has a length")
+            } else {
+                let front = self.segs.front_mut().expect("not empty, it has a length");
+                let rest = front.split_off(take);
+                let head = std::mem::replace(front, rest);
+                if let Some(t) = self.trace.as_mut() {
+                    t.moved += (front_len - take) as u64;
+                    t.resizes += 1;
+                }
+                head
+            };
+            self.held -= take;
+            match self.decoder.feed_owned(seg).map_err(decode_error)? {
+                None => {
+                    self.fed_to += take as u64;
+                    given += take;
+                }
+                Some(rest) => {
+                    self.held += rest.len();
+                    self.segs.push_front(rest);
+                    if let Some(t) = self.trace.as_mut() {
+                        t.refusals += 1;
+                    }
+                    if !self.decoder.wait_for_worker() {
+                        if given == 0 && last_resort {
+                            given += self.starve(take)?;
+                        }
+                        break;
+                    }
+                    if let Some(t) = self.trace.as_mut() {
+                        t.refusal_waits += 1;
+                    }
+                }
+            }
+        }
+        Ok(given)
+    }
+
+    /// Gets a decode moving again that has nothing left to move it.
+    ///
+    /// Reached only with the piece refused, nothing fed and no worker to wait
+    /// for: the decoder will take no more input, and nothing it is holding is
+    /// going to hand any back. Two things can be wrong, and both are answered
+    /// here because neither costs anything anywhere else.
+    ///
+    /// The allowance can be smaller than a read, so that every piece is
+    /// refused for being a piece while there is room for part of one. Offered
+    /// by reference the same bytes are taken in part, which is the one place
+    /// this reader copies its input and the price of a limit that small.
+    ///
+    /// Or there can be no room at all, because what the decoder holds is a run
+    /// it cannot claim — a run is complete only once the header after it has
+    /// arrived, and a run that nearly fills the allowance leaves nowhere to
+    /// put that header. Feeding cannot resolve that and neither can waiting;
+    /// what can is the chase, which decodes the chunks already in hand on this
+    /// thread and frees the room the header needs. It is the same condition
+    /// the chase is armed on elsewhere — nothing pending, nothing outstanding,
+    /// no way to read further — arrived at from the other side; see
+    /// [`Self::nothing_left_to_decode`].
+    fn starve(&mut self, want: usize) -> std::io::Result<usize> {
+        let took = self.offer_part_of_the_front(want)?;
+        if took == 0 && self.nothing_left_to_decode() {
+            self.chasing = true;
+            self.set_chase(true);
+        }
+        Ok(took)
+    }
+
+    /// Feeds as much of the front piece as the decoder will take, copying it.
+    fn offer_part_of_the_front(&mut self, want: usize) -> std::io::Result<usize> {
+        let front = match self.segs.front_mut() {
+            Some(front) => front,
+            None => return Ok(0),
+        };
+        let offer = want.min(front.len());
+        let took = self
+            .decoder
+            .feed(&front[..offer])
+            .map_err(decode_error)?
+            .min(offer);
+        if took == 0 {
+            return Ok(0);
+        }
+        let tail = front.len() - took;
+        let kept = front.split_off(took);
+        drop(std::mem::replace(front, kept));
+        self.held -= took;
+        self.fed_to += took as u64;
+        if let Some(t) = self.trace.as_mut() {
+            t.moved += tail as u64;
+            t.resizes += 1;
+            t.copied_feeds += 1;
+        }
+        if self.segs.front().is_some_and(Vec::is_empty) {
+            self.segs.pop_front();
+        }
+        Ok(took)
     }
 
     /// Feeds the packed stream until every worker has something to do, the
@@ -1206,13 +1360,9 @@ impl<R: Read> Lzma2MtReader<R> {
             if !whatever_is_held && far_enough && self.fed_at_boundary() {
                 break;
             }
-            let limit = self.safe_limit().saturating_sub(self.base);
-            let mut end = self
-                .inbuf
-                .len()
-                .min(usize::try_from(limit).unwrap_or(usize::MAX));
-            if end <= self.in_pos {
-                if !self.input_done && self.inbuf.len() - self.in_pos < hold {
+            let mut end = self.read_to().min(self.safe_limit());
+            if end <= self.fed_to {
+                if !self.input_done && self.held < hold {
                     self.refill()?;
                     continue;
                 }
@@ -1240,13 +1390,12 @@ impl<R: Read> Lzma2MtReader<R> {
                 // worker and none out with one — because a run in either of
                 // those places will be drained, which frees the allowance,
                 // which reads the boundary. See [`Self::nothing_left_to_decode`].
-                if (self.chasing || self.nothing_left_to_decode()) && self.in_pos < self.inbuf.len()
-                {
+                if (self.chasing || self.nothing_left_to_decode()) && self.held > 0 {
                     self.chasing = true;
                     self.set_chase(true);
-                    end = self.inbuf.len().min(self.in_pos + MT_INPUT_CHUNK);
+                    end = self.read_to().min(self.fed_to + MT_INPUT_CHUNK as u64);
                     if let Some(t) = self.trace.as_mut() {
-                        t.chased += (end - self.in_pos) as u64;
+                        t.chased += end - self.fed_to;
                     }
                 } else {
                     break;
@@ -1257,12 +1406,8 @@ impl<R: Read> Lzma2MtReader<R> {
                     self.set_chase(false);
                 }
             }
-            let offered = end - self.in_pos;
-            let taken = self
-                .decoder
-                .feed(&self.inbuf[self.in_pos..end])
-                .map_err(decode_error)?;
-            self.in_pos += taken;
+            let offered = usize::try_from(end - self.fed_to).unwrap_or(usize::MAX);
+            let taken = self.hand_over(offered, whatever_is_held)?;
             self.fed_total += taken as u64;
             fed |= taken > 0;
             if taken < offered {
@@ -1278,7 +1423,7 @@ impl<R: Read> Drop for Lzma2MtReader<R> {
     fn drop(&mut self) {
         if let Some(t) = self.trace.as_ref() {
             eprintln!(
-                "mt-trace: threads={} spawned={} drains={} drain={:.3}s sink={:.3}s/{} small={} MiB pump={:.3}s fed={} MiB fed_partial={} MiB st_decoded={} MiB out={} MiB runs={} moved={} MiB resizes={}",
+                "mt-trace: threads={} spawned={} drains={} drain={:.3}s sink={:.3}s/{} small={} MiB pump={:.3}s fed={} MiB fed_partial={} MiB st_decoded={} MiB out={} MiB runs={} moved={} MiB resizes={} refused={} refused_waited={} copied_feeds={}",
                 self.applied_threads,
                 self.decoder.spawned_threads(),
                 t.drains,
@@ -1294,6 +1439,9 @@ impl<R: Read> Drop for Lzma2MtReader<R> {
                 self.decoder.runs_claimed(),
                 t.moved >> 20,
                 t.resizes,
+                t.refusals,
+                t.refusal_waits,
+                t.copied_feeds,
             );
         }
     }
@@ -1794,6 +1942,64 @@ mod stall_tests {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             let n = buf.len().min(self.most);
             self.inner.read(&mut buf[..n])
+        }
+    }
+
+
+    /// A stream longer than the allowance is refused somewhere, and every
+    /// piece refused is handed over later instead of being dropped or cut up.
+    ///
+    /// A refusal is all or nothing, so a piece is turned away for the want of
+    /// its last byte and the decode has to come back to it. What proves it
+    /// came back is the output: the stream decodes whole, with every run
+    /// claimed, and without a single byte of it reaching the decoder by the
+    /// one path that copies. The count is not asserted exactly — how many
+    /// refusals a decode meets depends on the order its workers finish in —
+    /// only that the budget was reached at all, which a stream this much
+    /// larger than the limit cannot avoid.
+    #[test]
+    fn a_refused_piece_is_offered_again_and_taken() {
+        let (packed, plain) = stream(48, 4);
+        for threads in [2, 4, 8] {
+            let (mut rd, control) = reader(Cursor::new(packed.clone()), threads);
+            rd.trace = Some(Box::default());
+            let (out, _peak, _widest) = drain_watching(&mut rd, &control);
+            assert_eq!(out, plain, "threads={threads}");
+            assert_eq!(rd.decoder.runs_claimed(), 48, "threads={threads}");
+            let t = rd.trace.as_ref().expect("the trace this test turned on");
+            assert!(t.refusals > 0, "the budget was never reached: {threads}");
+            assert_eq!(t.copied_feeds, 0, "threads={threads}");
+        }
+    }
+
+    /// The input reaches the decoder as the pieces it was read in, and the
+    /// only copy on the way is the cut that ends a piece at a run boundary.
+    ///
+    /// Both counters are bounded by the reads rather than by the runs or the
+    /// bytes, which is the property worth keeping: a piece is cut at most
+    /// once, so a stream of any length pays for its input once per read and
+    /// never again. A reader that copied what it had not fed yet — down over
+    /// itself to make room, or out into a feed — would pay per refill, and on
+    /// a stream that is refused often that cost grows with the square of what
+    /// it is holding.
+    #[test]
+    fn the_input_is_never_copied_more_than_once_per_read() {
+        for (runs, chunks) in [(48, 4), (12, 16), (96, 2)] {
+            let (packed, plain) = stream(runs, chunks);
+            let reads = packed.len().div_ceil(super::MT_INPUT_CHUNK);
+            for threads in [2, 4, 8] {
+                let (mut rd, control) = reader(Cursor::new(packed.clone()), threads);
+                rd.trace = Some(Box::default());
+                let (out, _peak, _widest) = drain_watching(&mut rd, &control);
+                assert_eq!(out, plain, "{runs}x{chunks} threads={threads}");
+                let t = rd.trace.as_ref().expect("the trace this test turned on");
+                assert_eq!(t.copied_feeds, 0, "{runs}x{chunks} threads={threads}");
+                assert!(
+                    t.resizes as usize <= reads,
+                    "{runs}x{chunks} threads={threads}: {} cuts in {reads} reads",
+                    t.resizes,
+                );
+            }
         }
     }
 
