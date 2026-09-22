@@ -1,0 +1,22 @@
+[package]
+name = "wasm-conformance"
+description = "Runs sevenz-turbo's wasm host-AES reference embedding under a native wasmtime and holds its extraction to the native decoder's"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+rust-version = "1.97.1"
+version = "0.0.0"
+
+# The harness builds the crate's wasm guest example with a nested cargo and
+# runs it here. Keeping wasmtime in this crate rather than in sevenz-turbo's
+# dev-dependencies is what keeps it out of every other `cargo test` and
+# `cargo clippy`; the wasm-conformance CI job is the one place it is built.
+[dev-dependencies]
+wasmtime = "48"
+wasmtime-wasi = "48"
+# The reference host AES the guest imports, and the writer that makes the
+# archives it extracts.
+aes = "0.9"
+cbc = "0.2"
+sevenz-turbo = { path = "../..", features = ["aes256", "compress"] }
+tempfile = "3"

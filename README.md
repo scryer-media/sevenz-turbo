@@ -366,8 +366,8 @@ The contract the hook must satisfy:
 
 `examples/wasm_host_extract_conformance.rs` is a complete reference embedding —
 a `wasm32-wasip1` guest that declares one raw import in a `host` namespace and
-forwards the hook to it — and `tests/wasm_host_extract_conformance.rs` is the
-native `wasmtime` harness that runs it: it writes an encrypted fixture archive,
+forwards the hook to it — and `tools/wasm-conformance` is the native `wasmtime`
+harness that runs it: it writes an encrypted fixture archive,
 extracts it inside the guest through a reference host AES, and asserts the
 guest's bytes equal the native decoder's. `wasmtime` is a dev-dependency of that
 harness only and never enters the crate's dependency graph.
