@@ -33,7 +33,7 @@
 //!
 //! Skipped automatically if the `wasm32-wasip1` target is not installed.
 
-#![cfg(all(not(target_family = "wasm"), feature = "aes256", feature = "compress"))]
+#![cfg(not(target_family = "wasm"))]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -136,6 +136,15 @@ fn has_wasip1_std(rustc: &Path) -> bool {
         .is_some_and(|out| Path::new(String::from_utf8_lossy(&out.stdout).trim()).is_dir())
 }
 
+/// The workspace root: where the nested cargo runs from, and where the guest
+/// example lives. This crate sits two directories below it.
+fn workspace_root() -> PathBuf {
+    let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    root.pop();
+    root.pop();
+    root
+}
+
 /// Resolve a `(cargo, rustc)` pair that can actually build `wasm32-wasip1`.
 ///
 /// The ambient `cargo`/`rustc` are not necessarily the toolchain pinned by
@@ -160,7 +169,7 @@ fn wasm_toolchain() -> Option<(PathBuf, PathBuf)> {
     }
     if let Some(out) = Command::new("rustup")
         .args(["which", "rustc"])
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .current_dir(workspace_root())
         .output()
         .ok()
         .filter(|out| out.status.success())
@@ -188,7 +197,7 @@ fn wasm_toolchain() -> Option<(PathBuf, PathBuf)> {
 static CONFORMANCE_WASM: LazyLock<PathBuf> = LazyLock::new(build_conformance_wasm);
 
 fn build_conformance_wasm() -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = workspace_root();
     let target_dir =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("wasm-host-conformance-target");
     let (cargo, rustc) =

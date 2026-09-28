@@ -128,3 +128,7 @@ with a version bump and a changelog entry like any other.
   and `cargo test --all-features` must pass before a commit is proposed.
 - Any code change bumps the crate version, `Cargo.lock` and `CHANGELOG.md` in
   the same change.
+- `tools/wasm-conformance` is the only place `wasmtime` is allowed: it is a
+  workspace member, not a test of this crate, and every workspace-wide
+  `cargo test`/`cargo clippy` in CI and the release path excludes it. Do not
+  add `wasmtime` (or any wasm host) to this crate's dev-dependencies.

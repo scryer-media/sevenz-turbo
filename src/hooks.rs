@@ -27,7 +27,7 @@
 //! `examples/wasm_host_extract_conformance.rs` is a complete reference
 //! embedding: a `wasm32-wasip1` guest that declares one raw import in a `host`
 //! namespace and installs a hook that forwards to it, driven by the native
-//! `wasmtime` harness in `tests/wasm_host_extract_conformance.rs`.
+//! `wasmtime` harness in `tools/wasm-conformance`.
 //!
 //! ## Contract the hook must satisfy
 //!

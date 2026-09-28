@@ -158,11 +158,17 @@ impl Release {
         if skip_tests {
             println!("release: skipping cargo test");
         } else {
-            println!("release: cargo test --locked --workspace --release");
+            println!(
+                "release: cargo test --locked --workspace --exclude wasm-conformance --release"
+            );
             if !cargo(&[
                 "test",
                 "--locked",
                 "--workspace",
+                // The wasm conformance harness builds wasmtime and needs a
+                // wasip1 std; it has its own CI job and is not a release gate.
+                "--exclude",
+                "wasm-conformance",
                 "--release",
                 "--no-fail-fast",
             ]) {

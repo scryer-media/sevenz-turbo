@@ -1750,8 +1750,6 @@ dependencies = [
  "rand",
  "tempfile",
  "wasm-bindgen",
- "wasmtime",
- "wasmtime-wasi",
  "zeroize",
  "zstd 0.14.0",
 ]
@@ -2171,6 +2169,18 @@ dependencies = [
  "wasm-encoder 0.254.0",
  "wasmparser 0.254.0",
  "wat",
+]
+
+[[package]]
+name = "wasm-conformance"
+version = "0.0.0"
+dependencies = [
+ "aes",
+ "cbc",
+ "sevenz-turbo",
+ "tempfile",
+ "wasmtime",
+ "wasmtime-wasi",
 ]
 
 [[package]]

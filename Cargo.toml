@@ -17,7 +17,7 @@ exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renova
 # depends on upstream `sevenz-rust2` to time the fork against it, and that
 # dependency must not appear in this crate's own graph at all.
 [workspace]
-members = ["tools/decode-bench", "xtask"]
+members = ["tools/decode-bench", "tools/wasm-conformance", "xtask"]
 resolver = "3"
 
 [lib]
@@ -110,17 +110,11 @@ wasm-bindgen = "0.2"
 rand = { version = "0.10" }
 tempfile = "3"
 
-# The `wasm_host_extract_conformance` integration test drives the wasm
-# `crypto-host` example through a native `wasmtime` host that supplies the
-# reference AES the example imports. These are native-only tooling for that
-# harness and MUST stay out of the wasm example build — hence the target gate.
-# `wasmtime` is a dev-dependency and nothing else: it never enters the crate's
-# own dependency graph.
-[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
-aes = "0.9"
-cbc = "0.2"
-wasmtime = "48"
-wasmtime-wasi = "48"
+# The wasm `crypto-host` example is driven by `tools/wasm-conformance`, a
+# workspace member that owns the native `wasmtime` host supplying the reference
+# AES the example imports. It lives outside this crate so that no other
+# `cargo test` or `cargo clippy` builds wasmtime: `wasmtime` never enters this
+# crate's dependency graph, dev or otherwise.
 
 [[example]]
 name = "advance"

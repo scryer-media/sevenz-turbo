@@ -135,7 +135,9 @@ jobs:
           fi
       - name: Test
         if: github.event_name == 'push'
-        run: cargo test --locked --workspace --no-fail-fast
+        # The wasm conformance harness builds wasmtime and needs a wasip1
+        # std; it has its own CI job and is not a release gate.
+        run: cargo test --locked --workspace --exclude wasm-conformance --no-fail-fast
       - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-semver-checks@0.50.0
