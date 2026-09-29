@@ -18,7 +18,7 @@ use crate::{
     codec::filter::bcj2::Bcj2Reader,
     codec::lzma_turbo::{Lzma2Control, Lzma2Handle, Lzma2Progress},
     container::{ArchiveLimits, BlockCompletion, SubStreamCompletion},
-    decoder::{DecodeOptions, add_decoder},
+    decoder::{DecodeOptions, add_decoder, check_chain_memory},
     error::{Error, Limit},
 };
 
@@ -248,6 +248,11 @@ impl Archive {
     /// full in order to parse it, so checking the size afterwards is checking
     /// nothing. An archive that declares more is refused with
     /// [`Error::EndHeaderTooLarge`] before the allocation.
+    ///
+    /// A compressed header is decoded under the rest of `limits`: its declared
+    /// size against [`ArchiveLimits::max_header_unpacked_bytes`], and its coder
+    /// chain, summed, against [`ArchiveLimits::memory_limit_bytes`], which is
+    /// refused with [`Error::MaxMemLimited`] before any coder is built.
     ///
     /// # Errors
     ///
@@ -487,22 +492,7 @@ impl Archive {
                 HeaderBounds::new(next_header_size_int, opts.limits),
                 opts,
             )?;
-            // Read the decoded header lazily instead of pre-allocating `buf_size` bytes:
-            // a crafted encoded header can declare a huge unpack size, and `resize`
-            // would allocate it all up front (OOM) before any data is produced. `take`
-            // caps the read at the declared size while `read_to_end` grows the buffer to
-            // match only what is actually decoded, so the allocation tracks real input.
-            buf.clear();
-            (&mut out_reader)
-                .take(buf_size as u64)
-                .read_to_end(&mut buf)
-                .map_err(|e| Error::bad_password(e, !password.is_empty()))?;
-            if buf.len() != buf_size {
-                return Err(Error::bad_password(
-                    io::Error::from(io::ErrorKind::UnexpectedEof),
-                    !password.is_empty(),
-                ));
-            }
+            buf = read_decoded_header(&mut out_reader, buf_size, password)?;
             archive = Archive::default();
             buf_reader = buf.as_slice();
             nid = buf_reader.read_u8()?;
@@ -649,6 +639,16 @@ impl Archive {
         }
         let unpack_size = usize::try_from(declared_unpack)
             .map_err(|_| Error::other("encoded header unpack size out of range"))?;
+        // Each coder is checked against the memory limit as it is built, which
+        // alone lets a chain of them hold the limit several times over; the
+        // chain is refused here, as a whole, before any of them allocates.
+        let reserved_kb = check_chain_memory(
+            block
+                .ordered_coder_iter()
+                .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index))),
+            opts.limits,
+        )?;
+        let opts = &opts.reserving(reserved_kb);
         let pack_size = archive.pack_sizes[first_pack_stream_index] as usize;
         let input_reader = BoundedReader::new(reader, pack_size);
         let mut decoder: Box<dyn Read> = Box::new(input_reader);
@@ -1680,8 +1680,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
     ///   buffered ([`Error::EndHeaderTooLarge`]);
     /// - [`Archive::decoder_memory_estimate`], against
     ///   [`ArchiveLimits::memory_limit_bytes`], before any decoder is built
-    ///   ([`Error::MemoryLimited`]). The same limit then bounds each coder as
-    ///   it is constructed.
+    ///   ([`Error::MemoryLimited`]). The same limit then bounds each block's
+    ///   coder chain, summed, before it is constructed.
     ///
     /// An archive whose coder chain has no memory model is refused too when a
     /// memory limit is set: a budget that cannot be computed has not been met.
@@ -1993,6 +1993,30 @@ impl<R: Read + Seek> ArchiveReader<R> {
     ) -> Result<(Box<dyn Read + 'r>, usize), Error> {
         let block = &archive.blocks[block_index];
         crate::container::check_aes_coders(block.coders.iter(), opts.limits)?;
+        // The chain as a whole against the memory limit, before any coder is
+        // built; see `read_encoded_header`. Under `ArchiveReader::with_limits`
+        // this never refuses anything, because `decoder_memory_estimate` has
+        // already bounded the same sum from above; it is what bounds a
+        // `BlockDecoder` built with limits of its own.
+        let reserved_kb = if block.total_input_streams > block.total_output_streams {
+            // Every coder of a multi-stream graph is built.
+            check_chain_memory(
+                block
+                    .coders
+                    .iter()
+                    .enumerate()
+                    .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index))),
+                opts.limits,
+            )?
+        } else {
+            check_chain_memory(
+                block
+                    .ordered_coder_iter()
+                    .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index))),
+                opts.limits,
+            )?
+        };
+        let opts = &opts.reserving(reserved_kb);
         if block.total_input_streams > block.total_output_streams {
             return Self::build_decode_stack2(source, archive, block_index, password, opts);
         }
@@ -2416,6 +2440,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     // One file is read here and its checksum is verified as it
                     // streams past; there are no other boundaries to declare.
                     checksum_splits: &[],
+                    reserved_kb: 0,
                 };
                 self.lzma2.set_block_index(block_index);
                 let (mut block_reader, _size) = Self::build_decode_stack(
@@ -2530,7 +2555,8 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
     ///
     /// The header has already been parsed by the time a caller holds a
     /// [`BlockDecoder`], so only the decoder-memory half of [`ArchiveLimits`]
-    /// applies here; it bounds each coder as it is built.
+    /// applies here; it bounds the block's coder chain, summed, before any of
+    /// it is built ([`Error::MaxMemLimited`], located in the block).
     pub fn with_limits(
         thread_count: u32,
         block_index: usize,
@@ -2649,6 +2675,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
             verify_checksums,
             lzma2_control: Some(&lzma2),
             checksum_splits: &splits,
+            reserved_kb: 0,
         };
         lzma2.set_block_index(block_index);
         // Where this block's packed bytes start, so a failure below can say
@@ -2810,6 +2837,87 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
             return vec![u64::MAX];
         }
         offsets
+    }
+}
+
+/// Reads a decoded header of exactly `declared` bytes into a buffer that never
+/// grows past it.
+///
+/// `declared` has already been bounded by
+/// [`ArchiveLimits::max_header_unpacked_bytes`], so the buffer is reserved at
+/// that size once, up front, rather than grown by doubling as `read_to_end`
+/// would: doubling can leave the buffer's capacity at nearly twice the declared
+/// size, which is memory the limit was meant to rule out. The reservation is
+/// fallible, so a caller who lifted that limit and was handed a header claiming
+/// more than the process can have is refused rather than aborted. Only the
+/// pages the decoder actually writes are touched.
+fn read_decoded_header(
+    decoded: &mut dyn Read,
+    declared: usize,
+    password: &Password,
+) -> Result<Vec<u8>, Error> {
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(declared)
+        .map_err(|_| Error::other("encoded header unpack size cannot be allocated"))?;
+    // `take` stops the read at the declared size, and a buffer whose length
+    // reaches its capacity is probed on the stack before `read_to_end` grows
+    // it, so an exact-sized stream ends with the capacity unchanged.
+    decoded
+        .take(declared as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| Error::bad_password(e, !password.is_empty()))?;
+    if buf.len() != declared {
+        return Err(Error::bad_password(
+            io::Error::from(io::ErrorKind::UnexpectedEof),
+            !password.is_empty(),
+        ));
+    }
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod decoded_header_buffer_tests {
+    use super::*;
+
+    /// Yields its bytes a few at a time, the way a decoder hands out output.
+    struct Trickle<'a>(&'a [u8]);
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = buf.len().min(self.0.len()).min(7);
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn capacity_stays_at_the_declared_size() {
+        // Sizes either side of the points where doubling from `read_to_end`'s
+        // first reservation would have overshot.
+        for declared in [1usize, 31, 32, 33, 4096, 8191, 8193, 100_000] {
+            let data: Vec<u8> = (0..declared).map(|i| i as u8).collect();
+            // A decoder with more to give than the header declares is cut off
+            // at the declared size, and still does not grow the buffer.
+            let mut longer = data.clone();
+            longer.extend_from_slice(&[0xAA; 64]);
+            for source in [&data, &longer] {
+                let buf = read_decoded_header(&mut Trickle(source), declared, &Password::empty())
+                    .unwrap();
+                assert_eq!(buf, data);
+                assert_eq!(
+                    buf.capacity(),
+                    declared,
+                    "the decoded header buffer must not grow past its declared size"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_decode_is_refused() {
+        let err = read_decoded_header(&mut Trickle(&[1, 2, 3]), 4, &Password::empty()).unwrap_err();
+        assert!(matches!(err, Error::Io(ref e, _) if e.kind() == io::ErrorKind::UnexpectedEof));
     }
 }
 

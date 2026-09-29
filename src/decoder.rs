@@ -34,6 +34,7 @@ use crate::{Password, archive::EncoderMethod, block::Coder, error::Error};
 /// upstream threads through the decode-stack builders. Bundling them is what
 /// lets the LZMA2 coder be handed a control block as well without every
 /// function between here and the reader growing a ninth argument.
+#[derive(Clone, Copy)]
 pub(crate) struct DecodeOptions<'a> {
     /// What the caller will let the archive allocate.
     pub(crate) limits: &'a ArchiveLimits,
@@ -53,6 +54,13 @@ pub(crate) struct DecodeOptions<'a> {
     /// checksum each piece in the worker that produced it. Empty when nothing
     /// is to be checksummed there.
     pub(crate) checksum_splits: &'a [u64],
+    /// Decoder memory, in kilobytes, that the other coders of this chain have
+    /// already been granted out of `limits.memory_limit_bytes`. Set from
+    /// [`check_chain_memory`]; a coder that fits itself to what is left
+    /// (Zstandard's window) subtracts it, so that the chain stays within the
+    /// limit as a whole rather than each coder within it alone.
+    #[cfg_attr(not(feature = "zstd"), allow(dead_code))]
+    pub(crate) reserved_kb: usize,
 }
 
 impl<'a> DecodeOptions<'a> {
@@ -66,6 +74,16 @@ impl<'a> DecodeOptions<'a> {
             verify_checksums: true,
             lzma2_control: None,
             checksum_splits: &[],
+            reserved_kb: 0,
+        }
+    }
+
+    /// The same options, with `reserved_kb` already granted to the chain's
+    /// sized coders.
+    pub(crate) fn reserving(self, reserved_kb: usize) -> Self {
+        Self {
+            reserved_kb,
+            ..self
         }
     }
 
@@ -130,6 +148,69 @@ impl<R: Read> Read for Decoder<R> {
             Decoder::Aes256Sha256(r) => r.read(buf),
         }
     }
+}
+
+/// Kilobytes of decoder state one coder's decoder holds, by the same model
+/// [`add_decoder`] checks it against the limit with: the dictionary, clamped to
+/// the coder's output the way the decoder clamps it, plus the LZ state for
+/// LZMA and LZMA2; the declared model for PPMd.
+///
+/// `None` for every other coder: filters and the fixed-size codecs are not
+/// sized against the limit, and Zstandard's window is fitted to whatever the
+/// limit leaves (see [`DecodeOptions::reserved_kb`]). `None` too for
+/// properties too short to read a size out of, so that [`add_decoder`] still
+/// reports them in its own words when it reaches the coder.
+fn sized_coder_memory_kb(coder: &Coder, uncompressed_len: usize) -> Option<usize> {
+    let method_id = coder.encoder_method_id();
+    if method_id == EncoderMethod::ID_LZMA {
+        let dict_size = crate::codec::lzma_turbo::clamp_dictionary(
+            crate::codec::lzma_turbo::lzma_dictionary_size(&coder.properties).ok()?,
+            uncompressed_len as u64,
+        );
+        Some(lzma2_memory_usage_kb(dict_size))
+    } else if method_id == EncoderMethod::ID_LZMA2 {
+        let dict_prop = lzma2_clamped_prop(*coder.properties.first()?, uncompressed_len as u64);
+        Some(lzma2_memory_usage_kb(
+            lzma2_dictionary_size(&[dict_prop]).ok()?,
+        ))
+    } else if cfg!(feature = "ppmd") && method_id == EncoderMethod::ID_PPMD {
+        let size = coder.properties.get(1..5)?;
+        let memory_size = u32::from_le_bytes([size[0], size[1], size[2], size[3]]);
+        Some(memory_size.div_ceil(1024) as usize)
+    } else {
+        None
+    }
+}
+
+/// Refuses a coder chain whose sized coders need more decoder memory
+/// *together* than `limits.memory_limit_bytes`, before any of them is built.
+///
+/// [`add_decoder`] checks each coder alone, which bounds nothing about a chain
+/// of them: a block can declare up to `max_coders_per_block` coders, each just
+/// under the limit. `coders` is each coder the decode will build with the
+/// output length it will be built for, exactly as [`add_decoder`] will be
+/// handed them, so a chain that fits here fits there. The refusal is the same
+/// [`Error::MaxMemLimited`] the per-coder check raises, with `actaul_kb` the
+/// chain's total.
+///
+/// Returns the kilobytes the chain's sized coders take, for
+/// [`DecodeOptions::reserving`].
+pub(crate) fn check_chain_memory<'c>(
+    coders: impl IntoIterator<Item = (&'c Coder, u64)>,
+    limits: &ArchiveLimits,
+) -> Result<usize, Error> {
+    let max_kb = limits.memory_limit_kb();
+    let total_kb = coders
+        .into_iter()
+        .filter_map(|(coder, len)| sized_coder_memory_kb(coder, len as usize))
+        .fold(0usize, usize::saturating_add);
+    if total_kb > max_kb {
+        return Err(Error::MaxMemLimited {
+            max_kb,
+            actaul_kb: total_kb,
+        });
+    }
+    Ok(total_kb)
 }
 
 pub fn add_decoder<I: Read>(
@@ -247,12 +328,15 @@ pub fn add_decoder<I: Read>(
             // decoder allocates it. The format allows windows far larger than
             // any 7z encoder writes, so the window is bounded here: by the
             // caller's memory limit when there is one, and otherwise by the
-            // 128 MiB the reference decoder itself refuses to exceed.
+            // 128 MiB the reference decoder itself refuses to exceed. The
+            // budget is what the chain's sized coders have left of the limit,
+            // so a window beside an LZMA dictionary does not double it.
             const ZSTD_DEFAULT_WINDOW_LOG: u32 = 27;
             let window_log = if max_mem_limit_kb == usize::MAX {
                 ZSTD_DEFAULT_WINDOW_LOG
             } else {
-                let bytes = (max_mem_limit_kb as u64).saturating_mul(1024).max(1024);
+                let budget_kb = max_mem_limit_kb.saturating_sub(opts.reserved_kb);
+                let bytes = (budget_kb as u64).saturating_mul(1024).max(1024);
                 // The largest power of two that fits in the budget, never above
                 // the default and never below the 1 KiB floor the format has.
                 (63 - bytes.leading_zeros()).clamp(10, ZSTD_DEFAULT_WINDOW_LOG)

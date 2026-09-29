@@ -58,9 +58,9 @@ sets them, because only the caller knows what it can afford.
 
 | Field | Default | The attack it closes | When it is hit |
 | --- | --- | --- | --- |
-| `memory_limit_bytes` | unlimited | A block declaring a 4 GiB dictionary. Bounds `Archive::decoder_memory_estimate` and each coder as it is built, and caps the zstd window. | `Error::MemoryLimited` / `Error::MaxMemLimited` before the decoder exists. A parallel LZMA2 decode that cannot fit its in-flight runs in the budget degrades to single-threaded instead of failing. |
+| `memory_limit_bytes` | unlimited | A block declaring a 4 GiB dictionary. A header or block chaining several coders that each fit it alone. Bounds `Archive::decoder_memory_estimate`, and, for every decode including the encoded header's, the sum of the chain's LZMA, LZMA2 and PPMd coders before any of them is built; caps the zstd window at what that sum leaves. | `Error::MemoryLimited` (from the estimate) / `Error::MaxMemLimited` (a chain or coder at decode time, carrying the chain's total) before the decoder exists. A parallel LZMA2 decode that cannot fit its in-flight runs in the budget degrades to single-threaded instead of failing. |
 | `max_end_header_bytes` | unlimited | The end-header size is read out of the file's first 32 bytes and that many bytes are buffered to parse it. | `Error::EndHeaderTooLarge`, before the buffer is allocated. |
-| `max_header_unpacked_bytes` | 64 MiB | A compressed header is a block like any other: a kilobyte of input can declare that it unpacks to a terabyte, and the result is buffered whole before it can be parsed. | `Error::LimitExceeded { what: HeaderUnpackedBytes }` before a byte is decoded. |
+| `max_header_unpacked_bytes` | 64 MiB | A compressed header is a block like any other: a kilobyte of input can declare that it unpacks to a terabyte, and the result is buffered whole before it can be parsed. | `Error::LimitExceeded { what: HeaderUnpackedBytes }` before a byte is decoded. The buffer is reserved once at the declared size and never grows past it. |
 | `max_header_depth` | 2 | A compressed header that decodes to another compressed header: unbounded recursion driven by a few bytes. 2 is one encoded header containing the real one, the only nesting 7-Zip writes. | `Error::LimitExceeded { what: HeaderDepth }`. |
 | `max_entries` | 1,000,000 | The amplifying counts: files, blocks, pack streams, sub-streams, bind pairs. An `ArchiveEntry` is a hundred-odd bytes reserved by one byte of count. The largest archives seen in the wild have a few hundred thousand entries. | `Error::LimitExceeded { what: Entries }` before the reservation. |
 | `max_name_bytes` | 64 KiB | The names blob carries one length for all of the names in it, so without a per-name bound a single name can be the whole blob — and a name becomes a path in every consumer. Four times the longest path any mainstream filesystem accepts. | `Error::LimitExceeded { what: NameBytes }`. |
@@ -141,10 +141,10 @@ attacker-chosen. What bounds each:
 
 | Coder | What it allocates | Bound |
 | --- | --- | --- |
-| LZMA, LZMA2 | The dictionary | **Clamped to the coder's declared unpacked size** before the budget check: a match can never reach further back than the output produced so far, so a 4 GiB dictionary on a 1 KiB stream is memory that is allocated and never read. 7-Zip reduces it the same way. Then `memory_limit_bytes`. |
+| LZMA, LZMA2 | The dictionary | **Clamped to the coder's declared unpacked size** before the budget check: a match can never reach further back than the output produced so far, so a 4 GiB dictionary on a 1 KiB stream is memory that is allocated and never read. 7-Zip reduces it the same way. Then `memory_limit_bytes`, summed over the chain. |
 | LZMA2, parallel | Runs in flight (packed + unpacked at once) | The in-flight budget, which is `memory_limit_bytes` minus the decoder's own footprint. Too small to hold a run means single-threaded, not refused. |
-| PPMd | `mem_size` bytes of model | The format's own `PPMD7_MIN/MAX_MEM_SIZE` and `MIN/MAX_ORDER`, then `memory_limit_bytes`. |
-| zstd | The back-reference window the frame declares | `window_log_max`, set from `memory_limit_bytes`, and otherwise the 128 MiB the reference decoder itself refuses to exceed. |
+| PPMd | `mem_size` bytes of model | The format's own `PPMD7_MIN/MAX_MEM_SIZE` and `MIN/MAX_ORDER`, then `memory_limit_bytes`, summed over the chain. |
+| zstd | The back-reference window the frame declares | `window_log_max`, set from what the chain's sized coders leave of `memory_limit_bytes`, and otherwise the 128 MiB the reference decoder itself refuses to exceed. |
 | brotli | The window | Bounded by the format at 16 MiB; the large-window extension is not enabled. |
 | bzip2 | The block | Fixed by the format at 900 KiB. |
 | deflate | The window | Fixed by the format at 32 KiB. |

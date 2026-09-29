@@ -1731,7 +1731,7 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.26.0"
+version = "0.26.1"
 dependencies = [
  "aes",
  "aws-lc-rs",

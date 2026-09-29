@@ -180,7 +180,8 @@ Everything here is new surface; no upstream signature changed meaning.
   `Archive::read_with_limits` and `BlockDecoder::with_limits`: one model for
   what an archive is allowed to claim, checked *before* the allocation or the
   work it bounds. Two affordability limits — `memory_limit_bytes` (bounding
-  `Archive::decoder_memory_estimate` and then each coder as it is built) and
+  `Archive::decoder_memory_estimate` and then each coder chain, summed,
+  before it is built, the encoded header's included) and
   `max_end_header_bytes` (before the header is buffered) — and the structural
   bounds `max_header_unpacked_bytes`, `max_header_depth`, `max_entries`,
   `max_name_bytes`, `max_total_name_bytes`, `max_coders_per_block`,
@@ -384,6 +385,31 @@ Everything here is new surface; no upstream signature changed meaning.
 - The vendored BCJ round-trip tests generate their sample data instead of
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
+
+## 0.26.1 - 2026-09-29
+
+- Fixed: `ArchiveLimits::memory_limit_bytes` bounds a coder chain as a whole,
+  not each coder on its own. An encoded header was decoded with every coder
+  checked alone against the limit, so a crafted header chaining several LZMA,
+  LZMA2 or PPMd coders, each just under it, held the limit several times over
+  in decoder state. The chain's dictionaries and models — by the same model
+  the per-coder check uses, dictionaries clamped to each coder's output — are
+  now summed and checked before any coder is built, and a chain over the
+  limit is refused with the `Error::MaxMemLimited` a single coder over it
+  already raised, carrying the chain's total. A Zstandard window in the same
+  chain is capped at what the sized coders leave. A header whose coders fit
+  together reads exactly as before.
+- The same sum bounds block decodes. Under `ArchiveReader::with_limits` it
+  refuses nothing new, because `decoder_memory_estimate` already bounds the
+  sum from above; it is what now bounds a `BlockDecoder` built with limits of
+  its own, which reports it located in the block, as it reports a single
+  coder over the limit.
+- Fixed: a decoded header is read into a buffer reserved once at its declared
+  size, which `max_header_unpacked_bytes` has already bounded, instead of one
+  grown by doubling. Doubling could leave the buffer at nearly twice the
+  declared size, past the limit it was checked against. The reservation is
+  fallible, so a caller that lifted the limit is refused rather than aborted
+  by a header claiming more than the process can have.
 
 ## 0.26.0 - 2026-09-22
 
