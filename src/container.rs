@@ -40,7 +40,9 @@ pub struct ArchiveLimits {
     /// Largest decoder footprint the caller will allow, in bytes.
     ///
     /// Default: no limit. Bounds [`Archive::decoder_memory_estimate`], which
-    /// is dominated by the dictionary a block declares.
+    /// is dominated by the dictionary a block declares, and, when a header or
+    /// block is decoded, the sum of its coder chain's dictionaries and models
+    /// rather than each coder alone.
     pub memory_limit_bytes: u64,
     /// Largest end header the caller will allow to be buffered, in bytes.
     ///

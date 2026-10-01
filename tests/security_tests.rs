@@ -1017,3 +1017,170 @@ fn a_header_with_blocks_but_no_files_does_not_panic() {
         });
     }
 }
+
+// ---------------------------------------------------------------------------
+// Decoder memory is bounded per chain, not per coder
+//
+// Each coder is checked against `memory_limit_bytes` as it is built, which on
+// its own lets a block chain several coders that are each just under the
+// limit. The crafted blocks below chain LZMA2 coders over stored LZMA2 chunks,
+// so every layer is real and decodes; each coder's dictionary clamps to the
+// 4 KiB minimum and is charged, with its LZ state, about a megabyte.
+// ---------------------------------------------------------------------------
+
+const ID_LZMA2: u8 = 0x21;
+const MIB: u64 = 1 << 20;
+
+/// `data` as one stored (uncompressed) LZMA2 chunk with a dictionary reset,
+/// then the end marker.
+fn lzma2_stored(data: &[u8]) -> Vec<u8> {
+    assert!(!data.is_empty() && data.len() <= 1 << 16);
+    let size = (data.len() - 1) as u16;
+    let mut out = vec![0x01];
+    out.extend_from_slice(&size.to_be_bytes());
+    out.extend_from_slice(data);
+    out.push(0x00);
+    out
+}
+
+/// A pack info plus an unpack info whose one block chains `coders` LZMA2
+/// coders over `plain`, and the packed bytes that block decodes from.
+///
+/// Coder 0 reads the packed stream and each coder's output feeds the next, so
+/// the packed bytes are `plain` wrapped once per coder.
+fn chained_lzma2_streams_info(plain: &[u8], coders: usize) -> (Vec<u8>, Vec<u8>) {
+    // layers[k] is `plain` wrapped k times; coder i outputs layers[coders-1-i].
+    let mut layers = vec![plain.to_vec()];
+    for _ in 0..coders {
+        let next = lzma2_stored(layers.last().unwrap());
+        layers.push(next);
+    }
+    let packed = layers[coders].clone();
+
+    let mut info = vec![K_PACK_INFO, 0x00, 0x01, K_SIZE];
+    write_number(&mut info, packed.len() as u64);
+    info.push(K_END);
+    info.extend_from_slice(&[K_UNPACK_INFO, K_FOLDER, 0x01, 0x00]);
+    write_number(&mut info, coders as u64);
+    for _ in 0..coders {
+        // id_size = 1, simple, has attributes; one property byte: the
+        // smallest LZMA2 dictionary.
+        info.extend_from_slice(&[0x21, ID_LZMA2, 0x01, 0x00]);
+    }
+    for k in 0..coders - 1 {
+        // Coder k's output (out stream k) is coder k+1's input (in stream k+1).
+        write_number(&mut info, k as u64 + 1);
+        write_number(&mut info, k as u64);
+    }
+    info.push(K_CODERS_UNPACK_SIZE);
+    for i in 0..coders {
+        write_number(&mut info, layers[coders - 1 - i].len() as u64);
+    }
+    info.push(K_END);
+    (info, packed)
+}
+
+/// An archive whose header is encoded through `coders` chained LZMA2 coders
+/// and decodes to an empty header.
+fn archive_with_chained_header_coders(coders: usize) -> Vec<u8> {
+    let (info, packed) = chained_lzma2_streams_info(&[K_HEADER, K_END], coders);
+    let mut nh = vec![0x17]; // K_ENCODED_HEADER
+    nh.extend_from_slice(&info);
+    nh.push(K_END);
+    raw_7z_with_packed(&packed, &nh)
+}
+
+fn read_header_with_memory_limit(bytes: &[u8], memory_limit_bytes: u64) -> Result<(), Error> {
+    sevenz_turbo::Archive::read_with_limits(
+        &mut Cursor::new(bytes),
+        &Password::empty(),
+        &ArchiveLimits::memory(memory_limit_bytes),
+    )
+    .map(|_| ())
+}
+
+/// Two header coders that each fit the limit alone but not together are
+/// refused before either is built, with the error the per-coder check raises.
+#[test]
+fn header_coders_over_the_memory_limit_together_are_refused() {
+    let limit = MIB + MIB / 2;
+    // Each coder alone is within the limit: one of them reads.
+    read_header_with_memory_limit(&archive_with_chained_header_coders(1), limit)
+        .expect("one header coder fits the limit on its own");
+
+    match read_header_with_memory_limit(&archive_with_chained_header_coders(2), limit) {
+        Err(Error::MaxMemLimited { max_kb, actaul_kb }) => {
+            assert_eq!(max_kb as u64, limit / 1024);
+            assert!(
+                actaul_kb > max_kb,
+                "the refusal reports the chain's total, {actaul_kb} KiB"
+            );
+        }
+        other => panic!("a header chain over the limit in total must be refused, got {other:?}"),
+    }
+}
+
+/// The same chain reads when the limit covers the coders together, and when
+/// there is no limit at all.
+#[test]
+fn header_coders_within_the_memory_limit_together_still_read() {
+    let bytes = archive_with_chained_header_coders(2);
+    read_header_with_memory_limit(&bytes, 3 * MIB).expect("two coders fit three megabytes");
+    sevenz_turbo::Archive::read(&mut Cursor::new(bytes.as_slice()), &Password::empty())
+        .expect("no limit, no refusal");
+}
+
+/// The same bound holds for a data block decoded through a `BlockDecoder`
+/// built with limits of its own, which the archive-wide estimate in
+/// `ArchiveReader::with_limits` does not reach.
+#[test]
+fn block_coders_over_the_memory_limit_together_are_refused() {
+    let plain = b"invented fixture contents for a chained block";
+    let (info, packed) = chained_lzma2_streams_info(plain, 2);
+    let mut nh = vec![K_HEADER, K_MAIN_STREAMS_INFO];
+    nh.extend_from_slice(&info);
+    nh.extend_from_slice(&[
+        K_SUB_STREAMS_INFO,
+        K_END, // one stream in the one block
+        K_END, // streams info end
+        K_FILES_INFO,
+        0x01,  // num_files = 1
+        K_END, // files info properties end
+        K_END, // header end
+    ]);
+    let bytes = raw_7z_with_packed(&packed, &nh);
+    let archive =
+        sevenz_turbo::Archive::read(&mut Cursor::new(bytes.as_slice()), &Password::empty())
+            .unwrap();
+    let password = Password::empty();
+
+    let decode = |limit: u64| {
+        let mut source = Cursor::new(bytes.as_slice());
+        let mut out = Vec::new();
+        sevenz_turbo::BlockDecoder::with_limits(
+            1,
+            0,
+            &archive,
+            &password,
+            &mut source,
+            ArchiveLimits::memory(limit),
+        )
+        .for_each_entries(&mut |_e: &ArchiveEntry, rd: &mut dyn std::io::Read| {
+            rd.read_to_end(&mut out)?;
+            Ok(true)
+        })
+        .map(|_| out)
+    };
+
+    assert_eq!(decode(3 * MIB).unwrap(), plain);
+    // A block decode reports its failures located in the block; the refusal
+    // inside is the same `MaxMemLimited` a single coder over the limit gives.
+    match decode(MIB + MIB / 2) {
+        Err(Error::BlockDecode {
+            block_index: 0,
+            ref message,
+            ..
+        }) if message.starts_with("MaxMemLimited") => {}
+        other => panic!("a block chain over the limit in total must be refused, got {other:?}"),
+    }
+}
