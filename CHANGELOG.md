@@ -421,6 +421,11 @@ Everything here is new surface; no upstream signature changed meaning.
   `Error::Unsupported` when the first entry is written. Encrypting a BCJ2
   block would need an AES coder on every pack stream, which this writer does
   not build.
+- Fixed: a header whose pack-stream CRCs were not all defined (a pack stream
+  whose CRC32 is 0) wrote the defined-bits vector but not the CRC values
+  that 7-Zip's `WriteHashDigests` puts after it, so the header did not parse.
+  The values are now written. One pack stream in four billion hits this; a
+  BCJ2 block has four.
 - Tested: the folder layout, bind pairs and pack-stream order against the
   ones 7-Zip writes; round trips through this crate's reader single- and
   multi-threaded, in all three layouts, for empty and one-to-five-byte
