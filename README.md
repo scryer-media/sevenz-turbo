@@ -306,7 +306,7 @@ writer.finish().expect("compress ok");
 | BCJ PPC       | ✓            | ✓          |
 | BCJ SPARC     | ✓            | ✓          |
 | BCJ IA64      | ✓            | ✓          |
-| BCJ2          | ✓            |             |
+| BCJ2          | ✓            | ✓          |
 | DELTA         | ✓            | ✓          |
 
 ### WASM support

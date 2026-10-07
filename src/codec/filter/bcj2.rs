@@ -1,5 +1,5 @@
 //! BCJ2, the four-stream branch converter for x86 executables, read from a 7z
-//! folder's four coder outputs.
+//! folder's four coder outputs and, behind `compress`, written into them.
 //!
 //! The conversion itself is `lzma_turbo::filters::bcj2`, the SDK's `Bcj2.c`
 //! ported and held bit-exact against it. That decoder is slice-driven: it is
@@ -13,6 +13,8 @@ use std::io::Read;
 use lzma_turbo::filters::bcj2::{
     Bcj2Dec, Bcj2DecStreams, NUM_STREAMS, STREAM_CALL, STREAM_JUMP, STREAM_MAIN, STREAM_RC,
 };
+#[cfg(feature = "compress")]
+use lzma_turbo::filters::bcj2::{Bcj2Enc, Bcj2EncFinishMode, Bcj2EncOut};
 
 use super::error_invalid_data;
 
@@ -148,6 +150,144 @@ impl<R: Read> Read for Bcj2Reader<R> {
     }
 }
 
+/// How much of each stream one encoder call may write before its window is
+/// handed on to the stream's sink. A multiple of four, as `Bcj2.h` asks of
+/// the call and jump windows.
+#[cfg(feature = "compress")]
+const ENC_WINDOW: usize = 1 << 16;
+
+/// What a [`Bcj2Writer`] hands back when it is finished: the main stream's
+/// sink, the call and jump streams' sinks, the raw range-coded stream, and
+/// how many bytes went into the call and jump sinks.
+#[cfg(feature = "compress")]
+pub(crate) struct Bcj2Finished<W, S> {
+    pub(crate) main: W,
+    pub(crate) call: S,
+    pub(crate) jump: S,
+    pub(crate) rc: Vec<u8>,
+    pub(crate) call_len: u64,
+    pub(crate) jump_len: u64,
+}
+
+/// BCJ2, written: the `Write` around `lzma_turbo::filters::bcj2::Bcj2Enc`.
+///
+/// Whatever is written is split into the four streams as it arrives. The
+/// main, call and jump streams go straight on to their sinks — in a 7z
+/// folder, each is the input of its own coder — and the range-coded stream,
+/// which 7-Zip stores without a coder, is kept here until
+/// [`finish`](Self::finish).
+///
+/// The encoder runs with `Bcj2Enc_Init`'s settings: virtual address zero, the
+/// default relative limit and no file-size limit. 7-Zip's own encoder also
+/// narrows the limit to each member's size as the block crosses file
+/// boundaries (`Bcj2Coder.cpp`), which only changes which branches are
+/// converted, never what a decoder makes of them.
+#[cfg(feature = "compress")]
+pub(crate) struct Bcj2Writer<W, S> {
+    encoder: Bcj2Enc,
+    main: W,
+    call: S,
+    jump: S,
+    rc: Vec<u8>,
+    call_len: u64,
+    jump_len: u64,
+    windows: [Box<[u8]>; NUM_STREAMS],
+}
+
+#[cfg(feature = "compress")]
+impl<W: std::io::Write, S: std::io::Write> Bcj2Writer<W, S> {
+    pub(crate) fn new(main: W, call: S, jump: S) -> Self {
+        Self {
+            encoder: Bcj2Enc::new(),
+            main,
+            call,
+            jump,
+            rc: Vec::new(),
+            call_len: 0,
+            jump_len: 0,
+            windows: std::array::from_fn(|_| vec![0u8; ENC_WINDOW].into_boxed_slice()),
+        }
+    }
+
+    /// Runs the encoder over `src` until it has taken all of it — or, when
+    /// `finishing`, until the range coder is flushed — handing each window on
+    /// to its sink after every call.
+    fn pump(&mut self, src: &[u8], finishing: bool) -> std::io::Result<()> {
+        let mut src_pos = 0;
+        loop {
+            let pos = {
+                let [main, call, jump, rc] = &mut self.windows;
+                let mut out = Bcj2EncOut::new(main, call, jump, rc);
+                self.encoder.encode(&mut out, src, &mut src_pos);
+                out.pos
+            };
+            self.main
+                .write_all(&self.windows[STREAM_MAIN][..pos[STREAM_MAIN]])?;
+            self.call
+                .write_all(&self.windows[STREAM_CALL][..pos[STREAM_CALL]])?;
+            self.jump
+                .write_all(&self.windows[STREAM_JUMP][..pos[STREAM_JUMP]])?;
+            self.rc
+                .extend_from_slice(&self.windows[STREAM_RC][..pos[STREAM_RC]]);
+            self.call_len += pos[STREAM_CALL] as u64;
+            self.jump_len += pos[STREAM_JUMP] as u64;
+
+            if finishing && self.encoder.is_finished() {
+                return Ok(());
+            }
+            if self.encoder.full_stream().is_some() {
+                // A window filled up; it has been drained, so go again.
+                continue;
+            }
+            if finishing {
+                // Under `EndStream` the encoder stops only for a full window
+                // or a flushed range coder; anything else would loop forever.
+                return Err(std::io::Error::other(
+                    "bcj2 encoder stopped before flushing its range coder",
+                ));
+            }
+            // It wants more source, and it has taken all of this: what it
+            // could not decide about yet is held back inside it.
+            debug_assert_eq!(src_pos, src.len());
+            return Ok(());
+        }
+    }
+
+    /// Flushes the encoder and hands back the sinks and the range-coded
+    /// stream. The sinks are not finished: that is the caller's.
+    pub(crate) fn finish(mut self) -> std::io::Result<Bcj2Finished<W, S>> {
+        self.encoder.set_finish_mode(Bcj2EncFinishMode::EndStream);
+        self.pump(&[], true)?;
+        Ok(Bcj2Finished {
+            main: self.main,
+            call: self.call,
+            jump: self.jump,
+            rc: self.rc,
+            call_len: self.call_len,
+            jump_len: self.jump_len,
+        })
+    }
+}
+
+#[cfg(feature = "compress")]
+impl<W: std::io::Write, S: std::io::Write> std::io::Write for Bcj2Writer<W, S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !buf.is_empty() {
+            self.pump(buf, false)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // The encoder holds back up to four bytes it cannot decide about
+        // until it sees what follows; those are not flushed here, only by
+        // `finish`, because writing them out now would change the stream.
+        self.main.flush()?;
+        self.call.flush()?;
+        self.jump.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read;
@@ -252,6 +392,48 @@ mod tests {
                 out.extend_from_slice(&buf[..n]);
             }
             assert!(out == data, "len {len} step {step} window {window}");
+        }
+    }
+
+    /// The writer, fed in pieces of every awkward size, makes exactly the
+    /// streams the encoder makes of the whole buffer in one call - so where
+    /// the archive writer's reads happen to split the data cannot change a
+    /// byte - and the reader turns them back into the input.
+    #[cfg(feature = "compress")]
+    #[test]
+    fn the_writer_matches_a_one_shot_encode_however_it_is_fed() {
+        use std::io::Write;
+
+        for len in [0usize, 1, 4, 5, 6, 7, 64 * 1024, 300 * 1024 + 3] {
+            let data = pseudo_x86(len);
+            let whole = encode(&data);
+            for step in [1usize, 3, 4, 5, 4096, usize::MAX] {
+                let mut writer = Bcj2Writer::new(Vec::new(), Vec::new(), Vec::new());
+                for piece in data.chunks(step.min(data.len().max(1))) {
+                    writer.write_all(piece).unwrap();
+                }
+                let done = writer.finish().unwrap();
+                assert_eq!(done.call_len, done.call.len() as u64);
+                assert_eq!(done.jump_len, done.jump.len() as u64);
+                let streams = [done.main, done.call, done.jump, done.rc];
+                assert!(streams == whole, "len {len} step {step}");
+            }
+            if len >= 64 * 1024 {
+                assert!(!whole[STREAM_CALL].is_empty() && !whole[STREAM_JUMP].is_empty());
+            }
+            let inputs = whole
+                .into_iter()
+                .map(|data| Trickle {
+                    data,
+                    at: 0,
+                    step: usize::MAX,
+                })
+                .collect();
+            let mut out = Vec::new();
+            Bcj2Reader::new(inputs, data.len() as u64)
+                .read_to_end(&mut out)
+                .unwrap();
+            assert!(out == data, "len {len}");
         }
     }
 
