@@ -119,7 +119,7 @@ func TestPlanEncodeArgsMatch7zz(t *testing.T) {
 				t.Errorf("ours %q lacks %q", ours, want)
 			}
 		}
-		for _, want := range []string{"-mx=5", "-mmt=" + all, "-ms=off", "-m0=lzma2"} {
+		for _, want := range []string{"-mx=5", "-mmt=" + all, "-ms=off", "-m0=lzma2:d=8m:fb=32:mf=bt4:a=1"} {
 			if !strings.Contains(oracle, want) {
 				t.Errorf("7zz %q lacks %q", oracle, want)
 			}

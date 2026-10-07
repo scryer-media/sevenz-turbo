@@ -45,11 +45,12 @@ count, then `all`; `--quick` runs 1 and `all`):
 | aes-256 | `decode/aes_store/T1`, `decode/aes_mx1/T{1,all}`, `decode/aes_kdf/T1` (+ `list/aes_kdf`) | AES-256-CBC decrypt in both cryptography builds; SHA-256 key derivation dominated rows |
 | filters | `decode/{bcj_x86,bcj_arm64,bcj2,delta}/T1` | the BCJ x86/ARM64, BCJ2 and delta filters |
 | ppmd (secondary) | `decode/ppmd/T1` | PPMd through `ppmd-rust` |
-| encode | `encode/payload-sub/L{1,3,5,7,9}/T{1,all}`, `encode/payload-sub/L5/T<sweep>`, `encode/tree/L5/Tall/{solid,non-solid}` | the `compress` writer (LZMA2 through lzma-turbo's encoder) vs `7zz a -m0=lzma2 -mx<L> -mmt<T>`, with the archive-size ratio; every archive this crate writes is checked once with an untimed `7zz t` |
+| encode | `encode/payload-sub/L{1,3,5,7,9}/T{1,all}`, `encode/payload-sub/L5/T<sweep>`, `encode/tree/L5/Tall/{solid,non-solid}` | the `compress` writer (LZMA2 through lzma-turbo's encoder) vs `7zz a -m0=lzma2:d=…:fb=…:mf=…:a=… -mx<L> -mmt<T>`, with the archive-size ratio; 7zz is given this crate's level settings (xz's table, not 7-Zip's `-mx` defaults), so both sides use the same dictionary, match finder and fast bytes; every archive this crate writes is checked once with an untimed `7zz t` |
 | encode aes-256 | `encode/payload-sub/L5/Tall/aes`, `encode/kdf-tree/L5/T1/non-solid/aes` | AES-256 write (`-mhe=on` on the 7zz side; this crate encrypts the header by default) |
 
 A multi-threaded encode uses the block size `7zz` would (four dictionaries,
-clamped to 1-256 MiB), so the size ratio compares like with like. The
+clamped to 1-256 MiB) for the same dictionary, so the size ratio compares
+like with like. The
 `--quick` corpus is too small for the level-5 block (32 MiB) to split, so its
 multi-threaded level-5 encode rows are effectively single-block; use the full
 corpus for encode scaling.
