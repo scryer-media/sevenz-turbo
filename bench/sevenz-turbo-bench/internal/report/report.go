@@ -20,7 +20,7 @@ import (
 const Schema = "sevenz-turbo-bench/report/1"
 
 // Orientation is stated in every report header.
-const Orientation = "Every ratio is sevenz-turbo / 7zz (candidate over reference) of the medians: below 1.000 sevenz-turbo is faster (wall, CPU), smaller (archive size) or lower (peak RSS); above 1.000 it is slower, larger or higher."
+const Orientation = "ratio = 7zz / sevenz-turbo, >1 = sevenz-turbo better. Every ratio is reference over candidate (oracle/ours) of the medians: above 1.000 sevenz-turbo is faster (wall, CPU), smaller (archive size) or lower (peak RSS); below 1.000 it is slower, larger or higher."
 
 // Stat is a median with its range.
 type Stat struct {
@@ -152,10 +152,10 @@ func Build(raw *suite.Raw) *Report {
 			}
 			if oracle != nil && ours.OK > 0 && oracle.OK > 0 {
 				ratio := Ratio{Scenario: scenario.ID, Group: scenario.Group, Variant: variant,
-					Wall: divide(ours.Wall.Median, oracle.Wall.Median), CPU: divide(ours.CPU.Median, oracle.CPU.Median),
-					RSS: divide(ours.RSS.Median, oracle.RSS.Median)}
+					Wall: divide(oracle.Wall.Median, ours.Wall.Median), CPU: divide(oracle.CPU.Median, ours.CPU.Median),
+					RSS: divide(oracle.RSS.Median, ours.RSS.Median)}
 				if scenario.Op == suite.OpEncode {
-					ratio.Size = divide(float64(ours.BytesOut), float64(oracle.BytesOut))
+					ratio.Size = divide(float64(oracle.BytesOut), float64(ours.BytesOut))
 				}
 				report.Ratios = append(report.Ratios, ratio)
 			}

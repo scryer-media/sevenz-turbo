@@ -44,13 +44,13 @@ func TestBuildRatiosAndOrientation(t *testing.T) {
 		t.Fatalf("ratios %v", built.Ratios)
 	}
 	ratio := built.Ratios[0]
-	if *ratio.Wall != 0.5 || *ratio.RSS != 2 {
-		t.Fatalf("wall %v rss %v, want 0.5 and 2 (sevenz-turbo over 7zz)", *ratio.Wall, *ratio.RSS)
+	if *ratio.Wall != 2 || *ratio.RSS != 0.5 {
+		t.Fatalf("wall %v rss %v, want 2 and 0.5 (7zz over sevenz-turbo)", *ratio.Wall, *ratio.RSS)
 	}
 	if built.Rows[0].Wall.Median != 1.1 || built.Rows[0].Wall.N != 3 {
 		t.Fatalf("median %+v", built.Rows[0].Wall)
 	}
-	if len(built.RSS) != 1 || *built.RSS[0].Ratio != 2 {
+	if len(built.RSS) != 1 || *built.RSS[0].Ratio != 0.5 {
 		t.Fatalf("rss %+v", built.RSS)
 	}
 	md := Markdown(built)

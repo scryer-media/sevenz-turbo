@@ -95,7 +95,7 @@ func TestRunWithoutAProcessHasNoPeak(t *testing.T) {
 func TestCompleteRSSScenarioFlagsDifferentSources(t *testing.T) {
 	scenario := RSSScenario{Scenario: "fixture", CandidateMedianBytes: 30 << 20, ReferenceMedianBytes: 20 << 20, CandidateSource: RSSSourceRusageTasksetExec, ReferenceSource: RSSSourceRusage}
 	CompleteRSSScenario(&scenario)
-	if scenario.Ratio == nil || *scenario.Ratio != 1.5 {
+	if scenario.Ratio == nil || *scenario.Ratio != 2.0/3.0 {
 		t.Fatalf("ratio %v", scenario.Ratio)
 	}
 	if !strings.Contains(scenario.Note, "measured differently") {
@@ -112,8 +112,8 @@ func TestSortAndRenderRSSSummary(t *testing.T) {
 	ratio := func(value float64) *float64 { return &value }
 	scenarios := []RSSScenario{
 		{Scenario: "fixture-b", CandidateMedianBytes: 1 << 20, CandidateMinBytes: 1 << 20, CandidateMaxBytes: 1 << 20, CandidateSource: RSSSourceRusage, Note: "no reference row"},
-		{Scenario: "fixture-c", CandidateMedianBytes: 10 << 20, CandidateMinBytes: 9 << 20, CandidateMaxBytes: 11 << 20, ReferenceMedianBytes: 20 << 20, ReferenceMinBytes: 20 << 20, ReferenceMaxBytes: 20 << 20, Ratio: ratio(0.5), CandidateSource: RSSSourceRusage, ReferenceSource: RSSSourceRusage},
-		{Scenario: "fixture-a", CandidateMedianBytes: 30 << 20, CandidateMinBytes: 30 << 20, CandidateMaxBytes: 30 << 20, ReferenceMedianBytes: 10 << 20, ReferenceMinBytes: 10 << 20, ReferenceMaxBytes: 10 << 20, Ratio: ratio(3), CandidateSource: RSSSourcePeakWorkingSet, ReferenceSource: RSSSourcePeakWorkingSet},
+		{Scenario: "fixture-c", CandidateMedianBytes: 10 << 20, CandidateMinBytes: 9 << 20, CandidateMaxBytes: 11 << 20, ReferenceMedianBytes: 20 << 20, ReferenceMinBytes: 20 << 20, ReferenceMaxBytes: 20 << 20, Ratio: ratio(2), CandidateSource: RSSSourceRusage, ReferenceSource: RSSSourceRusage},
+		{Scenario: "fixture-a", CandidateMedianBytes: 30 << 20, CandidateMinBytes: 30 << 20, CandidateMaxBytes: 30 << 20, ReferenceMedianBytes: 10 << 20, ReferenceMinBytes: 10 << 20, ReferenceMaxBytes: 10 << 20, Ratio: ratio(1.0 / 3), CandidateSource: RSSSourcePeakWorkingSet, ReferenceSource: RSSSourcePeakWorkingSet},
 	}
 	SortRSSScenarios(scenarios)
 	if scenarios[0].Scenario != "fixture-a" || scenarios[1].Scenario != "fixture-c" || scenarios[2].Scenario != "fixture-b" {
@@ -124,8 +124,8 @@ func TestSortAndRenderRSSSummary(t *testing.T) {
 	want := strings.Join([]string{
 		"| scenario | sevenz-turbo MiB | 7zz MiB | RSS ratio | source | note |",
 		"|---|---|---|---|---|---|",
-		"| fixture-a | 30.0 [30.0–30.0] | 10.0 [10.0–10.0] | 3.000 | peak-working-set | - |",
-		"| fixture-c | 10.0 [9.0–11.0] | 20.0 [20.0–20.0] | 0.500 | rusage | - |",
+		"| fixture-a | 30.0 [30.0–30.0] | 10.0 [10.0–10.0] | 0.333 | peak-working-set | - |",
+		"| fixture-c | 10.0 [9.0–11.0] | 20.0 [20.0–20.0] | 2.000 | rusage | - |",
 		"| fixture-b | 1.0 [1.0–1.0] | - | - | rusage | no reference row |",
 	}, "\n")
 	if !strings.Contains(b.String(), want) {

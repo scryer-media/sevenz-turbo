@@ -60,9 +60,11 @@ Decodes of the same archive by any of this crate's engines must produce the
 same output digest, and every decode must produce exactly the fixture's
 unpacked byte count; either mismatch fails the run.
 
-Every ratio is **sevenz-turbo / 7zz** of the medians: below 1.000
-sevenz-turbo is faster, smaller or lower; above 1.000 it is slower, larger or
-higher.
+Every ratio is **7zz / sevenz-turbo** of the medians (oracle over ours, the
+direction rarpar-bench and the weaver bench reports use, so merged reports
+read the same way): ratio = 7zz / sevenz-turbo, >1 = sevenz-turbo better.
+Above 1.000 sevenz-turbo is faster, smaller or lower; below 1.000 it is
+slower, larger or higher. The peak RSS section lists the lowest ratio first.
 
 ## Build
 
