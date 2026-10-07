@@ -1,0 +1,5 @@
+# The corpus is generated on every host by `sevenz-turbo-bench fixtures`;
+# no fixture byte is ever committed.
+*
+!.gitignore
+!README.md

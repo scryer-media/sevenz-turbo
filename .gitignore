@@ -9,8 +9,15 @@
 
 # Generated benchmark and differential fixtures. Only the small archives under
 # tests/resources and examples/data are tracked; everything else that 7zz or a
-# test writes is scratch. The CI `hygiene` lane enforces this.
-/bench/
+# test writes is scratch. The CI `hygiene` lane enforces this. Under bench/,
+# only the Go harness source and the corpus README are tracked; the corpus
+# itself (bench/fixtures/<profile>/) is generated on every host.
+/bench/*
+!/bench/sevenz-turbo-bench/
+!/bench/fixtures/
+/bench/sevenz-turbo-bench/sevenz-turbo-bench
+/bench/sevenz-turbo-bench/sevenz-turbo-bench.exe
+/bench/sevenz-turbo-bench/results/
 /fixtures/
 *.7z.tmp
 
