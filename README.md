@@ -4,25 +4,35 @@
 [![crates.io](https://img.shields.io/crates/v/sevenz-turbo.svg)](https://crates.io/crates/sevenz-turbo)
 [![docs.rs](https://docs.rs/sevenz-turbo/badge.svg)](https://docs.rs/sevenz-turbo)
 
-A 7z compressor/decompressor in pure Rust.
+A 7z compressor/decompressor in Rust. The default build links AWS-LC (C and
+assembly) for its cryptography and `lzma-turbo`'s ports of the LZMA SDK's
+assembly decode loops; `default-features = false` with `native-crypto` builds
+without a C toolchain, as the WASM build does (the optional `zstd` codec
+aside, which links the C `zstd`).
 
 ## This is a fork
 
 `sevenz-turbo` is a fork of
 **[sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2)** by Nils
-Hasenbanck (Apache-2.0), taken at upstream `12ed7c8`, just after v0.22.2.
-Nearly all of the code here is upstream's, and it stays that way: the public
-API and the Rust module paths are upstream's, so migrating is
-`sevenz_rust2::` → `sevenz_turbo::` plus whatever new calls you want.
+Hasenbanck (Apache-2.0), taken at upstream `12ed7c8`, just after v0.22.2. It
+is a hard fork: it is not rebased onto sevenz-rust2, nothing is sent back, and
+the two have diverged for good. The public API and the Rust module paths
+started as upstream's and are kept compatible while that costs nothing, so
+migrating is `sevenz_rust2::` → `sevenz_turbo::` plus whatever new calls you
+want; an API the container work needs to change will change, with a version
+bump and a changelog entry.
 
-Two things differ, and they are the whole reason the fork exists.
+Two things are the reason the fork exists; the default thread count, the
+cryptography backends and the limits on hostile archives below also differ
+from upstream.
 
-### 1. LZMA and LZMA2 decode with `lzma-turbo`
+### 1. LZMA and LZMA2 decode and encode with `lzma-turbo`
 
 Upstream decodes LZMA/LZMA2 with
 [`lzma-rust2`](https://github.com/hasenbanck/lzma-rust2), which is the fastest
-pure-Rust LZMA decoder published but still about 1.3x slower than 7-Zip
-single-threaded. This fork routes those two coders to
+pure-Rust LZMA decoder published but still well behind 7-Zip single-threaded
+(28.7 s against 20.2 s through `sevenz-rust2` in the [Speed](#speed) table).
+This fork routes those two coders to
 [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a port of Igor
 Pavlov's reference decoder (including the LZMA SDK's assembly loops) that is at
 parity with `7zz` single-threaded. Archives are written with `lzma-turbo`'s
@@ -39,9 +49,9 @@ not decide on its own to occupy every core, or to hold the memory that costs.
 let mut reader = ArchiveReader::new(file, Password::empty())?.with_threads(8);
 ```
 
-An archive written that way decodes about six times faster on eight threads
-than on one, and within a fifth of what `7zz t` takes with every thread on the
-same machine. An archive written `-mmt=1` is one run from beginning to end and
+An archive written that way decodes about four times faster on eight threads
+than on one (19.9 s to 4.59 s in the [Speed](#speed) table), and within a fifth
+of what `7zz t` takes with every thread on the same machine. An archive written `-mmt=1` is one run from beginning to end and
 cannot be split at all, so a thread count above one neither helps it nor — as
 of the read-ahead rule — hurts it: see [docs/benchmarking.md](docs/benchmarking.md).
 
@@ -77,7 +87,9 @@ than the runs in flight alone would need: reading a long way ahead is what
 keeps the decoder from finishing a run on the delivering thread, which is worth
 about 1.5x at low thread counts and is explained in
 [docs/lzma-turbo-requests.md](docs/lzma-turbo-requests.md). Decoding a 900 MiB
-block peaks around 2.5 GiB. A caller who would rather have the memory than the
+block peaked at about 2.6 GiB at two threads and 4.1 GiB at eight, against
+376 MiB single-threaded, when it was measured (linux-x86_64, 2026-09-16,
+sevenz-turbo 0.23.0; see [docs/benchmarking.md](docs/benchmarking.md)). A caller who would rather have the memory than the
 speed says so with `ArchiveLimits::memory`, which bounds the read-ahead along
 with everything else; a caller who wants neither leaves the thread count at
 one, where a block costs its dictionary and nothing else.
@@ -107,6 +119,8 @@ to honour before it allocates, needs to ask the archive a few things first:
   boundaries this crate does not know about, such as across blocks. Both are
   re-exported from `lzma-turbo`, so a consumer folds with the same
   implementation the decoder's workers checksummed with.
+- `Error::BlockDecode` names the block and the packed offset for a corrupt
+  archive, distinctly from I/O and unsupported-method failures.
 
 ### Where the checksums come from
 
@@ -123,11 +137,10 @@ a block decoded single-threaded, where the consuming thread is the decoding
 thread; and a block whose LZMA2 output passes through a filter (BCJ, delta,
 BCJ2), where the bytes a worker saw are not the bytes the file is made of and
 the filter runs on the consuming thread anyway.
-- `Error::BlockDecode` names the block and the packed offset for a corrupt
-  archive, distinctly from I/O and unsupported-method failures.
 
-Added rather than altered so far — every sevenz-rust2 signature still means
-what it did, which keeps the migration a rename. See
+The container API was added rather than altered so far, which keeps the
+migration a rename; the one change of behaviour behind an unchanged name is
+the default LZMA2 thread count, one rather than `available_parallelism()`. See
 [CHANGELOG.md](CHANGELOG.md), section `## Fork`, for the record of
 divergences, and [AGENTS.md](AGENTS.md) for the rules of a crate that has
 left its origin behind.
@@ -139,13 +152,14 @@ of the SDK encoder. The alternative is `lzma-rust2`'s pure-Rust encoders,
 behind the `lzma-rust2-encoder` feature (off by default), which is what every
 version before 0.25.0 used; the option types and the archives are the same
 either way, only the compressed bytes differ. A compression level means the
-same dictionary under both: 256 KiB at level 0, doubling to 64 MiB at level 9.
+same dictionary under both: 256 KiB at level 0, rising to 64 MiB at level 9.
 
 ### Crypto backends
 
 The 7z `aes256` coder needs AES-256-CBC and SHA-256, and **both** follow the
 backend feature. The default is `aws-lc-rs` — `DecryptingKey::cbc`, AWS-LC's
-unpadded CBC mode, plus its SHA-256. Enabling `native-crypto` switches both to
+unpadded CBC mode, plus its SHA-256, which this crate reaches through
+`lzma-turbo`'s `crypto` module. Enabling `native-crypto` switches both to
 RustCrypto (`aes`/`cbc` and `sha2`) and takes precedence, so a consumer that
 cannot build C can use `default-features = false` with `aes256, native-crypto`;
 that lane compiles to AES-NI on x86-64 and to the ARMv8 cryptography extensions
@@ -163,10 +177,17 @@ reports which one a build selected.
 
 ## Speed
 
-Two 7z archives of the same 1 GiB, decoded and CRC-checked in full, on
-Linux x86_64 (Intel Arrow Lake-H, 16 threads), median of three runs.
-`mt.7z` was written by `7zz -mmt=on`, so its LZMA2 stream can be decoded in
-parallel; `st.7z` by `7zz -mmt=1`, so it cannot, by anyone.
+Measured 2026-09-16/17 at sevenz-turbo 0.23.0 (on `lzma-fast` 0.2.0-0.3.0,
+since renamed `lzma-turbo`), on the
+hosts described in [docs/benchmarking.md](docs/benchmarking.md); the crate has
+changed since, and current numbers for any host come from
+[`bench/sevenz-turbo-bench`](bench/sevenz-turbo-bench/README.md), which runs the
+whole matrix against `7zz` with peak RSS on every row.
+
+Two 7z archives of the same 1 GiB, decoded and CRC-checked in full, on the
+16-thread linux-x86_64 host, median of three runs. `mt.7z` was written by
+`7zz -mmt=on`, so its LZMA2 stream can be decoded in parallel; `st.7z` by
+`7zz -mmt=1`, so it cannot, by anyone.
 
 | decoder | `mt.7z` | `st.7z` |
 | --- | --- | --- |
@@ -174,14 +195,17 @@ parallel; `st.7z` by `7zz -mmt=1`, so it cannot, by anyone.
 | `7zz t -mmt=1` | 20.2 s | 20.2 s |
 | `sevenz-rust2` 0.22.2 | 25.6 s | 28.7 s |
 | `sevenz-turbo`, 1 thread | 19.9 s | 20.0 s |
-| `sevenz-turbo`, 8 threads | 4.59 s | 20.0 s |
+| `sevenz-turbo`, 8 threads | 4.59 s | 20.0 s (\*) |
+
+(\*) [docs/benchmarking.md](docs/benchmarking.md) records 21.16 s for this
+cell from its own run on the same host; 20.0 s is not recorded there.
 
 On an Apple M5 Max the same `mt.7z` takes 2.28 s at 8 threads against
 2.13 s for `7zz`.
 
 Encrypted archives are where the fork is clearly ahead. The same 1 GiB,
 stored (`-mx0`) and AES-256 encrypted, so that decrypting it is nearly all
-of the work:
+of the work (same date and version):
 
 | `aes_store.7z` | `sevenz-turbo` | `7zz t` | `sevenz-rust2` |
 | --- | --- | --- | --- |
@@ -201,6 +225,8 @@ What each phase of a decode costs, and the rest of the fixtures, are in
 [dependencies]
 sevenz-turbo = "0.26"
 ```
+
+The minimum supported Rust version is 1.97.1, which `lzma-turbo` requires.
 
 Decompress "data/sample.7z" to "data/sample":
 
@@ -282,17 +308,17 @@ writer.finish().expect("compress ok");
 
 ### Supported codecs and filters
 
-| Codec       | Decompression | Compression |
-|-------------|---------------|-------------|
-| COPY        | ✓            | ✓          |
-| LZMA        | ✓ (lzma-turbo) | ✓          |
-| LZMA2       | ✓ (lzma-turbo) | ✓          |
-| BROTLI (*)  | ✓            | ✓          |
-| BZIP2       | ✓            | ✓          |
-| DEFLATE (*) | ✓            | ✓          |
-| PPMD        | ✓            | ✓          |
-| LZ4 (*)     | ✓            | ✓          |
-| ZSTD (*)    | ✓            | ✓          |
+| Codec       | Decompression | Compression | Implemented by |
+|-------------|---------------|-------------|----------------|
+| COPY        | ✓            | ✓          | this crate |
+| LZMA        | ✓            | ✓          | `lzma-turbo` (encode: `lzma-rust2` with `lzma-rust2-encoder`) |
+| LZMA2       | ✓            | ✓          | `lzma-turbo`, including the parallel decoder (encode: `lzma-rust2` with `lzma-rust2-encoder`) |
+| BROTLI (*)  | ✓            | ✓          | `brotli` crate |
+| BZIP2       | ✓            | ✓          | `bzip2` crate |
+| DEFLATE (*) | ✓            | ✓          | `flate2` crate (`zlib-rs`) |
+| PPMD        | ✓            | ✓          | `ppmd-rust` crate |
+| LZ4 (*)     | ✓            | ✓          | `lz4_flex` crate |
+| ZSTD (*)    | ✓            | ✓          | `zstd` crate |
 
 (*) Require optional cargo feature.
 
@@ -308,6 +334,12 @@ writer.finish().expect("compress ok");
 | BCJ IA64      | ✓            | ✓          |
 | BCJ2          | ✓            |             |
 | DELTA         | ✓            | ✓          |
+
+Every branch converter, BCJ2 and the delta filter are `lzma-turbo`'s
+(`lzma_turbo::filters`). The `Read`/`Write` wrappers around the BCJ and delta
+converters were vendored from `lzma-rust2` 0.20.1 (`src/codec/filter/`); the
+BCJ2 reader is this crate's own. CRC-32 everywhere is `crc-fast`, through
+`lzma-turbo`'s `crc` module.
 
 ### WASM support
 
@@ -382,13 +414,14 @@ Almost none of this crate is ours, and the people it belongs to should be
 named before the licence is.
 
 - **Nils Hasenbanck** wrote and maintains
-  [`sevenz-rust2`](https://github.com/hasenbanck/sevenz-rust2), which is the
-  code in this repository: the archive reader and writer, the coders, the
-  encryption, the tests and the examples. He also wrote
+  [`sevenz-rust2`](https://github.com/hasenbanck/sevenz-rust2), which is
+  where the code in this repository comes from: the archive reader and
+  writer, the coders, the encryption, the tests and the examples all started
+  as his. He also wrote
   [`lzma-rust2`](https://github.com/hasenbanck/lzma-rust2), whose encoders
-  are the `lzma-rust2-encoder` alternative. This fork is his work with two
-  changes bolted on, and if you are not sure you need those changes, his
-  crate is the one to use.
+  are the `lzma-rust2-encoder` alternative and whose filter readers and
+  writers are vendored here. This fork is built on his work, and if you are
+  not sure you need what it changes, his crate is the one to use.
 - **dyz1990** wrote the original
   [`sevenz-rust`](https://github.com/dyz1990/sevenz-rust) that `sevenz-rust2`
   continued, and with it the first 7z implementation in pure Rust.
@@ -406,8 +439,9 @@ This crate is licensed under the
 [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0),
 the same as upstream, and upstream's copyright notices are unchanged.
 
-Note that `lzma-turbo`, which this crate depends on for LZMA/LZMA2 decoding, is
-licensed GPL-3.0-or-later. This crate's own source stays Apache-2.0, but a
+Note that `lzma-turbo`, which this crate depends on for LZMA/LZMA2 decoding
+and encoding, the BCJ/BCJ2/delta filters and CRC-32, is licensed
+GPL-3.0-or-later. This crate's own source stays Apache-2.0, but a
 binary that links it together with `lzma-turbo` is a combined work under the
 GPL. If that is a problem for you, upstream `sevenz-rust2` is the crate you
 want.
