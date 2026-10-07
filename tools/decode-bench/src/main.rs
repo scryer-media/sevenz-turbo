@@ -21,6 +21,8 @@
 //! live outside the repository, the run takes minutes, and it is a thing an
 //! operator runs deliberately rather than something CI measures.
 
+mod op;
+
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -38,7 +40,11 @@ usage: decode-bench [--runs N] [--no-oracle] [--threads LIST] [--password P] <ar
   --cipher-only   time AES-256-CBC alone over 1 GiB in memory and exit
   --cipher-chunk KIB  chunk size for --cipher-only, repeatable (default 1024)
   --floor         time reading <archive.7z> and digesting it, and exit
-  --io-profile    decode once through a counting reader and report read sizes";
+  --io-profile    decode once through a counting reader and report read sizes
+
+  decode-bench op version|list|decode|encode ...
+                  one operation per process, one JSON line on stdout; the lane
+                  bench/sevenz-turbo-bench drives (see src/op.rs)";
 
 fn main() {
     let mut runs = 3usize;
@@ -52,6 +58,10 @@ fn main() {
     let mut cipher_chunks: Vec<usize> = Vec::new();
     let mut io_profile = false;
     let mut memory_limit = u64::MAX;
+
+    if std::env::args().nth(1).as_deref() == Some("op") {
+        op::main(std::env::args().skip(2).collect());
+    }
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
