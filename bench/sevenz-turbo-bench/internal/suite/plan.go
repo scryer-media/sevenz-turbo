@@ -1,0 +1,369 @@
+// Package suite is the benchmark matrix and its runner: which scenario runs
+// which variants with which arguments, and the interleaved loop that measures
+// every run as its own child process.
+package suite
+
+import (
+	"fmt"
+	"path/filepath"
+	"runtime"
+	"strconv"
+
+	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/fixtures"
+)
+
+// Variant names. The candidate is this crate as the default build ships it
+// (AWS-LC cryptography); the reference is the official 7zz.
+const (
+	VariantTurbo       = "sevenz-turbo"
+	VariantTurboNative = "sevenz-turbo native-crypto"
+	VariantUpstream    = "sevenz-rust2"
+	VariantOracle      = "7zz"
+)
+
+// Roles. A failing candidate or reference run fails the whole run; a failing
+// secondary run is reported and does not.
+const (
+	RoleCandidate = "candidate"
+	RoleReference = "reference"
+	RoleSecondary = "secondary"
+)
+
+// Ops.
+const (
+	OpList   = "list"
+	OpDecode = "decode"
+	OpEncode = "encode"
+)
+
+// Groups, in report order.
+var Groups = []string{
+	"container parse",
+	"lzma2 single-stream",
+	"lzma2 parallel",
+	"lzma",
+	"memory budget",
+	"solid vs non-solid",
+	"aes-256",
+	"filters",
+	"ppmd (secondary)",
+	"encode",
+	"encode aes-256",
+}
+
+// Scenario is one row group of the matrix: one operation on one input, run
+// by every variant.
+type Scenario struct {
+	ID      string `json:"id"`
+	Group   string `json:"group"`
+	Op      string `json:"op"`
+	Fixture string `json:"fixture"`
+	// Threads is the requested thread count, "all" for every core.
+	Threads string `json:"threads"`
+	Level   int    `json:"level,omitempty"`
+	// MemoryLimit is the decode budget passed to ArchiveLimits::memory.
+	MemoryLimit int64  `json:"memory_limit,omitempty"`
+	NonSolid    bool   `json:"non_solid,omitempty"`
+	Encrypted   bool   `json:"encrypted,omitempty"`
+	NoVerify    bool   `json:"no_verify,omitempty"`
+	Stream      bool   `json:"stream,omitempty"`
+	Note        string `json:"note,omitempty"`
+	Variants    []Run  `json:"variants"`
+}
+
+// Run is one variant's command for a scenario.
+type Run struct {
+	Variant string   `json:"variant"`
+	Role    string   `json:"role"`
+	Tool    string   `json:"tool"`
+	Args    []string `json:"args"`
+	// Dir is the working directory (7zz a adds paths relative to it).
+	Dir string `json:"dir,omitempty"`
+	// Output is the archive an encode writes, removed after every run.
+	Output string `json:"output,omitempty"`
+	// JSON marks a decode-bench op run whose last stdout line is its result.
+	JSON bool `json:"json"`
+}
+
+// Tools are the binaries a plan runs.
+type Tools struct {
+	Candidate string
+	// Native is the native-crypto build; empty skips its rows.
+	Native string
+	Oracle string
+}
+
+// Settings shape the matrix.
+type Settings struct {
+	Quick bool
+	// Threads is the decode/encode sweep; "all" is always last.
+	Threads []string
+	Levels  []int
+	// Budgets are the memory-budget decode limits, low first.
+	Budgets []int64
+	// BudgetThreads is the thread count the budget rows ask for.
+	BudgetThreads string
+}
+
+// DefaultSettings is the full matrix, or its --quick subset, for a host with
+// cpus cores.
+func DefaultSettings(quick bool, cpus int) Settings {
+	settings := Settings{Quick: quick}
+	if quick {
+		settings.Threads = []string{"1", "all"}
+		settings.Levels = []int{1, 5}
+		settings.Budgets = []int64{20 << 20, 96 << 20}
+	} else {
+		for _, n := range []int{1, 2, 4, 8, 16} {
+			if n < cpus {
+				settings.Threads = append(settings.Threads, strconv.Itoa(n))
+			}
+		}
+		settings.Threads = append(settings.Threads, "all")
+		settings.Levels = []int{1, 3, 5, 7, 9}
+		settings.Budgets = []int64{64 << 20, 512 << 20}
+	}
+	settings.BudgetThreads = strconv.Itoa(min(8, cpus))
+	return settings
+}
+
+// ResolveThreads turns "all" into the core count, as both sides are given a
+// number.
+func ResolveThreads(threads string) string {
+	if threads == "all" {
+		return strconv.Itoa(runtime.NumCPU())
+	}
+	return threads
+}
+
+// Plan builds the matrix over the corpus in dir. scratch is where encode rows
+// write their archives.
+func Plan(manifest *fixtures.Manifest, dir, scratch string, tools Tools, settings Settings) ([]Scenario, error) {
+	p := planner{manifest: manifest, dir: dir, scratch: scratch, tools: tools}
+	for _, name := range []string{"tree_solid.7z", "tree_nonsolid.7z", "mt.7z", "aes_kdf.7z"} {
+		p.list(name)
+	}
+	for _, threads := range []string{"1", "all"} {
+		p.decode("lzma2 single-stream", "st.7z", threads, decodeOpts{upstream: true,
+			note: "one stream, no dictionary resets: more threads cannot help any decoder"})
+	}
+	for _, threads := range settings.Threads {
+		upstream := threads == "1" || threads == "all"
+		p.decode("lzma2 parallel", "mt.7z", threads, decodeOpts{upstream: upstream})
+	}
+	p.decode("lzma2 parallel", "mt.7z", "all", decodeOpts{noVerify: true, note: "CRC-32 verification off: the cost of checking"})
+	p.decode("lzma2 parallel", "mt.7z", "all", decodeOpts{stream: true, note: "the single-parse streaming consumer path (block_decoder per block, sub-stream CRC hook)"})
+	p.decode("lzma", "lzma.7z", "1", decodeOpts{upstream: true})
+	for _, budget := range settings.Budgets {
+		p.decode("memory budget", "mt.7z", settings.BudgetThreads, decodeOpts{memoryLimit: budget,
+			note: "decode under ArchiveLimits::memory; parallel_path=false means the budget forced the single-threaded fallback. 7zz has no decode budget: it runs unbounded at the same threads"})
+	}
+	for _, name := range []string{"tree_solid.7z", "tree_nonsolid.7z"} {
+		for _, threads := range []string{"1", "all"} {
+			p.decode("solid vs non-solid", name, threads, decodeOpts{upstream: threads == "1"})
+		}
+		p.decode("solid vs non-solid", name, "all", decodeOpts{noVerify: true, note: "per-member CRC-32 off"})
+		p.decode("solid vs non-solid", name, "all", decodeOpts{stream: true, note: "streaming consumer path"})
+	}
+	p.decode("aes-256", "aes_store.7z", "1", decodeOpts{upstream: true, native: true})
+	for _, threads := range []string{"1", "all"} {
+		p.decode("aes-256", "aes_mx1.7z", threads, decodeOpts{upstream: threads == "1", native: true})
+	}
+	p.list("aes_kdf.7z")
+	p.decode("aes-256", "aes_kdf.7z", "1", decodeOpts{upstream: true, native: true,
+		note: "one SHA-256 key derivation per folder unless cached: the key-derivation row"})
+	for _, name := range []string{"bcj_x86.7z", "bcj_arm64.7z", "bcj2.7z", "delta.7z"} {
+		p.decode("filters", name, "1", decodeOpts{upstream: true})
+	}
+	p.decode("ppmd (secondary)", "ppmd.7z", "1", decodeOpts{upstream: true, note: "PPMd is the external ppmd-rust crate, not this crate's code"})
+
+	encodeThreads := []string{"1", "all"}
+	for _, level := range settings.Levels {
+		for _, threads := range encodeThreads {
+			p.encode("encode", "payload-sub", level, threads, encodeOpts{})
+		}
+	}
+	for _, threads := range settings.Threads {
+		if threads != "1" && threads != "all" {
+			p.encode("encode", "payload-sub", 5, threads, encodeOpts{})
+		}
+	}
+	p.encode("encode", "tree", 5, "all", encodeOpts{})
+	p.encode("encode", "tree", 5, "all", encodeOpts{nonSolid: true})
+	p.encode("encode aes-256", "payload-sub", 5, "all", encodeOpts{encrypted: true})
+	p.encode("encode aes-256", "kdf-tree", 5, "1", encodeOpts{encrypted: true, nonSolid: true,
+		note: "tiny members, one encrypted folder each: write-side key-derivation and per-folder cost"})
+	return p.scenarios, p.err
+}
+
+type planner struct {
+	manifest  *fixtures.Manifest
+	dir       string
+	scratch   string
+	tools     Tools
+	scenarios []Scenario
+	seen      map[string]bool
+	err       error
+}
+
+func (p *planner) add(scenario Scenario) {
+	if p.seen == nil {
+		p.seen = map[string]bool{}
+	}
+	if p.seen[scenario.ID] {
+		return
+	}
+	p.seen[scenario.ID] = true
+	p.scenarios = append(p.scenarios, scenario)
+}
+
+func (p *planner) archive(name string) (fixtures.ArchiveRecord, bool) {
+	record, ok := p.manifest.Archive(name)
+	if !ok && p.err == nil {
+		p.err = fmt.Errorf("fixture %s is not in the manifest: run `sevenz-turbo-bench fixtures` first", name)
+	}
+	return record, ok
+}
+
+func stem(name string) string { return name[:len(name)-len(filepath.Ext(name))] }
+
+func (p *planner) list(name string) {
+	record, ok := p.archive(name)
+	if !ok {
+		return
+	}
+	path := filepath.Join(p.dir, name)
+	ours := []string{"op", "list", "--archive", path}
+	oracle := []string{"l", "-slt"}
+	if record.Encrypted {
+		ours = append(ours, "--password", fixtures.Password)
+		oracle = append(oracle, "-p"+fixtures.Password)
+	}
+	oracle = append(oracle, path)
+	p.add(Scenario{
+		ID: "list/" + stem(name), Group: "container parse", Op: OpList, Fixture: name, Threads: "1",
+		Encrypted: record.Encrypted,
+		Note:      "header parse and entry walk only; 7zz l -slt also formats every entry's properties",
+		Variants: []Run{
+			{Variant: VariantTurbo, Role: RoleCandidate, Tool: p.tools.Candidate, Args: ours, JSON: true},
+			{Variant: VariantOracle, Role: RoleReference, Tool: p.tools.Oracle, Args: oracle},
+		},
+	})
+}
+
+type decodeOpts struct {
+	upstream, native, noVerify, stream bool
+	memoryLimit                        int64
+	note                               string
+}
+
+func (p *planner) decode(group, name, threads string, o decodeOpts) {
+	record, ok := p.archive(name)
+	if !ok {
+		return
+	}
+	path := filepath.Join(p.dir, name)
+	n := ResolveThreads(threads)
+	id := fmt.Sprintf("decode/%s/T%s", stem(name), threads)
+	ours := []string{"op", "decode", "--archive", path, "--threads", n}
+	switch {
+	case o.noVerify:
+		id += "/no-verify"
+		ours = append(ours, "--no-verify")
+	case o.stream:
+		id += "/stream"
+		ours = append(ours, "--stream")
+	}
+	if o.memoryLimit > 0 {
+		id += fmt.Sprintf("/budget-%dMiB", o.memoryLimit>>20)
+		ours = append(ours, "--memory-limit", strconv.FormatInt(o.memoryLimit, 10))
+	}
+	oracle := []string{"t", "-bso0", "-bsp0", "-mmt=" + n}
+	if record.Encrypted {
+		ours = append(ours, "--password", fixtures.Password)
+		oracle = append(oracle, "-p"+fixtures.Password)
+	}
+	oracle = append(oracle, path)
+	variants := []Run{{Variant: VariantTurbo, Role: RoleCandidate, Tool: p.tools.Candidate, Args: ours, JSON: true}}
+	if o.native && p.tools.Native != "" {
+		variants = append(variants, Run{Variant: VariantTurboNative, Role: RoleCandidate, Tool: p.tools.Native, Args: ours, JSON: true})
+	}
+	variants = append(variants, Run{Variant: VariantOracle, Role: RoleReference, Tool: p.tools.Oracle, Args: oracle})
+	if o.upstream {
+		upstream := []string{"op", "decode", "--engine", "upstream", "--archive", path, "--threads", n}
+		if record.Encrypted {
+			upstream = append(upstream, "--password", fixtures.Password)
+		}
+		variants = append(variants, Run{Variant: VariantUpstream, Role: RoleSecondary, Tool: p.tools.Candidate, Args: upstream, JSON: true})
+	}
+	p.add(Scenario{
+		ID: id, Group: group, Op: OpDecode, Fixture: name, Threads: threads,
+		MemoryLimit: o.memoryLimit, Encrypted: record.Encrypted, NoVerify: o.noVerify, Stream: o.stream,
+		Note: o.note, Variants: variants,
+	})
+}
+
+type encodeOpts struct {
+	nonSolid, encrypted bool
+	note                string
+}
+
+func (p *planner) encode(group, source string, level int, threads string, o encodeOpts) {
+	record, ok := p.manifest.Source(source)
+	if !ok {
+		if p.err == nil {
+			p.err = fmt.Errorf("source %s is not in the manifest: run `sevenz-turbo-bench fixtures` first", source)
+		}
+		return
+	}
+	n := ResolveThreads(threads)
+	id := fmt.Sprintf("encode/%s/L%d/T%s", source, level, threads)
+	solid := "solid"
+	if o.nonSolid {
+		solid = "non-solid"
+	}
+	if record.Kind == fixtures.KindTree {
+		id += "/" + solid
+	}
+	if o.encrypted {
+		id += "/aes"
+	}
+	slug := filepath.Base(id)
+	ourOut := filepath.Join(p.scratch, fmt.Sprintf("%d-%s-ours.7z", len(p.scenarios), slug))
+	oracleOut := filepath.Join(p.scratch, fmt.Sprintf("%d-%s-7zz.7z", len(p.scenarios), slug))
+	input := fixtures.SourceDir(p.dir, source)
+	ours := []string{"op", "encode", "--input", input, "--out", ourOut, "--level", strconv.Itoa(level), "--threads", n}
+	oracle := []string{"a", "-bso0", "-bsp0", "-y", "-t7z", "-m0=lzma2", fmt.Sprintf("-mx=%d", level), "-mmt=" + n}
+	if o.nonSolid {
+		ours = append(ours, "--non-solid")
+		oracle = append(oracle, "-ms=off")
+	} else {
+		oracle = append(oracle, "-ms=on")
+	}
+	if o.encrypted {
+		ours = append(ours, "--password", fixtures.Password)
+		oracle = append(oracle, "-p"+fixtures.Password, "-mhe=on")
+	}
+	entries, err := fixtures.Entries(p.dir, source)
+	if err != nil && p.err == nil {
+		p.err = err
+	}
+	oracle = append(oracle, oracleOut)
+	oracle = append(oracle, entries...)
+	variants := []Run{{Variant: VariantTurbo, Role: RoleCandidate, Tool: p.tools.Candidate, Args: ours, Output: ourOut, JSON: true}}
+	if o.encrypted && p.tools.Native != "" {
+		nativeOut := filepath.Join(p.scratch, fmt.Sprintf("%d-%s-native.7z", len(p.scenarios), slug))
+		native := append([]string(nil), ours...)
+		for i := range native {
+			if native[i] == ourOut {
+				native[i] = nativeOut
+			}
+		}
+		variants = append(variants, Run{Variant: VariantTurboNative, Role: RoleCandidate, Tool: p.tools.Native, Args: native, Output: nativeOut, JSON: true})
+	}
+	variants = append(variants, Run{Variant: VariantOracle, Role: RoleReference, Tool: p.tools.Oracle, Args: oracle, Dir: input, Output: oracleOut})
+	p.add(Scenario{
+		ID: id, Group: group, Op: OpEncode, Fixture: source, Threads: threads, Level: level,
+		NonSolid: o.nonSolid, Encrypted: o.encrypted, Note: o.note, Variants: variants,
+	})
+}
