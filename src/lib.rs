@@ -71,6 +71,19 @@ pub fn crypto_backend() -> &'static str {
     crypto_backend::BACKEND
 }
 
+/// The SHA-256 of `data`, computed by the backend [`crypto_backend`] names.
+///
+/// For a consumer that wants one digest routine in its binary and wants it to
+/// be the one this crate's `aes256` coder uses, rather than linking a second
+/// cryptography library (or a second configuration of the same one) beside it.
+#[cfg(feature = "aes256")]
+#[must_use]
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut sha = crypto_backend::Sha256::new();
+    sha.update(data);
+    sha.finalize()
+}
+
 /// Names the LZMA and LZMA2 encoder this build of the crate selected:
 /// `"lzma-turbo"`, or `"lzma-rust2"` when the `lzma-rust2-encoder` feature is
 /// on.

@@ -403,6 +403,10 @@ Everything here is new surface; no upstream signature changed meaning.
 
 - Bench harness: `run` refuses an `--out` whose `scratch` directory already
   exists instead of deleting it at the end of the run.
+- `sevenz_turbo::sha256` digests with the backend `crypto_backend` names.
+  decode-bench takes its `Cargo.lock` digest through it, so the
+  `native-crypto` candidate no longer links AWS-LC's SHA-256 beside
+  RustCrypto's for that one digest.
 - Each folder's LZMA and LZMA2 coder is sized to the folder. Every folder was
   set up with the full dictionary and, with more than one thread allowed, a
   multi-threaded LZMA2 coder that buffers a whole 32 MiB block, so a
