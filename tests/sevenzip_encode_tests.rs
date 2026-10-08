@@ -261,7 +261,7 @@ fn every_aes_folder_and_the_header_has_its_own_iv() {
 
 /// An archive this crate encrypts carries 7-Zip's own key-derivation work
 /// factor, 2^19 rounds, unless the caller asked for less; either way 7-Zip
-/// reads it. Before 0.28.0 the default was 2^8, which made every password
+/// reads it. Before 0.27.0 the default was 2^8, which made every password
 /// guess 2048 times cheaper than against an archive 7-Zip wrote.
 #[cfg(feature = "aes256")]
 #[test]

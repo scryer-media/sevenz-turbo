@@ -285,7 +285,7 @@ Everything here is new surface; no upstream signature changed meaning.
 ### Cryptography
 
 - Archives are encrypted with 7-Zip's key-derivation work factor, 2^19
-  SHA-256 rounds (0.28.0); upstream writes 2^8. A derived key is shared by
+  SHA-256 rounds (0.27.0); upstream writes 2^8. A derived key is shared by
   the clones of its `Password`, so it is derived once per archive rather than
   once per folder.
 
@@ -404,7 +404,7 @@ Everything here is new surface; no upstream signature changed meaning.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
-## 0.28.0 - 2026-10-09
+## 0.27.0 - 2026-10-09
 
 - Security fix: every AES-256 folder, and the encrypted header, is now
   encrypted under its own random IV, as 7-Zip's writer does.
@@ -424,7 +424,7 @@ Everything here is new surface; no upstream signature changed meaning.
   that 7-Zip writes, so a password guess against an archive written here was
   2048 times cheaper than against one 7-Zip wrote. The default is now 19,
   `AesEncoderOptions::DEFAULT_NUM_CYCLES_POWER`; archives written before
-  0.28.0 are as weak as they were and should be re-encrypted if the password
+  0.27.0 are as weak as they were and should be re-encrypted if the password
   matters. A lower work factor can still be chosen deliberately, with
   `with_num_cycles_power` or the public field. Both directions are held to
   7-Zip: `7zz t` passes what is written at 19 and at a lowered power and `7zz
@@ -591,9 +591,6 @@ Everything here is new surface; no upstream signature changed meaning.
   default_wasm`, `-D warnings`) passes: `Decoder::Delta` boxes its reader,
   whose filter history would otherwise size every variant, and two closures
   in `util::wasm` became the functions they wrapped. No behaviour changed.
-
-## 0.27.0 - 2026-10-07
-
 - Bench harness: `run` refuses an `--out` whose `scratch` directory already
   exists instead of deleting it at the end of the run.
 - `sevenz_turbo::sha256` digests with the backend `crypto_backend` names.
