@@ -4,7 +4,7 @@ use std::{cell::RefCell, io::Write, rc::Rc};
 use lzma_rust2::{Lzma2Writer, Lzma2WriterMt, LzmaWriter};
 
 #[cfg(not(feature = "lzma-rust2-encoder"))]
-use crate::codec::lzma_turbo::writer::{Coder, LzmaTurboWriter};
+use crate::codec::lzma_turbo::writer::{Coder, LzmaTurboWriter, SideCoder};
 
 use crate::codec::filter::{
     bcj::BcjWriter,
@@ -325,13 +325,15 @@ fn bcj2_side_encoder(sink: SharedBuf) -> Result<Box<dyn Write>, Error> {
     let lz = {
         // 7-Zip's side coders run its default level (5, the binary-tree
         // match finder) with the settings above.
-        let props = lzma_turbo::LzmaEncProps::new()
-            .with_level(5)
-            .with_dict_size(BCJ2_SIDE_DICT_SIZE)
-            .with_fast_bytes(BCJ2_SIDE_FAST_BYTES)
-            .with_lclppb(BCJ2_SIDE_LC, BCJ2_SIDE_LP, BCJ2_SIDE_PB)
-            .with_num_threads(1);
-        LzmaTurboWriter::new(input, &props, Coder::Lzma)?
+        SideCoder {
+            level: 5,
+            dict_size: BCJ2_SIDE_DICT_SIZE,
+            fast_bytes: BCJ2_SIDE_FAST_BYTES,
+            lc: BCJ2_SIDE_LC,
+            lp: BCJ2_SIDE_LP,
+            pb: BCJ2_SIDE_PB,
+        }
+        .writer(input)?
     };
     #[cfg(feature = "lzma-rust2-encoder")]
     let lz = {
