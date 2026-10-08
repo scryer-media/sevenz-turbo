@@ -428,7 +428,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         R: Read,
         F: Fn(usize, &ArchiveEntry) -> std::io::Result<Option<R>> + Sync,
     {
-        let methods = Arc::clone(&self.content_methods);
+        let methods = Arc::new(encoder::one_thread_each(&self.content_methods));
         let workers = (threads as usize).min(run.len());
         let first = run.start;
         let outcome = crate::ordered::run(

@@ -459,6 +459,28 @@ pub(crate) fn folder_threads(methods: &[EncoderConfiguration]) -> u32 {
         .unwrap_or(1)
 }
 
+/// `methods` for a folder coded on one worker of a parallel non-solid write:
+/// every LZMA2 coder on one thread.
+///
+/// The workers are the thread budget, and such a folder already keeps one
+/// thread busy (see [`folder_threads`]); left at more than one, its coder would
+/// still start a match-finder thread of its own and double the threads in use.
+pub(crate) fn one_thread_each(methods: &[EncoderConfiguration]) -> Vec<EncoderConfiguration> {
+    methods
+        .iter()
+        .map(|mc| match &mc.options {
+            Some(EncoderOptions::Lzma2(options)) if options.threads > 1 => EncoderConfiguration {
+                method: mc.method,
+                options: Some(EncoderOptions::Lzma2(Lzma2Options {
+                    threads: 1,
+                    ..options.clone()
+                })),
+            },
+            _ => mc.clone(),
+        })
+        .collect()
+}
+
 pub(crate) fn add_encoder<W: Write>(
     input: CountingWriter<W>,
     method_config: &EncoderConfiguration,

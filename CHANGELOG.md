@@ -544,7 +544,9 @@ Everything here is new surface; no upstream signature changed meaning.
   a thread of its own, as 7-Zip does (`numThreads = 2` for the normal
   algorithm with a binary-tree finder; one for the fast algorithm and hash
   chains). A single-threaded encode and the LZMA coder are unchanged. The
-  memory estimate does not yet count that thread's buffers.
+  memory estimate does not yet count that thread's buffers. A folder coded
+  on a worker of `push_archive_entries_non_solid` keeps its match finder on
+  the worker's thread, so the workers stay within the thread count.
 - Bench tooling: `decode-bench op version` reports `ppmd_crates`, every
   `ppmd-*` crate in the `Cargo.lock` the binary embeds with its version, and
   `ppmd_turbo` (its version, or `absent`), in place of `ppmd_rust`; the
