@@ -573,6 +573,17 @@ Everything here is new surface; no upstream signature changed meaning.
   barely compresses at order 8 took 2.52 s instead of 2.45 s (7zz:
   2.44 s), and 4 MiB of x86 code 0.43 s instead of 0.42 s. Text encodes as
   fast as before.
+- Writing LZMA or LZMA2 where no thread can be started (`wasm32`) no longer
+  holds the folder's whole input. The thread-less path collected every byte
+  and encoded on `finish`, so its memory grew with the input; it now pushes
+  each write into `lzma-turbo`'s push encoders on the caller's thread, which
+  run the encoder as far as a queue of about one 2 MiB LZMA2 chunk allows.
+  The packed bytes are unchanged, byte for byte, and the threaded path is
+  untouched. Forced onto that path on Apple silicon (level 1, 8 MiB
+  dictionary, one thread), peak RSS went from 395 to 67 MiB for a 256 MiB
+  input and from 1382 to 67 MiB for 1 GiB, with wall and CPU time no worse.
+  Building with `--cfg sevenz_turbo_unthreaded` sends every writer down that
+  path, for tests and measurement on a host with threads.
 
 ## 0.27.0 - 2026-10-07
 

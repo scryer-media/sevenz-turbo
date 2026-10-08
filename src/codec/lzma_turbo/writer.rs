@@ -11,17 +11,22 @@
 //! holds (its dictionary, and for block-parallel LZMA2 one block per thread).
 //!
 //! Where a thread cannot be started - `wasm32-unknown-unknown` has none - the
-//! adapter falls back to holding the whole input and encoding it on
-//! [`LzmaTurboWriter::finish`]. The two paths run the same encoder over the
-//! same stream abstraction and produce the same bytes.
+//! adapter drives `lzma-turbo`'s push encoders on the caller's thread instead:
+//! each write is queued and the encoder's block loop runs as far as the queue
+//! allows, so what is held is the encoder's window plus about one LZMA2 chunk,
+//! whatever the folder's size. That path is always one solid stream, which is
+//! what the threaded path writes at one thread, byte for byte.
+//!
+//! Building with `--cfg sevenz_turbo_unthreaded` makes every writer take that
+//! path, so that it can be tested and measured on a host with threads.
 
 use std::io::{self, Write};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
 use lzma_turbo::{
-    BLOCK_SIZE_SOLID, Error as LzmaError, Lzma2Encoder, LzmaEncProps, LzmaEncoder, SeqInStream,
-    SeqOutStream, SliceStream,
+    Error as LzmaError, Lzma2Encoder, Lzma2PushEncoder, LzmaEncProps, LzmaEncoder, LzmaPushEncoder,
+    SeqInStream, SeqOutStream,
 };
 
 /// Bytes per message on the input channel. A caller's large write is cut into
@@ -98,24 +103,48 @@ impl Encoder {
         }
     }
 
-    /// Runs the whole stream. `threaded` is whether block threads may be
-    /// started; the fallback path, which exists because a thread could not
-    /// be, says no.
+    /// Runs the whole stream.
     fn run(
         &mut self,
         input: &mut (dyn SeqInStream + Send),
         out: &mut (dyn SeqOutStream + Send),
-        threaded: bool,
     ) -> Result<(), LzmaError> {
         match self {
             Encoder::Lzma(enc) => enc.encode_send(input, out),
-            Encoder::Lzma2(enc) => {
-                if !threaded {
-                    enc.set_threads(1);
-                    enc.set_block_size(BLOCK_SIZE_SOLID);
-                }
-                enc.encode_mt(input, out)
-            }
+            Encoder::Lzma2(enc) => enc.encode_mt(input, out),
+        }
+    }
+}
+
+/// The encoder the thread-less path pushes into. LZMA2 is one solid block on
+/// one thread, whatever block plan the coder was given: block threads are
+/// what that plan is for, and there are none.
+enum Pusher {
+    Lzma(Box<LzmaPushEncoder>),
+    Lzma2(Box<Lzma2PushEncoder>),
+}
+
+impl Pusher {
+    fn new(props: &LzmaEncProps, coder: Coder) -> Result<Self, LzmaError> {
+        match coder {
+            Coder::Lzma => Ok(Pusher::Lzma(Box::new(LzmaPushEncoder::new(
+                &props.with_end_mark(false),
+            )?))),
+            Coder::Lzma2 { .. } => Ok(Pusher::Lzma2(Box::new(Lzma2PushEncoder::new(props)?))),
+        }
+    }
+
+    fn push(&mut self, data: &[u8], out: &mut Vec<u8>) -> Result<(), LzmaError> {
+        match self {
+            Pusher::Lzma(enc) => enc.push(data, out),
+            Pusher::Lzma2(enc) => enc.push(data, out),
+        }
+    }
+
+    fn finish(&mut self, out: &mut Vec<u8>) -> Result<(), LzmaError> {
+        match self {
+            Pusher::Lzma(enc) => enc.finish(out),
+            Pusher::Lzma2(enc) => enc.finish(out),
         }
     }
 }
@@ -170,9 +199,12 @@ enum State {
         output: Receiver<Vec<u8>>,
         worker: Option<JoinHandle<Result<(), LzmaError>>>,
     },
-    Buffered {
-        encoder: Encoder,
-        buf: Vec<u8>,
+    /// No encoder thread: the encoder runs inside `write`.
+    Pushed {
+        encoder: Pusher,
+        /// What the encoder produced during the current call, handed to the
+        /// inner writer before the call returns.
+        out: Vec<u8>,
     },
 }
 
@@ -204,18 +236,22 @@ impl<W: Write> LzmaTurboWriter<W> {
         let mut encoder = Encoder::new(props, coder).map_err(io_error)?;
         let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(INPUT_DEPTH);
         let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
-        let spawned = std::thread::Builder::new()
-            .name("sevenz-turbo lzma encoder".into())
-            .spawn(move || {
-                let mut source = ChannelSource {
-                    rx: input_rx,
-                    pending: Vec::new(),
-                    pos: 0,
-                };
-                let mut sink = ChannelSink(output_tx);
-                encoder.run(&mut source, &mut sink, true)
-                // `sink` drops here, which is what ends the writer's drain.
-            });
+        let spawned = if cfg!(sevenz_turbo_unthreaded) {
+            Err(io::Error::from(io::ErrorKind::Unsupported))
+        } else {
+            std::thread::Builder::new()
+                .name("sevenz-turbo lzma encoder".into())
+                .spawn(move || {
+                    let mut source = ChannelSource {
+                        rx: input_rx,
+                        pending: Vec::new(),
+                        pos: 0,
+                    };
+                    let mut sink = ChannelSink(output_tx);
+                    encoder.run(&mut source, &mut sink)
+                    // `sink` drops here, which is what ends the writer's drain.
+                })
+        };
         let state = match spawned {
             Ok(worker) => State::Streaming {
                 input: Some(input_tx),
@@ -223,14 +259,11 @@ impl<W: Write> LzmaTurboWriter<W> {
                 worker: Some(worker),
             },
             Err(_) => {
-                // No threads on this target: hold the input and encode it on
-                // `finish`. The encoder moved into the closure that failed to
-                // start, so build it again; the same settings were accepted a
-                // moment ago.
-                let encoder = Encoder::new(props, coder).map_err(io_error)?;
-                State::Buffered {
-                    encoder,
-                    buf: Vec::new(),
+                // No threads on this target: run the encoder inside `write`.
+                // The same settings were accepted a moment ago.
+                State::Pushed {
+                    encoder: Pusher::new(props, coder).map_err(io_error)?,
+                    out: Vec::new(),
                 }
             }
         };
@@ -286,11 +319,9 @@ impl<W: Write> LzmaTurboWriter<W> {
                     Err(_) => return Err(io::Error::other("the LZMA encoder thread panicked")),
                 }
             }
-            State::Buffered { encoder, buf } => {
-                let mut out = Vec::new();
-                let mut input = SliceStream::new(buf);
-                encoder.run(&mut input, &mut out, false).map_err(io_error)?;
-                inner.write_all(&out)?;
+            State::Pushed { encoder, out } => {
+                encoder.finish(out).map_err(io_error)?;
+                inner.write_all(out)?;
             }
         }
         inner.flush()?;
@@ -313,10 +344,17 @@ impl<W: Write> Write for LzmaTurboWriter<W> {
                     self.drain()?;
                 }
             }
-            State::Buffered { buf: held, .. } => {
-                held.try_reserve(buf.len())
-                    .map_err(|_| io_error(LzmaError::Alloc))?;
-                held.extend_from_slice(buf);
+            State::Pushed { encoder, out } => {
+                let inner = self.inner.as_mut().expect("open");
+                // Cut as the threaded path cuts, so that what one call leaves
+                // in `out` is bounded too.
+                for chunk in buf.chunks(CHUNK) {
+                    encoder.push(chunk, out).map_err(io_error)?;
+                    if !out.is_empty() {
+                        inner.write_all(out)?;
+                        out.clear();
+                    }
+                }
             }
         }
         Ok(buf.len())
@@ -334,7 +372,7 @@ mod tests {
 
     use lzma_turbo::{BLOCK_SIZE_SOLID, Lzma2Reader, LzmaEncProps, LzmaProps, LzmaReader};
 
-    use super::{CHUNK, Coder, Encoder, LzmaTurboWriter, State};
+    use super::{CHUNK, Coder, LzmaTurboWriter, Pusher, State};
 
     fn sample(len: usize) -> Vec<u8> {
         // Compressible but not trivial: a short period with a slow drift.
@@ -385,6 +423,7 @@ mod tests {
             },
         )
         .expect("writer");
+        #[cfg(not(any(sevenz_turbo_unthreaded, target_family = "wasm")))]
         assert!(matches!(w.state, State::Streaming { .. }));
         let mut pos = 0;
         for piece in [1, 7, CHUNK - 1, CHUNK, CHUNK + 1, 1000] {
@@ -423,32 +462,116 @@ mod tests {
         assert_eq!(decode_lzma2(&packed, data.len()), data);
     }
 
+    /// The writer a target without threads gets.
+    fn unthreaded(coder: Coder) -> LzmaTurboWriter<Vec<u8>> {
+        LzmaTurboWriter {
+            inner: Some(Vec::new()),
+            state: State::Pushed {
+                encoder: Pusher::new(&props(), coder).expect("encoder"),
+                out: Vec::new(),
+            },
+        }
+    }
+
+    fn streamed(coder: Coder, data: &[u8]) -> Vec<u8> {
+        let mut w = LzmaTurboWriter::new(Vec::new(), &props(), coder).expect("writer");
+        w.write_all(data).expect("write");
+        w.finish().expect("finish")
+    }
+
     /// The path a target without threads takes, and its bytes are the
-    /// streamed path's.
+    /// streamed path's, in pieces of every size around the chunk cut.
     #[test]
-    fn buffered_fallback_matches_the_stream() {
-        let data = sample(2 * CHUNK + 1);
-        let coder = Coder::Lzma2 {
+    fn the_unthreaded_path_matches_the_stream() {
+        let data = sample(5 * CHUNK + 4321);
+        for coder in [
+            Coder::Lzma2 {
+                block_size: BLOCK_SIZE_SOLID,
+                threads: 1,
+            },
+            Coder::Lzma,
+        ] {
+            let want = streamed(coder, &data);
+            let mut w = unthreaded(coder);
+            let mut pos = 0;
+            for piece in [1, 7, CHUNK - 1, CHUNK, CHUNK + 1, 1000, 3 * CHUNK] {
+                let end = (pos + piece).min(data.len());
+                w.write_all(&data[pos..end]).expect("write");
+                pos = end;
+            }
+            w.write_all(&data[pos..]).expect("write");
+            assert_eq!(w.finish().expect("finish"), want, "{coder:?}");
+        }
+        let packed = streamed(
+            Coder::Lzma2 {
+                block_size: BLOCK_SIZE_SOLID,
+                threads: 1,
+            },
+            &data,
+        );
+        assert_eq!(decode_lzma2(&packed, data.len()), data);
+    }
+
+    /// Block threads cannot run without threads: the unthreaded path writes
+    /// the solid stream the one-thread plan writes.
+    #[test]
+    fn the_unthreaded_path_ignores_the_block_plan() {
+        let data = sample(3 * CHUNK);
+        let want = streamed(
+            Coder::Lzma2 {
+                block_size: BLOCK_SIZE_SOLID,
+                threads: 1,
+            },
+            &data,
+        );
+        let mut w = unthreaded(Coder::Lzma2 {
+            block_size: CHUNK as u64,
+            threads: 3,
+        });
+        w.write_all(&data).expect("write");
+        assert_eq!(w.finish().expect("finish"), want);
+    }
+
+    /// The unthreaded path writes as it goes rather than holding the folder:
+    /// compressed bytes reach the inner writer before `finish`, and what is
+    /// still queued is under one LZMA2 chunk and a margin.
+    #[test]
+    fn the_unthreaded_path_streams() {
+        let data = sample(16 * CHUNK);
+        let mut w = unthreaded(Coder::Lzma2 {
             block_size: BLOCK_SIZE_SOLID,
             threads: 1,
-        };
+        });
+        let mut written_before_finish = 0;
+        for piece in data.chunks(CHUNK) {
+            w.write_all(piece).expect("write");
+            written_before_finish = w.inner.as_ref().expect("open").len();
+            let State::Pushed { out, .. } = &w.state else {
+                unreachable!()
+            };
+            assert!(out.is_empty(), "every write hands its output on");
+        }
+        assert!(written_before_finish > 0);
+        let packed = w.finish().expect("finish");
+        assert!(packed.len() > written_before_finish);
+        assert_eq!(decode_lzma2(&packed, data.len()), data);
+    }
 
-        let mut streamed = LzmaTurboWriter::new(Vec::new(), &props(), coder).expect("writer");
-        streamed.write_all(&data).expect("write");
-        let streamed = streamed.finish().expect("finish");
-
-        let mut buffered = LzmaTurboWriter {
-            inner: Some(Vec::new()),
-            state: State::Buffered {
-                encoder: Encoder::new(&props(), coder).expect("encoder"),
-                buf: Vec::new(),
+    #[test]
+    fn the_unthreaded_path_handles_empty_input() {
+        for coder in [
+            Coder::Lzma2 {
+                block_size: BLOCK_SIZE_SOLID,
+                threads: 1,
             },
-        };
-        buffered.write_all(&data).expect("write");
-        let buffered = buffered.finish().expect("finish");
-
-        assert_eq!(buffered, streamed);
-        assert_eq!(decode_lzma2(&buffered, data.len()), data);
+            Coder::Lzma,
+        ] {
+            assert_eq!(
+                unthreaded(coder).finish().expect("finish"),
+                streamed(coder, &[]),
+                "{coder:?}"
+            );
+        }
     }
 
     #[test]

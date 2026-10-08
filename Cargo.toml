@@ -92,7 +92,7 @@ getrandom = { version = "0.4", optional = true }
 # (`cargo xtask release` refuses to tag while it is here). Consumers get both
 # crates from crates.io.
 # TODO(release): lzma-turbo = "0.7"
-lzma-turbo = { version = "0.7.0", path = "../../../lzma-turbo/.worktrees/w3-chunk-kind", default-features = false, features = ["std", "asm", "crc", "filters"] }
+lzma-turbo = { version = "0.7.0", path = "../../../lzma-turbo/.worktrees/push-encoder", default-features = false, features = ["std", "asm", "crc", "filters"] }
 # Encoders only, behind `lzma-rust2-encoder`, as the alternative to
 # `lzma-turbo`'s. The decode path never reaches lzma-rust2; see AGENTS.md.
 lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "encoder", "optimization"], optional = true }
@@ -156,3 +156,9 @@ all-features = true
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# `--cfg sevenz_turbo_unthreaded` (through RUSTFLAGS) makes the LZMA and LZMA2
+# writers take the path a target without threads takes, so that it can be
+# tested and measured on a host that has them. Never set for a build that ships.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sevenz_turbo_unthreaded)"] }
