@@ -465,6 +465,7 @@ pub(crate) fn folder_threads(methods: &[EncoderConfiguration]) -> u32 {
 /// The workers are the thread budget, and such a folder already keeps one
 /// thread busy (see [`folder_threads`]); left at more than one, its coder would
 /// still start a match-finder thread of its own and double the threads in use.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn one_thread_each(methods: &[EncoderConfiguration]) -> Vec<EncoderConfiguration> {
     methods
         .iter()
