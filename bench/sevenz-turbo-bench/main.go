@@ -370,6 +370,10 @@ func cmdRun(ctx context.Context, args []string) int {
 		if err := os.MkdirAll(scratch, 0o755); err != nil {
 			return fail(err)
 		}
+		// From here the directory is the run's, so it goes whichever way
+		// the run ends: a planning failure must not leave it to refuse the
+		// next run with the same --out.
+		defer func() { _ = os.RemoveAll(scratch) }()
 	}
 	scratch, _ = filepath.Abs(scratch)
 	settings := suite.DefaultSettings(*quick, cpus)
@@ -400,7 +404,6 @@ func cmdRun(ctx context.Context, args []string) int {
 		raw.Machine.OS, raw.Machine.Architecture, raw.Machine.CPUCount, chain.Oracle.Version, chain.LinkedLzmaTurbo)
 	suite.Execute(ctx, raw, suite.Options{Warmups: *warmups, Repeats: *repeats, PinCPUs: *pin, Timeout: *timeout, Log: os.Stderr, Oracle: binaries.Oracle})
 	raw.FinishedUTC = time.Now().UTC().Format(time.RFC3339)
-	_ = os.RemoveAll(scratch)
 	if err := suite.Write(filepath.Join(*out, "raw.json"), raw); err != nil {
 		return fail(err)
 	}
