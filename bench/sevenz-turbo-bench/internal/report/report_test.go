@@ -128,6 +128,9 @@ func TestMergeRefusesDifferentWorkloads(t *testing.T) {
 		"oracle":  func(r *suite.Raw) { r.Toolchain.Oracle.Version = "99.0" },
 		"quick":   func(r *suite.Raw) { r.Quick = !r.Quick },
 		"pinning": func(r *suite.Raw) { r.PinCPUs = "0-7" },
+		"only":    func(r *suite.Raw) { r.Only = []string{"decode/mt"} },
+		"repeats": func(r *suite.Raw) { r.Repeats++ },
+		"warmups": func(r *suite.Raw) { r.Warmups++ },
 		"dirty":   func(r *suite.Raw) { r.Toolchain.Candidates[0].Version["git_dirty"] = "true" },
 		"unknown": func(r *suite.Raw) { delete(r.Toolchain.Candidates[0].Version, "git_dirty") },
 	} {

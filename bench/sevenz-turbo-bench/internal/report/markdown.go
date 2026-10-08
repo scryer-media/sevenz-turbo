@@ -53,8 +53,12 @@ func Markdown(report *Report) string {
 	}
 	fmt.Fprintf(&b, "- ISA: %s (from %s)\n", strings.Join(m.ISA, " "), strings.Join(m.ISASources, ", "))
 	if report.RunProfile != "" {
-		fmt.Fprintf(&b, "- run: %s to %s, run profile %s over the %s corpus, %d repeat(s), %d warmup(s)\n\n", report.StartedUTC,
-			report.FinishedUTC, report.RunProfile, report.Profile, report.Repeats, report.Warmups)
+		only := ""
+		if len(report.Only) > 0 {
+			only = ", only " + strings.Join(report.Only, ",")
+		}
+		fmt.Fprintf(&b, "- run: %s to %s, run profile %s over the %s corpus%s, %d repeat(s), %d warmup(s)\n\n", report.StartedUTC,
+			report.FinishedUTC, report.RunProfile, report.Profile, only, report.Repeats, report.Warmups)
 	} else {
 		fmt.Fprintf(&b, "- run: %s to %s, profile %s, quick=%t\n\n", report.StartedUTC, report.FinishedUTC, report.Profile, report.Quick)
 	}

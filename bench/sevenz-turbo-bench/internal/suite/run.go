@@ -65,22 +65,24 @@ type RunRecord struct {
 
 // Raw is raw.json: everything a run measured.
 type Raw struct {
-	SchemaVersion  int                 `json:"schema_version"`
-	Schema         string              `json:"schema"`
-	StartedUTC     string              `json:"started_utc"`
-	FinishedUTC    string              `json:"finished_utc"`
-	Machine        host.Machine        `json:"machine"`
-	Toolchain      toolchain.Toolchain `json:"toolchain"`
-	Fixtures       *fixtures.Manifest  `json:"fixtures"`
-	RunProfile     string              `json:"run_profile,omitempty"`
-	Quick          bool                `json:"quick"`
-	Warmups        int                 `json:"warmups"`
-	Repeats        int                 `json:"repeats"`
-	Threads        []string            `json:"threads"`
-	PinCPUs        string              `json:"pin_cpus,omitempty"`
-	TimeoutSeconds float64             `json:"timeout_seconds,omitempty"`
-	Scenarios      []Scenario          `json:"scenarios"`
-	Runs           []RunRecord         `json:"runs"`
+	SchemaVersion int                 `json:"schema_version"`
+	Schema        string              `json:"schema"`
+	StartedUTC    string              `json:"started_utc"`
+	FinishedUTC   string              `json:"finished_utc"`
+	Machine       host.Machine        `json:"machine"`
+	Toolchain     toolchain.Toolchain `json:"toolchain"`
+	Fixtures      *fixtures.Manifest  `json:"fixtures"`
+	RunProfile    string              `json:"run_profile,omitempty"`
+	Quick         bool                `json:"quick"`
+	Warmups       int                 `json:"warmups"`
+	Repeats       int                 `json:"repeats"`
+	Threads       []string            `json:"threads"`
+	PinCPUs       string              `json:"pin_cpus,omitempty"`
+	// Only is the --only selection the plan was narrowed to, if any.
+	Only           []string    `json:"only,omitempty"`
+	TimeoutSeconds float64     `json:"timeout_seconds,omitempty"`
+	Scenarios      []Scenario  `json:"scenarios"`
+	Runs           []RunRecord `json:"runs"`
 }
 
 // Options control Execute.
@@ -110,6 +112,15 @@ func orderFor(n, repeat int) []int {
 
 // Execute runs every scenario, interleaving its variants, and appends a
 // record per run.
+//
+// The untimed checks of a pass (the `7zz t` of a candidate's archive, the
+// digest rerun of a decode) wait until every variant of that pass has been
+// measured, so they never sit between two measured variants: no variant
+// follows a full untimed decode the others did not.
+//
+// An interrupted run stops at once. The pass it interrupted is incomplete,
+// its interleaving broken, so none of it is recorded: the report holds only
+// whole passes, and none of the runs that were never attempted.
 func Execute(ctx context.Context, raw *Raw, options Options) {
 	logf := func(format string, args ...any) {
 		if options.Log != nil {
@@ -126,28 +137,24 @@ func Execute(ctx context.Context, raw *Raw, options Options) {
 			if warmup {
 				repeat = pass
 			}
-			for position, variant := range orderFor(len(scenario.Variants), pass) {
-				run := scenario.Variants[variant]
-				record := measure(ctx, raw, scenario, run, options)
-				record.Warmup, record.Repeat, record.Position = warmup, repeat, position
-				if !warmup && repeat == 0 && run.Role == RoleCandidate && scenario.Op == OpEncode && record.Status == StatusOK {
-					record.Verified = verify(ctx, options.Oracle, run.Output, scenario.Encrypted, options.Timeout)
-					if record.Verified != "ok" {
-						record.Status, record.Failure, record.Error = StatusFailed, "7zz-rejects-output", record.Verified
-					}
+			records, ok := runPass(ctx, raw, scenario, pass, options)
+			if ok {
+				ok = checkPass(ctx, scenario, records, warmup || repeat != 0, options)
+			}
+			for _, done := range records {
+				if done.run.Output != "" {
+					_ = os.Remove(done.run.Output)
 				}
-				if !warmup && repeat == 0 && run.JSON && scenario.Op == OpDecode && record.Status == StatusOK {
-					digest, err := outputDigest(ctx, run, options.Timeout)
-					if err != nil {
-						record.Status, record.Failure, record.Error = StatusFailed, "digest-run", err.Error()
-					}
-					record.Digest = digest
-				}
-				if run.Output != "" {
-					_ = os.Remove(run.Output)
-				}
+			}
+			if !ok {
+				logf("interrupted: %s pass %d not recorded", scenario.ID, pass+1)
+				return
+			}
+			for _, done := range records {
+				record := done.record
+				record.Warmup, record.Repeat = warmup, repeat
 				checkDigest(digests, scenario, &record)
-				line := fmt.Sprintf("  %-28s %-6s wall %.3fs rss %s MiB", run.Variant, record.Status, record.WallSeconds, procmeasure.MiB(record.MaxRSSBytes))
+				line := fmt.Sprintf("  %-28s %-6s wall %.3fs rss %s MiB", done.run.Variant, record.Status, record.WallSeconds, procmeasure.MiB(record.MaxRSSBytes))
 				if warmup {
 					line += " (warmup)"
 				}
@@ -159,6 +166,56 @@ func Execute(ctx context.Context, raw *Raw, options Options) {
 			}
 		}
 	}
+}
+
+// passRun is one variant measured in a pass, awaiting the pass's checks.
+type passRun struct {
+	run    Run
+	record RunRecord
+}
+
+// runPass measures every variant of one pass in its interleaved order. It
+// reports false, having stopped, once the run is interrupted.
+func runPass(ctx context.Context, raw *Raw, scenario Scenario, pass int, options Options) ([]passRun, bool) {
+	records := make([]passRun, 0, len(scenario.Variants))
+	for position, variant := range orderFor(len(scenario.Variants), pass) {
+		if ctx.Err() != nil {
+			return records, false
+		}
+		run := scenario.Variants[variant]
+		record := measure(ctx, raw, scenario, run, options)
+		record.Position = position
+		records = append(records, passRun{run: run, record: record})
+	}
+	return records, ctx.Err() == nil
+}
+
+// checkPass runs the untimed checks of a measured pass (first measured
+// repeat only). It reports false once the run is interrupted.
+func checkPass(ctx context.Context, scenario Scenario, records []passRun, skip bool, options Options) bool {
+	if skip {
+		return true
+	}
+	for i := range records {
+		run, record := records[i].run, &records[i].record
+		if run.Role == RoleCandidate && scenario.Op == OpEncode && record.Status == StatusOK {
+			record.Verified = verify(ctx, options.Oracle, run.Output, scenario.Encrypted, options.Timeout)
+			if record.Verified != "ok" {
+				record.Status, record.Failure, record.Error = StatusFailed, "7zz-rejects-output", record.Verified
+			}
+		}
+		if run.JSON && scenario.Op == OpDecode && record.Status == StatusOK {
+			digest, err := outputDigest(ctx, run, options.Timeout)
+			if err != nil {
+				record.Status, record.Failure, record.Error = StatusFailed, "digest-run", err.Error()
+			}
+			record.Digest = digest
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // checkDigest holds every decode of the same archive by any of this crate's

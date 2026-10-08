@@ -380,7 +380,7 @@ func cmdRun(ctx context.Context, args []string) int {
 		SchemaVersion: 1, Schema: suite.RawSchema, StartedUTC: time.Now().UTC().Format(time.RFC3339),
 		Machine: host.Collect(ctx, *machine), Toolchain: chain, Fixtures: manifest, RunProfile: profile.Name, Quick: *quick,
 		Warmups: *warmups, Repeats: *repeats, Threads: settings.Threads, PinCPUs: *pin,
-		TimeoutSeconds: timeout.Seconds(), Scenarios: scenarios, Runs: []suite.RunRecord{},
+		Only: settings.Only, TimeoutSeconds: timeout.Seconds(), Scenarios: scenarios, Runs: []suite.RunRecord{},
 	}
 	fmt.Fprintf(os.Stderr, "run: %d scenarios on %s (%s/%s, %d cores), 7zz %s, lzma-turbo %s\n", len(scenarios), raw.Machine.Label,
 		raw.Machine.OS, raw.Machine.Architecture, raw.Machine.CPUCount, chain.Oracle.Version, chain.LinkedLzmaTurbo)
