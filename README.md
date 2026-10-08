@@ -332,7 +332,7 @@ writer.finish().expect("compress ok");
 | BCJ PPC       | ✓            | ✓          |
 | BCJ SPARC     | ✓            | ✓          |
 | BCJ IA64      | ✓            | ✓          |
-| BCJ2          | ✓            |             |
+| BCJ2          | ✓            | ✓          |
 | DELTA         | ✓            | ✓          |
 
 Every branch converter, BCJ2 and the delta filter are `lzma-turbo`'s

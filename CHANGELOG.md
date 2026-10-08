@@ -277,6 +277,11 @@ Everything here is new surface; no upstream signature changed meaning.
   in a serialised section of the multi-threaded path, and thread counts
   default to one.
 
+### Encoding
+
+- BCJ2 is written as well as read (0.27.0). Upstream reads BCJ2 folders but
+  cannot write one.
+
 ### Cryptography
 
 - **The AES decoder decrypts in the caller's buffer.** It used to read the
@@ -410,6 +415,46 @@ Everything here is new surface; no upstream signature changed meaning.
   When no entry says, the writer reads up to 1 MiB ahead and sizes a shorter
   stream by what it read. A wrong hint costs ratio or threads, never
   correctness; the push records the bytes actually read, as before.
+- BCJ2 can be written. It is asked for as the single-stream filters are, as
+  the last content method after the coder for its main stream:
+  `set_content_methods(vec![EncoderMethod::LZMA2.into(),
+  EncoderMethod::BCJ2_FILTER.into()])` (LZMA in place of LZMA2 works too, as
+  do filters between them). It is opt-in: the default method stays LZMA2
+  alone, for executables as for anything else.
+- The block is the four-stream folder 7-Zip writes for `-mf=BCJ2`, coder for
+  coder: an LZMA coder each for the jump and call streams, the main stream's
+  coders, then BCJ2 with four inputs; BCJ2's main, call and jump inputs bound
+  to those coders; and four pack streams in 7-Zip's file order - main, the
+  range-coded stream stored raw, call, jump. The call and jump coders take
+  7-Zip's settings from `AddBcj2Methods` in `7zUpdate.cpp`: a 1 MiB
+  dictionary, 128 fast bytes, one thread, `lc0 lp2`. The conversion is
+  `lzma-turbo`'s port of the SDK's `Bcj2Enc.c`, run with its defaults.
+- The main stream is coded as it arrives. The call and jump streams are coded
+  as they arrive too, into memory, and appended after the main stream with
+  the range-coded stream when the block ends, so a block holds its coded call
+  and jump streams in memory until then - as 7-Zip does with the streams
+  after the first.
+- All three ways of writing a block take it: `push_archive_entry`,
+  `push_archive_entries` (solid) and `prepare_block` /
+  `push_prepared_block`. A `PreparedBlock`'s `compressed_len` counts all four
+  pack streams, and so does a BCJ2 entry's `compressed_size`.
+- A method list that puts BCJ2 anywhere but last, gives it no coder for the
+  main stream, or combines it with AES-256 is refused with
+  `Error::Unsupported` when the first entry is written. Encrypting a BCJ2
+  block would need an AES coder on every pack stream, which this writer does
+  not build.
+- Fixed: a header whose pack-stream CRCs were not all defined (a pack stream
+  whose CRC32 is 0) wrote the defined-bits vector but not the CRC values
+  that 7-Zip's `WriteHashDigests` puts after it, so the header did not parse.
+  The values are now written. One pack stream in four billion hits this; a
+  BCJ2 block has four.
+- Tested: the folder layout, bind pairs and pack-stream order against the
+  ones 7-Zip writes; round trips through this crate's reader single- and
+  multi-threaded, in all three layouts, for empty and one-to-five-byte
+  inputs and for x86 code whose call and jump streams are not empty; that how
+  the source is read cannot change a byte of the archive; and, where `7zz` or
+  `7z` is on `PATH`, that 7-Zip tests and extracts the archives to their
+  inputs.
 
 ## 0.26.1 - 2026-09-29
 

@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::{cell::RefCell, io::Write, rc::Rc};
 
 #[cfg(feature = "lzma-rust2-encoder")]
 use lzma_rust2::{Lzma2Writer, Lzma2WriterMt, LzmaWriter};
@@ -6,7 +6,11 @@ use lzma_rust2::{Lzma2Writer, Lzma2WriterMt, LzmaWriter};
 #[cfg(not(feature = "lzma-rust2-encoder"))]
 use crate::codec::lzma_turbo::writer::{Coder, LzmaTurboWriter};
 
-use crate::codec::filter::{bcj::BcjWriter, delta::DeltaWriter};
+use crate::codec::filter::{
+    bcj::BcjWriter,
+    bcj2::{Bcj2Finished, Bcj2Writer},
+    delta::DeltaWriter,
+};
 
 #[cfg(feature = "brotli")]
 use crate::codec::brotli::BrotliEncoder;
@@ -33,6 +37,10 @@ use crate::{
     writer::CountingWriter,
 };
 
+/// A BCJ2 coder in a chain: its main stream goes on down the chain, and its
+/// call and jump streams into coders of their own.
+pub(crate) type Bcj2ChainWriter<W> = Bcj2Writer<CountingWriter<W>, Box<dyn Write>>;
+
 // One of these is built per coder in a chain and boxed there as a
 // `dyn Write`; its variants range from a counting writer to a brotli state
 // of several KiB, and the difference costs nothing.
@@ -40,6 +48,7 @@ use crate::{
 pub(crate) enum Encoder<W: Write> {
     Copy(CountingWriter<W>),
     Bcj(Option<BcjWriter<CountingWriter<W>>>),
+    Bcj2(Option<Box<Bcj2ChainWriter<W>>>, Bcj2Side),
     Delta(DeltaWriter<CountingWriter<W>>),
     // LZMA and LZMA2 are `lzma-turbo`'s encoders unless the build asked for
     // `lzma-rust2`'s; see `Cargo.toml`. Both fronts have the same shape here.
@@ -85,6 +94,36 @@ impl<W: Write> Write for Encoder<W> {
                     let writer = w.take().unwrap();
                     let mut inner = writer.finish()?;
                     inner.write(buf)?;
+                    Ok(0)
+                }
+                false => w.as_mut().unwrap().write(buf),
+            },
+            Encoder::Bcj2(w, side) => match buf.is_empty() {
+                true => {
+                    let writer = w.take().unwrap();
+                    let Bcj2Finished {
+                        mut main,
+                        mut call,
+                        mut jump,
+                        rc,
+                        call_len,
+                        jump_len,
+                    } = writer.finish()?;
+                    // Finish the call and jump coders, whose output lands in
+                    // the buffers `side` shares with them, before the main
+                    // chain: the archive writer appends these streams after
+                    // the main one, once the chain has unwound.
+                    call.write(&[])?;
+                    jump.write(&[])?;
+                    drop((call, jump));
+                    *side.tail.borrow_mut() = Some(Bcj2Tail {
+                        rc,
+                        call: side.call.take(),
+                        jump: side.jump.take(),
+                        call_size: call_len,
+                        jump_size: jump_len,
+                    });
+                    main.write(buf)?;
                     Ok(0)
                 }
                 false => w.as_mut().unwrap().write(buf),
@@ -179,6 +218,7 @@ impl<W: Write> Write for Encoder<W> {
         match self {
             Encoder::Copy(w) => w.flush(),
             Encoder::Bcj(w) => w.as_mut().unwrap().flush(),
+            Encoder::Bcj2(w, _) => w.as_mut().unwrap().flush(),
             Encoder::Delta(w) => w.flush(),
             Encoder::Lzma(w) => w.as_mut().unwrap().flush(),
             Encoder::Lzma2(w) => w.as_mut().unwrap().flush(),
@@ -200,6 +240,128 @@ impl<W: Write> Write for Encoder<W> {
             Encoder::Aes(w) => w.flush(),
         }
     }
+}
+
+/// A byte buffer that outlives the writer it is handed to: the call and jump
+/// coders of a BCJ2 block write into one each, and the block's tail is taken
+/// out of them once those coders are finished.
+#[derive(Clone, Default)]
+pub(crate) struct SharedBuf(Rc<RefCell<Vec<u8>>>);
+
+impl SharedBuf {
+    fn take(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.0.borrow_mut())
+    }
+}
+
+impl Write for SharedBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What a BCJ2 block produces besides its main stream, available once the
+/// coder chain has been finished.
+#[derive(Debug, Default)]
+pub(crate) struct Bcj2Tail {
+    /// The range-coded stream, which 7-Zip stores without a coder.
+    pub(crate) rc: Vec<u8>,
+    /// The call stream, LZMA-coded.
+    pub(crate) call: Vec<u8>,
+    /// The jump stream, LZMA-coded.
+    pub(crate) jump: Vec<u8>,
+    /// The call stream's size before its coder.
+    pub(crate) call_size: u64,
+    /// The jump stream's size before its coder.
+    pub(crate) jump_size: u64,
+}
+
+/// Where a BCJ2 coder leaves its [`Bcj2Tail`] when it is finished.
+pub(crate) type Bcj2Slot = Rc<RefCell<Option<Bcj2Tail>>>;
+
+/// The handles a BCJ2 coder in the chain keeps on the buffers its call and
+/// jump coders write into, and on the slot its tail goes to.
+pub(crate) struct Bcj2Side {
+    call: SharedBuf,
+    jump: SharedBuf,
+    tail: Bcj2Slot,
+}
+
+/// The dictionary 7-Zip gives the call and jump streams' LZMA coders.
+///
+/// `AddBcj2Methods` in 7-Zip's `CPP/7zip/Archive/7z/7zUpdate.cpp` sets
+/// `kDictionarySize = 1 << 20`, `kNumFastBytes = 128`, `kNumThreads = 1`,
+/// `kLitPosBits = 2` and `kLitContextBits = 0` (pb stays at its 2): the two
+/// streams are four-byte big-endian addresses, which a byte of literal
+/// context does not predict and their position in the word does.
+pub(crate) const BCJ2_SIDE_DICT_SIZE: u32 = 1 << 20;
+const BCJ2_SIDE_FAST_BYTES: u32 = 128;
+const BCJ2_SIDE_LC: u8 = 0;
+const BCJ2_SIDE_LP: u8 = 2;
+const BCJ2_SIDE_PB: u8 = 2;
+
+/// The LZMA property bytes of the call and jump coders: `(pb * 5 + lp) * 9 +
+/// lc`, then the dictionary.
+pub(crate) fn bcj2_side_properties() -> [u8; 5] {
+    let mut props = [0u8; 5];
+    props[0] = (BCJ2_SIDE_PB * 5 + BCJ2_SIDE_LP) * 9 + BCJ2_SIDE_LC;
+    props[1..].copy_from_slice(&BCJ2_SIDE_DICT_SIZE.to_le_bytes());
+    props
+}
+
+/// An LZMA coder for a BCJ2 call or jump stream, writing into `sink`.
+fn bcj2_side_encoder(sink: SharedBuf) -> Result<Box<dyn Write>, Error> {
+    let input = CountingWriter::new(sink);
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    let lz = {
+        // 7-Zip's side coders run its default level (5, the binary-tree
+        // match finder) with the settings above.
+        let props = lzma_turbo::LzmaEncProps::new()
+            .with_level(5)
+            .with_dict_size(BCJ2_SIDE_DICT_SIZE)
+            .with_fast_bytes(BCJ2_SIDE_FAST_BYTES)
+            .with_lclppb(BCJ2_SIDE_LC, BCJ2_SIDE_LP, BCJ2_SIDE_PB)
+            .with_num_threads(1);
+        LzmaTurboWriter::new(input, &props, Coder::Lzma)?
+    };
+    #[cfg(feature = "lzma-rust2-encoder")]
+    let lz = {
+        let mut options = lzma_rust2::LzmaOptions::with_preset(5);
+        options.dict_size = BCJ2_SIDE_DICT_SIZE;
+        options.nice_len = BCJ2_SIDE_FAST_BYTES;
+        options.lc = u32::from(BCJ2_SIDE_LC);
+        options.lp = u32::from(BCJ2_SIDE_LP);
+        options.pb = u32::from(BCJ2_SIDE_PB);
+        LzmaWriter::new_no_header(input, &options, false)?
+    };
+    Ok(Box::new(Encoder::Lzma(Some(lz))))
+}
+
+/// A BCJ2 coder whose main stream goes on to `main`, with the call and jump
+/// streams' LZMA coders built here. The returned slot is filled when the
+/// coder is finished.
+pub(crate) fn add_bcj2_encoder<W: Write>(
+    main: CountingWriter<W>,
+) -> Result<(Encoder<W>, Bcj2Slot), Error> {
+    let call = SharedBuf::default();
+    let jump = SharedBuf::default();
+    let tail = Bcj2Slot::default();
+    let writer = Bcj2Writer::new(
+        main,
+        bcj2_side_encoder(call.clone())?,
+        bcj2_side_encoder(jump.clone())?,
+    );
+    let side = Bcj2Side {
+        call,
+        jump,
+        tail: Rc::clone(&tail),
+    };
+    Ok((Encoder::Bcj2(Some(Box::new(writer)), side), tail))
 }
 
 fn validate_lzma_dictionary_size(dict_size: u32) -> Result<(), Error> {

@@ -13,14 +13,15 @@ impl UnpackInfo {
         methods: Arc<Vec<EncoderConfiguration>>,
         sizes: Vec<u64>,
         crc: u32,
-    ) {
+    ) -> &mut BlockInfo {
         self.blocks.push(BlockInfo {
             methods,
             sizes,
             crc,
             num_sub_unpack_streams: 1,
             ..Default::default()
-        })
+        });
+        self.blocks.last_mut().expect("just pushed")
     }
 
     pub(crate) fn add_multiple(
@@ -31,7 +32,7 @@ impl UnpackInfo {
         num_sub_unpack_streams: u64,
         sub_stream_sizes: Vec<u64>,
         sub_stream_crcs: Vec<u32>,
-    ) {
+    ) -> &mut BlockInfo {
         self.blocks.push(BlockInfo {
             methods,
             sizes,
@@ -39,7 +40,9 @@ impl UnpackInfo {
             num_sub_unpack_streams,
             sub_stream_crcs,
             sub_stream_sizes,
-        })
+            bcj2: None,
+        });
+        self.blocks.last_mut().expect("just pushed")
     }
 
     pub(crate) fn write_to<H: Write>(&mut self, header: &mut H) -> std::io::Result<()> {
@@ -53,6 +56,12 @@ impl UnpackInfo {
         }
         header.write_u8(K_CODERS_UNPACK_SIZE)?;
         for block in self.blocks.iter() {
+            // A BCJ2 block's call and jump coders come first in its coder
+            // list, so their output sizes do too; see `write_bcj2_to`.
+            if let Some(bcj2) = block.bcj2 {
+                write_u64(header, bcj2.jump)?;
+                write_u64(header, bcj2.call)?;
+            }
             for size in block.sizes.iter().copied() {
                 write_u64(header, size)?;
             }
@@ -128,6 +137,14 @@ impl UnpackInfo {
     }
 }
 
+/// The output sizes of a BCJ2 block's call and jump coders, which the block's
+/// method list does not name.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Bcj2SideSizes {
+    pub(crate) call: u64,
+    pub(crate) jump: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BlockInfo {
     pub(crate) methods: Arc<Vec<EncoderConfiguration>>,
@@ -136,6 +153,9 @@ pub(crate) struct BlockInfo {
     pub(crate) num_sub_unpack_streams: u64,
     pub(crate) sub_stream_sizes: Vec<u64>,
     pub(crate) sub_stream_crcs: Vec<u32>,
+    /// Set when `methods` ends in BCJ2: the block is then the four-stream
+    /// folder 7-Zip writes, not a linear chain.
+    pub(crate) bcj2: Option<Bcj2SideSizes>,
 }
 
 impl BlockInfo {
@@ -144,6 +164,9 @@ impl BlockInfo {
         header: &mut W,
         cache: &mut Vec<u8>,
     ) -> std::io::Result<()> {
+        if self.bcj2.is_some() {
+            return self.write_bcj2_to(header, cache);
+        }
         cache.clear();
         let mut num_coders = 0;
         for mc in self.methods.iter() {
@@ -155,6 +178,69 @@ impl BlockInfo {
         for i in 0..num_coders - 1 {
             write_u64(header, i as u64 + 1)?;
             write_u64(header, i as u64)?;
+        }
+        Ok(())
+    }
+
+    /// The folder 7-Zip writes for `BCJ2` over a main coder chain, which is
+    /// what `CEncoder::SetFolder` in `CPP/7zip/Archive/7z/7zEncode.cpp` makes
+    /// of the methods `AddBcj2Methods` in `7zUpdate.cpp` sets up. With `k`
+    /// coders `m[0..k]` on the main stream (`m[0]` reading its pack stream,
+    /// as in a linear chain) the coders are, in order:
+    ///
+    /// | coder   | method          | in streams        | out stream |
+    /// |---------|-----------------|-------------------|------------|
+    /// | 0       | LZMA, jump      | 0                 | 0          |
+    /// | 1       | LZMA, call      | 1                 | 1          |
+    /// | 2 + i   | `m[i]`          | 2 + i             | 2 + i      |
+    /// | 2 + k   | BCJ2            | 2 + k ..= 5 + k   | 2 + k      |
+    ///
+    /// BCJ2's four inputs are main, call, jump and rc. The bind pairs feed
+    /// main from `m[k - 1]`, call from coder 1 and jump from coder 0, and
+    /// chain the main coders as a linear chain does; they are written in
+    /// descending input order, as 7-Zip writes them. The four pack streams
+    /// are, in file order, main (`m[0]`'s input), rc (BCJ2's last input,
+    /// stored raw), call and jump.
+    fn write_bcj2_to<W: Write>(&self, header: &mut W, cache: &mut Vec<u8>) -> std::io::Result<()> {
+        let k = self.methods.len() as u64 - 1;
+        let bcj2 = 2 + k;
+        cache.clear();
+        let side = encoder::bcj2_side_properties();
+        for _ in 0..2 {
+            let id = EncoderMethod::ID_LZMA;
+            cache.write_u8(id.len() as u8 | 0x20)?;
+            cache.write_all(id)?;
+            cache.write_u8(side.len() as u8)?;
+            cache.write_all(&side)?;
+        }
+        for mc in &self.methods[..k as usize] {
+            self.write_single_codec(mc, cache)?;
+        }
+        // BCJ2 itself: a four-byte ID, no properties, and the 0x10 flag that
+        // says its stream counts follow - four in, one out.
+        let id = EncoderMethod::ID_BCJ2;
+        cache.write_u8(id.len() as u8 | 0x10)?;
+        cache.write_all(id)?;
+        write_u64(cache, 4)?;
+        write_u64(cache, 1)?;
+
+        write_u64(header, k + 3)?;
+        header.write_all(cache)?;
+
+        // Bind pairs, as (in, out).
+        write_u64(header, bcj2 + 2)?;
+        write_u64(header, 0)?;
+        write_u64(header, bcj2 + 1)?;
+        write_u64(header, 1)?;
+        write_u64(header, bcj2)?;
+        write_u64(header, bcj2 - 1)?;
+        for i in (1..k).rev() {
+            write_u64(header, 2 + i)?;
+            write_u64(header, 1 + i)?;
+        }
+        // Pack streams, in file order.
+        for in_index in [2, bcj2 + 3, 1, 0] {
+            write_u64(header, in_index)?;
         }
         Ok(())
     }

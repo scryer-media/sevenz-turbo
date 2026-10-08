@@ -40,7 +40,7 @@
 //! | BCJ PPC       | ✓             | ✓           |
 //! | BCJ SPARC     | ✓             | ✓           |
 //! | BCJ IA64      | ✓             | ✓           |
-//! | BCJ2          | ✓             |             |
+//! | BCJ2          | ✓             | ✓           |
 //! | DELTA         | ✓             | ✓           |
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
