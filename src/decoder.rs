@@ -207,6 +207,20 @@ fn ppmd_memory_kb(memory_size: u32) -> usize {
     (memory_size.div_ceil(1024) as usize).saturating_add(INPUT_BUF_SIZE.div_ceil(1024))
 }
 
+/// The memory limit a block's LZMA2 plan is sized against: the caller's
+/// limit less what the rest of the chain was granted by
+/// [`check_chain_memory`]. `reserved_kb` is the whole chain's reservation,
+/// this coder's own `own_kb` included, and the plan subtracts its own
+/// dictionary and state itself, so only the others' share comes off here. A
+/// limit of `u64::MAX` is no limit and stays so.
+fn lzma2_plan_budget(memory_limit_bytes: u64, reserved_kb: usize, own_kb: usize) -> u64 {
+    if memory_limit_bytes == u64::MAX {
+        return u64::MAX;
+    }
+    let others_kb = reserved_kb.saturating_sub(own_kb) as u64;
+    memory_limit_bytes.saturating_sub(others_kb.saturating_mul(1024))
+}
+
 /// Refuses a coder chain whose sized coders need more decoder memory
 /// *together* than `limits.memory_limit_bytes`, before any of them is built.
 ///
@@ -311,7 +325,7 @@ pub fn add_decoder<I: Read>(
                 Some(control) => Lzma2Plan::for_block(
                     opts.threads,
                     opts.adaptive_lzma2,
-                    opts.limits.memory_limit_bytes,
+                    lzma2_plan_budget(opts.limits.memory_limit_bytes, opts.reserved_kb, mem_size),
                     dic_size,
                     uncompressed_len as u64,
                     control,
@@ -471,4 +485,28 @@ fn get_ppmd_params(coder: &Coder, max_mem_limit_kb: usize) -> Result<PpmdParams,
     }
 
     Ok(params)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::lzma2_plan_budget;
+
+    /// What the chain's other coders hold comes off the LZMA2 plan's limit;
+    /// the coder's own share does not, because the plan subtracts that
+    /// itself; and no limit stays no limit.
+    #[test]
+    fn the_plan_budget_is_the_limit_less_the_other_coders_share() {
+        let limit = 64 << 20;
+        assert_eq!(lzma2_plan_budget(limit, 0, 0), limit);
+        // Own share only: nothing comes off.
+        assert_eq!(lzma2_plan_budget(limit, 9 << 10, 9 << 10), limit);
+        // The pack buffer (64 KiB) and an AES coder's share come off.
+        assert_eq!(
+            lzma2_plan_budget(limit, (9 << 10) + 64 + 1024, 9 << 10),
+            limit - ((64 + 1024) << 10)
+        );
+        // A reservation past the limit leaves nothing, not a wrap.
+        assert_eq!(lzma2_plan_budget(1 << 20, 4 << 20, 0), 0);
+        assert_eq!(lzma2_plan_budget(u64::MAX, 4 << 20, 0), u64::MAX);
+    }
 }
