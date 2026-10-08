@@ -117,6 +117,14 @@ pub struct ArchiveEntry {
     /// CRC32 checksum of compressed data.
     pub compressed_crc: u64,
     /// Uncompressed size in bytes.
+    ///
+    /// Before the entry is pushed to an `ArchiveWriter` this is read as how many bytes its reader
+    /// will yield, zero meaning unknown: an LZMA or LZMA2 folder smaller than the configured
+    /// dictionary is coded with a dictionary its own size, as 7-Zip does, and one that fits a
+    /// single LZMA2 block is coded on one thread. [`ArchiveEntry::from_path`] fills it from the
+    /// file's metadata; when no entry of a folder says, the writer reads up to 1 MiB ahead to find
+    /// out. A wrong value never makes an archive unreadable; one too small only costs compression
+    /// ratio and threads. Pushing the entry replaces it with the number of bytes actually read.
     pub size: u64,
     /// Compressed size in bytes.
     pub compressed_size: u64,
@@ -182,6 +190,12 @@ impl ArchiveEntry {
         };
 
         if let Ok(meta) = path.metadata() {
+            // How much the file holds now. Pushing the entry replaces it with
+            // what was actually read; until then the writer takes it as the
+            // folder's size, to size the dictionary.
+            if meta.is_file() {
+                entry.size = meta.len();
+            }
             if let Ok(modified) = meta.modified()
                 && let Ok(date) = NtTime::try_from(modified)
             {
