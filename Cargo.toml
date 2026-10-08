@@ -81,7 +81,7 @@ aes = { version = "0.9", features = ["zeroize"], optional = true }
 # The same pin and the same features `lzma-turbo` uses, so a build that has both
 # crates resolves one copy of AWS-LC. AES-256-CBC is this crate's own (7z
 # cryptography is not `lzma-turbo`'s job), so the dependency is direct.
-aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
 brotli = { version = ">= 7, < 10", default-features = false, optional = true, features = ["std"] }
 bzip2 = { version = "0.6", optional = true }
 cbc = { version = "0.2", optional = true }
