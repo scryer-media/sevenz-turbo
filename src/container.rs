@@ -320,10 +320,12 @@ pub struct BlockCompletion {
 /// so this hands the answer over instead of throwing it away.
 ///
 /// The CRC reported here has already been checked against the header: a
-/// mismatch is [`Error::ChecksumVerificationFailed`] and the hook is never
-/// reached. Files the archive records no checksum for are not reported at all.
+/// mismatch is [`Error::BlockDecode`] of kind
+/// [`BlockErrorKind::ChecksumMismatch`] and the hook is never reached. Files
+/// the archive records no checksum for are not reported at all.
 ///
-/// [`Error::ChecksumVerificationFailed`]: crate::Error::ChecksumVerificationFailed
+/// [`Error::BlockDecode`]: crate::Error::BlockDecode
+/// [`BlockErrorKind::ChecksumMismatch`]: crate::BlockErrorKind::ChecksumMismatch
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubStreamCompletion {
     /// Index of the block in [`Archive::blocks`].

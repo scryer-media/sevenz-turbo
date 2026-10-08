@@ -476,6 +476,25 @@ Everything here is new surface; no upstream signature changed meaning.
   from 17.0 s to 4.0 s (7zz: 3.9 s) and by `-mx1` from 13.4 s to 2.2 s
   (7zz: 2.4 s); a gigabyte of random data, stored chunks, still decodes on
   two threads, in 0.2 s.
+- Fixed: a CRC-32 that does not match is one error on every path:
+  `Error::BlockDecode` with `BlockErrorKind::ChecksumMismatch`, located in
+  its block, with the same message. Only the parallel path's folded check
+  said so. A block holding one file - every block of a non-solid store
+  archive, where a damaged byte shows up as nothing but a CRC mismatch -
+  reported `BlockDecode` of kind `Io` around an `io::Error` of kind `Other`,
+  and a file of a solid block decoded on one thread came out as a bare
+  `Error::Io` with no block at all, so a consumer that keeps a damaged set
+  for repair on a checksum mismatch gave those up as fatal.
+  `ArchiveReader::read_file` reports the same error. An encrypted block's
+  mismatch is still `BlockErrorKind::Password`, since a wrong password looks
+  the same.
+- Fixed: `set_verify_checksums(false)` turns off the block checksum as well.
+  A block holding one file was still checked against the file's CRC, which
+  the block borrows, and a block's own CRC was checked on the consuming
+  thread even where the parallel decoder's workers already fold it. A
+  one-file block read through `for_each_entries` or `read_file` is now
+  checked once, against the file's CRC, instead of twice over the same
+  bytes; the block check stays wherever it is the only one.
 
 ## 0.26.1 - 2026-09-29
 

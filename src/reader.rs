@@ -1770,8 +1770,9 @@ impl<R: Read + Seek> ArchiveReader<R> {
     /// second time. The hook fires after the entry callback returns for that
     /// file, once per file the archive records a checksum for, in order.
     ///
-    /// A failed check never reaches the hook: it is
-    /// [`Error::ChecksumVerificationFailed`] out of the entry callback.
+    /// A failed check never reaches the hook: it is [`Error::BlockDecode`] of
+    /// kind [`crate::BlockErrorKind::ChecksumMismatch`] out of
+    /// [`ArchiveReader::for_each_entries`].
     pub fn set_sub_stream_complete_hook(
         &mut self,
         hook: impl FnMut(SubStreamCompletion) + Send + 'static,
@@ -2036,7 +2037,11 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let (mut has_crc, mut crc) = (block.has_crc, block.crc);
 
         // Single stream blocks might have it's CRC stored in the single substream information.
+        // A caller that checks the file itself already checks exactly that
+        // CRC over exactly these bytes, so it is borrowed only for the callers
+        // whose one check this is.
         if !has_crc
+            && !opts.files_verified
             && block.num_unpack_sub_streams == 1
             && let Some(sub_streams_info) = archive.sub_streams_info.as_ref()
         {
@@ -2070,7 +2075,12 @@ impl<R: Read + Seek> ArchiveReader<R> {
             )?;
             decoder = Box::new(next);
         }
-        if has_crc {
+        // Read after the coders are built: the LZMA2 coder decides there
+        // whether its workers fold the checksums, and when they do, the
+        // block's is folded with them rather than taken again here, on the
+        // thread delivering the bytes. A caller that said not to verify gets
+        // no verifying reader at all.
+        if has_crc && opts.verify_checksums && !opts.folding_checksums() {
             decoder = Box::new(Crc32VerifyingReader::new(
                 decoder,
                 block.get_unpack_size() as usize,
@@ -2165,7 +2175,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             0,
             opts,
         )?;
-        if block.has_crc {
+        if block.has_crc && opts.verify_checksums {
             decoder = Box::new(Crc32VerifyingReader::new(
                 decoder,
                 block.get_unpack_size() as usize,
@@ -2445,6 +2455,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     // One file is read here and its checksum is verified as it
                     // streams past; there are no other boundaries to declare.
                     checksum_splits: &[],
+                    // Below, against the file's own CRC.
+                    files_verified: true,
                     reserved_kb: 0,
                 };
                 self.lzma2.set_block_index(block_index);
@@ -2468,7 +2480,21 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     ));
                 }
 
-                decoder.read_to_end(&mut data)?;
+                decoder.read_to_end(&mut data).map_err(|e| {
+                    // A checksum that did not match is reported located and
+                    // typed, as `for_each_entries` reports it.
+                    let e = Error::from(e);
+                    if e.is_checksum_failure() {
+                        let packed_offset = self
+                            .archive
+                            .block_pack_streams(block_index)
+                            .first()
+                            .map_or(0, |range| range.offset);
+                        e.in_block(block_index, packed_offset)
+                    } else {
+                        e
+                    }
+                })?;
 
                 Ok(data)
             }
@@ -2680,6 +2706,9 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
             verify_checksums,
             lzma2_control: Some(&lzma2),
             checksum_splits: &splits,
+            // Every file below is checked against its CRC as it is read, on
+            // this thread or folded from the workers'.
+            files_verified: verify_checksums,
             reserved_kb: 0,
         };
         lzma2.set_block_index(block_index);
@@ -2719,12 +2748,19 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                     Box::new(BoundedReader::new(&mut block_reader, file.size as usize));
                 if file.has_crc && verify_checksums && !folding {
                     crc_report.set(None);
-                    decoder = Box::new(Crc32VerifyingReader::reporting(
-                        decoder,
-                        file.size as usize,
-                        file.crc,
-                        Rc::clone(&crc_report),
-                    ));
+                    // A file that does not match its CRC is the block's
+                    // fault, although the check sits above the recording
+                    // reader: it is recorded too, so the failure leaves this
+                    // block located and typed as the folded check's does.
+                    decoder = Box::new(FaultRecordingReader {
+                        inner: Crc32VerifyingReader::reporting(
+                            decoder,
+                            file.size as usize,
+                            file.crc,
+                            Rc::clone(&crc_report),
+                        ),
+                        faulted: Rc::clone(&faulted),
+                    });
                 }
                 let outcome = each(file, &mut decoder)
                     .map_err(|e| e.maybe_bad_password(!self.password.is_empty()))
@@ -2954,5 +2990,65 @@ mod count_limit_tests {
                 .add_count(usize::MAX, 1)
                 .is_err()
         );
+    }
+}
+
+#[cfg(all(test, feature = "compress"))]
+mod block_checksum_tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::ArchiveWriter;
+
+    /// A one-file block whose only block checksum is the one it borrows from
+    /// its file, with that borrowed copy made wrong while the file's own
+    /// stays right. Which of the two a decode trips over says which check
+    /// it ran.
+    fn one_file_with_a_wrong_borrowed_crc() -> (Cursor<Vec<u8>>, Archive) {
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("one"), Some(data.as_slice()))
+            .expect("push");
+        let mut source = writer.finish().expect("finish");
+        let mut archive = Archive::read(&mut source, &Password::empty()).expect("parse");
+        let block = &archive.blocks[0];
+        assert!(!block.has_crc && block.num_unpack_sub_streams == 1);
+        let info = archive.sub_streams_info.as_mut().expect("sub-streams");
+        info.crcs[0] ^= 1;
+        (source, archive)
+    }
+
+    /// `for_each_entries` checks the file itself, so the block's reader does
+    /// not check the same bytes against the same CRC a second time.
+    #[test]
+    fn a_one_file_block_is_checked_once() {
+        let (mut source, archive) = one_file_with_a_wrong_borrowed_crc();
+        let password = Password::empty();
+        BlockDecoder::new(1, 0, &archive, &password, &mut source)
+            .for_each_entries(&mut |_, rd| {
+                io::copy(rd, &mut io::sink())?;
+                Ok(true)
+            })
+            .expect("only the file's own checksum is checked, and it is right");
+    }
+
+    /// A caller that does not check the file keeps the block's check, which
+    /// is then the only one there is.
+    #[test]
+    fn the_block_check_stays_where_it_is_the_only_one() {
+        let (mut source, archive) = one_file_with_a_wrong_borrowed_crc();
+        let limits = ArchiveLimits::default();
+        let opts = DecodeOptions::header(&limits);
+        let (mut rd, _) = ArchiveReader::<Cursor<Vec<u8>>>::build_decode_stack(
+            &mut source,
+            &archive,
+            0,
+            &Password::empty(),
+            &opts,
+        )
+        .expect("stack");
+        let err = io::copy(&mut rd, &mut io::sink()).expect_err("the borrowed CRC is checked");
+        assert!(Error::from(err).is_checksum_failure());
     }
 }

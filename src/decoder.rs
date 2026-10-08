@@ -54,6 +54,13 @@ pub(crate) struct DecodeOptions<'a> {
     /// checksum each piece in the worker that produced it. Empty when nothing
     /// is to be checksummed there.
     pub(crate) checksum_splits: &'a [u64],
+    /// Whether the caller checks each of this block's files against its own
+    /// CRC-32 as it reads it. A block holding one file whose only checksum is
+    /// that file's would otherwise be checked twice over the same bytes: once
+    /// by the block's verifying reader, with the CRC borrowed from the file,
+    /// and again by the caller's. False wherever the block's reader is the
+    /// only check there is.
+    pub(crate) files_verified: bool,
     /// Decoder memory, in kilobytes, that the other coders of this chain have
     /// already been granted out of `limits.memory_limit_bytes`. Set from
     /// [`check_chain_memory`]; a coder that fits itself to what is left
@@ -74,6 +81,7 @@ impl<'a> DecodeOptions<'a> {
             verify_checksums: true,
             lzma2_control: None,
             checksum_splits: &[],
+            files_verified: false,
             reserved_kb: 0,
         }
     }
