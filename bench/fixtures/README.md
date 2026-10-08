@@ -14,9 +14,13 @@ go run . fixtures --profile quick --dir ../fixtures/quick   # smoke corpus, ~250
 Every source is generated from a fixed seed, so every host builds the same
 input bytes. The archives are written by the host's `7zz a`; `fixtures.json`
 records every source's and archive's size and SHA-256 and the `7zz` banner and
-digest, so two hosts' corpora can be compared byte for byte. A file already
-present is kept and re-hashed, never rewritten; delete the directory to
-regenerate it.
+digest, so two hosts' corpora can be compared byte for byte. A source already
+present is kept only when its `.complete` marker names the same recipe and its
+members are exactly the recipe's; an archive only when its
+`<name>.provenance.json` names the same `7zz`, switches and source content and
+its bytes are unchanged. Anything else is regenerated. `run` rehashes every
+source and archive against `fixtures.json` before planning and refuses a
+corpus that has changed since.
 
 ## Sources (`src/<name>/`)
 

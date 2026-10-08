@@ -8,6 +8,7 @@ import (
 	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/host"
 	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/procmeasure"
 	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/suite"
+	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/toolchain"
 )
 
 func run(scenario, variant, role string, wall float64, rss int64, status string) suite.RunRecord {
@@ -77,10 +78,51 @@ func TestMergeListsEveryHost(t *testing.T) {
 	secondRaw := sampleRaw()
 	secondRaw.Machine.Label = "other-host"
 	second := Build(secondRaw)
-	md := Merge([]*Report{first, second})
+	md, err := Merge([]*Report{first, second})
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, want := range []string{"test-host", "other-host", "decode/mt/T4", "## lzma2 parallel", "Worst peak RSS ratio"} {
 		if !strings.Contains(md, want) {
 			t.Errorf("merged report lacks %q", want)
 		}
+	}
+}
+
+func TestMergeRefusesDifferentWorkloads(t *testing.T) {
+	base := func() *suite.Raw {
+		raw := sampleRaw()
+		raw.Fixtures.Sources = []fixtures.SourceRecord{{SourceSpec: fixtures.SourceSpec{Name: "text"}, SHA256: "aaa"}}
+		raw.Fixtures.Archives = []fixtures.ArchiveRecord{{ArchiveSpec: fixtures.ArchiveSpec{Name: "mt.7z", Source: "text", Args: []string{"-mx=5"}}, SHA256: "host-specific"}}
+		raw.Toolchain.Candidates = []toolchain.Candidate{{Label: "sevenz-turbo", Version: map[string]any{"git_commit": "c1", "cargo_lock_sha256": "l1"}}}
+		return raw
+	}
+	first := Build(base())
+	sameRaw := base()
+	sameRaw.Machine.Label = "other-host"
+	sameRaw.Fixtures.Archives[0].SHA256 = "differs-by-salt"
+	if _, err := Merge([]*Report{first, Build(sameRaw)}); err != nil {
+		t.Fatalf("matching workloads refused: %v", err)
+	}
+	for name, change := range map[string]func(*suite.Raw){
+		"profile": func(r *suite.Raw) { r.Fixtures.Profile = "full" },
+		"source":  func(r *suite.Raw) { r.Fixtures.Sources[0].SHA256 = "bbb" },
+		"args":    func(r *suite.Raw) { r.Fixtures.Archives[0].Args = []string{"-mx=9"} },
+		"commit":  func(r *suite.Raw) { r.Toolchain.Candidates[0].Version["git_commit"] = "c2" },
+		"lock":    func(r *suite.Raw) { r.Toolchain.Candidates[0].Version["cargo_lock_sha256"] = "l2" },
+		"oracle":  func(r *suite.Raw) { r.Toolchain.Oracle.Version = "99.0" },
+		"quick":   func(r *suite.Raw) { r.Quick = !r.Quick },
+	} {
+		raw := base()
+		raw.Machine.Label = "other-host"
+		change(raw)
+		if _, err := Merge([]*Report{first, Build(raw)}); err == nil {
+			t.Errorf("%s differs but the reports were merged", name)
+		}
+	}
+	legacy := Build(base())
+	legacy.Fixtures = nil
+	if _, err := Merge([]*Report{first, legacy}); err == nil || !strings.Contains(err.Error(), "report") {
+		t.Errorf("a report without a fixture manifest was merged: %v", err)
 	}
 }

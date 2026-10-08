@@ -69,7 +69,11 @@ func Markdown(report *Report) string {
 	if t.Rust.Dirty {
 		dirty = " (dirty)"
 	}
-	fmt.Fprintf(&b, "- rustc: %s; crate commit %s%s\n\n", t.Rust.Rustc, short(t.Rust.Commit), dirty)
+	fmt.Fprintf(&b, "- rustc: %s; crate commit %s%s; Cargo.lock %s\n", t.Rust.Rustc, short(t.Rust.Commit), dirty, short(t.Rust.CargoLock))
+	if t.Rust.Note != "" {
+		fmt.Fprintf(&b, "- note: %s\n", t.Rust.Note)
+	}
+	fmt.Fprintln(&b)
 
 	if len(report.Failures) > 0 {
 		fmt.Fprintln(&b, "## Failures")
@@ -208,8 +212,12 @@ func short(digest string) string {
 
 // Merge renders a cross-host report.md from several hosts' reports: per
 // scenario, each host's sevenz-turbo median wall time and its wall and RSS
-// ratios against that host's 7zz, plus encode size ratios.
-func Merge(reports []*Report) string {
+// ratios against that host's 7zz, plus encode size ratios. Reports that did
+// not measure the same workload (see Comparable) are refused.
+func Merge(reports []*Report) (string, error) {
+	if err := Comparable(reports); err != nil {
+		return "", err
+	}
 	var b strings.Builder
 	fmt.Fprintln(&b, "# sevenz-turbo bench: cross-host summary")
 	fmt.Fprintln(&b)
@@ -307,7 +315,7 @@ func Merge(reports []*Report) string {
 			fmt.Fprintln(&b)
 		}
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 func nextGroup(order []string, key string, groupOf map[string]string) string {

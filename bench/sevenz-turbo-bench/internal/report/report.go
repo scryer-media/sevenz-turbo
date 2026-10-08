@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/fixtures"
 	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/host"
 	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/procmeasure"
 	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/suite"
@@ -84,22 +85,26 @@ type Ratio struct {
 
 // Report is report.json.
 type Report struct {
-	SchemaVersion int                       `json:"schema_version"`
-	Schema        string                    `json:"schema"`
-	Orientation   string                    `json:"orientation"`
-	StartedUTC    string                    `json:"started_utc"`
-	FinishedUTC   string                    `json:"finished_utc"`
-	Machine       host.Machine              `json:"machine"`
-	Toolchain     toolchain.Toolchain       `json:"toolchain"`
-	Profile       string                    `json:"profile"`
-	RunProfile    string                    `json:"run_profile,omitempty"`
-	Quick         bool                      `json:"quick"`
-	Warmups       int                       `json:"warmups"`
-	Repeats       int                       `json:"repeats"`
-	Scenarios     []suite.Scenario          `json:"scenarios"`
-	Rows          []Row                     `json:"rows"`
-	Ratios        []Ratio                   `json:"ratios"`
-	RSS           []procmeasure.RSSScenario `json:"rss_scenarios"`
+	SchemaVersion int                 `json:"schema_version"`
+	Schema        string              `json:"schema"`
+	Orientation   string              `json:"orientation"`
+	StartedUTC    string              `json:"started_utc"`
+	FinishedUTC   string              `json:"finished_utc"`
+	Machine       host.Machine        `json:"machine"`
+	Toolchain     toolchain.Toolchain `json:"toolchain"`
+	Profile       string              `json:"profile"`
+	RunProfile    string              `json:"run_profile,omitempty"`
+	Quick         bool                `json:"quick"`
+	Warmups       int                 `json:"warmups"`
+	Repeats       int                 `json:"repeats"`
+	Scenarios     []suite.Scenario    `json:"scenarios"`
+	// Fixtures is the corpus manifest the run measured: source and archive
+	// digests and the switches each archive was written with. Merge compares
+	// it across hosts.
+	Fixtures *fixtures.Manifest        `json:"fixtures,omitempty"`
+	Rows     []Row                     `json:"rows"`
+	Ratios   []Ratio                   `json:"ratios"`
+	RSS      []procmeasure.RSSScenario `json:"rss_scenarios"`
 	// Failures lists every failed or unfinished candidate/reference run;
 	// SecondaryFailures the sevenz-rust2 ones, which do not fail the run.
 	Failures          []string `json:"failures"`
@@ -116,6 +121,7 @@ func Build(raw *suite.Raw) *Report {
 	}
 	if raw.Fixtures != nil {
 		report.Profile = raw.Fixtures.Profile
+		report.Fixtures = raw.Fixtures
 	}
 	type key struct{ scenario, variant string }
 	grouped := map[key][]suite.RunRecord{}
@@ -310,4 +316,73 @@ func Load(path string) (*Report, error) {
 		return nil, fmt.Errorf("%s: schema %q version %d, want %q version 1", path, report.Schema, report.SchemaVersion, Schema)
 	}
 	return &report, nil
+}
+
+// Comparable reports whether reports measured the same workload with the same
+// tools, so their rows can share a cross-host table: the same corpus profile
+// and run shape, the same source content and archive recipes, the same 7zz
+// release, and every candidate built from the same commit and Cargo.lock.
+// Archive digests are not compared: 7zz writes random AES salts and records
+// host file attributes, so equal recipes give different bytes per host.
+func Comparable(reports []*Report) error {
+	if len(reports) < 2 {
+		return nil
+	}
+	base := reports[0]
+	baseKey, err := workload(base)
+	if err != nil {
+		return fmt.Errorf("%s: %w", base.Machine.Label, err)
+	}
+	for _, other := range reports[1:] {
+		key, err := workload(other)
+		if err != nil {
+			return fmt.Errorf("%s: %w", other.Machine.Label, err)
+		}
+		for _, field := range sortedKeys(baseKey, key) {
+			if baseKey[field] != key[field] {
+				return fmt.Errorf("%s and %s measured different workloads: %s is %q vs %q",
+					base.Machine.Label, other.Machine.Label, field, dash(baseKey[field]), dash(key[field]))
+			}
+		}
+	}
+	return nil
+}
+
+// workload flattens what Comparable compares into named fields.
+func workload(r *Report) (map[string]string, error) {
+	if r.Fixtures == nil {
+		return nil, fmt.Errorf("report.json carries no fixture manifest; rebuild it with `sevenz-turbo-bench report` from its raw.json")
+	}
+	key := map[string]string{
+		"corpus profile": r.Profile,
+		"run profile":    r.RunProfile,
+		"quick":          fmt.Sprint(r.Quick),
+		"7zz version":    r.Toolchain.Oracle.Version,
+	}
+	for _, source := range r.Fixtures.Sources {
+		key["source "+source.Name] = source.SHA256
+	}
+	for _, archive := range r.Fixtures.Archives {
+		key["archive "+archive.Name] = fmt.Sprintf("%s %s encrypted=%t", archive.Source, strings.Join(archive.Args, " "), archive.Encrypted)
+	}
+	for _, candidate := range r.Toolchain.Candidates {
+		key["candidate "+candidate.Label+" commit"] = candidate.Field("git_commit")
+		key["candidate "+candidate.Label+" Cargo.lock"] = candidate.Field("cargo_lock_sha256")
+	}
+	return key, nil
+}
+
+func sortedKeys(a, b map[string]string) []string {
+	seen := map[string]bool{}
+	var keys []string
+	for _, m := range []map[string]string{a, b} {
+		for k := range m {
+			if !seen[k] {
+				seen[k] = true
+				keys = append(keys, k)
+			}
+		}
+	}
+	sort.Strings(keys)
+	return keys
 }

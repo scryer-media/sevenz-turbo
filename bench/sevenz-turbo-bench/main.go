@@ -30,6 +30,7 @@ import (
 
 	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/fixtures"
 	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/host"
+	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/procmeasure"
 	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/report"
 	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/suite"
 	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/toolchain"
@@ -192,15 +193,20 @@ func (f toolFlags) collect(ctx context.Context) (toolchain.Toolchain, suite.Tool
 	if err != nil {
 		return toolchain.Toolchain{}, suite.Tools{}, prerequisite{err}
 	}
-	chain := toolchain.Toolchain{Candidates: []toolchain.Candidate{primary}, Rust: rust, LinkedLzmaTurbo: primary.Field("lzma_turbo")}
+	if err := toolchain.CheckBackend(primary, "--candidate", toolchain.BackendDefault); err != nil {
+		return toolchain.Toolchain{}, suite.Tools{}, prerequisite{fmt.Errorf("%w: build it with default features", err)}
+	}
+	// The checkout's rustc, commit and Cargo.lock describe the candidate only
+	// when the candidate says it was built from that commit and lock.
+	chain := toolchain.Toolchain{Candidates: []toolchain.Candidate{primary}, Rust: toolchain.BindRust(rust, primary), LinkedLzmaTurbo: primary.Field("lzma_turbo")}
 	tools := suite.Tools{Candidate: candidate}
 	if *f.native != "" {
 		native, err := toolchain.ProbeCandidate(ctx, suite.VariantTurboNative, *f.native)
 		if err != nil {
 			return toolchain.Toolchain{}, suite.Tools{}, prerequisite{err}
 		}
-		if backend := native.Field("crypto_backend"); backend == primary.Field("crypto_backend") {
-			return toolchain.Toolchain{}, suite.Tools{}, prerequisite{fmt.Errorf("--candidate-native reports crypto backend %q, the same as --candidate: build it with --features native-crypto", backend)}
+		if err := toolchain.CheckBackend(native, "--candidate-native", toolchain.BackendNative); err != nil {
+			return toolchain.Toolchain{}, suite.Tools{}, prerequisite{fmt.Errorf("%w: build it with --features native-crypto", err)}
 		}
 		chain.Candidates = append(chain.Candidates, native)
 		tools.Native = *f.native
@@ -294,6 +300,21 @@ func cmdRun(ctx context.Context, args []string) int {
 		fmt.Fprintln(os.Stderr, "run: --repeats must be at least 1")
 		return exitUsage
 	}
+	// Thread counts follow the CPUs the processes may use: the pinned range
+	// when --pin-cpus confines them, else every CPU.
+	cpus := runtime.NumCPU()
+	if *pin != "" {
+		if !procmeasure.PinSupported() {
+			fmt.Fprintf(os.Stderr, "run: --pin-cpus is not supported on %s (Linux with taskset, or Windows)\n", runtime.GOOS)
+			return exitUsage
+		}
+		count, err := procmeasure.PinCount(*pin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "run: --pin-cpus: %v\n", err)
+			return exitUsage
+		}
+		cpus = count
+	}
 	if *dir == "" {
 		*dir = defaultFixtureDir(profile.Corpus == "quick")
 	}
@@ -303,6 +324,13 @@ func cmdRun(ctx context.Context, args []string) int {
 	}
 	if manifest.Profile != profile.Corpus {
 		fmt.Fprintf(os.Stderr, "run: note: profile %s over the %s corpus in %s\n", profile.Name, manifest.Profile, *dir)
+	}
+	// A run measures the corpus as the manifest records it: every source and
+	// archive is rehashed before planning. --list measures nothing and skips it.
+	if !*list {
+		if err := manifest.Verify(*dir); err != nil {
+			return fail(prerequisite{fmt.Errorf("fixtures in %s: %w", *dir, err)})
+		}
 	}
 	chain, binaries, err := tools.collect(ctx)
 	if err != nil {
@@ -321,22 +349,13 @@ func cmdRun(ctx context.Context, args []string) int {
 		}
 	}
 	scratch, _ = filepath.Abs(scratch)
-	settings := suite.DefaultSettings(*quick, runtime.NumCPU())
+	settings := suite.DefaultSettings(*quick, cpus)
+	if *only != "" {
+		settings.Only = strings.Split(*only, ",")
+	}
 	scenarios, err := suite.Plan(manifest, absolute, scratch, binaries, settings)
 	if err != nil {
 		return fail(prerequisite{err})
-	}
-	if *only != "" {
-		var kept []suite.Scenario
-		for _, scenario := range scenarios {
-			for _, part := range strings.Split(*only, ",") {
-				if part != "" && strings.Contains(scenario.ID, part) {
-					kept = append(kept, scenario)
-					break
-				}
-			}
-		}
-		scenarios = kept
 	}
 	planLine := fmt.Sprintf("profile %s over the %s corpus: %d scenarios, %d processes at %d repeat(s) + %d warmup(s)",
 		profile.Name, manifest.Profile, len(scenarios), suite.Processes(scenarios, *repeats, *warmups), *repeats, *warmups)
@@ -430,7 +449,11 @@ func cmdMerge(args []string) int {
 		}
 		reports = append(reports, loaded)
 	}
-	if err := os.WriteFile(*out, []byte(report.Merge(reports)), 0o644); err != nil {
+	merged, err := report.Merge(reports)
+	if err != nil {
+		return fail(prerequisite{err})
+	}
+	if err := os.WriteFile(*out, []byte(merged), 0o644); err != nil {
 		return fail(err)
 	}
 	fmt.Printf("wrote %s (%d hosts)\n", *out, len(reports))

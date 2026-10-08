@@ -59,7 +59,9 @@ Within a scenario the variants are interleaved and their order is reversed
 every repeat. Each cell is the median [min-max] of the measured repeats.
 Decodes of the same archive by any of this crate's engines must produce the
 same output digest, and every decode must produce exactly the fixture's
-unpacked byte count; either mismatch fails the run.
+unpacked byte count; either mismatch fails the run. The digest comes from one
+extra untimed decode per engine (`--digest`), so no timed row pays for
+hashing.
 
 Every ratio is **7zz / sevenz-turbo** of the medians (oracle over ours, the
 direction rarpar-bench and the weaver bench reports use, so merged reports
@@ -125,6 +127,10 @@ echo "rc=$?"
 # collect results/report.json from every host, then:
 $B/sevenz-turbo-bench merge --out cross-arch.md host-*/report.json
 ```
+
+`merge` refuses reports that measured different workloads: a different corpus
+or run profile, source content, archive switches, 7zz release, or candidate
+commit or `Cargo.lock`.
 
 `report` regenerates `report.json` and `report.md` from a `raw.json`, the same
 protocol rarpar-bench's macro suites use:
