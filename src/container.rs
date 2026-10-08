@@ -406,6 +406,11 @@ const FILTER_BYTES: u64 = MIB;
 /// Its sub-streams' own decoders are separate coders in the same block and are
 /// summed with it.
 const BCJ2_BYTES: u64 = 16 * MIB;
+/// A block reads its pack stream through one buffer under its coders,
+/// whatever they are, so even a Copy block costs this much. Charged to every
+/// block, BCJ2's included, which has none (its own estimate covers its
+/// buffers): the estimate stays an upper bound on the reader's chain check.
+pub(crate) const BLOCK_INPUT_BYTES: u64 = crate::decoder::INPUT_BUF_SIZE as u64;
 
 pub(crate) fn check_aes_coders<'a>(
     coders: impl Iterator<Item = &'a Coder>,
@@ -446,6 +451,7 @@ impl Archive {
     ///
     /// | Coder | Estimate |
     /// | --- | --- |
+    /// | every block, under its coders | 64 KiB (the pack stream's read buffer) |
     /// | Copy | 0 |
     /// | LZMA, LZMA2 | declared dictionary + 1 MiB |
     /// | PPMd | declared model size + 1 MiB |
@@ -470,7 +476,7 @@ impl Archive {
     pub fn decoder_memory_estimate(&self) -> Result<u64, UnsizedCoder> {
         let mut largest_block = 0u64;
         for block in &self.blocks {
-            let mut chain = 0u64;
+            let mut chain = BLOCK_INPUT_BYTES;
             for coder in &block.coders {
                 chain = chain.saturating_add(coder_memory_estimate(coder)?);
             }

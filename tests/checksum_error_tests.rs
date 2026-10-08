@@ -187,3 +187,56 @@ fn a_folded_mismatch_is_the_same_checksum_mismatch() {
     );
     assert_checksum_mismatch(result, 0);
 }
+
+/// Under a wrong password a store-mode block decrypts to garbage, and the
+/// file's CRC is the first check to fail. That is the password's fault, not
+/// damage a repair could fix: `read_file` says `Password`, as
+/// `for_each_entries` does, still located in the block.
+#[cfg(feature = "aes256")]
+#[test]
+fn a_wrong_password_mismatch_is_a_password_error_on_every_path() {
+    use sevenz_turbo::encoder_options::AesEncoderOptions;
+
+    let files = [payload(100_000, 3), payload(50_000, 4)];
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+    writer.set_encrypt_header(false);
+    writer.set_content_methods(vec![
+        AesEncoderOptions::new(Password::from("right")).into(),
+        EncoderMethod::COPY.into(),
+    ]);
+    for (i, f) in files.iter().enumerate() {
+        writer
+            .push_archive_entry(
+                ArchiveEntry::new_file(&format!("f{i}")),
+                Some(Cursor::new(f.as_slice())),
+            )
+            .expect("push");
+    }
+    let bytes = writer.finish().expect("finish").into_inner();
+
+    #[track_caller]
+    fn assert_password(result: Result<(), Error>, what: &str) {
+        match result {
+            Err(Error::BlockDecode {
+                block_index: 0,
+                kind: BlockErrorKind::Password,
+                ..
+            }) => {}
+            other => panic!("{what}: expected a located password error, got {other:?}"),
+        }
+    }
+
+    let mut reader =
+        ArchiveReader::new(Cursor::new(bytes.clone()), Password::from("wrong")).expect("open");
+    assert_password(
+        reader.for_each_entries(|_, rd| read_all(rd)),
+        "for_each_entries",
+    );
+    let mut reader =
+        ArchiveReader::new(Cursor::new(bytes.clone()), Password::from("wrong")).expect("open");
+    assert_password(reader.read_file("f0").map(drop), "read_file");
+
+    // The right password reads the same archive back.
+    let mut reader = ArchiveReader::new(Cursor::new(bytes), Password::from("right")).expect("open");
+    assert_eq!(reader.read_file("f0").expect("decodes"), files[0]);
+}

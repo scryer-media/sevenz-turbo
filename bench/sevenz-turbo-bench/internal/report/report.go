@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
@@ -97,7 +98,12 @@ type Report struct {
 	Quick         bool                `json:"quick"`
 	Warmups       int                 `json:"warmups"`
 	Repeats       int                 `json:"repeats"`
-	Scenarios     []suite.Scenario    `json:"scenarios"`
+	// PinCPUs is the CPU range every measured process was confined to
+	// (--pin-cpus), or "" when processes could use the whole host.
+	PinCPUs string `json:"pin_cpus,omitempty"`
+	// Only is the --only selection the run was narrowed to, if any.
+	Only      []string         `json:"only,omitempty"`
+	Scenarios []suite.Scenario `json:"scenarios"`
 	// Fixtures is the corpus manifest the run measured: source and archive
 	// digests and the switches each archive was written with. Merge compares
 	// it across hosts.
@@ -116,7 +122,7 @@ func Build(raw *suite.Raw) *Report {
 	report := &Report{
 		SchemaVersion: 1, Schema: Schema, Orientation: Orientation,
 		StartedUTC: raw.StartedUTC, FinishedUTC: raw.FinishedUTC, Machine: raw.Machine, Toolchain: raw.Toolchain,
-		RunProfile: raw.RunProfile, Quick: raw.Quick, Warmups: raw.Warmups, Repeats: raw.Repeats, Scenarios: raw.Scenarios,
+		RunProfile: raw.RunProfile, Quick: raw.Quick, Warmups: raw.Warmups, Repeats: raw.Repeats, PinCPUs: raw.PinCPUs, Only: raw.Only, Scenarios: raw.Scenarios,
 		Failures: []string{}, SecondaryFailures: []string{},
 	}
 	if raw.Fixtures != nil {
@@ -323,13 +329,25 @@ func Load(path string) (*Report, error) {
 
 // Comparable reports whether reports measured the same workload with the same
 // tools, so their rows can share a cross-host table: the same corpus profile
-// and run shape, the same source content and archive recipes, the same 7zz
+// written by the same 7zz release
+// and run shape (run profile, --only selection, repeats and warmups), the
+// same CPU pinning, the same source content and archive recipes, the same 7zz
 // release, and every candidate built from the same commit and Cargo.lock.
 // Archive digests are not compared: 7zz writes random AES salts and records
-// host file attributes, so equal recipes give different bytes per host.
+// host file attributes, so equal recipes give different bytes per host. Every
+// candidate must be a clean build (git_dirty false): uncommitted changes have
+// no fingerprint, so two dirty builds of one commit are not shown equal.
 func Comparable(reports []*Report) error {
 	if len(reports) < 2 {
 		return nil
+	}
+	for _, r := range reports {
+		for _, candidate := range r.Toolchain.Candidates {
+			if dirty := candidate.Field("git_dirty"); dirty != "false" {
+				return fmt.Errorf("%s: candidate %s was not a clean build (git_dirty %q); merged reports must come from binaries built from a committed tree",
+					r.Machine.Label, candidate.Label, dash(dirty))
+			}
+		}
 	}
 	base := reports[0]
 	baseKey, err := workload(base)
@@ -361,7 +379,20 @@ func workload(r *Report) (map[string]string, error) {
 		"run profile":    r.RunProfile,
 		"quick":          fmt.Sprint(r.Quick),
 		"7zz version":    r.Toolchain.Oracle.Version,
+		"CPU pinning":    r.PinCPUs,
+		"repeats":        fmt.Sprint(r.Repeats),
+		"warmups":        fmt.Sprint(r.Warmups),
+		"only":           strings.Join(slices.Sorted(slices.Values(r.Only)), ","),
 	}
+	// The plan itself is not compared: its thread sweep stops below each
+	// host's core count, so hosts of different sizes legitimately plan
+	// different thread rows, which the merged table shows as dashes. What
+	// the operator chose is compared instead; with the corpus and the
+	// candidates, it fixes every other row.
+	// The archives' bytes differ per host (salts, attributes), but the 7zz
+	// release that wrote them decides their chunking and sizes, so a corpus
+	// written by another release is another workload.
+	_, key["fixture 7zz version"] = toolchain.ParseBanner(r.Fixtures.Oracle.Banner)
 	for _, source := range r.Fixtures.Sources {
 		key["source "+source.Name] = source.SHA256
 	}
@@ -371,6 +402,7 @@ func workload(r *Report) (map[string]string, error) {
 	for _, candidate := range r.Toolchain.Candidates {
 		key["candidate "+candidate.Label+" commit"] = candidate.Field("git_commit")
 		key["candidate "+candidate.Label+" Cargo.lock"] = candidate.Field("cargo_lock_sha256")
+		key["candidate "+candidate.Label+" git_dirty"] = candidate.Field("git_dirty")
 	}
 	return key, nil
 }

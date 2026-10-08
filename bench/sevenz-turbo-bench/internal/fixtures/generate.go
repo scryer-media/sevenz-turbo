@@ -229,18 +229,52 @@ const sourceGenerator = 1
 const markerName = ".complete"
 
 // sourceMarker is the marker's contents: every recipe field that shapes the
-// bytes (not the note), and the generator version.
-func sourceMarker(source SourceSpec) []byte {
-	data, _ := json.Marshal(struct {
-		Generator    int    `json:"generator"`
-		Name         string `json:"name"`
-		Kind         string `json:"kind"`
-		Bytes        int64  `json:"bytes,omitempty"`
-		Files        int    `json:"files,omitempty"`
-		AverageBytes int64  `json:"average_bytes,omitempty"`
-		Seed         uint64 `json:"seed,omitempty"`
-	}{sourceGenerator, source.Name, source.Kind, source.Bytes, source.Files, source.AverageBytes, source.Seed})
-	return data
+// bytes (not the note), the generator version, and the content digest taken
+// when generation finished, so a member edited in place (same size) is
+// caught on reuse.
+type sourceMarker struct {
+	Generator    int    `json:"generator"`
+	Name         string `json:"name"`
+	Kind         string `json:"kind"`
+	Bytes        int64  `json:"bytes,omitempty"`
+	Files        int    `json:"files,omitempty"`
+	AverageBytes int64  `json:"average_bytes,omitempty"`
+	Seed         uint64 `json:"seed,omitempty"`
+	SHA256       string `json:"sha256"`
+}
+
+func markerFor(source SourceSpec, digest string) sourceMarker {
+	return sourceMarker{sourceGenerator, source.Name, source.Kind, source.Bytes, source.Files, source.AverageBytes, source.Seed, digest}
+}
+
+// sourceContent is a source's digest, as the manifest records it, with its
+// byte and file counts.
+type sourceContent struct {
+	sha256 string
+	bytes  int64
+	files  int
+}
+
+// hashSource digests the source at root: a tree's members in recipe order,
+// each prefixed by its path and size; a single file's bytes.
+func hashSource(root string, source SourceSpec) (sourceContent, error) {
+	if source.Kind == KindTree {
+		digest := sha256.New()
+		var content sourceContent
+		files := payload.Tree(source.Files, source.AverageBytes, source.Seed)
+		for _, file := range files {
+			fmt.Fprintf(digest, "%s\x00%d\x00", file.Path, file.Size)
+			if err := hashInto(digest, filepath.Join(root, filepath.FromSlash(file.Path))); err != nil {
+				return content, err
+			}
+			content.bytes += file.Size
+		}
+		content.files = len(files)
+		content.sha256 = hex.EncodeToString(digest.Sum(nil))
+		return content, nil
+	}
+	digest, size, err := FileSHA256(filepath.Join(root, source.FileName()))
+	return sourceContent{sha256: digest, bytes: size, files: 1}, err
 }
 
 // expectedMembers is every file a source holds, by slash-separated path
@@ -258,7 +292,9 @@ func expectedMembers(source SourceSpec) map[string]int64 {
 }
 
 // diskMembers lists the regular files under root as expectedMembers does,
-// skipping top-level dot names (the marker), as Entries does.
+// skipping top-level dot names (the marker), as Entries does. Any other
+// entry (a symlink, a FIFO, a device) is an error: 7zz and decode-bench would
+// treat it differently, and a FIFO could stall either.
 func diskMembers(root string) (map[string]int64, error) {
 	members := map[string]int64{}
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
@@ -279,29 +315,58 @@ func diskMembers(root string) (map[string]int64, error) {
 			}
 			return nil
 		}
-		if entry.Type().IsRegular() {
-			info, err := entry.Info()
-			if err != nil {
-				return err
-			}
-			members[relative] = info.Size()
+		if entry.IsDir() {
+			return nil
 		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("%s is not a regular file", relative)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		members[relative] = info.Size()
 		return nil
 	})
 	return members, err
 }
 
 // sourceProblem says why the source directory at root is not exactly what the
-// recipe writes, or "" when it is: the marker must name the recipe, and the
-// files must be the recipe's members at their sizes, with nothing extra.
+// recipe writes, or "" when it is.
 func sourceProblem(root string, source SourceSpec) string {
-	marker, err := os.ReadFile(filepath.Join(root, markerName))
+	_, problem := checkSource(root, source)
+	return problem
+}
+
+// checkSource hashes the source at root when it is exactly what the recipe
+// wrote, or says why not: the marker must name the recipe, the files must be
+// the recipe's members at their sizes with nothing extra, and their content
+// must still hash to the digest the marker took when generation finished.
+func checkSource(root string, source SourceSpec) (sourceContent, string) {
+	data, err := os.ReadFile(filepath.Join(root, markerName))
 	if err != nil {
-		return "no completion marker"
+		return sourceContent{}, "no completion marker"
 	}
-	if !bytes.Equal(marker, sourceMarker(source)) {
-		return "written by a different recipe"
+	var marker sourceMarker
+	if err := json.Unmarshal(data, &marker); err != nil || marker != markerFor(source, marker.SHA256) || marker.SHA256 == "" {
+		return sourceContent{}, "written by a different recipe"
 	}
+	if problem := memberProblem(root, source); problem != "" {
+		return sourceContent{}, problem
+	}
+	content, err := hashSource(root, source)
+	if err != nil {
+		return content, err.Error()
+	}
+	if content.sha256 != marker.SHA256 {
+		return content, "contents changed since it was generated"
+	}
+	return content, ""
+}
+
+// memberProblem says why the files at root are not the recipe's members at
+// their sizes, with nothing extra, or "" when they are.
+func memberProblem(root string, source SourceSpec) string {
 	onDisk, err := diskMembers(root)
 	if err != nil {
 		return err.Error()
@@ -329,28 +394,11 @@ func sourceProblem(root string, source SourceSpec) string {
 func measureSource(dir string, source SourceSpec) (SourceRecord, error) {
 	root := SourceDir(dir, source.Name)
 	record := SourceRecord{SourceSpec: source, Path: filepath.Join("src", source.Name)}
-	if problem := sourceProblem(root, source); problem != "" {
+	content, problem := checkSource(root, source)
+	if problem != "" {
 		return record, errors.New(problem)
 	}
-	if source.Kind == KindTree {
-		digest := sha256.New()
-		files := payload.Tree(source.Files, source.AverageBytes, source.Seed)
-		for _, file := range files {
-			fmt.Fprintf(digest, "%s\x00%d\x00", file.Path, file.Size)
-			if err := hashInto(digest, filepath.Join(root, filepath.FromSlash(file.Path))); err != nil {
-				return record, err
-			}
-			record.TotalBytes += file.Size
-		}
-		record.FileCount = len(files)
-		record.SHA256 = hex.EncodeToString(digest.Sum(nil))
-		return record, nil
-	}
-	digest, size, err := FileSHA256(filepath.Join(root, source.FileName()))
-	if err != nil {
-		return record, err
-	}
-	record.TotalBytes, record.FileCount, record.SHA256 = size, 1, digest
+	record.TotalBytes, record.FileCount, record.SHA256 = content.bytes, content.files, content.sha256
 	return record, nil
 }
 
@@ -404,7 +452,18 @@ func generateSource(root string, source SourceSpec, reason string, logf func(str
 	if err := fixMtimes(root); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(root, markerName), sourceMarker(source), 0o644)
+	if problem := memberProblem(root, source); problem != "" {
+		return fmt.Errorf("generated %s is not its recipe: %s", source.Name, problem)
+	}
+	content, err := hashSource(root, source)
+	if err != nil {
+		return err
+	}
+	marker, err := json.Marshal(markerFor(source, content.sha256))
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(root, markerName), marker, 0o644)
 }
 
 // Entries is what 7zz is told to add for a source, relative to its directory:

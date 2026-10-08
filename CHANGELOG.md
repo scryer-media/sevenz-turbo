@@ -320,7 +320,10 @@ Everything here is new surface; no upstream signature changed meaning.
   cryptography extensions on aarch64. Neither lane needs a streaming API: a
   chunk is decrypted with the current IV and that chunk's last ciphertext
   block, copied out before the in-place decrypt, is the next chunk's IV. The
-  encoder (`compress`) keeps RustCrypto's `cbc::Encryptor`.
+  encoder (`compress`) follows the same switch over the same unpadded CBC:
+  AWS-LC's `EncryptingKey::cbc` by default, RustCrypto's `cbc::Encryptor`
+  under `native-crypto` and wherever AWS-LC is not selected (a wasm build
+  encrypts in the guest).
   `aws-lc-rs` is a direct optional dependency on the pin and features
   `lzma-turbo` uses, so a build with both crates resolves one copy of AWS-LC.
 - `aes256` no longer implies a backend: enabling it with neither
@@ -569,9 +572,11 @@ Everything here is new surface; no upstream signature changed meaning.
   and 8.5 MB, at the same archive size.
 - The writer learns a folder's size from its entries: `ArchiveEntry::size` is
   read as a size hint before a push (zero means unknown), `from_path` now
-  fills it in from the file's length, and a solid block is sized by the sum.
-  When no entry says, the writer reads up to 1 MiB ahead and sizes a shorter
-  stream by what it read. A wrong hint costs ratio or threads, never
+  fills it in from the file's length, and a solid block is sized by the sum
+  when every file in it declares a size. When any file says zero, the writer
+  reads up to 1 MiB ahead instead and sizes a shorter stream by what it read,
+  so a block mixing `from_path` and `new_file` entries is never sized by its
+  known entries alone. A wrong hint costs ratio or threads, never
   correctness; the push records the bytes actually read, as before.
 - BCJ2 can be written. It is asked for as the single-stream filters are, as
   the last content method after the coder for its main stream:
@@ -618,6 +623,10 @@ Everything here is new surface; no upstream signature changed meaning.
   archive was reopened than the writer reported when it was pushed. The
   first entry of a block now carries the sum of every pack stream the block
   reads.
+- New `sevenz_turbo::lzma_encoder() -> &'static str` (behind `compress`):
+  `"lzma-turbo"`, or `"lzma-rust2"` when the `lzma-rust2-encoder` feature
+  is on, which a dependency can turn on unnoticed - the encoder's
+  counterpart of `crypto_backend()`.
 - The one-block rule applies to the `lzma-rust2-encoder` build as well: a
   folder known to fit one LZMA2 block is coded by `lzma-rust2`'s
   single-threaded writer instead of starting its multi-threaded one.
@@ -644,8 +653,8 @@ Everything here is new surface; no upstream signature changed meaning.
   `Error::Io` with no block at all, so a consumer that keeps a damaged set
   for repair on a checksum mismatch gave those up as fatal.
   `ArchiveReader::read_file` reports the same error. An encrypted block's
-  mismatch is still `BlockErrorKind::Password`, since a wrong password looks
-  the same.
+  mismatch is still `BlockErrorKind::Password` on every path, `read_file`
+  included, since a wrong password looks the same.
 - Fixed: `set_verify_checksums(false)` turns off the block checksum as well.
   A block holding one file was still checked against the file's CRC, which
   the block borrows, and a block's own CRC was checked on the consuming
@@ -679,7 +688,10 @@ Everything here is new surface; no upstream signature changed meaning.
   small the caller's reads are. 7-Zip's filter coders read at least as
   much. A Copy+BCJ block of 4 MiB went from 1,033 reads to 69. A coder that
   already reads large pieces - LZMA, LZMA2 - goes through the buffer
-  without a second copy, and no other row moved.
+  without a second copy, and no other row moved. The buffer counts against
+  `memory_limit_bytes`: `Archive::decoder_memory_estimate` charges every
+  block 64 KiB for it, and so does the chain check of a block read through
+  it, so a Copy block no longer estimates at zero.
 - An LZMA2 block that declares less than 1 MiB of output is decoded
   single-threaded whatever thread count or adaptive mode was asked for.
   7-Zip's and lzma-turbo's multi-threaded encoders never cut a run finer

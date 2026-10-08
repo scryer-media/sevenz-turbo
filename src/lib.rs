@@ -70,6 +70,23 @@ mod encryption;
 pub fn crypto_backend() -> &'static str {
     crypto_backend::BACKEND
 }
+
+/// Names the LZMA and LZMA2 encoder this build of the crate selected:
+/// `"lzma-turbo"`, or `"lzma-rust2"` when the `lzma-rust2-encoder` feature is
+/// on.
+///
+/// Like [`crypto_backend`], a dependency can turn that feature on without the
+/// top-level crate noticing; this is here to be asserted on.
+#[cfg(feature = "compress")]
+#[must_use]
+pub fn lzma_encoder() -> &'static str {
+    if cfg!(feature = "lzma-rust2-encoder") {
+        "lzma-rust2"
+    } else {
+        "lzma-turbo"
+    }
+}
+
 /// Embedder-supplied delegation hooks for the bulk AES-256-CBC decrypt
 /// (the `crypto-host` feature). See the module documentation for the contract
 /// a host must satisfy.

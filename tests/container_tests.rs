@@ -388,3 +388,49 @@ fn a_callers_own_error_is_not_blamed_on_the_block() {
         "a healthy block must not be reported as damaged: {error:?}"
     );
 }
+
+/// A Copy block allocates nothing for its coder, but it is still read through
+/// the block's 64 KiB pack-stream buffer: the estimate, the reader's limit
+/// and a `BlockDecoder`'s own limit all count it.
+#[test]
+fn a_copy_block_is_charged_its_read_buffer() {
+    const BUFFER: u64 = 64 * 1024;
+    let bytes = archive_bytes(vec![EncoderMethod::COPY.into()], 1, false);
+    let archive = read_archive(&bytes);
+    assert_eq!(archive.decoder_memory_estimate().expect("sized"), BUFFER);
+
+    let open = |limit: u64| {
+        ArchiveReader::with_limits(
+            Cursor::new(bytes.clone()),
+            Password::empty(),
+            ArchiveLimits::memory(limit),
+        )
+    };
+    assert!(
+        matches!(open(BUFFER - 1), Err(Error::MemoryLimited { required_bytes, .. }) if required_bytes == BUFFER),
+        "a budget below the read buffer was accepted"
+    );
+    open(BUFFER).expect("the read buffer fits exactly");
+
+    let password = Password::empty();
+    let decode = |limit: u64| {
+        let mut source = Cursor::new(bytes.as_slice());
+        sevenz_turbo::BlockDecoder::with_limits(
+            1,
+            0,
+            &archive,
+            &password,
+            &mut source,
+            ArchiveLimits::memory(limit),
+        )
+        .for_each_entries(&mut |_, rd: &mut dyn Read| {
+            std::io::copy(rd, &mut std::io::sink())?;
+            Ok(true)
+        })
+    };
+    match decode(BUFFER - 1024) {
+        Err(Error::BlockDecode { ref message, .. }) if message.starts_with("MaxMemLimited") => {}
+        other => panic!("a block budget below the read buffer must be refused, got {other:?}"),
+    }
+    decode(BUFFER).expect("the read buffer fits exactly");
+}

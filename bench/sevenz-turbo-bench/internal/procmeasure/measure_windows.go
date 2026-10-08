@@ -4,6 +4,7 @@ package procmeasure
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"syscall"
@@ -62,6 +63,9 @@ func PinSupported() bool { return true }
 type probe struct {
 	handle syscall.Handle
 	pinned string
+	// pinErr is why a requested pin could not be applied; the child has
+	// been killed, so nothing unconfined is measured as if it were pinned.
+	pinErr error
 }
 
 func attachProbe(cmd *exec.Cmd, pin string) probe {
@@ -71,12 +75,20 @@ func attachProbe(cmd *exec.Cmd, pin string) probe {
 	// K32GetProcessMemoryInfo needs QUERY_INFORMATION|VM_READ; the affinity
 	// call needs SET_INFORMATION, requested only when pinning.
 	access := uint32(processQueryInformation | processVMRead)
-	mask, pinning := affinityMask(pin)
+	pinning := pin != ""
+	var mask uintptr
 	if pinning {
+		var err error
+		if mask, err = affinityMask(pin); err != nil {
+			return refusePin(cmd, probe{}, err)
+		}
 		access |= processSetInformation
 	}
 	handle, err := syscall.OpenProcess(access, false, uint32(cmd.Process.Pid))
 	if err != nil {
+		if pinning {
+			return refusePin(cmd, probe{}, fmt.Errorf("open the process to pin it: %w", err))
+		}
 		return probe{}
 	}
 	p := probe{handle: handle}
@@ -84,9 +96,11 @@ func attachProbe(cmd *exec.Cmd, pin string) probe {
 		// The child is already running when the mask lands: process start-up
 		// takes a few milliseconds before any benchmark work, and Go exposes no
 		// suspended-start handle to close that window entirely.
-		if r, _, _ := procSetProcessAffinityMask.Call(uintptr(handle), mask); r != 0 {
-			p.pinned = pin
+		r, _, callErr := procSetProcessAffinityMask.Call(uintptr(handle), mask)
+		if r == 0 {
+			return refusePin(cmd, p, fmt.Errorf("SetProcessAffinityMask(%s): %w", pin, callErr))
 		}
+		p.pinned = pin
 	}
 	return p
 }
@@ -118,20 +132,28 @@ func fillRusage(*Measurement, *os.ProcessState) {}
 // tools measured here do not spawn children on Windows.
 func configureKill(*exec.Cmd) {}
 
+// refusePin kills a child whose requested pin could not be applied, so the
+// run fails rather than measuring an unconfined process.
+func refusePin(cmd *exec.Cmd, p probe, err error) probe {
+	_ = cmd.Process.Kill()
+	p.pinErr = err
+	return p
+}
+
 // affinityMask turns "0-7" (or "3") into a processor mask.
-func affinityMask(pin string) (uintptr, bool) {
-	if pin == "" {
-		return 0, false
-	}
+func affinityMask(pin string) (uintptr, error) {
 	first, last, err := ParsePinRange(pin)
 	if err != nil {
-		return 0, false
+		return 0, err
+	}
+	if last >= int(8*unsafe.Sizeof(uintptr(0))) {
+		return 0, fmt.Errorf("CPU %d is beyond one processor group's affinity mask", last)
 	}
 	var mask uintptr
 	for cpu := first; cpu <= last; cpu++ {
 		mask |= 1 << uint(cpu)
 	}
-	return mask, true
+	return mask, nil
 }
 
 func isQuarantineError(err error) bool {

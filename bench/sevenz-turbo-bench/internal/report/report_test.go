@@ -60,6 +60,21 @@ func TestBuildRatiosAndOrientation(t *testing.T) {
 			t.Errorf("report.md lacks %q", want)
 		}
 	}
+	if strings.Contains(md, "CPU pinning") {
+		t.Error("an unpinned run's report.md mentions pinning")
+	}
+}
+
+func TestPinnedRunIsReported(t *testing.T) {
+	raw := sampleRaw()
+	raw.PinCPUs = "0-7"
+	built := Build(raw)
+	if built.PinCPUs != "0-7" {
+		t.Fatalf("report.json pin_cpus %q, want 0-7", built.PinCPUs)
+	}
+	if md := Markdown(built); !strings.Contains(md, "confined to CPUs 0-7") {
+		t.Error("report.md does not state the pinned CPU range")
+	}
 }
 
 func TestCandidateFailureIsReported(t *testing.T) {
@@ -92,15 +107,18 @@ func TestMergeListsEveryHost(t *testing.T) {
 func TestMergeRefusesDifferentWorkloads(t *testing.T) {
 	base := func() *suite.Raw {
 		raw := sampleRaw()
+		raw.Fixtures.Oracle.Banner = "7-Zip (z) 26.01 (arm64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-04-27"
 		raw.Fixtures.Sources = []fixtures.SourceRecord{{SourceSpec: fixtures.SourceSpec{Name: "text"}, SHA256: "aaa"}}
 		raw.Fixtures.Archives = []fixtures.ArchiveRecord{{ArchiveSpec: fixtures.ArchiveSpec{Name: "mt.7z", Source: "text", Args: []string{"-mx=5"}}, SHA256: "host-specific"}}
-		raw.Toolchain.Candidates = []toolchain.Candidate{{Label: "sevenz-turbo", Version: map[string]any{"git_commit": "c1", "cargo_lock_sha256": "l1"}}}
+		raw.Toolchain.Candidates = []toolchain.Candidate{{Label: "sevenz-turbo", Version: map[string]any{"git_commit": "c1", "git_dirty": "false", "cargo_lock_sha256": "l1"}}}
 		return raw
 	}
 	first := Build(base())
 	sameRaw := base()
 	sameRaw.Machine.Label = "other-host"
 	sameRaw.Fixtures.Archives[0].SHA256 = "differs-by-salt"
+	// The same release built for another architecture wrote the same corpus.
+	sameRaw.Fixtures.Oracle.Banner = "7-Zip (z) 26.01 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-04-27"
 	if _, err := Merge([]*Report{first, Build(sameRaw)}); err != nil {
 		t.Fatalf("matching workloads refused: %v", err)
 	}
@@ -112,6 +130,15 @@ func TestMergeRefusesDifferentWorkloads(t *testing.T) {
 		"lock":    func(r *suite.Raw) { r.Toolchain.Candidates[0].Version["cargo_lock_sha256"] = "l2" },
 		"oracle":  func(r *suite.Raw) { r.Toolchain.Oracle.Version = "99.0" },
 		"quick":   func(r *suite.Raw) { r.Quick = !r.Quick },
+		"pinning": func(r *suite.Raw) { r.PinCPUs = "0-7" },
+		"fixture 7zz": func(r *suite.Raw) {
+			r.Fixtures.Oracle.Banner = "7-Zip (z) 25.01 (x64) : Copyright (c) 1999-2025 Igor Pavlov : 2025-08-03"
+		},
+		"only":    func(r *suite.Raw) { r.Only = []string{"decode/mt"} },
+		"repeats": func(r *suite.Raw) { r.Repeats++ },
+		"warmups": func(r *suite.Raw) { r.Warmups++ },
+		"dirty":   func(r *suite.Raw) { r.Toolchain.Candidates[0].Version["git_dirty"] = "true" },
+		"unknown": func(r *suite.Raw) { delete(r.Toolchain.Candidates[0].Version, "git_dirty") },
 	} {
 		raw := base()
 		raw.Machine.Label = "other-host"

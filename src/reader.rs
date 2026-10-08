@@ -649,6 +649,7 @@ impl Archive {
                 .ordered_coder_iter()
                 .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index))),
             opts.limits,
+            0,
         )?;
         let opts = &opts.reserving(reserved_kb);
         let pack_size = archive.pack_sizes[first_pack_stream_index] as usize;
@@ -2104,13 +2105,16 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     .enumerate()
                     .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index))),
                 opts.limits,
+                0,
             )?
         } else {
+            // Under the chain, the pack stream's read buffer (below).
             check_chain_memory(
                 block
                     .ordered_coder_iter()
                     .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index))),
                 opts.limits,
+                crate::decoder::INPUT_BUF_SIZE / 1024,
             )?
         };
         let opts = &opts.reserving(reserved_kb);
@@ -2716,9 +2720,13 @@ impl<R: Read + Seek> ArchiveReader<R> {
 
                 decoder.read_to_end(&mut data).map_err(|e| {
                     // A checksum that did not match is reported located and
-                    // typed, as `for_each_entries` reports it.
+                    // typed, as `for_each_entries` reports it: under a
+                    // password it may be the wrong key decrypting to garbage,
+                    // so it stays `Password` there, never repairable damage.
                     let e = Error::from(e);
-                    if e.is_checksum_failure() {
+                    let checksum = e.is_checksum_failure();
+                    let e = e.maybe_bad_password(!self.password.is_empty());
+                    if checksum {
                         let packed_offset = self
                             .archive
                             .block_pack_streams(block_index)
