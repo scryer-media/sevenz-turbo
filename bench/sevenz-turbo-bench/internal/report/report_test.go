@@ -107,6 +107,7 @@ func TestMergeListsEveryHost(t *testing.T) {
 func TestMergeRefusesDifferentWorkloads(t *testing.T) {
 	base := func() *suite.Raw {
 		raw := sampleRaw()
+		raw.Fixtures.Oracle.Banner = "7-Zip (z) 26.01 (arm64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-04-27"
 		raw.Fixtures.Sources = []fixtures.SourceRecord{{SourceSpec: fixtures.SourceSpec{Name: "text"}, SHA256: "aaa"}}
 		raw.Fixtures.Archives = []fixtures.ArchiveRecord{{ArchiveSpec: fixtures.ArchiveSpec{Name: "mt.7z", Source: "text", Args: []string{"-mx=5"}}, SHA256: "host-specific"}}
 		raw.Toolchain.Candidates = []toolchain.Candidate{{Label: "sevenz-turbo", Version: map[string]any{"git_commit": "c1", "git_dirty": "false", "cargo_lock_sha256": "l1"}}}
@@ -116,6 +117,8 @@ func TestMergeRefusesDifferentWorkloads(t *testing.T) {
 	sameRaw := base()
 	sameRaw.Machine.Label = "other-host"
 	sameRaw.Fixtures.Archives[0].SHA256 = "differs-by-salt"
+	// The same release built for another architecture wrote the same corpus.
+	sameRaw.Fixtures.Oracle.Banner = "7-Zip (z) 26.01 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-04-27"
 	if _, err := Merge([]*Report{first, Build(sameRaw)}); err != nil {
 		t.Fatalf("matching workloads refused: %v", err)
 	}
@@ -128,6 +131,9 @@ func TestMergeRefusesDifferentWorkloads(t *testing.T) {
 		"oracle":  func(r *suite.Raw) { r.Toolchain.Oracle.Version = "99.0" },
 		"quick":   func(r *suite.Raw) { r.Quick = !r.Quick },
 		"pinning": func(r *suite.Raw) { r.PinCPUs = "0-7" },
+		"fixture 7zz": func(r *suite.Raw) {
+			r.Fixtures.Oracle.Banner = "7-Zip (z) 25.01 (x64) : Copyright (c) 1999-2025 Igor Pavlov : 2025-08-03"
+		},
 		"only":    func(r *suite.Raw) { r.Only = []string{"decode/mt"} },
 		"repeats": func(r *suite.Raw) { r.Repeats++ },
 		"warmups": func(r *suite.Raw) { r.Warmups++ },

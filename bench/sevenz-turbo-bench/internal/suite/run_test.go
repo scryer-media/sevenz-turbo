@@ -202,3 +202,41 @@ func TestAnInterruptedRunStopsAtOnce(t *testing.T) {
 		t.Fatalf("a cancelled run started %v and recorded %d runs", got, len(raw.Runs))
 	}
 }
+
+func TestAnEncodeMustTakeTheWholeSource(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "out.7z")
+	if err := os.WriteFile(output, []byte("7z"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	raw := &Raw{Fixtures: &fixtures.Manifest{Sources: []fixtures.SourceRecord{
+		{SourceSpec: fixtures.SourceSpec{Name: "tree"}, TotalBytes: 100, FileCount: 3},
+	}}}
+	scenario := Scenario{ID: "encode/tree/L5", Op: OpEncode, Fixture: "tree"}
+	run := Run{Variant: VariantTurbo, Role: RoleCandidate, Output: output, JSON: true}
+	result := func(files, bytes float64) map[string]any {
+		return map[string]any{"ok": true, "files": files, "bytes_in": bytes}
+	}
+
+	whole := RunRecord{Status: StatusOK, Result: result(3, 100)}
+	fillBytes(raw, scenario, run, &whole)
+	if whole.Status != StatusOK || whole.BytesIn != 100 || whole.BytesOut != 2 {
+		t.Fatalf("a whole encode: %+v", whole)
+	}
+	for name, short := range map[string]map[string]any{
+		"a member skipped": result(2, 60),
+		"bytes missing":    result(3, 90),
+	} {
+		record := RunRecord{Status: StatusOK, Result: short}
+		fillBytes(raw, scenario, run, &record)
+		if record.Status != StatusFailed || record.Failure != "short-input" {
+			t.Fatalf("%s passed: %+v", name, record)
+		}
+	}
+
+	// 7zz a reports no JSON and is not checked this way.
+	oracle := RunRecord{Status: StatusOK}
+	fillBytes(raw, scenario, Run{Variant: VariantOracle, Role: RoleReference, Output: output}, &oracle)
+	if oracle.Status != StatusOK {
+		t.Fatalf("7zz a failed: %+v", oracle)
+	}
+}

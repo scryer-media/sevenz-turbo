@@ -315,6 +315,16 @@ func fillBytes(raw *Raw, scenario Scenario, run Run, record *RunRecord) {
 	case OpEncode:
 		if source, ok := raw.Fixtures.Source(scenario.Fixture); ok {
 			record.BytesIn = source.TotalBytes
+			// decode-bench reports the members it encoded; they must be
+			// the whole source, or the row's throughput is inflated and it
+			// is compared against a 7zz that encoded everything.
+			if record.Status == StatusOK && record.Result != nil {
+				files, bytes := int64(number(record.Result["files"])), int64(number(record.Result["bytes_in"]))
+				if files != int64(source.FileCount) || bytes != source.TotalBytes {
+					record.Status, record.Failure = StatusFailed, "short-input"
+					record.Error = fmt.Sprintf("encoded %d files of %d bytes, the source holds %d of %d", files, bytes, source.FileCount, source.TotalBytes)
+				}
+			}
 		}
 		if info, err := os.Stat(run.Output); err == nil && record.Status == StatusOK {
 			record.BytesOut = info.Size()

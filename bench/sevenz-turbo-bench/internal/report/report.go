@@ -329,6 +329,7 @@ func Load(path string) (*Report, error) {
 
 // Comparable reports whether reports measured the same workload with the same
 // tools, so their rows can share a cross-host table: the same corpus profile
+// written by the same 7zz release
 // and run shape (run profile, --only selection, repeats and warmups), the
 // same CPU pinning, the same source content and archive recipes, the same 7zz
 // release, and every candidate built from the same commit and Cargo.lock.
@@ -388,6 +389,10 @@ func workload(r *Report) (map[string]string, error) {
 	// different thread rows, which the merged table shows as dashes. What
 	// the operator chose is compared instead; with the corpus and the
 	// candidates, it fixes every other row.
+	// The archives' bytes differ per host (salts, attributes), but the 7zz
+	// release that wrote them decides their chunking and sizes, so a corpus
+	// written by another release is another workload.
+	_, key["fixture 7zz version"] = toolchain.ParseBanner(r.Fixtures.Oracle.Banner)
 	for _, source := range r.Fixtures.Sources {
 		key["source "+source.Name] = source.SHA256
 	}
