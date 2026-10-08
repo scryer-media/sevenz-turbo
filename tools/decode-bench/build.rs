@@ -22,6 +22,13 @@ fn main() {
         "cargo:rustc-env=DECODE_BENCH_GIT_DIRTY={}",
         git_dirty(manifest_dir)
     );
+    // The Cargo profile the binary is built under ("release" or "debug"), so
+    // the harness can refuse to time an unoptimised candidate. Cargo sets
+    // PROFILE for build scripts; a custom profile reports the one it inherits.
+    println!(
+        "cargo:rustc-env=DECODE_BENCH_PROFILE={}",
+        std::env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string())
+    );
     let text = std::fs::read_to_string(&lock).unwrap_or_default();
     for (name, env) in [
         ("sevenz-turbo", "DECODE_BENCH_SEVENZ_TURBO_VERSION"),

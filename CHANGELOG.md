@@ -594,6 +594,19 @@ Everything here is new surface; no upstream signature changed meaning.
 
 ## 0.27.0 - 2026-10-07
 
+- Bench harness: `run` refuses an `--out` whose `scratch` directory already
+  exists instead of deleting it at the end of the run.
+- `sevenz_turbo::sha256` digests with the backend `crypto_backend` names.
+  decode-bench takes its `Cargo.lock` digest through it, so the
+  `native-crypto` candidate no longer links AWS-LC's SHA-256 beside
+  RustCrypto's for that one digest.
+- The memory limit charges a PPMd coder for the 64 KiB input buffer it reads
+  through as well as its model, in the per-coder check and the chain check
+  alike, so the buffer is counted before the coder is built.
+- decode-bench reports the Cargo profile it was built under as
+  `build_profile`, and the bench harness refuses a candidate that does not
+  report `release` and counts the profile in the identity the native
+  candidate must share with the primary one.
 - Each folder's LZMA and LZMA2 coder is sized to the folder. Every folder was
   set up with the full dictionary and, with more than one thread allowed, a
   multi-threaded LZMA2 coder that buffers a whole 32 MiB block, so a

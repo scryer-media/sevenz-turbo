@@ -212,11 +212,11 @@ const CARGO_LOCK: &[u8] = include_bytes!("../../../Cargo.lock");
 
 /// The SHA-256 of [`CARGO_LOCK`], lower-case hex: the same digest the harness
 /// takes of a checkout's `Cargo.lock`, to tell whether that checkout built
-/// this binary.
+/// this binary. Taken by the crate's own backend, so the `native-crypto`
+/// build does not carry AWS-LC's SHA-256 beside RustCrypto's for this one
+/// digest.
 fn cargo_lock_sha256() -> String {
-    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CARGO_LOCK);
-    digest
-        .as_ref()
+    sevenz_turbo::sha256(CARGO_LOCK)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -265,14 +265,15 @@ fn locked_ppmd_crates() -> Vec<String> {
 }
 
 /// What the binary is: the crate version, the cryptography backend and LZMA
-/// encoder the build selected, the commit and `Cargo.lock` it was built from
-/// and whether its sources had uncommitted changes then, and the versions
-/// locked when it was built.
+/// encoder the build selected, the Cargo profile it was built under, the
+/// commit and `Cargo.lock` it was built from and whether its sources had
+/// uncommitted changes then, and the versions locked when it was built.
 fn version() -> Fields {
     vec![
         ("decode_bench", str(env!("CARGO_PKG_VERSION"))),
         ("crypto_backend", str(sevenz_turbo::crypto_backend())),
         ("lzma_encoder", str(sevenz_turbo::lzma_encoder())),
+        ("build_profile", str(env!("DECODE_BENCH_PROFILE"))),
         ("git_commit", str(env!("DECODE_BENCH_GIT_COMMIT"))),
         ("git_dirty", str(env!("DECODE_BENCH_GIT_DIRTY"))),
         ("cargo_lock_sha256", Json::Str(cargo_lock_sha256())),

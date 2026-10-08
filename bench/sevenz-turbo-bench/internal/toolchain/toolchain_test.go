@@ -144,9 +144,20 @@ func TestCheckEncoder(t *testing.T) {
 	}
 }
 
+func TestCheckProfile(t *testing.T) {
+	if CheckProfile(Candidate{Version: map[string]any{"build_profile": "release"}}, "--candidate") != nil {
+		t.Fatal("a release build was refused")
+	}
+	for _, version := range []map[string]any{{"build_profile": "debug"}, {"build_profile": "unknown"}, {}} {
+		if CheckProfile(Candidate{Version: version}, "--candidate") == nil {
+			t.Errorf("%v was accepted", version)
+		}
+	}
+}
+
 func TestSameBuild(t *testing.T) {
 	build := func(change func(map[string]any)) Candidate {
-		version := map[string]any{"git_commit": "abc", "git_dirty": "false", "cargo_lock_sha256": "l1", "sevenz_turbo": "0.27.0", "lzma_turbo": "0.7.0"}
+		version := map[string]any{"git_commit": "abc", "git_dirty": "false", "cargo_lock_sha256": "l1", "build_profile": "release", "sevenz_turbo": "0.27.0", "lzma_turbo": "0.7.0"}
 		if change != nil {
 			change(version)
 		}
@@ -159,6 +170,7 @@ func TestSameBuild(t *testing.T) {
 		"commit":  func(v map[string]any) { v["git_commit"] = "def" },
 		"lock":    func(v map[string]any) { v["cargo_lock_sha256"] = "l2" },
 		"version": func(v map[string]any) { v["lzma_turbo"] = "0.6.0" },
+		"profile": func(v map[string]any) { v["build_profile"] = "debug" },
 		"dirty":   func(v map[string]any) { v["git_dirty"] = "true" },
 		"missing": func(v map[string]any) { delete(v, "git_commit") },
 	} {

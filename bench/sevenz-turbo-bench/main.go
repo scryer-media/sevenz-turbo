@@ -199,6 +199,9 @@ func (f toolFlags) collect(ctx context.Context) (toolchain.Toolchain, suite.Tool
 	if err := toolchain.CheckEncoder(primary, "--candidate"); err != nil {
 		return toolchain.Toolchain{}, suite.Tools{}, prerequisite{err}
 	}
+	if err := toolchain.CheckProfile(primary, "--candidate"); err != nil {
+		return toolchain.Toolchain{}, suite.Tools{}, prerequisite{err}
+	}
 	// The checkout's rustc, commit and Cargo.lock describe the candidate only
 	// when the candidate says it was built from that commit and lock.
 	chain := toolchain.Toolchain{Candidates: []toolchain.Candidate{primary}, Rust: toolchain.BindRust(rust, primary), LinkedLzmaTurbo: primary.Field("lzma_turbo")}
@@ -212,6 +215,9 @@ func (f toolFlags) collect(ctx context.Context) (toolchain.Toolchain, suite.Tool
 			return toolchain.Toolchain{}, suite.Tools{}, prerequisite{fmt.Errorf("%w: build it with --features native-crypto", err)}
 		}
 		if err := toolchain.CheckEncoder(native, "--candidate-native"); err != nil {
+			return toolchain.Toolchain{}, suite.Tools{}, prerequisite{err}
+		}
+		if err := toolchain.CheckProfile(native, "--candidate-native"); err != nil {
 			return toolchain.Toolchain{}, suite.Tools{}, prerequisite{err}
 		}
 		if err := toolchain.SameBuild(primary, native); err != nil {
@@ -353,6 +359,14 @@ func cmdRun(ctx context.Context, args []string) int {
 	scratch := filepath.Join(os.TempDir(), "sevenz-turbo-bench-list-scratch")
 	if !*list {
 		scratch = filepath.Join(*out, "scratch")
+		// The run creates this directory and removes it when it finishes,
+		// so one that already exists was not ours and may hold the
+		// operator's files; refuse it rather than delete it.
+		if _, err := os.Stat(scratch); err == nil {
+			return fail(fmt.Errorf("%s already exists; remove it or choose another --out", scratch))
+		} else if !os.IsNotExist(err) {
+			return fail(err)
+		}
 		if err := os.MkdirAll(scratch, 0o755); err != nil {
 			return fail(err)
 		}

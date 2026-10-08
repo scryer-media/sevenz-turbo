@@ -44,9 +44,11 @@ parse, a full decode on the convenience or the single-parse streaming path,
 optionally under `--memory-limit` or with the upstream engine, or an encode
 at a level and thread count), printing one JSON line, so the caller can take
 the operation's peak RSS from the exited process. `op version` reports the
-crypto backend and the locked `lzma-turbo`, `sevenz-rust2`, `aws-lc-rs` and
-`crc-fast` versions, and every `ppmd-*` crate the lock carries with its
-version (`ppmd_crates`, and `ppmd_turbo` on its own).
+crypto backend, the Cargo build profile and the locked `lzma-turbo`,
+`sevenz-rust2`, `aws-lc-rs` and `crc-fast` versions, and every `ppmd-*` crate
+the lock carries with its version (`ppmd_crates`, and `ppmd_turbo` on its
+own); the harness refuses a candidate that was not built with the `release`
+profile.
 
 It reports the median wall time of `--runs` repetitions, the MiB/s of
 *uncompressed* output, and a 64-bit digest of the extracted bytes, so "the two

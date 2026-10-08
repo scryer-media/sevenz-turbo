@@ -194,10 +194,17 @@ fn sized_coder_memory_kb(coder: &Coder, uncompressed_len: usize) -> Option<usize
     } else if cfg!(feature = "ppmd") && method_id == EncoderMethod::ID_PPMD {
         let size = coder.properties.get(1..5)?;
         let memory_size = u32::from_le_bytes([size[0], size[1], size[2], size[3]]);
-        Some(memory_size.div_ceil(1024) as usize)
+        Some(ppmd_memory_kb(memory_size))
     } else {
         None
     }
+}
+
+/// What a PPMd coder holds: its model, and the [`INPUT_BUF_SIZE`] buffer
+/// [`add_decoder`] reads its input through. One figure, so the chain check
+/// and the per-coder check charge the same thing.
+fn ppmd_memory_kb(memory_size: u32) -> usize {
+    (memory_size.div_ceil(1024) as usize).saturating_add(INPUT_BUF_SIZE.div_ceil(1024))
 }
 
 /// Refuses a coder chain whose sized coders need more decoder memory
@@ -455,7 +462,7 @@ fn get_ppmd_params(coder: &Coder, max_mem_limit_kb: usize) -> Result<PpmdParams,
     })?;
 
     // Checked before the decoder allocates its model.
-    let memory_size_kb = params.mem_size().div_ceil(1024) as usize;
+    let memory_size_kb = ppmd_memory_kb(params.mem_size());
     if memory_size_kb > max_mem_limit_kb {
         return Err(Error::MaxMemLimited {
             max_kb: max_mem_limit_kb,
