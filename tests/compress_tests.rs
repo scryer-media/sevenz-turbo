@@ -1,13 +1,14 @@
+#[cfg(feature = "compress")]
+use std::io::{Cursor, Read};
 #[cfg(all(feature = "compress", feature = "util"))]
 use std::{
     fs::File,
     hash::{Hash, Hasher},
-    io::{Cursor, Read},
 };
 
-#[cfg(all(feature = "compress", feature = "util"))]
+#[cfg(feature = "compress")]
 use sevenz_turbo::encoder_options::*;
-#[cfg(all(feature = "compress", feature = "util"))]
+#[cfg(feature = "compress")]
 use sevenz_turbo::*;
 #[cfg(all(feature = "compress", feature = "util"))]
 use tempfile::*;
