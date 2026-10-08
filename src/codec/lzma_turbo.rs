@@ -3037,7 +3037,7 @@ mod stall_tests {
             assert_eq!(out, plain);
             assert!(rd.dense, "one compressible run should not have widened it");
             assert!(widest <= MT_DENSE_THREADS, "{widest} workers");
-            assert!(MT_SHAPE_RUNS > 1, "one run in a row would flap the count");
+            const { assert!(MT_SHAPE_RUNS > 1, "one run in a row would flap the count") };
         }
     }
 }
