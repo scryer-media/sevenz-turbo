@@ -12,20 +12,26 @@
 //! decode-bench op list   --archive A [--password P]
 //! decode-bench op decode --archive A [--threads N] [--password P]
 //!                        [--memory-limit BYTES] [--no-verify] [--stream]
-//!                        [--engine turbo|upstream]
+//!                        [--engine turbo|upstream] [--digest]
 //! decode-bench op encode --input DIR --out FILE [--level L] [--threads N]
 //!                        [--non-solid] [--password P]
 //! ```
+//!
+//! A decode counts the bytes it drains and does nothing else with them, as
+//! `7zz t` does: the timed rows are run without `--digest`. The harness asks
+//! for the order-sensitive digest of the output in a separate, untimed run,
+//! to hold every engine to the same bytes.
 //!
 //! Exit status 0 with the JSON line on success; 1 with
 //! `{"ok":false,"error":...}` when the operation itself failed; 2 on a usage
 //! error.
 
 use std::fs::File;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use super::{Sink, drain, fork_password};
+use super::{Sink, fork_password};
 
 const USAGE: &str = "usage: decode-bench op version|list|decode|encode [options]";
 
@@ -39,6 +45,7 @@ struct Opts {
     memory_limit: Option<u64>,
     no_verify: bool,
     stream: bool,
+    digest: bool,
     engine: String,
     level: u32,
     non_solid: bool,
@@ -126,6 +133,7 @@ fn parse(args: &[String]) -> Opts {
             }
             "--no-verify" => opts.no_verify = true,
             "--stream" => opts.stream = true,
+            "--digest" => opts.digest = true,
             "--engine" => opts.engine = value(),
             "--level" => {
                 opts.level = value()
@@ -189,12 +197,34 @@ fn str(value: &str) -> Json {
     Json::Str(value.to_string())
 }
 
+/// The `Cargo.lock` this binary was built against.
+const CARGO_LOCK: &[u8] = include_bytes!("../../../Cargo.lock");
+
+/// The SHA-256 of [`CARGO_LOCK`], lower-case hex: the same digest the harness
+/// takes of a checkout's `Cargo.lock`, to tell whether that checkout built
+/// this binary.
+fn cargo_lock_sha256() -> String {
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, CARGO_LOCK);
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// What the binary is: the crate version, the cryptography backend the build
-/// selected, and the versions locked when it was built.
+/// selected, the commit and `Cargo.lock` it was built from, and the versions
+/// locked when it was built.
 fn version() -> Fields {
     vec![
         ("decode_bench", str(env!("CARGO_PKG_VERSION"))),
         ("crypto_backend", str(sevenz_turbo::crypto_backend())),
+        ("git_commit", str(env!("DECODE_BENCH_GIT_COMMIT"))),
+        ("cargo_lock_sha256", Json::Str(cargo_lock_sha256())),
+        (
+            "sevenz_turbo",
+            str(env!("DECODE_BENCH_SEVENZ_TURBO_VERSION")),
+        ),
         ("lzma_turbo", str(env!("DECODE_BENCH_LZMA_TURBO_VERSION"))),
         (
             "sevenz_rust2",
@@ -208,6 +238,47 @@ fn version() -> Fields {
             Json::Int(u64::from(super::all_threads())),
         ),
     ]
+}
+
+/// Where a decode's bytes go: counted, and digested only when `--digest`
+/// asked, so a timed row does no work on the output that `7zz t` does not.
+struct Output {
+    bytes: u64,
+    digest: Option<Sink>,
+}
+
+impl Output {
+    fn new(digest: bool) -> Self {
+        Self {
+            bytes: 0,
+            digest: digest.then(Sink::default),
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.bytes += bytes.len() as u64;
+        if let Some(sink) = &mut self.digest {
+            sink.update(bytes);
+        }
+    }
+
+    fn drain<R: Read + ?Sized>(&mut self, reader: &mut R, buf: &mut [u8]) -> std::io::Result<()> {
+        loop {
+            let read = reader.read(buf)?;
+            if read == 0 {
+                return Ok(());
+            }
+            self.update(&buf[..read]);
+        }
+    }
+
+    /// `bytes_out`, and `digest` when one was taken.
+    fn fields(self, fields: &mut Fields) {
+        fields.push(("bytes_out", Json::Int(self.bytes)));
+        if let Some(mut sink) = self.digest {
+            fields.push(("digest", Json::Str(format!("{:016x}", sink.finish()))));
+        }
+    }
 }
 
 fn archive_path(opts: &Opts) -> &PathBuf {
@@ -258,7 +329,7 @@ fn list(opts: &Opts) -> Result<Fields, String> {
     ])
 }
 
-/// A full decode through this crate, every entry into the digesting sink.
+/// A full decode through this crate, every entry drained into [`Output`].
 ///
 /// `--stream` is the streaming consumer's path rather than the convenience
 /// one: the header is parsed once, each block's pack-stream ranges and
@@ -280,7 +351,7 @@ fn decode_turbo(opts: &Opts) -> Result<Fields, String> {
     reader.set_verify_checksums(!opts.no_verify);
     let handle = reader.lzma2_handle();
 
-    let mut sink = Sink::default();
+    let mut sink = Output::new(opts.digest);
     let mut buf = vec![0u8; 1 << 20];
     let mut entries = 0u64;
     let mut max_spawned = 0u32;
@@ -308,18 +379,27 @@ fn decode_turbo(opts: &Opts) -> Result<Fields, String> {
     let blocks = reader.archive().blocks.len() as u64;
     let mut pack_ranges = 0u64;
     let mut sub_streams = 0u64;
-    let reported = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let reported = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, u32)>::new()));
+    let mut expected = std::collections::BTreeMap::new();
     if opts.stream {
-        let counter = std::sync::Arc::clone(&reported);
+        let sink = std::sync::Arc::clone(&reported);
         reader.set_sub_stream_complete_hook(move |done| {
             // The CRC-32 the decoder already verified; a consumer reporting
-            // per-file integrity takes it from here.
-            std::hint::black_box(done.crc32);
-            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // per-file integrity takes it from here. The pair is checked
+            // against the header once the decode is done.
+            if let Ok(mut reported) = sink.lock() {
+                reported.push((done.sub_stream_index, done.crc32));
+            }
         });
         for block in 0..reader.archive().blocks.len() {
             pack_ranges += reader.archive().block_pack_streams(block).len() as u64;
-            sub_streams += reader.archive().block_sub_streams(block).len() as u64;
+            let streams = reader.archive().block_sub_streams(block);
+            sub_streams += streams.len() as u64;
+            for stream in streams {
+                if let Some(crc) = stream.crc {
+                    expected.insert(stream.index, crc);
+                }
+            }
             let decoder = reader.block_decoder(block).map_err(|e| e.to_string())?;
             decoder
                 .for_each_entries(&mut each)
@@ -330,20 +410,29 @@ fn decode_turbo(opts: &Opts) -> Result<Fields, String> {
             .for_each_entries(&mut each)
             .map_err(|e| e.to_string())?;
     }
-    let digest = sink.finish();
+    let crcs_reported = if opts.stream {
+        let reported = reported
+            .lock()
+            .map_err(|_| "the sub-stream hook panicked".to_string())?;
+        check_reported_crcs(&expected, &reported, !opts.no_verify)?;
+        reported.len() as u64
+    } else {
+        0
+    };
     let mut fields = vec![
         ("engine", str("sevenz-turbo")),
         ("crypto_backend", str(sevenz_turbo::crypto_backend())),
         ("threads", Json::Int(u64::from(opts.threads.max(1)))),
         ("entries", Json::Int(entries)),
         ("blocks", Json::Int(blocks)),
-        ("bytes_out", Json::Int(sink.bytes)),
-        ("digest", Json::Str(format!("{digest:016x}"))),
+    ];
+    sink.fields(&mut fields);
+    fields.extend([
         ("parse_seconds", Json::Float(parse)),
         ("verify", Json::Bool(!opts.no_verify)),
         ("parallel_path", Json::Bool(parallel_seen)),
         ("max_spawned_threads", Json::Int(u64::from(max_spawned))),
-    ];
+    ]);
     if let Some(limit) = opts.memory_limit {
         fields.push(("memory_limit", Json::Int(limit)));
     }
@@ -351,12 +440,50 @@ fn decode_turbo(opts: &Opts) -> Result<Fields, String> {
         fields.push(("stream", Json::Bool(true)));
         fields.push(("pack_ranges", Json::Int(pack_ranges)));
         fields.push(("sub_streams", Json::Int(sub_streams)));
-        fields.push((
-            "crcs_reported",
-            Json::Int(reported.load(std::sync::atomic::Ordering::Relaxed)),
-        ));
+        fields.push(("crcs_reported", Json::Int(crcs_reported)));
     }
     Ok(fields)
+}
+
+/// The streaming lane's check of the sub-stream hook: with verification on,
+/// it fired exactly once for every sub-stream the header records a CRC-32 for,
+/// with that CRC. A hook that stops firing, fires twice, or hands over a
+/// different number fails the row instead of passing it as healthy.
+fn check_reported_crcs(
+    expected: &std::collections::BTreeMap<usize, u32>,
+    reported: &[(usize, u32)],
+    verify: bool,
+) -> Result<(), String> {
+    if !verify {
+        return Ok(());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for &(index, crc) in reported {
+        match expected.get(&index) {
+            None => {
+                return Err(format!(
+                    "sub-stream hook reported unexpected sub-stream {index}"
+                ));
+            }
+            Some(&want) if want != crc => {
+                return Err(format!(
+                    "sub-stream hook reported CRC {crc:08x} for sub-stream {index}, the header records {want:08x}"
+                ));
+            }
+            Some(_) => {}
+        }
+        if !seen.insert(index) {
+            return Err(format!("sub-stream hook reported sub-stream {index} twice"));
+        }
+    }
+    if seen.len() != expected.len() {
+        return Err(format!(
+            "sub-stream hook reported {} of the {} sub-streams with a CRC",
+            seen.len(),
+            expected.len()
+        ));
+    }
+    Ok(())
 }
 
 /// The same decode through upstream `sevenz-rust2`, the secondary reference.
@@ -369,26 +496,25 @@ fn decode_upstream(opts: &Opts) -> Result<Fields, String> {
         .map_or_else(sevenz_rust2::Password::empty, sevenz_rust2::Password::from);
     let mut reader = sevenz_rust2::ArchiveReader::new(file, password).map_err(|e| e.to_string())?;
     reader.set_thread_count(opts.threads.max(1));
-    let mut sink = Sink::default();
+    let mut sink = Output::new(opts.digest);
     let mut buf = vec![0u8; 1 << 20];
     let mut entries = 0u64;
     reader
         .for_each_entries(|entry, rd| {
             if !entry.is_directory() {
                 entries += 1;
-                drain(rd, &mut sink, &mut buf)?;
+                sink.drain(rd, &mut buf)?;
             }
             Ok(true)
         })
         .map_err(|e| e.to_string())?;
-    let digest = sink.finish();
-    Ok(vec![
+    let mut fields = vec![
         ("engine", str("sevenz-rust2")),
         ("threads", Json::Int(u64::from(opts.threads.max(1)))),
         ("entries", Json::Int(entries)),
-        ("bytes_out", Json::Int(sink.bytes)),
-        ("digest", Json::Str(format!("{digest:016x}"))),
-    ])
+    ];
+    sink.fields(&mut fields);
+    Ok(fields)
 }
 
 /// The block size `7zz` uses for a multi-threaded LZMA2 encode when none is
@@ -398,8 +524,100 @@ fn mt_block_size(dict: u32) -> u64 {
     (u64::from(dict) * 4).clamp(1 << 20, 256 << 20)
 }
 
+/// One regular file under an encode's `--input`.
+struct Member {
+    path: PathBuf,
+    /// The archive name: the path relative to `--input`.
+    name: String,
+    size: u64,
+}
+
+/// The files `7zz a` is given for the same source: every regular file under
+/// `input`, skipping top-level names that start with `.` (the fixture
+/// generator's `.complete` marker; the harness leaves them off `7zz`'s
+/// command line too), sorted by relative path so the order of a solid stream
+/// does not depend on how the filesystem enumerates a directory.
+fn source_members(input: &Path) -> Result<Vec<Member>, String> {
+    let mut members = Vec::new();
+    if input.is_file() {
+        let size = std::fs::metadata(input).map_err(|e| e.to_string())?.len();
+        let name = input
+            .file_name()
+            .ok_or_else(|| format!("{} has no file name", input.display()))?
+            .to_string_lossy()
+            .to_string();
+        members.push(Member {
+            path: input.to_path_buf(),
+            name,
+            size,
+        });
+        return Ok(members);
+    }
+    let mut stack = vec![input.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            if dir == input && entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let kind = entry.file_type().map_err(|e| e.to_string())?;
+            if kind.is_dir() {
+                stack.push(entry.path());
+            } else if kind.is_file() {
+                let path = entry.path();
+                let size = entry.metadata().map_err(|e| e.to_string())?.len();
+                let name = path
+                    .strip_prefix(input)
+                    .map_err(|e| e.to_string())?
+                    .to_string_lossy()
+                    .to_string();
+                members.push(Member { path, name, size });
+            }
+        }
+    }
+    members.sort_by(|a, b| {
+        Path::new(&a.name)
+            .components()
+            .cmp(Path::new(&b.name).components())
+    });
+    Ok(members)
+}
+
+/// A member's file, opened on its first read and closed at its end, so a
+/// solid block of thousands of members does not hold thousands of handles.
+struct LazyFile {
+    path: PathBuf,
+    file: Option<File>,
+    done: bool,
+}
+
+impl Read for LazyFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.done {
+            return Ok(0);
+        }
+        let file = match &mut self.file {
+            Some(file) => file,
+            None => self.file.insert(File::open(&self.path)?),
+        };
+        let read = file.read(buf)?;
+        if read == 0 && !buf.is_empty() {
+            self.file = None;
+            self.done = true;
+        }
+        Ok(read)
+    }
+}
+
+/// The largest solid block the crate's own `push_source_path` builds.
+const MAX_SOLID_BLOCK: u64 = 4 << 30;
+
 /// Writes an archive of `--input` (a directory) with LZMA2 at `--level`,
 /// solid unless `--non-solid`, AES-256 when `--password` is given.
+///
+/// The members are walked once, before encoding, and that walk is where the
+/// reported file and byte counts come from: there is no second pass over the
+/// source after the archive is finished.
 fn encode(opts: &Opts) -> Result<Fields, String> {
     use sevenz_turbo::encoder_options::{AesEncoderOptions, EncoderOptions, Lzma2Options};
 
@@ -425,33 +643,60 @@ fn encode(opts: &Opts) -> Result<Fields, String> {
     }
     methods.push(lzma2.into());
 
+    let members = source_members(input)?;
+    let files = members.len() as u64;
+    let bytes_in: u64 = members.iter().map(|m| m.size).sum();
+
     let mut writer = sevenz_turbo::ArchiveWriter::create(out).map_err(|e| e.to_string())?;
     writer.set_content_methods(methods);
+    let entry = |m: &Member| sevenz_turbo::ArchiveEntry::from_path(&m.path, m.name.clone());
     if opts.non_solid {
-        writer
-            .push_source_path_non_solid(input, |_| true)
-            .map_err(|e| e.to_string())?;
+        for member in &members {
+            let file = File::open(&member.path).map_err(|e| e.to_string())?;
+            writer
+                .push_archive_entry(entry(member), Some(file))
+                .map_err(|e| e.to_string())?;
+        }
     } else {
-        writer
-            .push_source_path(input, |_| true)
-            .map_err(|e| e.to_string())?;
+        // The crate's `push_source_path` rule: a block closes before it would
+        // reach 4 GiB, and a member that size or larger is a block of its own.
+        let mut entries = Vec::new();
+        let mut sources = Vec::new();
+        let mut block_bytes = 0u64;
+        for member in &members {
+            let lazy = || LazyFile {
+                path: member.path.clone(),
+                file: None,
+                done: false,
+            };
+            if member.size >= MAX_SOLID_BLOCK {
+                writer
+                    .push_archive_entry(entry(member), Some(lazy()))
+                    .map_err(|e| e.to_string())?;
+                continue;
+            }
+            if block_bytes + member.size >= MAX_SOLID_BLOCK {
+                writer
+                    .push_archive_entries(
+                        std::mem::take(&mut entries),
+                        std::mem::take(&mut sources),
+                    )
+                    .map_err(|e| e.to_string())?;
+                block_bytes = 0;
+            }
+            block_bytes += member.size;
+            entries.push(entry(member));
+            sources.push(sevenz_turbo::SourceReader::new(lazy()));
+        }
+        if !entries.is_empty() {
+            writer
+                .push_archive_entries(entries, sources)
+                .map_err(|e| e.to_string())?;
+        }
     }
     writer.finish().map_err(|e| e.to_string())?;
 
     let bytes_out = std::fs::metadata(out).map_err(|e| e.to_string())?.len();
-    let mut bytes_in = 0u64;
-    let mut files = 0u64;
-    let mut stack = vec![input.clone()];
-    while let Some(dir) = stack.pop() {
-        if dir.is_file() {
-            bytes_in += std::fs::metadata(&dir).map_err(|e| e.to_string())?.len();
-            files += 1;
-            continue;
-        }
-        for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
-            stack.push(entry.map_err(|e| e.to_string())?.path());
-        }
-    }
     Ok(vec![
         ("engine", str("sevenz-turbo")),
         ("crypto_backend", str(sevenz_turbo::crypto_backend())),
@@ -465,4 +710,115 @@ fn encode(opts: &Opts) -> Result<Fields, String> {
         ("bytes_in", Json::Int(bytes_in)),
         ("bytes_out", Json::Int(bytes_out)),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use super::{Opts, check_reported_crcs, encode, source_members};
+
+    /// A scratch directory under the system temp dir, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("decode-bench-op-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tree(root: &std::path::Path) {
+        for (name, bytes) in [
+            ("zeta.txt", &b"zeta"[..]),
+            ("alpha/b.bin", b"bb"),
+            ("alpha/a.bin", b"a"),
+            ("mid/.nested-dot", b"kept"),
+            (".complete", b"marker"),
+            (".hidden/inner.txt", b"skipped"),
+        ] {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn members_are_sorted_and_skip_top_level_dot_names() {
+        let scratch = Scratch::new("members");
+        tree(&scratch.0);
+        let members = source_members(&scratch.0).unwrap();
+        let names: Vec<_> = members.iter().map(|m| m.name.replace('\\', "/")).collect();
+        assert_eq!(
+            names,
+            ["alpha/a.bin", "alpha/b.bin", "mid/.nested-dot", "zeta.txt"]
+        );
+        assert_eq!(members.iter().map(|m| m.size).sum::<u64>(), 1 + 2 + 4 + 4);
+    }
+
+    #[test]
+    fn an_encode_writes_the_sorted_members_without_the_marker() {
+        let scratch = Scratch::new("encode");
+        let input = scratch.0.join("src");
+        tree(&input);
+        for non_solid in [false, true] {
+            let out = scratch.0.join(format!("out-{non_solid}.7z"));
+            let opts = Opts {
+                input: Some(input.clone()),
+                out: Some(out.clone()),
+                threads: 1,
+                level: 1,
+                non_solid,
+                ..Opts::default()
+            };
+            encode(&opts).unwrap();
+            let archive = sevenz_turbo::Archive::open(&out).unwrap();
+            let names: Vec<_> = archive
+                .files
+                .iter()
+                .map(|f| f.name.replace('\\', "/"))
+                .collect();
+            assert_eq!(
+                names,
+                ["alpha/a.bin", "alpha/b.bin", "mid/.nested-dot", "zeta.txt"],
+                "non_solid {non_solid}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stream_lane_refuses_a_hook_that_misses_or_misreports() {
+        let expected: BTreeMap<usize, u32> = [(0, 0xAA), (1, 0xBB), (2, 0xCC)].into();
+        assert!(check_reported_crcs(&expected, &[(0, 0xAA), (1, 0xBB), (2, 0xCC)], true).is_ok());
+        // One file never reported.
+        assert!(check_reported_crcs(&expected, &[(0, 0xAA), (2, 0xCC)], true).is_err());
+        // Nothing reported at all.
+        assert!(check_reported_crcs(&expected, &[], true).is_err());
+        // A wrong CRC, a duplicate and a stranger.
+        assert!(check_reported_crcs(&expected, &[(0, 0xAA), (1, 0x00), (2, 0xCC)], true).is_err());
+        assert!(
+            check_reported_crcs(
+                &expected,
+                &[(0, 0xAA), (0, 0xAA), (1, 0xBB), (2, 0xCC)],
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            check_reported_crcs(&expected, &[(0, 0xAA), (1, 0xBB), (2, 0xCC), (9, 1)], true)
+                .is_err()
+        );
+        // Without verification the hook is not held to anything.
+        assert!(check_reported_crcs(&expected, &[], false).is_ok());
+    }
 }
