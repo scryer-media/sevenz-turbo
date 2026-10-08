@@ -49,7 +49,12 @@ func Markdown(report *Report) string {
 		fmt.Fprintf(&b, "- memory: %.1f GiB\n", float64(m.MemoryBytes)/(1<<30))
 	}
 	fmt.Fprintf(&b, "- ISA: %s (from %s)\n", strings.Join(m.ISA, " "), strings.Join(m.ISASources, ", "))
-	fmt.Fprintf(&b, "- run: %s to %s, profile %s, quick=%t\n\n", report.StartedUTC, report.FinishedUTC, report.Profile, report.Quick)
+	if report.RunProfile != "" {
+		fmt.Fprintf(&b, "- run: %s to %s, run profile %s over the %s corpus, %d repeat(s), %d warmup(s)\n\n", report.StartedUTC,
+			report.FinishedUTC, report.RunProfile, report.Profile, report.Repeats, report.Warmups)
+	} else {
+		fmt.Fprintf(&b, "- run: %s to %s, profile %s, quick=%t\n\n", report.StartedUTC, report.FinishedUTC, report.Profile, report.Quick)
+	}
 	t := report.Toolchain
 	fmt.Fprintln(&b, "## Toolchain")
 	fmt.Fprintln(&b)

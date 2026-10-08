@@ -66,6 +66,7 @@ type Raw struct {
 	Machine        host.Machine        `json:"machine"`
 	Toolchain      toolchain.Toolchain `json:"toolchain"`
 	Fixtures       *fixtures.Manifest  `json:"fixtures"`
+	RunProfile     string              `json:"run_profile,omitempty"`
 	Quick          bool                `json:"quick"`
 	Warmups        int                 `json:"warmups"`
 	Repeats        int                 `json:"repeats"`

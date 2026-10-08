@@ -92,6 +92,7 @@ type Report struct {
 	Machine       host.Machine              `json:"machine"`
 	Toolchain     toolchain.Toolchain       `json:"toolchain"`
 	Profile       string                    `json:"profile"`
+	RunProfile    string                    `json:"run_profile,omitempty"`
 	Quick         bool                      `json:"quick"`
 	Warmups       int                       `json:"warmups"`
 	Repeats       int                       `json:"repeats"`
@@ -110,7 +111,7 @@ func Build(raw *suite.Raw) *Report {
 	report := &Report{
 		SchemaVersion: 1, Schema: Schema, Orientation: Orientation,
 		StartedUTC: raw.StartedUTC, FinishedUTC: raw.FinishedUTC, Machine: raw.Machine, Toolchain: raw.Toolchain,
-		Quick: raw.Quick, Warmups: raw.Warmups, Repeats: raw.Repeats, Scenarios: raw.Scenarios,
+		RunProfile: raw.RunProfile, Quick: raw.Quick, Warmups: raw.Warmups, Repeats: raw.Repeats, Scenarios: raw.Scenarios,
 		Failures: []string{}, SecondaryFailures: []string{},
 	}
 	if raw.Fixtures != nil {

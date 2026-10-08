@@ -147,3 +147,23 @@ func TestDefaultSettingsSweep(t *testing.T) {
 		t.Fatalf("quick: %v", got)
 	}
 }
+
+func TestRunProfiles(t *testing.T) {
+	for name, want := range map[string]RunProfile{
+		ProfileQuick: {Name: ProfileQuick, Quick: true, Corpus: "quick", Repeats: 2, Warmups: 0},
+		ProfileFull:  {Name: ProfileFull, Corpus: "full", Repeats: 5, Warmups: 1},
+		ProfileFleet: {Name: ProfileFleet, Corpus: "full", Repeats: 3, Warmups: 1},
+	} {
+		got, err := ProfileByName(name)
+		if err != nil || got != want {
+			t.Errorf("%s = %+v, %v; want %+v", name, got, err, want)
+		}
+	}
+	if _, err := ProfileByName("nightly"); err == nil {
+		t.Error("an unknown profile is accepted")
+	}
+	scenarios := []Scenario{{Variants: make([]Run, 2)}, {Variants: make([]Run, 4)}}
+	if n := Processes(scenarios, 3, 1); n != 24 {
+		t.Errorf("Processes = %d, want 24", n)
+	}
+}

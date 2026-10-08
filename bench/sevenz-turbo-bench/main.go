@@ -3,7 +3,8 @@
 //
 //	sevenz-turbo-bench fixtures  [--dir D] [--profile full|quick] [--oracle 7zz] [--only a.7z,...]
 //	sevenz-turbo-bench toolchain [--candidate B] [--candidate-native B] [--oracle 7zz] [--repo R]
-//	sevenz-turbo-bench run       --out DIR [--dir D] [--quick] [--candidate B] [--candidate-native B]
+//	sevenz-turbo-bench run       --out DIR [--dir D] [--profile quick|full|fleet] [--quick] [--list]
+//	                             [--candidate B] [--candidate-native B]
 //	                             [--oracle 7zz] [--machine LABEL] [--repeats N] [--warmups N]
 //	                             [--only SUBSTR,...] [--pin-cpus 0-7] [--timeout 1h]
 //	sevenz-turbo-bench report    --input raw.json --out report.json [--md report.md]
@@ -248,46 +249,60 @@ func cmdRun(ctx context.Context, args []string) int {
 	set := flag.NewFlagSet("run", flag.ContinueOnError)
 	tools := addToolFlags(set)
 	out := set.String("out", "", "results directory (raw.json, report.json, report.md)")
-	dir := set.String("dir", "", "corpus directory (default bench/fixtures/<full|quick>, or $SEVENZ_BENCH_FIXTURES)")
-	quick := set.Bool("quick", false, "the smoke subset over the quick corpus: threads 1/all, levels 1/5, 2 repeats, no warmup")
+	dir := set.String("dir", "", "corpus directory (default bench/fixtures/<the profile's corpus>, or $SEVENZ_BENCH_FIXTURES)")
+	profileName := set.String("profile", "", "run profile: quick (the smoke subset over the quick corpus: threads 1/all, levels 1/5, 2 repeats, no warmup), "+
+		"full (every scenario over the full corpus, 5 repeats, 1 warmup; the default) or "+
+		"fleet (every scenario over the full corpus, 3 repeats, 1 warmup)")
+	quick := set.Bool("quick", false, "the same as --profile quick")
+	list := set.Bool("list", false, "print the planned scenarios and the plan's size, then exit without running")
 	machine := set.String("machine", env("SEVENZ_BENCH_MACHINE", hostname()), "host label in the report (e.g. c7i.4xlarge-us-east-1)")
-	repeats := set.Int("repeats", -1, "measured runs per variant (default 5, quick 2)")
-	warmups := set.Int("warmups", -1, "discarded runs per variant before the measured ones (default 1, quick 0)")
+	repeats := set.Int("repeats", -1, "measured runs per variant (default: the profile's, full 5, fleet 3, quick 2)")
+	warmups := set.Int("warmups", -1, "discarded runs per variant before the measured ones (default: the profile's, full and fleet 1, quick 0)")
 	only := set.String("only", "", "comma-separated substrings; run only scenarios whose id contains one")
 	pin := set.String("pin-cpus", env("SEVENZ_BENCH_PIN_CPUS", ""), "inclusive CPU range to confine every process to (Linux taskset, Windows affinity)")
 	timeout := set.Duration("timeout", time.Hour, "per-process bound; a run past it is recorded as DNF")
 	if !parse(set, args) {
 		return exitUsage
 	}
-	if *out == "" {
+	if *quick {
+		if *profileName != "" && *profileName != suite.ProfileQuick {
+			fmt.Fprintf(os.Stderr, "run: --quick and --profile %s disagree\n", *profileName)
+			return exitUsage
+		}
+		*profileName = suite.ProfileQuick
+	}
+	if *profileName == "" {
+		*profileName = suite.ProfileFull
+	}
+	profile, err := suite.ProfileByName(*profileName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "run: %v\n", err)
+		return exitUsage
+	}
+	*quick = profile.Quick
+	if *out == "" && !*list {
 		fmt.Fprintln(os.Stderr, "run: --out is required")
 		return exitUsage
 	}
 	if *repeats < 0 {
-		*repeats = 5
-		if *quick {
-			*repeats = 2
-		}
+		*repeats = profile.Repeats
 	}
 	if *warmups < 0 {
-		*warmups = 1
-		if *quick {
-			*warmups = 0
-		}
+		*warmups = profile.Warmups
 	}
 	if *repeats < 1 {
 		fmt.Fprintln(os.Stderr, "run: --repeats must be at least 1")
 		return exitUsage
 	}
 	if *dir == "" {
-		*dir = defaultFixtureDir(*quick)
+		*dir = defaultFixtureDir(profile.Corpus == "quick")
 	}
 	manifest, err := fixtures.Load(*dir)
 	if err != nil {
 		return fail(prerequisite{fmt.Errorf("fixtures in %s: %w (run `sevenz-turbo-bench fixtures` first)", *dir, err)})
 	}
-	if *quick && manifest.Profile != "quick" {
-		fmt.Fprintf(os.Stderr, "run: note: --quick over the %s corpus in %s\n", manifest.Profile, *dir)
+	if manifest.Profile != profile.Corpus {
+		fmt.Fprintf(os.Stderr, "run: note: profile %s over the %s corpus in %s\n", profile.Name, manifest.Profile, *dir)
 	}
 	chain, binaries, err := tools.collect(ctx)
 	if err != nil {
@@ -297,9 +312,13 @@ func cmdRun(ctx context.Context, args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	scratch := filepath.Join(*out, "scratch")
-	if err := os.MkdirAll(scratch, 0o755); err != nil {
-		return fail(err)
+	// --list plans against a scratch path it never creates.
+	scratch := filepath.Join(os.TempDir(), "sevenz-turbo-bench-list-scratch")
+	if !*list {
+		scratch = filepath.Join(*out, "scratch")
+		if err := os.MkdirAll(scratch, 0o755); err != nil {
+			return fail(err)
+		}
 	}
 	scratch, _ = filepath.Abs(scratch)
 	settings := suite.DefaultSettings(*quick, runtime.NumCPU())
@@ -319,9 +338,19 @@ func cmdRun(ctx context.Context, args []string) int {
 		}
 		scenarios = kept
 	}
+	planLine := fmt.Sprintf("profile %s over the %s corpus: %d scenarios, %d processes at %d repeat(s) + %d warmup(s)",
+		profile.Name, manifest.Profile, len(scenarios), suite.Processes(scenarios, *repeats, *warmups), *repeats, *warmups)
+	if *list {
+		for _, scenario := range scenarios {
+			fmt.Printf("%s (%d variants)\n", scenario.ID, len(scenario.Variants))
+		}
+		fmt.Println(planLine)
+		return exitOK
+	}
+	fmt.Fprintf(os.Stderr, "run: %s\n", planLine)
 	raw := &suite.Raw{
 		SchemaVersion: 1, Schema: suite.RawSchema, StartedUTC: time.Now().UTC().Format(time.RFC3339),
-		Machine: host.Collect(ctx, *machine), Toolchain: chain, Fixtures: manifest, Quick: *quick,
+		Machine: host.Collect(ctx, *machine), Toolchain: chain, Fixtures: manifest, RunProfile: profile.Name, Quick: *quick,
 		Warmups: *warmups, Repeats: *repeats, Threads: settings.Threads, PinCPUs: *pin,
 		TimeoutSeconds: timeout.Seconds(), Scenarios: scenarios, Runs: []suite.RunRecord{},
 	}

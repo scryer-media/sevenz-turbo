@@ -31,8 +31,8 @@ Variants:
 | `7zz` | reference (oracle) | the official 7-Zip console binary: `7zz t` (decode), `7zz l -slt` (list), `7zz a` (encode) |
 | `sevenz-rust2` | secondary | upstream `sevenz-rust2 =0.22.2`, already linked by `decode-bench`; decode rows only, informational |
 
-The matrix (`T` = threads; the full sweep is 1, 2, 4, 8, 16 below the core
-count, then `all`; `--quick` runs 1 and `all`):
+The matrix (`T` = threads; the full and fleet sweep is 1, 2, 4, 8, 16 below
+the core count, then `all`; `--quick` runs 1 and `all`):
 
 | group | scenarios | what it shows |
 |---|---|---|
@@ -118,7 +118,7 @@ B=./dist
 $B/sevenz-turbo-bench fixtures --profile full --dir work/fixtures --oracle /opt/7zip/7zz
 $B/sevenz-turbo-bench toolchain --candidate $B/decode-bench --candidate-native $B/decode-bench-native \
     --oracle /opt/7zip/7zz > results/toolchain.json
-$B/sevenz-turbo-bench run --dir work/fixtures --out results \
+$B/sevenz-turbo-bench run --profile fleet --dir work/fixtures --out results \
     --candidate $B/decode-bench --candidate-native $B/decode-bench-native \
     --oracle /opt/7zip/7zz --machine c7i.4xlarge-us-east-1
 echo "rc=$?"
@@ -133,8 +133,27 @@ protocol rarpar-bench's macro suites use:
 $B/sevenz-turbo-bench report --input results/raw.json --out results/report.json
 ```
 
-A smoke run: `fixtures --profile quick` then `run --quick` (threads 1 and
-`all`, levels 1 and 5, 2 repeats, no warmup) takes a few minutes.
+`run --profile` picks the corpus, the matrix and the repeats. The explicit
+flags (`--dir`, `--repeats`, `--warmups`, `--only`) then override it. There
+are three profiles:
+
+| profile | corpus | matrix | repeats + warmups |
+|---|---|---|---|
+| `quick` (the same as `--quick`) | quick | threads 1 and `all`, levels 1 and 5 | 2 + 0 |
+| `full` (the default) | full | every scenario | 5 + 1 |
+| `fleet` | full | every scenario | 3 + 1 |
+
+A smoke run is `fixtures --profile quick` then `run --quick`, which takes a
+few minutes. `fleet` keeps every scenario of `full`, 52 on an 18-core host
+(the thread sweep stops below the core count), and only cuts the repeats.
+From the quick-corpus numbers scaled to the full corpus, it projects to about
+4.5 hours on a 12- or 16-thread x86 host. Most of that is a handful of rows:
+the non-solid tree encode, the PPMd decode (mostly its secondary
+sevenz-rust2 variant), the AES and single-thread level 3, 7 and 9 encodes,
+and the solid tree encode, each projected at 10 minutes or more there.
+`run --list` prints the planned scenarios, then their count and the number of
+processes the run will launch, and exits; `run` logs the same plan line
+before it starts.
 
 ### Flags and environment
 
@@ -143,11 +162,13 @@ A smoke run: `fixtures --profile quick` then `run --quick` (threads 1 and
 | `--candidate` | `SEVENZ_BENCH_CANDIDATE` | `<repo>/target/release/decode-bench` when run inside a checkout |
 | `--candidate-native` | `SEVENZ_BENCH_CANDIDATE_NATIVE` | none: the native-crypto rows are skipped |
 | `--oracle` | `SEVENZ_BENCH_ORACLE` | `7zz`, `7zz.exe`, `7z`, `7za` on `PATH` |
-| `--dir` | `SEVENZ_BENCH_FIXTURES` | `bench/fixtures/full` (`quick` with `--quick`) |
+| `--profile` | | `full`; also `quick` and `fleet` (above) |
+| `--dir` | `SEVENZ_BENCH_FIXTURES` | `bench/fixtures/<the profile's corpus>`: `full` for `full` and `fleet`, `quick` for `quick` |
 | `--machine` | `SEVENZ_BENCH_MACHINE` | the hostname |
 | `--repo` | `SEVENZ_BENCH_REPO` | the git toplevel of the working directory, for rustc/commit/Cargo.lock provenance |
 | `--pin-cpus 0-7` | `SEVENZ_BENCH_PIN_CPUS` | none (Linux `taskset`, Windows affinity mask; not macOS) |
-| `--repeats`, `--warmups` | | 5 and 1 (quick: 2 and 0) |
+| `--repeats`, `--warmups` | | the profile's: 5 and 1 (fleet: 3 and 1, quick: 2 and 0) |
+| `--list` | | off: print the plan and exit without running |
 | `--timeout` | | 1h per process; a run past it is recorded as DNF |
 | `--only a,b` | | run only scenarios whose id contains one of the substrings |
 | | `SEVENZ_BENCH_INSTANCE_TYPE` | recorded in the host descriptor (e.g. `c7g.4xlarge`); never probed |

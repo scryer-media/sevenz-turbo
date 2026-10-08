@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 
 	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/fixtures"
 )
@@ -125,6 +126,51 @@ func DefaultSettings(quick bool, cpus int) Settings {
 	}
 	settings.BudgetThreads = strconv.Itoa(min(8, cpus))
 	return settings
+}
+
+// Run profiles: which corpus, matrix, repeats and warmups `run --profile`
+// selects.
+const (
+	ProfileQuick = "quick" // the smoke subset over the quick corpus
+	ProfileFull  = "full"  // the whole matrix over the full corpus, 5 repeats
+	ProfileFleet = "fleet" // the whole matrix over the full corpus, 3 repeats
+)
+
+// Profiles lists the run profiles in the order the help text gives them.
+var Profiles = []string{ProfileQuick, ProfileFull, ProfileFleet}
+
+// RunProfile is a profile's defaults. Corpus is the fixture profile its
+// default --dir holds.
+type RunProfile struct {
+	Name    string
+	Quick   bool
+	Corpus  string
+	Repeats int
+	Warmups int
+}
+
+// ProfileByName returns a run profile. fleet is the full matrix, every
+// scenario, at three repeats instead of five: the fleet's time goes on the
+// full corpus's rows, not on more of them.
+func ProfileByName(name string) (RunProfile, error) {
+	switch name {
+	case ProfileQuick:
+		return RunProfile{Name: name, Quick: true, Corpus: "quick", Repeats: 2, Warmups: 0}, nil
+	case ProfileFull:
+		return RunProfile{Name: name, Corpus: "full", Repeats: 5, Warmups: 1}, nil
+	case ProfileFleet:
+		return RunProfile{Name: name, Corpus: "full", Repeats: 3, Warmups: 1}, nil
+	}
+	return RunProfile{}, fmt.Errorf("unknown profile %q (want %s)", name, strings.Join(Profiles, ", "))
+}
+
+// Processes is how many processes a planned matrix launches.
+func Processes(scenarios []Scenario, repeats, warmups int) int {
+	n := 0
+	for _, scenario := range scenarios {
+		n += len(scenario.Variants) * (repeats + warmups)
+	}
+	return n
 }
 
 // ResolveThreads turns "all" into the core count, as both sides are given a
