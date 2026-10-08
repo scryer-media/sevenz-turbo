@@ -460,6 +460,9 @@ Everything here is new surface; no upstream signature changed meaning.
   archive was reopened than the writer reported when it was pushed. The
   first entry of a block now carries the sum of every pack stream the block
   reads.
+- The one-block rule applies to the `lzma-rust2-encoder` build as well: a
+  folder known to fit one LZMA2 block is coded by `lzma-rust2`'s
+  single-threaded writer instead of starting its multi-threaded one.
 
 ## 0.26.1 - 2026-09-29
 

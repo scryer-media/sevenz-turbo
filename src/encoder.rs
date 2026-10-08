@@ -394,25 +394,41 @@ fn lzma2_property_for(dict_size: u32) -> u8 {
         .unwrap_or(40)
 }
 
-/// The block size and block-thread count `lzma-turbo`'s LZMA2 coder runs with.
+/// Whether the folder these options were sized for is known to fit one LZMA2
+/// block.
 ///
-/// One thread is the solid stream; block threads need a block size, and a
-/// chunk size without threads changes nothing. A folder known to fit one block
-/// is that block on one thread: the same bytes the block-parallel coder would
-/// produce, without starting its pool and buffering the block per folder.
-#[cfg(not(feature = "lzma-rust2-encoder"))]
-fn lzma2_block_plan(options: &Lzma2Options) -> (u64, usize) {
-    let fits_one_block = |block_size: u64| {
+/// Such a folder is that block on one thread, whichever encoder codes it: the
+/// same bytes the block-parallel coder would produce, without starting its
+/// pool and buffering the block per folder.
+fn lzma2_fits_one_block(options: &Lzma2Options) -> bool {
+    options.block_size().is_some_and(|block_size| {
         options
             .settings
             .input_size()
             .is_some_and(|size| size <= block_size)
-    };
+    })
+}
+
+/// The block size and block-thread count `lzma-turbo`'s LZMA2 coder runs with.
+///
+/// One thread is the solid stream; block threads need a block size, and a
+/// chunk size without threads changes nothing. A folder that fits one block
+/// (see [`lzma2_fits_one_block`]) runs on one thread.
+#[cfg(not(feature = "lzma-rust2-encoder"))]
+fn lzma2_block_plan(options: &Lzma2Options) -> (u64, usize) {
     match (options.threads, options.block_size()) {
         (0 | 1, _) | (_, None) => (lzma_turbo::BLOCK_SIZE_SOLID, 1),
-        (_, Some(block_size)) if fits_one_block(block_size) => (block_size, 1),
+        (_, Some(block_size)) if lzma2_fits_one_block(options) => (block_size, 1),
         (threads, Some(block_size)) => (block_size, threads as usize),
     }
+}
+
+/// Whether `lzma-rust2`'s multi-threaded LZMA2 writer codes a folder: only
+/// with more than one thread, and not for a folder that fits one block (see
+/// [`lzma2_fits_one_block`]).
+#[cfg(feature = "lzma-rust2-encoder")]
+fn lzma2_rust2_uses_mt(options: &Lzma2Options) -> bool {
+    options.threads > 1 && !lzma2_fits_one_block(options)
 }
 
 pub(crate) fn add_encoder<W: Write>(
@@ -482,9 +498,14 @@ pub(crate) fn add_encoder<W: Write>(
                         .block_size()
                         .and_then(std::num::NonZeroU64::new),
                 );
-                match lzma2_options.threads {
-                    0 | 1 => Encoder::Lzma2(Some(Lzma2Writer::new(input, options))),
-                    threads => Encoder::Lzma2Mt(Some(Lzma2WriterMt::new(input, options, threads)?)),
+                if lzma2_rust2_uses_mt(&lzma2_options) {
+                    Encoder::Lzma2Mt(Some(Lzma2WriterMt::new(
+                        input,
+                        options,
+                        lzma2_options.threads,
+                    )?))
+                } else {
+                    Encoder::Lzma2(Some(Lzma2Writer::new(input, options)))
                 }
             };
 
@@ -728,5 +749,30 @@ mod tests {
         assert_eq!(lzma2_block_plan(&sized(1000)), (32 << 20, 1));
         let solid = crate::encoder_options::Lzma2Options::from_level(5);
         assert_eq!(lzma2_block_plan(&solid), (lzma_turbo::BLOCK_SIZE_SOLID, 1));
+    }
+
+    /// The `lzma-rust2` encoder makes the same one-block decision: a folder
+    /// that fits one block is not handed to its multi-threaded writer.
+    #[cfg(feature = "lzma-rust2-encoder")]
+    #[test]
+    fn a_folder_that_fits_one_block_skips_the_rust2_mt_writer() {
+        use super::lzma2_rust2_uses_mt;
+        use crate::{EncoderConfiguration, encoder_options::EncoderOptions};
+
+        let options = crate::encoder_options::Lzma2Options::from_level_mt(5, 8, 32 << 20);
+        let sized = |size: u64| {
+            let config: EncoderConfiguration = options.clone().into();
+            match config.sized_for(size).expect("LZMA2").options {
+                Some(EncoderOptions::Lzma2(o)) => o,
+                other => panic!("not LZMA2 options: {other:?}"),
+            }
+        };
+        assert!(lzma2_rust2_uses_mt(&options));
+        assert!(!lzma2_rust2_uses_mt(&sized(16 << 20)));
+        assert!(!lzma2_rust2_uses_mt(&sized(32 << 20)));
+        assert!(lzma2_rust2_uses_mt(&sized((32 << 20) + 1)));
+        assert!(!lzma2_rust2_uses_mt(&sized(1000)));
+        let solid = crate::encoder_options::Lzma2Options::from_level(5);
+        assert!(!lzma2_rust2_uses_mt(&solid));
     }
 }

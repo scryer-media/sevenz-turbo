@@ -112,7 +112,6 @@ impl LzmaSettings {
     }
 
     /// How many bytes the coder will be given, if the writer knows.
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     pub(crate) const fn input_size(&self) -> Option<u64> {
         self.input_size
     }
