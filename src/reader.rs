@@ -1882,8 +1882,10 @@ impl<R: Read + Seek> ArchiveReader<R> {
     /// The count takes effect at the next LZMA2 **run boundary**, so changing
     /// it during a decode is allowed and lossless — a run begins with a
     /// dictionary reset, which is exactly where one decoder can hand over to
-    /// another. A count of `1` means the next run is decoded inline on the
-    /// calling thread; already-spawned workers park on their channel and cost
+    /// another. A count of `1` decodes one run at a time: on the calling
+    /// thread for a coder built single-threaded, and on one worker for a
+    /// coder that can widen, so that a widening is not held up behind a run
+    /// decoded inline. Already-spawned workers park on their channel and cost
     /// nothing until it goes back up.
     ///
     /// A block only decodes in parallel at all if its coder was built for it:
