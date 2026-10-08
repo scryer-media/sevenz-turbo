@@ -33,13 +33,29 @@ fn payload(len: usize, seed: u64) -> Vec<u8> {
 
 /// An archive of `members` entries, one block each unless `solid`.
 fn archive_bytes(methods: Vec<EncoderConfiguration>, members: usize, solid: bool) -> Vec<u8> {
+    archive_bytes_of(methods, members, solid, 48 * 1024)
+}
+
+/// Like [`archive_bytes`], but each member is longer than the writer reads ahead to size a
+/// folder (1 MiB) and declares no size, so every block keeps the configured dictionary instead
+/// of one reduced to the folder.
+fn unsized_archive_bytes(methods: Vec<EncoderConfiguration>, members: usize) -> Vec<u8> {
+    archive_bytes_of(methods, members, false, MIB as usize + 1)
+}
+
+fn archive_bytes_of(
+    methods: Vec<EncoderConfiguration>,
+    members: usize,
+    solid: bool,
+    member_len: usize,
+) -> Vec<u8> {
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
     writer.set_content_methods(methods);
     let entries: Vec<(String, Vec<u8>)> = (0..members)
         .map(|index| {
             (
                 format!("silver_horizon/{index}.bin"),
-                payload(48 * 1024 + index, 7 + index as u64),
+                payload(member_len + index, 7 + index as u64),
             )
         })
         .collect();
@@ -80,7 +96,7 @@ fn read_archive(bytes: &[u8]) -> Archive {
 #[test]
 fn memory_estimate_follows_the_declared_dictionary() {
     for dictionary_size in [1u32 << 16, 1 << 20, 1 << 24] {
-        let bytes = archive_bytes(vec![lzma2_config(dictionary_size)], 1, false);
+        let bytes = unsized_archive_bytes(vec![lzma2_config(dictionary_size)], 1);
         let archive = read_archive(&bytes);
         let estimate = archive.decoder_memory_estimate().expect("sized");
 
@@ -101,10 +117,10 @@ fn memory_estimate_follows_the_declared_dictionary() {
 
 #[test]
 fn memory_estimate_is_the_largest_block_not_their_sum() {
-    let one = read_archive(&archive_bytes(vec![lzma2_config(1 << 20)], 1, false))
+    let one = read_archive(&unsized_archive_bytes(vec![lzma2_config(1 << 20)], 1))
         .decoder_memory_estimate()
         .expect("sized");
-    let many = read_archive(&archive_bytes(vec![lzma2_config(1 << 20)], 4, false))
+    let many = read_archive(&unsized_archive_bytes(vec![lzma2_config(1 << 20)], 4))
         .decoder_memory_estimate()
         .expect("sized");
     assert_eq!(one, many, "blocks decode one after another");
