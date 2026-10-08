@@ -396,6 +396,15 @@ Everything here is new surface; no upstream signature changed meaning.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.28.0 - 2026-10-09
+
+- `lzma-turbo` 0.7.0.
+- An LZMA2 encode on more than one thread gives the binary-tree match finder
+  a thread of its own, as 7-Zip does (`numThreads = 2` for the normal
+  algorithm with a binary-tree finder; one for the fast algorithm and hash
+  chains). A single-threaded encode and the LZMA coder are unchanged. The
+  memory estimate does not yet count that thread's buffers.
+
 ## 0.27.0 - 2026-10-07
 
 - Each folder's LZMA and LZMA2 coder is sized to the folder. Every folder was
