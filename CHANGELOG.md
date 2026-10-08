@@ -463,6 +463,19 @@ Everything here is new surface; no upstream signature changed meaning.
 - The one-block rule applies to the `lzma-rust2-encoder` build as well: a
   folder known to fit one LZMA2 block is coded by `lzma-rust2`'s
   single-threaded writer instead of starting its multi-threaded one.
+- The parallel LZMA2 reader no longer holds LZMA-coded data that barely
+  compressed to two threads. A run counted as incompressible, and was
+  decoded on two threads however many were asked for, once it packed to 90
+  percent of its size or more; that line was meant for stored chunks, whose
+  decode is a copy bound by the read, but it also caught media archived at an
+  ordinary level, whose chunks are LZMA-coded at 92 to 99.5 percent and are
+  the slowest LZMA there is to decode. A run is now taken as incompressible
+  only when it is no smaller than what it decodes to, which an encoder that
+  codes a chunk only when coding shrinks it makes the stored case. On Apple
+  M5 Max at 18 threads, a gigabyte of such data written by `7zz -mx5` went
+  from 17.0 s to 4.0 s (7zz: 3.9 s) and by `-mx1` from 13.4 s to 2.2 s
+  (7zz: 2.4 s); a gigabyte of random data, stored chunks, still decodes on
+  two threads, in 0.2 s.
 
 ## 0.26.1 - 2026-09-29
 

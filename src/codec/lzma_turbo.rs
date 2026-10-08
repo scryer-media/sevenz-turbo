@@ -192,15 +192,20 @@ const MT_BACKSTOP_PER_THREAD_BYTES: u64 = 384 * 1024 * 1024;
 const MT_RUN_WINDOW: usize = 8;
 
 /// Packed bytes per hundred unpacked at or above which a run is taken to hold
-/// data that did not compress.
+/// data that did not compress: a run no smaller than what it decodes to.
 ///
-/// An encoder that cannot beat the data writes it out as it stands — LZMA2
-/// uncompressed chunks, packed a shade *larger* than unpacked — or shaves a
-/// percent or two off it and writes that. Either way the ratio sits against 1,
-/// nowhere near what even barely compressible data reaches, so the line
-/// between the two shapes is a wide one and exactly where it is drawn inside
-/// the gap does not matter.
-const MT_DENSE_PERCENT: u128 = 90;
+/// The shape the narrow decode is for is the stored one. An encoder that
+/// cannot beat a chunk writes it out as it stands — an LZMA2 uncompressed
+/// chunk, packed a shade *larger* than unpacked, because 7-Zip and liblzma
+/// both store a chunk that coding would not shrink — and decoding that is a
+/// copy, bound by the read. A run that is LZMA-coded is the opposite however
+/// little it shrank: data that barely compresses is literal after literal,
+/// the slowest LZMA there is, and decoding it is bound by the decode, so it
+/// wants every thread it can get. Coding shrinks a chunk or the chunk is
+/// stored, so "at least as large as unpacked" is the line between the two;
+/// drawn at 90, it held media archived at an ordinary level — LZMA chunks at
+/// 92 to 99.5 percent — to two threads, five times slower than 7-Zip.
+const MT_DENSE_PERCENT: u128 = 100;
 
 /// Threads an incompressible stream is decoded with, however many the caller
 /// asked for.
@@ -2969,6 +2974,69 @@ mod stall_tests {
                 assert_eq!(rd.applied_threads, threads, "threads={threads}");
                 assert!(widest <= threads, "threads={threads}: {widest} workers");
             }
+        }
+
+        /// One run of data LZMA still codes but barely shrinks — media
+        /// archived at an ordinary level — and the bytes it decodes to. The
+        /// payload is pseudo-random bytes with a short run of zeros every
+        /// 4 KiB, so each chunk comes out a couple of percent smaller than
+        /// its input: coded, not stored, and above the old 90 percent line.
+        fn barely_compressible_run(len: usize, seed: u64) -> (Vec<u8>, Vec<u8>) {
+            let mut x = seed | 1;
+            let plain: Vec<u8> = (0..len)
+                .map(|i| {
+                    if i % 4096 >= 4016 {
+                        return 0;
+                    }
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 24) as u8
+                })
+                .collect();
+            let props = LzmaEncProps::new().with_level(1).with_dict_size(1 << 16);
+            let mut w = LzmaTurboWriter::new(
+                Vec::new(),
+                &props,
+                Coder::Lzma2 {
+                    block_size: BLOCK_SIZE_SOLID,
+                    threads: 1,
+                },
+            )
+            .expect("build the encoder");
+            w.write_all(&plain).expect("encode");
+            let mut packed = w.finish().expect("finish the encode");
+            assert_eq!(packed.pop(), Some(0x00), "an encode ends in its end marker");
+            let (p, u) = (packed.len() as u64, len as u64);
+            assert!(
+                p < u && p * 100 >= u * 90,
+                "the fixture has to be coded and barely smaller: {p} of {u}",
+            );
+            (packed, plain)
+        }
+
+        /// A stream of LZMA-coded runs that barely shrank is decode-bound,
+        /// not read-bound, and keeps every thread the caller asked for: only
+        /// runs no smaller than their output — stored chunks — are the shape
+        /// the narrow decode is for. At the old 90 percent line this stream
+        /// was held to two threads.
+        #[test]
+        fn a_barely_compressible_coded_stream_is_not_narrowed() {
+            let mut packed = Vec::new();
+            let mut plain = Vec::new();
+            for seed in 0..6u64 {
+                let (run, run_plain) = barely_compressible_run(256 << 10, 0x9e37_79b9 + seed);
+                packed.extend_from_slice(&run);
+                plain.extend_from_slice(&run_plain);
+            }
+            packed.push(0x00);
+            let threads = 8;
+            let (mut rd, control) = reader_limited(Cursor::new(packed), threads, LIMIT);
+            let (out, _peak, widest) = drain_watching(&mut rd, &control);
+            assert_eq!(out, plain);
+            assert!(!rd.dense, "narrowed on coded runs");
+            assert_eq!(rd.applied_threads, threads);
+            assert!(widest <= threads, "{widest} workers");
         }
 
         /// An archive of a film beside a text file: compressible runs, then a span
