@@ -21,6 +21,7 @@ use crate::{
     decoder::{DecodeOptions, add_decoder, check_chain_memory},
     error::{Error, Limit},
     positional::{ReadAt, ReadAtCursor},
+    pipeline::{Chain, Stage},
 };
 
 /// Upper bound for eagerly pre-allocating an output buffer from an archive-declared
@@ -1970,8 +1971,10 @@ impl<R: Read + Seek> ArchiveReader<R> {
     /// The count takes effect at the next LZMA2 **run boundary**, so changing
     /// it during a decode is allowed and lossless — a run begins with a
     /// dictionary reset, which is exactly where one decoder can hand over to
-    /// another. A count of `1` means the next run is decoded inline on the
-    /// calling thread; already-spawned workers park on their channel and cost
+    /// another. A count of `1` decodes one run at a time: on the calling
+    /// thread for a coder built single-threaded, and on one worker for a
+    /// coder that can widen, so that a widening is not held up behind a run
+    /// decoded inline. Already-spawned workers park on their channel and cost
     /// nothing until it goes back up.
     ///
     /// A block only decodes in parallel at all if its coder was built for it:
@@ -2152,26 +2155,18 @@ impl<R: Read + Seek> ArchiveReader<R> {
         // small. The block re-seeks the source before this, and the bounded
         // reader stops the read-ahead at the pack stream's end, so nothing
         // beyond the block is consumed.
-        let mut decoder: Box<dyn Read> = Box::new(io::BufReader::with_capacity(
-            crate::decoder::INPUT_BUF_SIZE,
-            BoundedReader::new(source, pack_size),
-        ));
         let block = &archive.blocks[block_index];
+        let mut chain = Chain::new(block, opts);
+        let mut stage = Stage::Leaf(Box::new(BoundedReader::new(source, pack_size)));
         for (index, coder) in block.ordered_coder_iter() {
             if coder.num_in_streams != 1 || coder.num_out_streams != 1 {
                 return Err(Error::unsupported(
                     "Multi input/output stream coders are not supported",
                 ));
             }
-            let next = add_decoder(
-                decoder,
-                block.get_unpack_size_at_index(index) as usize,
-                coder,
-                password,
-                opts,
-            )?;
-            decoder = Box::new(next);
+            stage = chain.add(block, stage, index, password, opts)?;
         }
+        let mut decoder = chain.pipeline.here(stage);
         // Read after the coders are built: the LZMA2 coder decides there
         // whether its workers fold the checksums, and when they do, the
         // block's is folded with them rather than taken again here, on the
@@ -2263,7 +2258,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
         // output stream. `get_in_stream2` recursively wires up the whole coder graph,
         // so this also handles single-input filters (e.g. Delta) layered on top of a
         // BCJ2 coder's output, not just a bare BCJ2 main coder.
-        let mut decoder = Self::get_in_stream2(
+        let mut chain = Chain::new(block, opts);
+        let stage = Self::get_in_stream2(
             block,
             &sources,
             &coder_to_stream_map,
@@ -2271,7 +2267,9 @@ impl<R: Read + Seek> ArchiveReader<R> {
             main_coder_index,
             0,
             opts,
+            &mut chain,
         )?;
+        let mut decoder = chain.pipeline.here(stage);
         if block.has_crc && opts.verify_checksums {
             decoder = Box::new(Crc32VerifyingReader::new(
                 decoder,
@@ -2298,7 +2296,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
         in_stream_index: usize,
         depth: usize,
         opts: &DecodeOptions<'_>,
-    ) -> Result<Box<dyn Read + 'r>, Error>
+        chain: &mut Chain<'r>,
+    ) -> Result<Stage<'r>, Error>
     where
         R: 'r,
     {
@@ -2307,7 +2306,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             .iter()
             .position(|&i| i == in_stream_index as u64);
         if let Some(index) = index {
-            return Ok(Box::new(sources[index].clone()));
+            return Ok(Stage::Leaf(Box::new(sources[index].clone())));
         }
 
         let bp = block
@@ -2327,6 +2326,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             index,
             depth,
             opts,
+            chain,
         )
     }
 
@@ -2343,7 +2343,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
         in_stream_index: usize,
         depth: usize,
         opts: &DecodeOptions<'_>,
-    ) -> Result<Box<dyn Read + 'r>, Error>
+        chain: &mut Chain<'r>,
+    ) -> Result<Stage<'r>, Error>
     where
         R: 'r,
     {
@@ -2376,10 +2377,9 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 start_index,
                 depth + 1,
                 opts,
+                chain,
             )?;
-
-            let decoder = add_decoder(input, uncompressed_len, coder, password, opts)?;
-            return Ok(Box::new(decoder));
+            return chain.add(block, input, in_stream_index, password, opts);
         }
 
         // BCJ2 is the only multi-input coder we support. It takes four input streams
@@ -2395,7 +2395,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             }
             let mut inputs: Vec<Box<dyn Read>> = Vec::with_capacity(num_in_streams);
             for i in start_index..start_index + num_in_streams {
-                inputs.push(Self::get_in_stream(
+                let input = Self::get_in_stream(
                     block,
                     sources,
                     coder_to_stream_map,
@@ -2403,9 +2403,14 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     i,
                     depth + 1,
                     opts,
-                )?);
+                    chain,
+                )?;
+                inputs.push(chain.pipeline.here(input));
             }
-            return Ok(Box::new(Bcj2Reader::new(inputs, uncompressed_len as u64)));
+            return Ok(Stage::Here(Box::new(Bcj2Reader::new(
+                inputs,
+                uncompressed_len as u64,
+            ))));
         }
 
         Err(Error::unsupported(format!(

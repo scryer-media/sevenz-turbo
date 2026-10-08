@@ -458,6 +458,33 @@ Everything here is new surface; no upstream signature changed meaning.
   (11.7x; `7zz a -mmt=18` takes 16.8 s), at the same archive size, with peak
   RSS 186 MiB from 32 MiB. Single-threaded decode and encode, solid and
   single-folder archives, and the media rows are unchanged.
+- A block whose CPU-heavy coders would share the caller's thread decodes as
+  a pipeline when more than one thread is allowed: each coder below the top
+  with at least 1 MiB of output gets a thread of its own (at most one fewer
+  than the threads allowed, largest first), and the stages are joined by
+  bounded pipes of four 256 KiB pieces. An LZMA2 coder that decodes in
+  parallel already has its own workers and does not count, so AES over
+  parallel LZMA2 stays sequential: a thread for the cipher measured as a
+  wash. A coder's error arrives after the bytes it produced and unchanged,
+  so the block it is reported against is the same as before. One thread,
+  and wasm32, keep the sequential chain. A BCJ2 archive written by 7-Zip
+  (LZMA2 main stream, LZMA call and jump streams) decodes 1.07-1.08x faster
+  at 2-18 threads on Apple M5 Max and 1.09-1.11x at 2-8 threads on x86.
+- An adaptive LZMA2 decode reaches the fixed plan's width. It started at one
+  thread with the first run decoded on the calling thread, which held the
+  stream's cursor; a widening was only heard once a whole run had landed;
+  and the backlog it reported left out runs already claimed, so a governor
+  narrowed it again straight after widening it. It now hands the first run
+  to a worker, listens for a widening while that worker runs, counts every
+  run in hand behind the front of the output, and reads ahead for the width
+  it is offered. On a 1 GiB mx5 stream at 18 threads on Apple M5 Max, an
+  adaptive decode went from 4.45 s to 2.46 s (the fixed plan: 2.37 s) at
+  the fixed plan's 2.07 GB peak RSS, and from 7.56 s to 4.77 s at 8 threads
+  on x86 (fixed: 4.74 s). Incompressible data stays narrow.
+- A block of exactly one LZMA2 run (1 MiB) decodes single-threaded. The
+  parallel path wins only from the second run, and one run decoded in
+  parallel was 4.5% slower; the threshold is the encoder's minimum run size,
+  measured the same on x86 and arm64.
 
 ## 0.27.0 - 2026-10-07
 
