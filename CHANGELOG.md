@@ -396,6 +396,21 @@ Everything here is new surface; no upstream signature changed meaning.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.28.0 - 2026-10-09
+
+- Writing LZMA or LZMA2 where no thread can be started (`wasm32`) no longer
+  holds the folder's whole input. The thread-less path collected every byte
+  and encoded on `finish`, so its memory grew with the input; it now pushes
+  each write into `lzma-turbo`'s push encoders on the caller's thread, which
+  run the encoder as far as a queue of about one 2 MiB LZMA2 chunk allows.
+  The packed bytes are unchanged, byte for byte, and the threaded path is
+  untouched. Forced onto that path on Apple silicon (level 1, 8 MiB
+  dictionary, one thread), peak RSS went from 395 to 67 MiB for a 256 MiB
+  input and from 1382 to 67 MiB for 1 GiB, with wall and CPU time no worse.
+  Building with `--cfg sevenz_turbo_unthreaded` sends every writer down that
+  path, for tests and measurement on a host with threads.
+- `lzma-turbo` 0.7.0.
+
 ## 0.27.0 - 2026-10-07
 
 - Each folder's LZMA and LZMA2 coder is sized to the folder. Every folder was
