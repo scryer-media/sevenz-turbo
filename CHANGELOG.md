@@ -505,6 +505,23 @@ Everything here is new surface; no upstream signature changed meaning.
   on `PATH`, 7-Zip tests and extracts what every encode method writes -
   Copy, LZMA, LZMA2, LZMA2 with BCJ and with delta, PPMd, BZip2 and Deflate,
   solid and not, with and without AES-256.
+- PPMd decodes as fast as 7-Zip. Its range decoder takes its input a byte
+  at a time, and nothing between it and the archive buffered, so every
+  compressed byte was a read call on the source; a PPMd block now reads
+  through a 64 KiB buffer wherever it sits, under AES or in a BCJ2 graph
+  included, and AES under it decrypts 64 KiB at a time instead of one
+  16-byte block per call. On Apple M5 Max (heavily loaded), a 15 MB PPMd
+  block went from 12.5 s, 4.4 s of it in the kernel, to 5.8 s with none
+  (`7zz t -mmt=1`: 6.1 s), and an AES-256 PPMd block of 30 MB from 1.86
+  million reads to 454 and from 13.1 s to 12.4 s (7zz: 12.6 s).
+- The BCJ filters read and filter 64 KiB at a time rather than 4 KiB,
+  Brotli reads 64 KiB of input at a time, and every block's pack stream is
+  read through a 64 KiB buffer, so a chain whose first coder reads whatever
+  it is asked for - Copy, delta - makes no more read calls than that however
+  small the caller's reads are. 7-Zip's filter coders read at least as
+  much. A Copy+BCJ block of 4 MiB went from 1,033 reads to 69. A coder that
+  already reads large pieces - LZMA, LZMA2 - goes through the buffer
+  without a second copy, and no other row moved.
 
 ## 0.26.1 - 2026-09-29
 

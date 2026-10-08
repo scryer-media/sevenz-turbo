@@ -27,6 +27,17 @@ use crate::container::ArchiveLimits;
 use crate::encryption::Aes256Sha256Decoder;
 use crate::{Password, archive::EncoderMethod, block::Coder, error::Error};
 
+/// Bytes a decoder that reads its input in small pieces is given at a time.
+///
+/// PPMd's range decoder takes its input one byte per call, Brotli and the
+/// BCJ filters a few kilobytes, and straight off a pack stream every one of
+/// those calls is a read system call: a PPMd block of 15 MB took 15 million
+/// of them, and spent as long in the kernel as decoding. 7-Zip's filter
+/// coders read at least this much at a time. A `BufReader` of this size hands
+/// a read at least as large as itself straight through, so a coder that
+/// already reads in large pieces underneath one costs no second copy.
+pub(crate) const INPUT_BUF_SIZE: usize = 64 << 10;
+
 /// Everything a coder needs that is not in the archive: the caller's limits,
 /// how many threads they will allow, and the live link to the LZMA2 coder.
 ///
@@ -115,7 +126,7 @@ pub enum Decoder<R: Read> {
     Lzma(Box<LzmaReader<R>>),
     Lzma2(Box<Lzma2Coder<R>>),
     #[cfg(feature = "ppmd")]
-    Ppmd(Box<Ppmd7Decoder<R>>),
+    Ppmd(Box<Ppmd7Decoder<std::io::BufReader<R>>>),
     Bcj(BcjReader<R>),
     Delta(DeltaReader<R>),
     #[cfg(feature = "brotli")]
@@ -304,13 +315,18 @@ pub fn add_decoder<I: Read>(
         #[cfg(feature = "ppmd")]
         EncoderMethod::ID_PPMD => {
             let (order, memory_size) = get_ppmd_order_memory_size(coder, max_mem_limit_kb)?;
+            // Buffered here rather than at the bottom of the chain only, so a
+            // PPMd coder anywhere - under AES, inside a BCJ2 graph, in the
+            // header - reads its input in large pieces, and an AES coder
+            // under it decrypts them in bulk instead of a block per call.
+            let input = std::io::BufReader::with_capacity(INPUT_BUF_SIZE, input);
             let ppmd = Ppmd7Decoder::new(input, order, memory_size)
                 .map_err(|err| Error::other(err.to_string()))?;
             Ok(Decoder::Ppmd(Box::new(ppmd)))
         }
         #[cfg(feature = "brotli")]
         EncoderMethod::ID_BROTLI => {
-            let de = BrotliDecoder::new(input, 4096)?;
+            let de = BrotliDecoder::new(input, INPUT_BUF_SIZE)?;
             Ok(Decoder::Brotli(Box::new(de)))
         }
         #[cfg(feature = "bzip2")]

@@ -2058,7 +2058,16 @@ impl<R: Read + Seek> ArchiveReader<R> {
         source.seek(SeekFrom::Start(block_offset))?;
         let pack_size = archive.pack_sizes[first_pack_stream_index] as usize;
 
-        let mut decoder: Box<dyn Read> = Box::new(BoundedReader::new(source, pack_size));
+        // Buffered at the bottom too, for a chain whose first coder reads
+        // whatever its caller asks for: Copy, or delta straight off the pack
+        // stream, would otherwise make one read call per caller read, however
+        // small. The block re-seeks the source before this, and the bounded
+        // reader stops the read-ahead at the pack stream's end, so nothing
+        // beyond the block is consumed.
+        let mut decoder: Box<dyn Read> = Box::new(io::BufReader::with_capacity(
+            crate::decoder::INPUT_BUF_SIZE,
+            BoundedReader::new(source, pack_size),
+        ));
         let block = &archive.blocks[block_index];
         for (index, coder) in block.ordered_coder_iter() {
             if coder.num_in_streams != 1 || coder.num_out_streams != 1 {
