@@ -261,7 +261,7 @@ func Plan(manifest *fixtures.Manifest, dir, scratch string, tools Tools, setting
 	for _, name := range []string{"bcj_x86.7z", "bcj_arm64.7z", "bcj2.7z", "delta.7z"} {
 		p.decode("filters", name, "1", decodeOpts{upstream: true})
 	}
-	p.decode("ppmd (secondary)", "ppmd.7z", "1", decodeOpts{upstream: true, note: "PPMd is the external ppmd-rust crate, not this crate's code"})
+	p.decode("ppmd (secondary)", "ppmd.7z", "1", decodeOpts{upstream: true, note: "PPMd is the external ppmd-turbo crate, not this crate's code"})
 
 	encodeThreads := []string{"1", "all"}
 	for _, level := range settings.Levels {

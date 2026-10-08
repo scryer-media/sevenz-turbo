@@ -63,7 +63,7 @@ pub(crate) enum Encoder<W: Write> {
     #[cfg(feature = "lzma-rust2-encoder")]
     Lzma2Mt(Option<Lzma2WriterMt<CountingWriter<W>>>),
     #[cfg(feature = "ppmd")]
-    Ppmd(Option<Box<ppmd_rust::Ppmd7Encoder<CountingWriter<W>>>>),
+    Ppmd(Option<Box<ppmd_turbo::io::SevenZWriter<CountingWriter<W>>>>),
     #[cfg(feature = "brotli")]
     Brotli(BrotliEncoder<CountingWriter<W>>),
     #[cfg(feature = "bzip2")]
@@ -159,8 +159,11 @@ impl<W: Write> Write for Encoder<W> {
             #[cfg(feature = "ppmd")]
             Encoder::Ppmd(w) => match buf.is_empty() {
                 true => {
-                    let writer = w.take().unwrap();
-                    let mut inner = writer.finish(false)?;
+                    // 7-Zip writes no end marker in a `.7z`; the writer's
+                    // finish is the coder's flush, written once.
+                    let mut writer = w.take().unwrap();
+                    writer.finish()?;
+                    let mut inner = writer.into_inner();
                     let _ = inner.write(buf);
                     Ok(0)
                 }
@@ -226,12 +229,11 @@ impl<W: Write> Write for Encoder<W> {
             Encoder::Lzma2Mt(w) => w.as_mut().unwrap().flush(),
             #[cfg(feature = "brotli")]
             Encoder::Brotli(w) => w.flush(),
-            // Not `Ppmd7Encoder::flush`: that one ends the range coder, and
-            // `finish` ends it again, which left the five bytes of a second
-            // end after the stream and made `7zz t` call the block a data
-            // error. A flush here only passes down to the sink.
+            // Only passes down to the sink: the writer's flush never ends the
+            // range coder, so the stream's tail is written once, by finish,
+            // and `7zz t` accepts it.
             #[cfg(feature = "ppmd")]
-            Encoder::Ppmd(w) => w.as_mut().unwrap().get_mut().flush(),
+            Encoder::Ppmd(w) => w.as_mut().unwrap().flush(),
             #[cfg(feature = "bzip2")]
             Encoder::Bzip2(w) => w.as_mut().unwrap().flush(),
             #[cfg(feature = "deflate")]
@@ -522,9 +524,11 @@ pub(crate) fn add_encoder<W: Write>(
                 _ => PpmdOptions::default(),
             };
 
-            let ppmd_encoder =
-                ppmd_rust::Ppmd7Encoder::new(input, options.order, options.memory_size)
-                    .map_err(|err| Error::other(err.to_string()))?;
+            // The options are clamped into range when built, so these are the
+            // parameters the coder's properties record.
+            let params = ppmd_turbo::Params::clamped(options.order, options.memory_size);
+            let ppmd_encoder = ppmd_turbo::io::SevenZWriter::new(input, params)
+                .map_err(|err| Error::from(std::io::Error::from(err)))?;
 
             Ok(Encoder::Ppmd(Some(Box::new(ppmd_encoder))))
         }

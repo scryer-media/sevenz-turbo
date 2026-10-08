@@ -7,9 +7,7 @@ use bzip2::read::BzDecoder;
 use flate2::bufread::DeflateDecoder;
 use lzma_turbo::LzmaReader;
 #[cfg(feature = "ppmd")]
-use ppmd_rust::{
-    PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER, Ppmd7Decoder,
-};
+use ppmd_turbo::{Params as PpmdParams, SevenZDecoder as PpmdDecoder, io::SevenZReader};
 
 #[cfg(feature = "brotli")]
 use crate::codec::brotli::BrotliDecoder;
@@ -126,7 +124,7 @@ pub enum Decoder<R: Read> {
     Lzma(Box<LzmaReader<R>>),
     Lzma2(Box<Lzma2Coder<R>>),
     #[cfg(feature = "ppmd")]
-    Ppmd(Box<Ppmd7Decoder<std::io::BufReader<R>>>),
+    Ppmd(Box<SevenZReader<std::io::BufReader<R>>>),
     Bcj(BcjReader<R>),
     Delta(DeltaReader<R>),
     #[cfg(feature = "brotli")]
@@ -315,15 +313,22 @@ pub fn add_decoder<I: Read>(
         }
         #[cfg(feature = "ppmd")]
         EncoderMethod::ID_PPMD => {
-            let (order, memory_size) = get_ppmd_order_memory_size(coder, max_mem_limit_kb)?;
+            let params = get_ppmd_params(coder, max_mem_limit_kb)?;
             // Buffered here rather than at the bottom of the chain only, so a
             // PPMd coder anywhere - under AES, inside a BCJ2 graph, in the
             // header - reads its input in large pieces, and an AES coder
-            // under it decrypts them in bulk instead of a block per call.
+            // under it decrypts them in bulk instead of a block per call. The
+            // step decoder reads straight out of this buffer.
             let input = std::io::BufReader::with_capacity(INPUT_BUF_SIZE, input);
-            let ppmd = Ppmd7Decoder::new(input, order, memory_size)
-                .map_err(|err| Error::other(err.to_string()))?;
-            Ok(Decoder::Ppmd(Box::new(ppmd)))
+            // 7-Zip writes no end marker: the coder's unpacked size ends the
+            // stream. A stream that is corrupt or cut short fails its read as
+            // an I/O error of kind `InvalidData` or `UnexpectedEof`, the same
+            // classes the LZMA decoders report.
+            let decoder = PpmdDecoder::new(params, Some(uncompressed_len as u64))
+                .map_err(|err| Error::from(std::io::Error::from(err)))?;
+            Ok(Decoder::Ppmd(Box::new(SevenZReader::from_decoder(
+                input, decoder,
+            ))))
         }
         #[cfg(feature = "brotli")]
         EncoderMethod::ID_BROTLI => {
@@ -430,39 +435,22 @@ pub fn add_decoder<I: Read>(
 }
 
 #[cfg(feature = "ppmd")]
-fn get_ppmd_order_memory_size(coder: &Coder, max_mem_limit_kb: usize) -> Result<(u32, u32), Error> {
-    if coder.properties.len() < 5 {
-        return Err(Error::other("PPMD properties too short"));
-    }
-    let order = coder.properties[0] as u32;
-    let memory_size = u32::from_le_bytes([
-        coder.properties[1],
-        coder.properties[2],
-        coder.properties[3],
-        coder.properties[4],
-    ]);
+fn get_ppmd_params(coder: &Coder, max_mem_limit_kb: usize) -> Result<PpmdParams, Error> {
+    // 7-Zip reads the first five property bytes and ignores any after them.
+    let props = coder
+        .properties
+        .get(..5)
+        .ok_or_else(|| Error::other("PPMD properties too short"))?;
+    let params = PpmdParams::from_7z_props(props).map_err(|_| {
+        Error::other(format!(
+            "PPMD order {} or memory size {} out of range",
+            props[0],
+            u32::from_le_bytes([props[1], props[2], props[3], props[4]])
+        ))
+    })?;
 
-    if order < PPMD7_MIN_ORDER {
-        return Err(Error::other("PPMD order smaller than PPMD7_MIN_ORDER"));
-    }
-
-    if order > PPMD7_MAX_ORDER {
-        return Err(Error::other("PPMD order larger than PPMD7_MAX_ORDER"));
-    }
-
-    if memory_size < PPMD7_MIN_MEM_SIZE {
-        return Err(Error::other(
-            "PPMD memory size smaller than PPMD7_MIN_MEM_SIZE",
-        ));
-    }
-
-    if memory_size > PPMD7_MAX_MEM_SIZE {
-        return Err(Error::other(
-            "PPMD memory size larger than PPMD7_MAX_MEM_SIZE",
-        ));
-    }
-
-    let memory_size_kb = memory_size.div_ceil(1024) as usize;
+    // Checked before the decoder allocates its model.
+    let memory_size_kb = params.mem_size().div_ceil(1024) as usize;
     if memory_size_kb > max_mem_limit_kb {
         return Err(Error::MaxMemLimited {
             max_kb: max_mem_limit_kb,
@@ -470,5 +458,5 @@ fn get_ppmd_order_memory_size(coder: &Coder, max_mem_limit_kb: usize) -> Result<
         });
     }
 
-    Ok((order, memory_size))
+    Ok(params)
 }
