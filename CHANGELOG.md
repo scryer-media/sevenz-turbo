@@ -396,6 +396,69 @@ Everything here is new surface; no upstream signature changed meaning.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.28.0 - 2026-10-09
+
+- Security fix: every AES-256 folder, and the encrypted header, is now
+  encrypted under its own random IV, as 7-Zip's writer does.
+  `AesEncoderOptions::new` drew one IV, and every folder written with those
+  options - and the header - reused it under the same key, so two folders that
+  began with the same bytes began with the same ciphertext. The IV is drawn
+  per folder and written into that folder's coder properties; the salt and
+  cycle count stay the configured ones, so every folder's key is the same
+  one, derived as before.
+  `ArchiveWriter` no longer uses the `iv` field of `AesEncoderOptions` as any
+  folder's IV.
+  Two writes of the same encrypted input therefore no longer produce the same
+  bytes; the archives decode the same, and 7-Zip extracts them.
+- The folders of a non-solid archive decode in parallel. A new `ReadAt` trait
+  reads archive bytes at an offset with no shared cursor; it is implemented
+  for `std::fs::File` (`pread` on Unix, `seek_read` on Windows), for bytes in
+  memory (`[u8]`, `Vec<u8>`, and through `&`, `Box` and `Arc`), and by
+  `SerialReadAt`, which serialises the reads of any `Read + Seek`.
+  `ArchiveReader::open` sets one up from the file it opens;
+  `ArchiveReader::from_read_at` builds a reader over any `ReadAt` (its source
+  type is the new `ReadAtCursor`); `set_positional_source`,
+  `with_positional_source` and `clear_positional_source` attach or remove one
+  on a reader built any other way. With a positional source and more than one
+  thread, `for_each_entries` decodes runs of folders of at most 8 MiB
+  unpacked on parallel workers, each from its own cursor.
+- The callback still sees every entry, its bytes, the sub-stream and block
+  completion hooks, and any error in archive order, exactly as the
+  sequential walk would show them: a worker's output is staged and replayed on
+  the calling thread. A checksum mismatch or a damaged stream is still
+  reported as `Error::BlockDecode` naming the folder it is in and its packed
+  offset; a folder past it is never shown to the callback. The one visible
+  difference is that a worker reads each member to its end, so a member the
+  callback skipped is still checked.
+- The thread count is a budget, not a per-folder count: workers x threads
+  per folder never exceeds it (with a memory limit, each folder gets one
+  thread, and the number of workers is capped by the limit over the largest
+  folder's decoder plus its staging). A folder larger than 8 MiB is decoded
+  alone on the calling thread with the whole thread count, so a media-sized
+  archive takes the multi-threaded LZMA2 path as before. What is staged
+  between the workers and the caller is bounded: two folders per worker, at
+  most 8 MiB each, so at most 16 MiB per worker, whatever the archive says.
+  Without a positional source, with one thread, or on `wasm32`, every folder
+  decodes on the calling thread as before.
+- `ArchiveWriter::push_archive_entries_non_solid(entries, open, threads)`
+  codes each entry as a folder of its own on up to `threads` workers and
+  writes them in the order given: the archive a loop of
+  `push_archive_entry` writes, byte for byte apart from the encrypted
+  folders' IVs. `open(index, entry)` is called on the coding thread, so no
+  more files are open than folders in flight. Each worker stages at most two
+  folders of at most 8 MiB of compressed bytes before it waits for the
+  writer, so memory is bounded by threads x (one coder + 16 MiB), however
+  large the inputs. A folder whose coder would start block threads of its
+  own is coded alone on the calling thread, after the folders before it.
+- On Apple M5 Max (18 threads), the 8192-member non-solid tree (256 MiB
+  unpacked, 32 KiB average, written by `7zz -mx=5 -ms=off`) decodes in
+  0.30 s at all threads, from 3.35 s (11.2x; `7zz t` takes 3.43 s, as it
+  decodes non-solid folders one at a time), with peak RSS 18.5 MiB from
+  9.1 MiB. Writing it non-solid at all threads takes 1.72 s, from 20.2 s
+  (11.7x; `7zz a -mmt=18` takes 16.8 s), at the same archive size, with peak
+  RSS 186 MiB from 32 MiB. Single-threaded decode and encode, solid and
+  single-folder archives, and the media rows are unchanged.
+
 ## 0.27.0 - 2026-10-07
 
 - Each folder's LZMA and LZMA2 coder is sized to the folder. Every folder was

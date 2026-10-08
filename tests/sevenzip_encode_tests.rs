@@ -159,3 +159,102 @@ fn seven_zip_tests_and_extracts_every_encode_method() {
         }
     }
 }
+
+/// Every folder, and the encrypted header, is encrypted under its own random
+/// IV, as 7-Zip's own writer does, however the folders were coded; and 7-Zip
+/// extracts the result.
+#[cfg(feature = "aes256")]
+#[test]
+fn every_aes_folder_and_the_header_has_its_own_iv() {
+    use std::collections::HashSet;
+
+    let files = inputs();
+    let salt = [0x5C; 16];
+    let configured = [0x11; 16];
+    let methods = || -> Vec<EncoderConfiguration> {
+        vec![
+            AesEncoderOptions {
+                password: Password::from("pw"),
+                iv: configured,
+                salt,
+                num_cycles_power: 10,
+            }
+            .into(),
+            Lzma2Options::from_level(5).into(),
+        ]
+    };
+    let sequential = write(methods(), false, &files);
+    let parallel = {
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+        writer.set_content_methods(methods());
+        let entries = files
+            .iter()
+            .map(|(name, data)| {
+                let mut entry = ArchiveEntry::new_file(name);
+                entry.size = data.len() as u64;
+                entry
+            })
+            .collect();
+        writer
+            .push_archive_entries_non_solid(
+                entries,
+                |index, _| Ok(Some(files[index].1.as_slice())),
+                4,
+            )
+            .expect("push");
+        writer.finish().expect("finish").into_inner()
+    };
+    let solid = write(methods(), true, &files);
+
+    let mut seen = HashSet::new();
+    for (label, bytes, folders) in [
+        ("sequential", &sequential, files.len()),
+        ("parallel", &parallel, files.len()),
+        ("solid", &solid, 1),
+    ] {
+        let archive =
+            Archive::read(&mut Cursor::new(bytes.as_slice()), &Password::from("pw")).expect(label);
+        assert_eq!(archive.blocks.len(), folders, "{label}");
+        let mut ivs = Vec::new();
+        for block in &archive.blocks {
+            for coder in &block.coders {
+                if coder.encoder_method_id() == EncoderMethod::AES256_SHA256.id() {
+                    let props = coder.properties();
+                    assert_eq!(
+                        &props[2..18],
+                        &salt,
+                        "{label}: the salt is the configured one"
+                    );
+                    ivs.push(<[u8; 16]>::try_from(&props[18..34]).unwrap());
+                }
+            }
+        }
+        assert_eq!(ivs.len(), folders, "{label}: one AES coder per folder");
+        // The encoded header's own coder is outside the encryption: the only
+        // place the salt appears in the plain bytes, followed by its IV.
+        let at = bytes
+            .windows(16)
+            .rposition(|w| w == salt)
+            .expect("the encoded header's AES properties");
+        ivs.push(<[u8; 16]>::try_from(&bytes[at + 16..at + 32]).unwrap());
+        for iv in ivs {
+            assert_ne!(iv, configured, "{label}: a folder reused the options' IV");
+            assert!(seen.insert(iv), "{label}: an IV was used twice");
+        }
+    }
+
+    let Some(bin) = seven_zip() else {
+        eprintln!("skipping the 7-Zip half: neither 7zz nor 7z is on PATH");
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("tempdir");
+    check_with_7zip(
+        bin,
+        tmp.path(),
+        "aes-iv-sequential",
+        &sequential,
+        Some("pw"),
+    );
+    check_with_7zip(bin, tmp.path(), "aes-iv-parallel", &parallel, Some("pw"));
+    check_with_7zip(bin, tmp.path(), "aes-iv-solid", &solid, Some("pw"));
+}

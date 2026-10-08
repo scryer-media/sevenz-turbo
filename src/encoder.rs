@@ -435,6 +435,30 @@ fn lzma2_rust2_uses_mt(options: &Lzma2Options) -> bool {
     options.threads > 1 && !lzma2_fits_one_block(options)
 }
 
+/// The threads coding one folder with `methods` keeps busy: more than one
+/// only for a block-parallel LZMA2 coder, which starts block threads of its
+/// own. `methods` are the folder's, already sized for it.
+pub(crate) fn folder_threads(methods: &[EncoderConfiguration]) -> u32 {
+    methods
+        .iter()
+        .map(|mc| match (mc.method.id(), &mc.options) {
+            (EncoderMethod::ID_LZMA2, Some(EncoderOptions::Lzma2(options))) => {
+                #[cfg(not(feature = "lzma-rust2-encoder"))]
+                let threads = lzma2_block_plan(options).1 as u32;
+                #[cfg(feature = "lzma-rust2-encoder")]
+                let threads = if lzma2_rust2_uses_mt(options) {
+                    options.threads
+                } else {
+                    1
+                };
+                threads.max(1)
+            }
+            _ => 1,
+        })
+        .max()
+        .unwrap_or(1)
+}
+
 pub(crate) fn add_encoder<W: Write>(
     input: CountingWriter<W>,
     method_config: &EncoderConfiguration,

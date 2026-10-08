@@ -421,12 +421,16 @@ fn decode_turbo(opts: &Opts) -> Result<Fields, String> {
     let path = archive_path(opts);
     let file = File::open(path).map_err(|e| e.to_string())?;
     let started = Instant::now();
+    // A second handle as the positional source, the way `ArchiveReader::open`
+    // sets one up, so that independent folders decode in parallel.
+    let positional = file.try_clone().map_err(|e| e.to_string())?;
     let mut reader = sevenz_turbo::ArchiveReader::with_limits(
         file,
         fork_password(opts.password.as_deref()),
         limits(opts),
     )
     .map_err(|e| e.to_string())?;
+    reader.set_positional_source(positional);
     let parse = started.elapsed().as_secs_f64();
     let ceiling = opts.threads.max(1);
     if opts.adaptive {
@@ -750,12 +754,16 @@ fn encode(opts: &Opts) -> Result<Fields, String> {
     writer.set_content_methods(methods);
     let entry = |m: &Member| sevenz_turbo::ArchiveEntry::from_path(&m.path, m.name.clone());
     if opts.non_solid {
-        for member in &members {
-            let file = File::open(&member.path).map_err(|e| e.to_string())?;
-            writer
-                .push_archive_entry(entry(member), Some(file))
-                .map_err(|e| e.to_string())?;
-        }
+        // Independent folders are coded on parallel workers and written in
+        // member order; each member is opened on the thread that codes it.
+        let entries = members.iter().map(entry).collect();
+        writer
+            .push_archive_entries_non_solid(
+                entries,
+                |index, _| File::open(&members[index].path).map(Some),
+                threads,
+            )
+            .map_err(|e| e.to_string())?;
     } else {
         // The crate's `push_source_path` rule: a block closes before it would
         // reach 4 GiB, and a member that size or larger is a block of its own.

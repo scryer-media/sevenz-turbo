@@ -77,6 +77,9 @@ pub fn crypto_backend() -> &'static str {
 pub mod hooks;
 
 mod error;
+#[cfg(not(target_arch = "wasm32"))]
+mod ordered;
+mod positional;
 mod reader;
 
 #[cfg(feature = "compress")]
@@ -106,6 +109,7 @@ pub use container::{
 };
 pub use encryption::Password;
 pub use error::{BlockErrorKind, Error, Limit};
+pub use positional::{ReadAt, ReadAtCursor, SerialReadAt};
 pub use reader::{ArchiveReader, BlockDecoder};
 pub use time::NtTime;
 #[cfg(all(feature = "compress", feature = "util", not(target_arch = "wasm32")))]

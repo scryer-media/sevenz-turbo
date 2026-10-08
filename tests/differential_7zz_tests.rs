@@ -6,9 +6,11 @@
 //! it to". So every case here builds an archive with `7zz a`, extracts it twice
 //! (once with `7zz x`, once with this crate) and compares the bytes.
 //!
-//! Every case is extracted three times by this crate — single-threaded, with
-//! eight threads, and through the adaptive coder while the ceiling is one —
-//! and all three are compared against `7zz`'s own extraction. The thread count
+//! Every case is extracted four times by this crate — single-threaded, with
+//! eight threads, through the adaptive coder while the ceiling is one, and with
+//! eight threads from a positional source, so that the folders of a non-solid
+//! archive decode on parallel workers — and all four are compared against
+//! `7zz`'s own extraction. The thread count
 //! must not be able to change a byte: a run boundary is a dictionary reset, so
 //! which decoder took which run is not observable in the output.
 //!
@@ -131,23 +133,35 @@ struct Lane {
     name: &'static str,
     threads: u32,
     adaptive: bool,
+    /// Read through a positional source, so that independent folders decode
+    /// on parallel workers.
+    positional: bool,
 }
 
-const LANES: [Lane; 3] = [
+const LANES: [Lane; 4] = [
     Lane {
         name: "threads=1",
         threads: 1,
         adaptive: false,
+        positional: false,
     },
     Lane {
         name: "threads=8",
         threads: 8,
         adaptive: false,
+        positional: false,
     },
     Lane {
         name: "adaptive, threads=1",
         threads: 1,
         adaptive: true,
+        positional: false,
+    },
+    Lane {
+        name: "positional, threads=8",
+        threads: 8,
+        adaptive: false,
+        positional: true,
     },
 ];
 
@@ -159,6 +173,10 @@ fn extract_with_crate(
 ) -> BTreeMap<String, Vec<u8>> {
     let file = std::fs::File::open(archive).expect("open archive");
     let mut reader = ArchiveReader::new(file, password.clone()).expect("read archive");
+    if lane.positional {
+        let source = std::fs::File::open(archive).expect("open archive");
+        reader.set_positional_source(source);
+    }
     reader.set_threads(lane.threads);
     reader.set_adaptive_lzma2(lane.adaptive);
     let mut out = BTreeMap::new();
