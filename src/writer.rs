@@ -243,73 +243,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         if !entry.is_directory
             && let Some(mut r) = reader
         {
-            let mut compressed_len = 0;
-            let mut compressed = CompressWrapWriter::new(&mut self.output, &mut compressed_len);
-            let mut out = std::io::BufWriter::with_capacity(OUTPUT_BUF_LEN, &mut compressed);
-
-            let mut more_sizes: Vec<Rc<Cell<usize>>> =
-                Vec::with_capacity(self.content_methods.len() - 1);
-            let (head, folder) = folder_size([&entry], &mut r)
-                .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
-            let methods = sized_methods(&self.content_methods, folder);
-            let mut bcj2 = None;
-
-            let (crc, size) = {
-                let mut w = Self::create_writer(&methods, &mut out, &mut more_sizes, &mut bcj2)?;
-                let mut write_len = 0;
-                let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
-                w.write_all(&head)
-                    .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
-                drop(head);
-                let mut buf = vec![0u8; SOURCE_READ_LEN];
-                loop {
-                    match r.read(&mut buf) {
-                        Ok(n) => {
-                            if n == 0 {
-                                break;
-                            }
-                            w.write_all(&buf[..n]).map_err(|e| {
-                                Error::io_msg(e, format!("Encode entry:{}", entry.name()))
-                            })?;
-                        }
-                        Err(e) => {
-                            return Err(Error::io_msg(e, format!("Encode entry:{}", entry.name())));
-                        }
-                    }
-                }
-                w.flush()
-                    .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
-                w.write(&[])
-                    .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
-
-                (w.crc_value(), write_len)
-            };
-            out.flush()
-                .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
-            drop(out);
-            let compressed_crc = compressed.crc_value();
-            self.pack_info
-                .add_stream(compressed_len as u64, compressed_crc);
-            let bcj2 = Bcj2Packed::take(bcj2);
-            let tail_len = match &bcj2 {
-                Some(bcj2) => self.write_bcj2_tail(bcj2)?,
-                None => 0,
-            };
-            entry.has_stream = true;
-            entry.size = size as u64;
-            entry.crc = crc as u64;
-            entry.has_crc = true;
-            entry.compressed_crc = compressed_crc as u64;
-            entry.compressed_size = compressed_len as u64 + tail_len;
-
-            let mut sizes = Vec::with_capacity(more_sizes.len() + 1);
-            sizes.extend(more_sizes.iter().map(|s| s.get() as u64));
-            sizes.push(size as u64);
-
-            self.unpack_info.add(methods, sizes, crc).bcj2 = bcj2.map(|b| b.sizes);
-
-            self.files.push(entry);
-            return Ok(self.files.last().unwrap());
+            let folder = encode_entry(&self.content_methods, entry, &mut r, &mut self.output)?;
+            return self.record_folder(folder);
         }
         entry.has_stream = false;
         entry.size = 0;
@@ -317,6 +252,233 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         entry.has_crc = false;
         self.files.push(entry);
         Ok(self.files.last().unwrap())
+    }
+
+    /// Records a folder [`encode_entry`] has written the main pack stream of:
+    /// writes a BCJ2 folder's other three pack streams after it, and takes the
+    /// pack, block and entry metadata.
+    fn record_folder(&mut self, folder: EncodedFolder) -> Result<&ArchiveEntry> {
+        let EncodedFolder {
+            mut entry,
+            methods,
+            size,
+            more_sizes,
+            crc,
+            compressed_len,
+            compressed_crc,
+            bcj2,
+        } = folder;
+        self.pack_info.add_stream(compressed_len, compressed_crc);
+        let tail_len = match &bcj2 {
+            Some(bcj2) => self.write_bcj2_tail(bcj2)?,
+            None => 0,
+        };
+        entry.has_stream = true;
+        entry.size = size;
+        entry.crc = u64::from(crc);
+        entry.has_crc = true;
+        entry.compressed_crc = u64::from(compressed_crc);
+        entry.compressed_size = compressed_len + tail_len;
+
+        let mut sizes = more_sizes;
+        sizes.push(size);
+
+        self.unpack_info.add(methods, sizes, crc).bcj2 = bcj2.map(|b| b.sizes);
+
+        self.files.push(entry);
+        Ok(self.files.last().unwrap())
+    }
+
+    /// Non-solid compression of many entries, each a folder of its own, coded
+    /// on up to `threads` worker threads and written in the order given.
+    ///
+    /// The archive is the one a loop of [`ArchiveWriter::push_archive_entry`]
+    /// over `entries` writes - the same folders, in the same order, with the
+    /// same bytes - only built faster. `open(index, entry)` is called for each
+    /// entry that is not a directory, on the thread that will code it, just
+    /// before it is coded: it returns that entry's reader, or `None` for an
+    /// entry with no data. So no more files are open at once than there are
+    /// folders in flight. An entry's `size` is read, as by
+    /// [`ArchiveEntry::from_path`], as how many bytes its reader will yield.
+    ///
+    /// Folders go to the workers when they code on one thread each: always
+    /// for a single-threaded method chain, and for a block-parallel LZMA2 one
+    /// when the folder declares a size that fits one block. Any other folder,
+    /// one whose coder would start block threads of its own, is coded
+    /// alone on the calling thread, after every folder before it has been
+    /// written, so the workers and a multi-threaded coder never run at once.
+    ///
+    /// **Memory.** Each worker stages at most two folders' compressed bytes,
+    /// each at most 8 MiB, before it waits for the writer to take them, so
+    /// what is held between the workers and the output is bounded by the
+    /// thread count, whatever the folders' sizes; on top of that each worker
+    /// holds one folder's coder. A folder larger than the stage streams
+    /// through it as the writer catches up.
+    ///
+    /// With `threads` at one, and on targets without threads, this is the
+    /// loop of `push_archive_entry` itself.
+    ///
+    /// # Errors
+    ///
+    /// The first failure in entry order: what `open` returned, or what
+    /// `push_archive_entry` would have returned for that entry. Folders before
+    /// it have been written; none after it are.
+    pub fn push_archive_entries_non_solid<R, F>(
+        &mut self,
+        entries: Vec<ArchiveEntry>,
+        open: F,
+        threads: u32,
+    ) -> Result<&mut Self>
+    where
+        R: Read,
+        F: Fn(usize, &ArchiveEntry) -> std::io::Result<Option<R>> + Sync,
+    {
+        let threads = threads.clamp(1, 256);
+        let parallel = |entry: &ArchiveEntry| {
+            entry.is_directory
+                || encoder::folder_threads(&sized_methods(
+                    &self.content_methods,
+                    declared_size([entry]),
+                )) <= 1
+        };
+        let eligible: Vec<bool> = entries.iter().map(parallel).collect();
+        let mut index = 0;
+        while index < entries.len() {
+            let start = index;
+            while index < entries.len() && eligible[index] {
+                index += 1;
+            }
+            if threads > 1 && index - start > 1 {
+                self.push_non_solid_parallel(&entries, start..index, &open, threads)?;
+            } else {
+                for at in start..index {
+                    self.push_opened(&entries, at, &open)?;
+                }
+            }
+            if index < entries.len() {
+                self.push_opened(&entries, index, &open)?;
+                index += 1;
+            }
+        }
+        Ok(self)
+    }
+
+    /// One entry of [`ArchiveWriter::push_archive_entries_non_solid`], here.
+    fn push_opened<R, F>(&mut self, entries: &[ArchiveEntry], index: usize, open: &F) -> Result<()>
+    where
+        R: Read,
+        F: Fn(usize, &ArchiveEntry) -> std::io::Result<Option<R>>,
+    {
+        let entry = entries[index].clone();
+        let reader = if entry.is_directory {
+            None
+        } else {
+            open(index, &entry)
+                .map_err(|e| Error::io_msg(e, format!("Open entry:{}", entry.name())))?
+        };
+        self.push_archive_entry(entry, reader)?;
+        Ok(())
+    }
+
+    /// A run of [`ArchiveWriter::push_archive_entries_non_solid`]'s folders,
+    /// coded on workers and written here in order.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn push_non_solid_parallel<R, F>(
+        &mut self,
+        entries: &[ArchiveEntry],
+        run: std::ops::Range<usize>,
+        open: &F,
+        threads: u32,
+    ) -> Result<()>
+    where
+        R: Read,
+        F: Fn(usize, &ArchiveEntry) -> std::io::Result<Option<R>> + Sync,
+    {
+        let methods = Arc::clone(&self.content_methods);
+        let workers = (threads as usize).min(run.len());
+        let first = run.start;
+        let outcome = crate::ordered::run(
+            run.len(),
+            workers,
+            ENCODE_WINDOW_PER_WORKER * workers,
+            ENCODE_STAGE_BYTES,
+            |job, tx| {
+                let index = first + job;
+                let entry = entries[index].clone();
+                let result = if entry.is_directory {
+                    Ok(FolderOut::Unstreamed(entry))
+                } else {
+                    match open(index, &entry) {
+                        Err(e) => Err(Error::io_msg(e, format!("Open entry:{}", entry.name()))),
+                        Ok(None) => Ok(FolderOut::Unstreamed(entry)),
+                        Ok(Some(mut reader)) => {
+                            let mut sink = StageSink {
+                                tx: &mut *tx,
+                                cancelled: false,
+                            };
+                            let encoded = encode_entry(&methods, entry, &mut reader, &mut sink);
+                            if sink.cancelled {
+                                return;
+                            }
+                            encoded.map(FolderOut::Encoded)
+                        }
+                    }
+                };
+                let _ = tx.send(EncodeMessage::Done(Box::new(result)), 0);
+            },
+            |_, rx| loop {
+                match rx.recv() {
+                    Some(EncodeMessage::Data(bytes)) => self
+                        .output
+                        .write_all(&bytes)
+                        .map_err(|e| Error::io_msg(e, "write folder".to_string()))?,
+                    Some(EncodeMessage::Done(result)) => {
+                        match (*result)? {
+                            FolderOut::Encoded(folder) => {
+                                self.record_folder(folder)?;
+                            }
+                            FolderOut::Unstreamed(entry) => {
+                                self.push_archive_entry::<&[u8]>(entry, None)?;
+                            }
+                        }
+                        return Ok(());
+                    }
+                    None => {
+                        return Err(Error::other(
+                            "the worker coding this folder stopped before finishing it",
+                        ));
+                    }
+                }
+            },
+        );
+        match outcome {
+            Some(result) => result,
+            // Not one worker could be started: code the run here instead.
+            None => {
+                for at in run {
+                    self.push_opened(entries, at, open)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn push_non_solid_parallel<R, F>(
+        &mut self,
+        entries: &[ArchiveEntry],
+        run: std::ops::Range<usize>,
+        open: &F,
+        _threads: u32,
+    ) -> Result<()>
+    where
+        R: Read,
+        F: Fn(usize, &ArchiveEntry) -> std::io::Result<Option<R>> + Sync,
+    {
+        for at in run {
+            self.push_opened(entries, at, open)?;
+        }
+        Ok(())
     }
 
     /// Append a block compressed elsewhere by [`prepare_block`].
@@ -834,6 +996,148 @@ pub(crate) fn write_u64<W: Write>(header: &mut W, mut value: u64) -> std::io::Re
         i -= 1;
     }
     Ok(())
+}
+
+/// One non-solid folder, coded: its main pack stream has gone to the output
+/// it was coded into, and this is everything else the archive records.
+struct EncodedFolder {
+    entry: ArchiveEntry,
+    methods: Arc<Vec<EncoderConfiguration>>,
+    /// The folder's unpacked size: the entry's.
+    size: u64,
+    /// The unpacked sizes of the coders after the first, in chain order.
+    more_sizes: Vec<u64>,
+    crc: u32,
+    compressed_len: u64,
+    compressed_crc: u32,
+    bcj2: Option<Bcj2Packed>,
+}
+
+/// Codes `entry`'s data from `r` as one folder with `content_methods`, sized
+/// for the folder, writing the main pack stream to `output`.
+///
+/// The checksums of the data and of the compressed bytes are taken here, on
+/// the thread doing the coding, which is what lets a worker do all of it.
+fn encode_entry<R: Read, O: Write>(
+    content_methods: &Arc<Vec<EncoderConfiguration>>,
+    entry: ArchiveEntry,
+    r: &mut R,
+    output: O,
+) -> Result<EncodedFolder> {
+    let mut compressed_len = 0;
+    let mut compressed = CompressWrapWriter::new(output, &mut compressed_len);
+    let mut out = std::io::BufWriter::with_capacity(OUTPUT_BUF_LEN, &mut compressed);
+
+    let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(content_methods.len() - 1);
+    let (head, folder) = folder_size([&entry], r)
+        .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+    let methods = sized_methods(content_methods, folder);
+    let mut bcj2 = None;
+
+    let (crc, size) = {
+        let mut w = ArchiveWriter::<std::io::Cursor<Vec<u8>>>::create_writer(
+            &methods,
+            &mut out,
+            &mut more_sizes,
+            &mut bcj2,
+        )?;
+        let mut write_len = 0;
+        let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
+        w.write_all(&head)
+            .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+        drop(head);
+        let mut buf = vec![0u8; SOURCE_READ_LEN];
+        loop {
+            match r.read(&mut buf) {
+                Ok(n) => {
+                    if n == 0 {
+                        break;
+                    }
+                    w.write_all(&buf[..n])
+                        .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+                }
+                Err(e) => {
+                    return Err(Error::io_msg(e, format!("Encode entry:{}", entry.name())));
+                }
+            }
+        }
+        w.flush()
+            .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+        w.write(&[])
+            .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+
+        (w.crc_value(), write_len)
+    };
+    out.flush()
+        .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+    drop(out);
+    let compressed_crc = compressed.crc_value();
+    drop(compressed);
+    Ok(EncodedFolder {
+        entry,
+        methods,
+        size: size as u64,
+        more_sizes: more_sizes.iter().map(|s| s.get() as u64).collect(),
+        crc,
+        compressed_len: compressed_len as u64,
+        compressed_crc,
+        bcj2: Bcj2Packed::take(bcj2),
+    })
+}
+
+/// What each encode worker may stage, compressed, before it waits for the
+/// writer: per folder, with up to [`ENCODE_WINDOW_PER_WORKER`] folders per
+/// worker.
+#[cfg(not(target_arch = "wasm32"))]
+const ENCODE_STAGE_BYTES: usize = 8 << 20;
+
+/// Folders each encode worker may be ahead of the writer: the one it is
+/// coding and one finished and waiting.
+#[cfg(not(target_arch = "wasm32"))]
+const ENCODE_WINDOW_PER_WORKER: usize = 2;
+
+/// A folder a worker coded, or an entry with no data to code.
+#[cfg(not(target_arch = "wasm32"))]
+enum FolderOut {
+    Encoded(EncodedFolder),
+    Unstreamed(ArchiveEntry),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+enum EncodeMessage {
+    /// The next compressed bytes of the folder's main pack stream.
+    Data(Vec<u8>),
+    /// The folder is coded.
+    Done(Box<Result<FolderOut>>),
+}
+
+/// The output an encode worker codes into: the folder's stage.
+#[cfg(not(target_arch = "wasm32"))]
+struct StageSink<'t, 'a> {
+    tx: &'t mut crate::ordered::Sender<'a, EncodeMessage>,
+    cancelled: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Write for StageSink<'_, '_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self
+            .tx
+            .send(EncodeMessage::Data(buf.to_vec()), buf.len())
+            .is_err()
+        {
+            self.cancelled = true;
+            return Err(std::io::Error::other("folder encode cancelled"));
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 struct CompressWrapWriter<'a, W> {

@@ -20,6 +20,7 @@ use crate::{
     container::{ArchiveLimits, BlockCompletion, SubStreamCompletion},
     decoder::{DecodeOptions, add_decoder, check_chain_memory},
     error::{Error, Limit},
+    positional::{ReadAt, ReadAtCursor},
 };
 
 /// Upper bound for eagerly pre-allocating an output buffer from an archive-declared
@@ -1654,16 +1655,58 @@ pub struct ArchiveReader<R: Read + Seek> {
     on_block_complete: Option<Box<dyn FnMut(BlockCompletion) + Send>>,
     #[allow(clippy::type_complexity)]
     on_sub_stream_complete: Option<Box<dyn FnMut(SubStreamCompletion) + Send>>,
+    /// The same bytes as `source`, read at an offset, for decoding several
+    /// folders at once. See [`ArchiveReader::set_positional_source`].
+    positional: Option<Arc<dyn ReadAt>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl ArchiveReader<File> {
     /// Opens a 7z archive file at the given `path` and creates a [`ArchiveReader`] to read it.
+    ///
+    /// The reader keeps a second handle on the file as its positional source
+    /// (see [`ArchiveReader::set_positional_source`]), so with more than one
+    /// thread the folders of a non-solid archive decode in parallel. With the
+    /// default of one thread that handle is never read.
     #[inline]
     pub fn open(path: impl AsRef<std::path::Path>, password: Password) -> Result<Self, Error> {
         let file = File::open(path.as_ref())
             .map_err(|e| Error::file_open(e, path.as_ref().to_string_lossy().to_string()))?;
-        Self::new(file, password)
+        let positional = file.try_clone().ok();
+        let mut reader = Self::new(file, password)?;
+        #[cfg(any(unix, windows))]
+        if let Some(positional) = positional {
+            reader.set_positional_source(positional);
+        }
+        #[cfg(not(any(unix, windows)))]
+        drop(positional);
+        Ok(reader)
+    }
+}
+
+impl<S: ReadAt + 'static> ArchiveReader<ReadAtCursor<S>> {
+    /// A reader over a [`ReadAt`] source: a file, bytes in memory, or any
+    /// `Read + Seek` behind [`crate::SerialReadAt`].
+    ///
+    /// The header is parsed through a cursor of the reader's own, and the same
+    /// source is the reader's positional source, so with more than one thread
+    /// ([`ArchiveReader::set_threads`]) the folders of a non-solid archive
+    /// decode in parallel. See [`ArchiveReader::set_positional_source`] for
+    /// what that changes and what it does not.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveReader::with_limits`].
+    pub fn from_read_at(
+        source: S,
+        password: Password,
+        limits: ArchiveLimits,
+    ) -> Result<Self, Error> {
+        let source = Arc::new(source);
+        let mut reader =
+            Self::with_limits(ReadAtCursor::new(Arc::clone(&source)), password, limits)?;
+        reader.positional = Some(source);
+        Ok(reader)
     }
 }
 
@@ -1735,11 +1778,55 @@ impl<R: Read + Seek> ArchiveReader<R> {
             limits,
             on_block_complete: None,
             on_sub_stream_complete: None,
+            positional: None,
         };
 
         reader.fill_index();
 
         Ok(reader)
+    }
+
+    /// Gives the reader a positional view of its source, so that the folders
+    /// of a non-solid archive can be decoded concurrently.
+    ///
+    /// `source` must hold the same bytes as the reader's own source; the reader
+    /// cannot check that, and decodes whatever it reads. [`ArchiveReader::open`]
+    /// and [`ArchiveReader::from_read_at`] set it themselves.
+    ///
+    /// It changes nothing until the thread count is above one. Then
+    /// [`ArchiveReader::for_each_entries`] decodes each run of consecutive
+    /// small folders — none larger than 8 MiB unpacked — on worker threads,
+    /// as many at once as the thread count allows, each folder with its share
+    /// of the threads, while a folder too large to stage is decoded alone on
+    /// the calling thread with the whole count, exactly as without a
+    /// positional source. Nothing else changes:
+    ///
+    /// - **Order.** The callback, the sub-stream hook and the block hook are
+    ///   all called on the calling thread, in archive order, as on the
+    ///   sequential path; only the decoding happens elsewhere.
+    /// - **Memory.** At most two staged folders per worker, each at most
+    ///   8 MiB, are held between the workers and the callback. Under a memory
+    ///   limit the worker count is cut until every worker's decoder plus its
+    ///   staging fits the limit, and each folder then decodes on one thread.
+    /// - **Checks.** Every member's CRC is verified on the worker that decoded
+    ///   it, and a failure is the same located [`Error::BlockDecode`] naming
+    ///   the same folder. A worker reads each member in full, so a damaged
+    ///   member is reported even if the callback returned without reading it.
+    pub fn set_positional_source(&mut self, source: impl ReadAt + 'static) {
+        self.positional = Some(Arc::new(source));
+    }
+
+    /// [`ArchiveReader::set_positional_source`], for a builder chain.
+    #[must_use]
+    pub fn with_positional_source(mut self, source: impl ReadAt + 'static) -> Self {
+        self.set_positional_source(source);
+        self
+    }
+
+    /// Drops the positional source: every folder decodes on the calling
+    /// thread again, one at a time.
+    pub fn clear_positional_source(&mut self) {
+        self.positional = None;
     }
 
     /// Calls `hook` each time a block has been decoded in full and its
@@ -1861,6 +1948,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             limits: ArchiveLimits::default(),
             on_block_complete: None,
             on_sub_stream_complete: None,
+            positional: None,
         };
 
         reader.fill_index();
@@ -2335,50 +2423,23 @@ impl<R: Read + Seek> ArchiveReader<R> {
         &mut self,
         mut each: F,
     ) -> Result<(), Error> {
-        let block_count = self.archive.blocks.len();
-        for block_index in 0..block_count {
-            let block_decoder = BlockDecoder {
-                thread_count: self.thread_count,
-                adaptive_lzma2: self.adaptive_lzma2,
-                verify_checksums: self.verify_checksums,
-                lzma2: Arc::clone(&self.lzma2),
-                block_index,
-                archive: &self.archive,
-                password: &self.password,
-                source: &mut self.source,
-                limits: self.limits,
-                on_sub_stream_complete: self
-                    .on_sub_stream_complete
-                    .as_mut()
-                    .map(|hook| &mut **hook as &mut (dyn FnMut(SubStreamCompletion) + Send + '_)),
-            };
-            let finished = block_decoder.for_each_entries(&mut each)?;
-
-            if let Some(hook) = self.on_block_complete.as_mut() {
-                // Only a block the caller let run to the end has been decoded
-                // and checked in full; a callback that stopped early leaves the
-                // rest of the block unread, and saying otherwise would be a
-                // completion claim nobody verified.
-                if finished {
-                    let block = &self.archive.blocks[block_index];
-                    let sub_streams = self.archive.block_sub_streams(block_index);
-                    let crc_verified = block.has_crc
-                        || (!sub_streams.is_empty()
-                            && sub_streams
-                                .iter()
-                                .all(|sub_stream| sub_stream.crc.is_some()));
-                    hook(BlockCompletion {
-                        block_index,
-                        unpacked_size: block.get_unpack_size(),
-                        crc_verified,
-                    });
+        for phase in self.folder_phases() {
+            match phase {
+                FolderPhase::Alone { block } => self.decode_block_alone(block, &mut each)?,
+                #[cfg(not(target_arch = "wasm32"))]
+                FolderPhase::Parallel {
+                    blocks,
+                    workers,
+                    threads_per_folder,
+                } => self.decode_blocks_parallel(blocks, workers, threads_per_folder, &mut each)?,
+                // Never planned without threads; walked in order if it were.
+                #[cfg(target_arch = "wasm32")]
+                FolderPhase::Parallel { blocks, .. } => {
+                    for block in blocks {
+                        self.decode_block_alone(block, &mut each)?;
+                    }
                 }
             }
-
-            // Upstream moves on to the next block when a callback returns
-            // `false`, and consumers rely on that; only the hook treats it as
-            // "this block was not decoded in full".
-            let _ = finished;
         }
         // decode empty files
         for file_index in 0..self.archive.files.len() {
@@ -2392,6 +2453,165 @@ impl<R: Read + Seek> ArchiveReader<R> {
             }
         }
         Ok(())
+    }
+
+    /// How [`ArchiveReader::for_each_entries`] walks the folders: every one
+    /// alone on the calling thread, unless there is a positional source and
+    /// more than one thread to share among runs of small folders.
+    fn folder_phases(&self) -> Vec<FolderPhase> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.positional.is_some() && self.thread_count > 1 {
+            let folders = self.archive.blocks.iter().map(|block| {
+                let estimate = block.coders.iter().try_fold(0u64, |sum, coder| {
+                    crate::container::coder_memory_estimate(coder)
+                        .ok()
+                        .map(|bytes| sum.saturating_add(bytes))
+                });
+                (block.get_unpack_size(), estimate.unwrap_or(u64::MAX))
+            });
+            return plan_folders(folders, self.thread_count, self.limits.memory_limit_bytes);
+        }
+        (0..self.archive.blocks.len())
+            .map(|block| FolderPhase::Alone { block })
+            .collect()
+    }
+
+    /// One folder, decoded on the calling thread with the reader's own thread
+    /// count: the sequential path, unchanged.
+    fn decode_block_alone<F>(&mut self, block_index: usize, each: &mut F) -> Result<(), Error>
+    where
+        F: FnMut(&ArchiveEntry, &mut dyn Read) -> Result<bool, Error>,
+    {
+        let block_decoder = BlockDecoder {
+            thread_count: self.thread_count,
+            adaptive_lzma2: self.adaptive_lzma2,
+            verify_checksums: self.verify_checksums,
+            lzma2: Arc::clone(&self.lzma2),
+            block_index,
+            archive: &self.archive,
+            password: &self.password,
+            source: &mut self.source,
+            limits: self.limits,
+            on_sub_stream_complete: self
+                .on_sub_stream_complete
+                .as_mut()
+                .map(|hook| &mut **hook as &mut (dyn FnMut(SubStreamCompletion) + Send + '_)),
+        };
+        let finished = block_decoder.for_each_entries(each)?;
+        // Upstream moves on to the next block when a callback returns
+        // `false`, and consumers rely on that; only the hook treats it as
+        // "this block was not decoded in full".
+        Self::block_completed(
+            &self.archive,
+            self.on_block_complete
+                .as_mut()
+                .map(|hook| &mut **hook as &mut (dyn FnMut(BlockCompletion) + Send)),
+            block_index,
+            finished,
+        );
+        Ok(())
+    }
+
+    /// Fires the block hook for a block the caller let run to the end.
+    fn block_completed(
+        archive: &Archive,
+        hook: Option<&mut (dyn FnMut(BlockCompletion) + Send)>,
+        block_index: usize,
+        finished: bool,
+    ) {
+        // Only a block the caller let run to the end has been decoded and
+        // checked in full; a callback that stopped early leaves the rest of
+        // the block unread, and saying otherwise would be a completion claim
+        // nobody verified.
+        let (Some(hook), true) = (hook, finished) else {
+            return;
+        };
+        let block = &archive.blocks[block_index];
+        let sub_streams = archive.block_sub_streams(block_index);
+        let crc_verified = block.has_crc
+            || (!sub_streams.is_empty()
+                && sub_streams
+                    .iter()
+                    .all(|sub_stream| sub_stream.crc.is_some()));
+        hook(BlockCompletion {
+            block_index,
+            unpacked_size: block.get_unpack_size(),
+            crc_verified,
+        });
+    }
+
+    /// A run of small folders, decoded `workers` at a time from the
+    /// positional source and handed to `each` in archive order.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn decode_blocks_parallel<F>(
+        &mut self,
+        blocks: std::ops::Range<usize>,
+        workers: u32,
+        threads_per_folder: u32,
+        each: &mut F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(&ArchiveEntry, &mut dyn Read) -> Result<bool, Error>,
+    {
+        let Some(source) = self.positional.clone() else {
+            for block in blocks {
+                self.decode_block_alone(block, each)?;
+            }
+            return Ok(());
+        };
+        let first = blocks.start;
+        let workers = workers as usize;
+        let worker_side = FolderWorker {
+            archive: &self.archive,
+            password: &self.password,
+            limits: self.limits,
+            verify_checksums: self.verify_checksums,
+            threads: threads_per_folder,
+            source: &source,
+        };
+        let archive = &self.archive;
+        let encrypted = !self.password.is_empty();
+        let on_block = &mut self.on_block_complete;
+        let on_sub = &mut self.on_sub_stream_complete;
+        let outcome = crate::ordered::run(
+            blocks.len(),
+            workers,
+            FOLDER_WINDOW_PER_WORKER * workers,
+            FOLDER_STAGE_BYTES as usize,
+            |job, tx| worker_side.decode(first + job, tx),
+            |job, rx| {
+                let block_index = first + job;
+                let finished = replay_folder(
+                    archive,
+                    encrypted,
+                    block_index,
+                    rx,
+                    each,
+                    on_sub
+                        .as_mut()
+                        .map(|hook| &mut **hook as &mut (dyn FnMut(SubStreamCompletion) + Send)),
+                )?;
+                Self::block_completed(
+                    archive,
+                    on_block
+                        .as_mut()
+                        .map(|hook| &mut **hook as &mut (dyn FnMut(BlockCompletion) + Send)),
+                    block_index,
+                    finished,
+                );
+                Ok(())
+            },
+        );
+        match outcome {
+            Some(result) => result,
+            // Not one worker could be started: decode the run here instead.
+            None => {
+                for block in blocks {
+                    self.decode_block_alone(block, each)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Returns the data of a file with the given path inside the archive.
@@ -2890,6 +3110,461 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
     }
 }
 
+/// The largest folder, unpacked, that is decoded on a worker and staged for
+/// the callback rather than decoded alone on the calling thread.
+///
+/// Staging is what lets folders decode out of order and still reach the caller
+/// in order, and it is bounded by this per folder. A larger folder is decoded
+/// alone, with the reader's whole thread count for its own LZMA2 coder, which
+/// is where a large folder's parallelism is.
+pub(crate) const FOLDER_STAGE_BYTES: u64 = 8 << 20;
+
+/// How many folders each worker may have decoded ahead of the callback: one
+/// being decoded and one waiting, so a worker that finishes a folder while the
+/// callback is still on an earlier one starts the next instead of idling.
+pub(crate) const FOLDER_WINDOW_PER_WORKER: usize = 2;
+
+/// How much of a member a folder worker reads at once and hands over.
+#[cfg(not(target_arch = "wasm32"))]
+const FOLDER_CHUNK_BYTES: usize = 1 << 20;
+
+/// What a message costs in the stage beyond its bytes, so that a folder of
+/// many empty members still fills its stage and waits.
+#[cfg(not(target_arch = "wasm32"))]
+const FOLDER_MESSAGE_WEIGHT: usize = 64;
+
+/// One step of [`ArchiveReader::for_each_entries`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FolderPhase {
+    /// One folder, on the calling thread, with the reader's whole thread count
+    /// for its own coder.
+    Alone { block: usize },
+    /// Consecutive small folders, decoded `workers` at a time, each with
+    /// `threads_per_folder` threads for its own coder. `workers *
+    /// threads_per_folder` never exceeds the reader's thread count.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Parallel {
+        blocks: std::ops::Range<usize>,
+        workers: u32,
+        threads_per_folder: u32,
+    },
+}
+
+/// Plans the folders of an archive, given each folder's unpacked size and
+/// decoder memory estimate (`u64::MAX` when it has none), for a thread budget
+/// of `threads` and a memory limit of `memory_limit_bytes`.
+///
+/// A folder of at most [`FOLDER_STAGE_BYTES`] can be staged; a run of at
+/// least two of them is decoded in parallel, by as many workers as the budget,
+/// the run's length and the memory limit allow. Every other folder is decoded
+/// alone. With no memory limit, a run that has fewer folders than threads
+/// gives each folder an equal share of the rest; with one, each folder decodes
+/// on one thread, because a parallel LZMA2 coder sizes what it holds from the
+/// limit and several of them would each take the whole of it.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn plan_folders(
+    folders: impl Iterator<Item = (u64, u64)>,
+    threads: u32,
+    memory_limit_bytes: u64,
+) -> Vec<FolderPhase> {
+    let threads = threads.max(1);
+    let mut phases = Vec::new();
+    // The open run: where it starts, and the largest decoder in it.
+    let mut run: Option<(usize, u64)> = None;
+    let close = |phases: &mut Vec<FolderPhase>, start: usize, end: usize, largest: u64| {
+        let len = end - start;
+        let by_memory = if memory_limit_bytes == u64::MAX {
+            u64::MAX
+        } else {
+            let per_worker = largest
+                .saturating_add(FOLDER_STAGE_BYTES.saturating_mul(FOLDER_WINDOW_PER_WORKER as u64));
+            memory_limit_bytes / per_worker.max(1)
+        };
+        let workers = u64::from(threads).min(len as u64).min(by_memory).max(1) as u32;
+        if len < 2 || workers < 2 {
+            phases.extend((start..end).map(|block| FolderPhase::Alone { block }));
+            return;
+        }
+        let threads_per_folder = if memory_limit_bytes == u64::MAX {
+            (threads / workers).max(1)
+        } else {
+            1
+        };
+        phases.push(FolderPhase::Parallel {
+            blocks: start..end,
+            workers,
+            threads_per_folder,
+        });
+    };
+    let mut count = 0;
+    for (index, (unpacked, estimate)) in folders.enumerate() {
+        count = index + 1;
+        if unpacked <= FOLDER_STAGE_BYTES {
+            let largest = run.map_or(estimate, |(_, largest)| largest.max(estimate));
+            run = Some((run.map_or(index, |(start, _)| start), largest));
+            continue;
+        }
+        if let Some((start, largest)) = run.take() {
+            close(&mut phases, start, index, largest);
+        }
+        phases.push(FolderPhase::Alone { block: index });
+    }
+    if let Some((start, largest)) = run {
+        close(&mut phases, start, count, largest);
+    }
+    phases
+}
+
+/// What a folder worker hands the calling thread, in order.
+#[cfg(not(target_arch = "wasm32"))]
+enum FolderMessage {
+    /// The callback is about to be given this file.
+    Begin(usize),
+    /// The next bytes of the file begun last.
+    Data(Vec<u8>),
+    /// The file begun last ended cleanly.
+    End,
+    /// Reading the file begun last failed here, after the bytes before it.
+    Fault(io::Error),
+    /// A file's checksum became final, for the sub-stream hook.
+    Completion(SubStreamCompletion),
+    /// The folder is over.
+    Done(FolderEnd),
+}
+
+/// How a folder worker's decode ended.
+#[cfg(not(target_arch = "wasm32"))]
+enum FolderEnd {
+    /// Every file was decoded and checked.
+    Finished,
+    /// A file failed partway, and its [`FolderMessage::Fault`] says how.
+    Stopped,
+    /// The folder failed outside any file: its coders could not be built, or
+    /// its own checksum did not match. Already located.
+    Failed(Error),
+}
+
+/// What every folder worker of one run shares.
+#[cfg(not(target_arch = "wasm32"))]
+struct FolderWorker<'a> {
+    archive: &'a Archive,
+    password: &'a Password,
+    limits: ArchiveLimits,
+    verify_checksums: bool,
+    threads: u32,
+    source: &'a Arc<dyn ReadAt>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl FolderWorker<'_> {
+    /// Decodes one folder through the ordinary [`BlockDecoder`] over a cursor
+    /// of its own, sending what the callback would have been given.
+    fn decode(&self, block_index: usize, tx: &mut crate::ordered::Sender<'_, FolderMessage>) {
+        let mut cursor = ReadAtCursor::new(Arc::clone(self.source));
+        let completions = std::sync::Mutex::new(Vec::new());
+        let mut hook = |completion: SubStreamCompletion| {
+            if let Ok(mut pending) = completions.lock() {
+                pending.push(completion);
+            }
+        };
+        let mut decoder = BlockDecoder::with_limits(
+            self.threads,
+            block_index,
+            self.archive,
+            self.password,
+            &mut cursor,
+            self.limits,
+        )
+        .with_verify_checksums(self.verify_checksums);
+        decoder.on_sub_stream_complete = Some(&mut hook);
+
+        let first_file = self.archive.stream_map.block_first_file_index[block_index];
+        let mut next_file = first_file;
+        let mut stopped = false;
+        let mut cancelled = false;
+        // The hook fires after the callback returns for a file, so what it
+        // left is sent before the next file begins: the order the caller's
+        // own hook would have seen.
+        let flush = |tx: &mut crate::ordered::Sender<'_, FolderMessage>| {
+            let pending = std::mem::take(&mut *completions.lock().map_err(|_| ())?);
+            for completion in pending {
+                tx.send(FolderMessage::Completion(completion), FOLDER_MESSAGE_WEIGHT)
+                    .map_err(|_| ())?;
+            }
+            Ok::<(), ()>(())
+        };
+        let result = decoder.for_each_entries(&mut |entry, rd| {
+            let file_index = next_file;
+            next_file += 1;
+            let send = |tx: &mut crate::ordered::Sender<'_, FolderMessage>, message, weight| {
+                tx.send(message, weight)
+                    .map_err(|_| Error::other("folder decode cancelled"))
+            };
+            if flush(tx).is_err() {
+                cancelled = true;
+                return Err(Error::other("folder decode cancelled"));
+            }
+            send(tx, FolderMessage::Begin(file_index), FOLDER_MESSAGE_WEIGHT)
+                .inspect_err(|_| cancelled = true)?;
+            let mut left = if entry.has_stream { entry.size } else { 0 };
+            while left > 0 {
+                let mut chunk = vec![0u8; left.min(FOLDER_CHUNK_BYTES as u64) as usize];
+                let mut filled = 0;
+                let mut fault = None;
+                while filled < chunk.len() {
+                    match rd.read(&mut chunk[filled..]) {
+                        Ok(0) => break,
+                        Ok(n) => filled += n,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(e) => {
+                            fault = Some(e);
+                            break;
+                        }
+                    }
+                }
+                chunk.truncate(filled);
+                left -= filled as u64;
+                if !chunk.is_empty() {
+                    let weight = chunk.len() + FOLDER_MESSAGE_WEIGHT;
+                    send(tx, FolderMessage::Data(chunk), weight)
+                        .inspect_err(|_| cancelled = true)?;
+                }
+                if let Some(e) = fault {
+                    stopped = true;
+                    send(tx, FolderMessage::Fault(e), FOLDER_MESSAGE_WEIGHT)
+                        .inspect_err(|_| cancelled = true)?;
+                    return Err(Error::other("folder decode stopped"));
+                }
+                if filled == 0 {
+                    // The stream ended early: the callback would have seen the
+                    // end here too.
+                    break;
+                }
+            }
+            send(tx, FolderMessage::End, FOLDER_MESSAGE_WEIGHT)
+                .inspect_err(|_| cancelled = true)?;
+            Ok(true)
+        });
+        if cancelled || flush(tx).is_err() {
+            return;
+        }
+        let end = match result {
+            _ if stopped => FolderEnd::Stopped,
+            Ok(_) => FolderEnd::Finished,
+            Err(error) => FolderEnd::Failed(error),
+        };
+        let _ = tx.send(FolderMessage::Done(end), FOLDER_MESSAGE_WEIGHT);
+    }
+}
+
+/// Hands one folder a worker decoded to `each`, in order, as
+/// [`BlockDecoder::for_each_entries`] would have: the same files, the same
+/// bytes, the same errors in the same places, and the sub-stream hook after
+/// each file. Returns whether the callback let the folder run to its end.
+#[cfg(not(target_arch = "wasm32"))]
+fn replay_folder<F>(
+    archive: &Archive,
+    encrypted: bool,
+    block_index: usize,
+    rx: &mut crate::ordered::Receiver<'_, FolderMessage>,
+    each: &mut F,
+    mut on_sub_stream_complete: Option<&mut (dyn FnMut(SubStreamCompletion) + Send)>,
+) -> Result<bool, Error>
+where
+    F: FnMut(&ArchiveEntry, &mut dyn Read) -> Result<bool, Error>,
+{
+    let packed_offset = archive
+        .block_pack_streams(block_index)
+        .first()
+        .map_or(0, |range| range.offset);
+    let lost = || {
+        Error::other("the worker decoding this folder stopped before finishing it")
+            .in_block(block_index, packed_offset)
+    };
+    // A file's failure the callback was handed and did not return, kept so
+    // that it is still the folder's error.
+    let mut swallowed: Option<(io::ErrorKind, String)> = None;
+    loop {
+        match rx.recv() {
+            None => return Err(lost()),
+            Some(FolderMessage::Begin(file_index)) => {
+                let file = &archive.files[file_index];
+                if !(file.has_stream && file.size > 0) {
+                    // An empty file has no bytes to fail on: its errors are the
+                    // caller's own, passed through.
+                    match rx.recv() {
+                        Some(FolderMessage::End) => {}
+                        _ => return Err(lost()),
+                    }
+                    let empty_reader: &mut dyn Read = &mut ([0u8; 0].as_slice());
+                    if !each(file, empty_reader)? {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+                let mut entry = ReplayEntry {
+                    rx: &mut *rx,
+                    chunk: Vec::new(),
+                    pos: 0,
+                    state: ReplayState::Open,
+                    fault: None,
+                };
+                let outcome = each(file, &mut entry)
+                    .map_err(|e| e.maybe_bad_password(encrypted))
+                    .map_err(|e| {
+                        // As on the sequential path: only a failure that came
+                        // out of the decode is this folder's fault.
+                        if entry.state.faulted() {
+                            e.in_block(block_index, packed_offset)
+                        } else {
+                            e
+                        }
+                    })?;
+                let unseen = entry.finish();
+                if !outcome {
+                    return Ok(false);
+                }
+                if let Some(error) = unseen {
+                    // The worker read the whole file; the callback stopped
+                    // short of where it failed. The member is damaged all
+                    // the same.
+                    return Err(Error::from(error)
+                        .maybe_bad_password(encrypted)
+                        .in_block(block_index, packed_offset));
+                }
+                if let Some(fault) = entry.fault.take() {
+                    swallowed = Some(fault);
+                }
+            }
+            Some(FolderMessage::Completion(completion)) => {
+                if let Some(hook) = on_sub_stream_complete.as_deref_mut() {
+                    hook(completion);
+                }
+            }
+            Some(FolderMessage::Done(FolderEnd::Finished)) => return Ok(true),
+            Some(FolderMessage::Done(FolderEnd::Failed(error))) => return Err(error),
+            Some(FolderMessage::Done(FolderEnd::Stopped)) => {
+                let (kind, message) = swallowed
+                    .take()
+                    .unwrap_or((io::ErrorKind::Other, "folder decode stopped".to_string()));
+                return Err(Error::from(io::Error::new(kind, message))
+                    .maybe_bad_password(encrypted)
+                    .in_block(block_index, packed_offset));
+            }
+            Some(_) => return Err(lost()),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayState {
+    Open,
+    Ended,
+    Faulted,
+    Lost,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ReplayState {
+    fn faulted(self) -> bool {
+        matches!(self, Self::Faulted | Self::Lost)
+    }
+}
+
+/// The `Read` the callback is handed for one file a worker decoded.
+#[cfg(not(target_arch = "wasm32"))]
+struct ReplayEntry<'r, 'a> {
+    rx: &'r mut crate::ordered::Receiver<'a, FolderMessage>,
+    chunk: Vec<u8>,
+    pos: usize,
+    state: ReplayState,
+    /// The failure the callback was handed, described, for a later read and
+    /// for a callback that does not return it.
+    fault: Option<(io::ErrorKind, String)>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ReplayEntry<'_, '_> {
+    /// Takes the rest of the file's messages, returning a failure among them
+    /// that the callback never read as far as.
+    fn finish(&mut self) -> Option<io::Error> {
+        if self.state != ReplayState::Open {
+            return None;
+        }
+        loop {
+            match self.rx.recv() {
+                Some(FolderMessage::Data(_)) => {}
+                Some(FolderMessage::End) => {
+                    self.state = ReplayState::Ended;
+                    return None;
+                }
+                Some(FolderMessage::Fault(error)) => {
+                    self.state = ReplayState::Faulted;
+                    return Some(error);
+                }
+                _ => {
+                    self.state = ReplayState::Lost;
+                    return Some(io::Error::other(
+                        "the worker decoding this folder stopped before finishing it",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Read for ReplayEntry<'_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.pos < self.chunk.len() {
+                let n = buf.len().min(self.chunk.len() - self.pos);
+                buf[..n].copy_from_slice(&self.chunk[self.pos..self.pos + n]);
+                self.pos += n;
+                return Ok(n);
+            }
+            match self.state {
+                ReplayState::Open => {}
+                ReplayState::Ended => return Ok(0),
+                ReplayState::Faulted | ReplayState::Lost => {
+                    let (kind, message) = self
+                        .fault
+                        .clone()
+                        .unwrap_or((io::ErrorKind::Other, "folder decode failed".to_string()));
+                    return Err(io::Error::new(kind, message));
+                }
+            }
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            match self.rx.recv() {
+                Some(FolderMessage::Data(chunk)) => {
+                    self.chunk = chunk;
+                    self.pos = 0;
+                }
+                Some(FolderMessage::End) => {
+                    self.state = ReplayState::Ended;
+                    return Ok(0);
+                }
+                Some(FolderMessage::Fault(error)) => {
+                    self.state = ReplayState::Faulted;
+                    self.fault = Some((error.kind(), error.to_string()));
+                    return Err(error);
+                }
+                _ => {
+                    self.state = ReplayState::Lost;
+                    let error = io::Error::other(
+                        "the worker decoding this folder stopped before finishing it",
+                    );
+                    self.fault = Some((error.kind(), error.to_string()));
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
 /// Reads a decoded header of exactly `declared` bytes into a buffer that never
 /// grows past it.
 ///
@@ -3059,5 +3734,119 @@ mod block_checksum_tests {
         .expect("stack");
         let err = io::copy(&mut rd, &mut io::sink()).expect_err("the borrowed CRC is checked");
         assert!(Error::from(err).is_checksum_failure());
+    }
+}
+
+#[cfg(test)]
+mod folder_plan_tests {
+    use super::*;
+
+    /// Archives of varied shapes: unpacked sizes either side of the staging
+    /// bound, with and without decoder estimates.
+    fn shapes() -> Vec<Vec<(u64, u64)>> {
+        let small = |n: usize, estimate: u64| vec![(32 << 10, estimate); n];
+        let mut mixed = Vec::new();
+        for i in 0..200u64 {
+            let unpacked = if i % 37 == 0 {
+                64 << 20
+            } else {
+                (i * 7919) % (9 << 20)
+            };
+            mixed.push((unpacked, if i % 5 == 0 { u64::MAX } else { 1 << 20 }));
+        }
+        vec![
+            Vec::new(),
+            small(1, 1 << 20),
+            small(2, 1 << 20),
+            small(3, 64 << 20),
+            small(8192, 2 << 20),
+            vec![(FOLDER_STAGE_BYTES, 0), (FOLDER_STAGE_BYTES + 1, 0), (1, 0)],
+            mixed,
+        ]
+    }
+
+    #[test]
+    fn the_plan_never_exceeds_the_thread_budget() {
+        let limits = [u64::MAX, 0, 1, 16 << 20, 40 << 20, 1 << 30, 64 << 30];
+        for folders in shapes() {
+            for threads in [0, 1, 2, 3, 4, 5, 7, 8, 13, 18, 64, 255] {
+                for limit in limits {
+                    let phases = plan_folders(folders.iter().copied(), threads, limit);
+                    let mut next = 0;
+                    for phase in &phases {
+                        match phase {
+                            FolderPhase::Alone { block } => {
+                                assert_eq!(*block, next);
+                                next += 1;
+                            }
+                            FolderPhase::Parallel {
+                                blocks,
+                                workers,
+                                threads_per_folder,
+                            } => {
+                                assert_eq!(blocks.start, next);
+                                next = blocks.end;
+                                assert!(blocks.len() >= 2);
+                                assert!(*workers >= 2 && *threads_per_folder >= 1);
+                                assert!(*workers as usize <= blocks.len());
+                                assert!(
+                                    u64::from(*workers) * u64::from(*threads_per_folder)
+                                        <= u64::from(threads.max(1)),
+                                    "{workers} x {threads_per_folder} over {threads} threads"
+                                );
+                                if limit != u64::MAX {
+                                    assert_eq!(*threads_per_folder, 1);
+                                    let largest =
+                                        folders[blocks.clone()].iter().map(|f| f.1).max().unwrap();
+                                    let per_worker = largest.saturating_add(
+                                        FOLDER_STAGE_BYTES * FOLDER_WINDOW_PER_WORKER as u64,
+                                    );
+                                    assert!(
+                                        u64::from(*workers).saturating_mul(per_worker) <= limit
+                                    );
+                                }
+                                for &(unpacked, _) in &folders[blocks.clone()] {
+                                    assert!(unpacked <= FOLDER_STAGE_BYTES);
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(next, folders.len(), "every folder planned once, in order");
+                    if threads <= 1 {
+                        assert!(
+                            phases
+                                .iter()
+                                .all(|p| matches!(p, FolderPhase::Alone { .. })),
+                            "one thread decodes every folder alone"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_large_folder_keeps_the_whole_budget() {
+        let phases = plan_folders(
+            [
+                (1, 0),
+                (2, 0),
+                (FOLDER_STAGE_BYTES + 1, 0),
+                (3, 0),
+                (4, 0),
+                (5, 0),
+            ]
+            .into_iter(),
+            8,
+            u64::MAX,
+        );
+        assert!(matches!(
+            phases[..],
+            [
+                FolderPhase::Parallel { ref blocks, workers: 2, threads_per_folder: 4 },
+                FolderPhase::Alone { block: 2 },
+                FolderPhase::Parallel { blocks: ref rest, workers: 3, threads_per_folder: 2 },
+            ] if *blocks == (0..2) && *rest == (3..6)
+        ));
     }
 }
