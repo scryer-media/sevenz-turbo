@@ -196,7 +196,7 @@ const MT_OUTPUT_SPARE_PIECES: usize = 8;
 /// The block's declared size is what is compared, and it is only a hint here:
 /// a stream that is larger than it says is still decoded correctly by the
 /// single-threaded decoder, just not in parallel.
-const MT_MIN_BLOCK_BYTES: u64 = 1 << 20;
+pub(crate) const MT_MIN_BLOCK_BYTES: u64 = 1 << 20;
 
 /// Smallest in-flight budget a parallel LZMA2 decode is given. Below this the
 /// coder decodes single-threaded instead: see [`Lzma2Plan::for_block`].

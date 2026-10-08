@@ -87,6 +87,7 @@ pub(crate) mod bitset;
 pub(crate) mod block;
 pub(crate) mod codec;
 pub(crate) mod decoder;
+pub(crate) mod pipeline;
 
 mod time;
 #[cfg(feature = "util")]
