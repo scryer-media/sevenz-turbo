@@ -7,22 +7,21 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(feature = "compress")]
 use std::io::Write;
 
-#[cfg(feature = "compress")]
-use aes::{
-    Aes256,
-    cipher::{BlockModeEncrypt, KeyIvInit, array::Array},
-};
-
 use super::MAX_AES_CYCLES_POWER;
 use crate::Password;
 use crate::crypto_backend::{
     AES_BLOCK_LEN, Aes256Cbc, Aes256CbcLike, AesError, Sha256, Sha256Like,
 };
 #[cfg(feature = "compress")]
+use crate::crypto_backend::{Aes256CbcEnc, Aes256CbcEncLike};
+#[cfg(feature = "compress")]
 use crate::encoder_options::AesEncoderOptions;
 
-#[cfg(feature = "compress")]
-type Aes256CbcEnc = cbc::Encryptor<Aes256>;
+/// The size of the pieces the cipher is handed, both ways, unless a caller's
+/// own buffer is larger. A multiple of the block size. Per-call overhead in
+/// either backend is a few blocks' worth, so this keeps it off the profile,
+/// and it matches the buffer every other coder in the chain reads through.
+const AES_CHUNK_LEN: usize = 64 << 10;
 
 fn crypto_error(err: AesError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, err)
@@ -35,8 +34,12 @@ fn crypto_error(err: AesError) -> std::io::Error {
 /// so a gigabyte of payload is copied zero extra times and the reads are as
 /// large as the caller's buffer rather than a fixed small block. CBC needs no
 /// more state than that — 16 ciphertext bytes that did not complete a block
-/// (`carry`), and, when a caller reads less than one block at a time, the
-/// plaintext of the block that call had to decrypt (`plain`).
+/// (`carry`) — for a caller that reads [`AES_CHUNK_LEN`] or more at a time.
+///
+/// A caller that reads less — PPMd's range decoder behind its buffer, BCJ2's
+/// side streams, `read_to_end`'s first probes — is served from `plain`, which
+/// is filled [`AES_CHUNK_LEN`] at a time the same way, so the cipher and the
+/// layer below are never driven a block per call.
 pub(crate) struct Aes256Sha256Decoder<R> {
     cipher: Aes256Cbc,
     input: R,
@@ -44,8 +47,9 @@ pub(crate) struct Aes256Sha256Decoder<R> {
     /// Ciphertext that did not fill a block, waiting for the next read.
     carry: [u8; AES_BLOCK_LEN],
     carry_len: usize,
-    /// Plaintext decrypted for a caller whose buffer was smaller than a block.
-    plain: [u8; AES_BLOCK_LEN],
+    /// Plaintext decrypted ahead for a caller whose buffer is smaller than
+    /// [`AES_CHUNK_LEN`]. Empty until such a caller turns up.
+    plain: Box<[u8]>,
     plain_start: usize,
     plain_end: usize,
     pos: usize,
@@ -53,7 +57,7 @@ pub(crate) struct Aes256Sha256Decoder<R> {
 
 impl<R> Drop for Aes256Sha256Decoder<R> {
     fn drop(&mut self) {
-        self.plain.zeroize();
+        self.plain.as_mut().zeroize();
     }
 }
 
@@ -74,7 +78,7 @@ impl<R: Read> Aes256Sha256Decoder<R> {
             done: false,
             carry: [0; AES_BLOCK_LEN],
             carry_len: 0,
-            plain: [0; AES_BLOCK_LEN],
+            plain: Box::default(),
             plain_start: 0,
             plain_end: 0,
             pos: 0,
@@ -95,22 +99,46 @@ impl<R: Read> Aes256Sha256Decoder<R> {
         }
     }
 
-    /// Decrypts one block into `plain`, for a caller reading less than a block
-    /// at a time. Only such callers pay for this copy.
-    fn fill_one_block(&mut self) -> std::io::Result<usize> {
-        while self.carry_len < AES_BLOCK_LEN {
-            let read = self.input.read(&mut self.carry[self.carry_len..])?;
+    /// Decrypts up to [`AES_CHUNK_LEN`] into `plain`, for a caller reading
+    /// less than that at a time. Only such callers pay for this copy.
+    fn fill_plain(&mut self) -> std::io::Result<usize> {
+        if self.plain.is_empty() {
+            self.plain = vec![0; AES_CHUNK_LEN].into_boxed_slice();
+        }
+        let mut plain = std::mem::take(&mut self.plain);
+        let decrypted = self.decrypt_into(&mut plain);
+        self.plain = plain;
+        let decrypted = decrypted?;
+        self.plain_start = 0;
+        self.plain_end = decrypted;
+        Ok(decrypted)
+    }
+
+    /// Fills `buf` with ciphertext from below, as much as one read gives past
+    /// the first block, and decrypts the whole blocks of it in place. Zero is
+    /// the end of the stream. `buf` is at least a block long.
+    fn decrypt_into(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let capacity = buf.len() - buf.len() % AES_BLOCK_LEN;
+        buf[..self.carry_len].copy_from_slice(&self.carry[..self.carry_len]);
+        let mut filled = self.carry_len;
+        self.carry_len = 0;
+        while filled < AES_BLOCK_LEN {
+            let read = self.input.read(&mut buf[filled..capacity])?;
             if read == 0 {
+                self.carry[..filled].copy_from_slice(&buf[..filled]);
+                self.carry_len = filled;
                 return self.finish();
             }
-            self.carry_len += read;
+            filled += read;
         }
-        self.plain = self.carry;
-        self.carry_len = 0;
-        self.cipher.decrypt(&mut self.plain).map_err(crypto_error)?;
-        self.plain_start = 0;
-        self.plain_end = AES_BLOCK_LEN;
-        Ok(AES_BLOCK_LEN)
+
+        let whole = filled - filled % AES_BLOCK_LEN;
+        self.carry_len = filled - whole;
+        self.carry[..self.carry_len].copy_from_slice(&buf[whole..filled]);
+        self.cipher
+            .decrypt(&mut buf[..whole])
+            .map_err(crypto_error)?;
+        Ok(whole)
     }
 
     /// Hands over whatever of `plain` is still undelivered.
@@ -134,34 +162,15 @@ impl<R: Read> Read for Aes256Sha256Decoder<R> {
         if self.done {
             return Ok(0);
         }
-        if buf.len() < AES_BLOCK_LEN {
-            if self.fill_one_block()? == 0 {
+        if buf.len() < AES_CHUNK_LEN {
+            if self.fill_plain()? == 0 {
                 return Ok(0);
             }
             return Ok(self.drain_plain(buf));
         }
 
-        // The bulk path. Everything below happens inside `buf`.
-        let capacity = buf.len() - buf.len() % AES_BLOCK_LEN;
-        buf[..self.carry_len].copy_from_slice(&self.carry[..self.carry_len]);
-        let mut filled = self.carry_len;
-        self.carry_len = 0;
-        while filled < AES_BLOCK_LEN {
-            let read = self.input.read(&mut buf[filled..capacity])?;
-            if read == 0 {
-                self.carry[..filled].copy_from_slice(&buf[..filled]);
-                self.carry_len = filled;
-                return self.finish();
-            }
-            filled += read;
-        }
-
-        let whole = filled - filled % AES_BLOCK_LEN;
-        self.carry_len = filled - whole;
-        self.carry[..self.carry_len].copy_from_slice(&buf[whole..filled]);
-        self.cipher
-            .decrypt(&mut buf[..whole])
-            .map_err(crypto_error)?;
+        // The bulk path: everything happens inside `buf`.
+        let whole = self.decrypt_into(buf)?;
         self.pos += whole;
         Ok(whole)
     }
@@ -170,7 +179,7 @@ impl<R: Read> Read for Aes256Sha256Decoder<R> {
 impl<R: Read + Seek> Seek for Aes256Sha256Decoder<R> {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         // Only a forward skip inside what is already decrypted is supported,
-        // which is what this was ever asked for; the buffer is now one block.
+        // which is what this was ever asked for.
         let len = self.plain_end - self.plain_start;
         match pos {
             std::io::SeekFrom::Start(p) => {
@@ -346,12 +355,17 @@ fn derive_key_with_budget(
 }
 
 #[cfg(feature = "compress")]
+/// The 7z `aes256` encoder.
+///
+/// Plaintext is gathered into `buffer` and encrypted and written
+/// [`AES_CHUNK_LEN`] at a time, so the cipher is handed large buffers and the
+/// writer below sees one write per chunk rather than one per block. The
+/// final partial block is zero-padded when the stream is finished.
 pub(crate) struct Aes256Sha256Encoder<W> {
     output: W,
     enc: Aes256CbcEnc,
     buffer: Vec<u8>,
     finished: bool,
-    write_size: u32,
 }
 
 #[cfg(feature = "compress")]
@@ -373,23 +387,29 @@ impl<W> Aes256Sha256Encoder<W> {
 
         Ok(Self {
             output,
-            enc: Aes256CbcEnc::new_from_slices(key.as_ref(), &iv)
+            enc: Aes256CbcEnc::new(key.as_ref(), &iv)
                 .map_err(|e| crate::Error::other(e.to_string()))?,
-            buffer: Default::default(),
+            buffer: Vec::new(),
             finished: false,
-            write_size: 0,
         })
     }
 
-    #[inline(always)]
-    fn write_block(&mut self, block: &mut [u8]) -> std::io::Result<()>
+    /// Encrypts and writes the whole blocks at the front of `buffer`, keeping
+    /// the partial block after them for the next write.
+    fn write_whole_blocks(&mut self) -> std::io::Result<()>
     where
         W: Write,
     {
-        let block2: &mut Array<u8, _> = (&mut *block).try_into().unwrap();
-        self.enc.encrypt_block(block2);
-        self.output.write_all(block)?;
-        self.write_size += block.len() as u32;
+        let whole = self.buffer.len() - self.buffer.len() % AES_BLOCK_LEN;
+        if whole == 0 {
+            return Ok(());
+        }
+        self.enc
+            .encrypt(&mut self.buffer[..whole])
+            .map_err(crypto_error)?;
+        self.output.write_all(&self.buffer[..whole])?;
+        self.buffer.copy_within(whole.., 0);
+        self.buffer.truncate(self.buffer.len() - whole);
         Ok(())
     }
 }
@@ -406,46 +426,28 @@ impl<W: Write> Write for Aes256Sha256Encoder<W> {
             return self.output.write(buf);
         }
         let len = buf.len();
-        if !self.buffer.is_empty() {
-            assert!(self.buffer.len() < 16);
-            if buf.len() + self.buffer.len() >= 16 {
-                let buffer = &self.buffer[..];
-                let end = 16 - buffer.len();
-
-                let mut block = [0u8; 16];
-                block[0..buffer.len()].copy_from_slice(buffer);
-                block[buffer.len()..16].copy_from_slice(&buf[..end]);
-                self.write_block(&mut block)?;
-                self.buffer.clear();
-                buf = &buf[end..];
-            } else {
-                self.buffer.extend_from_slice(buf);
-                return Ok(len);
+        if self.buffer.capacity() < AES_CHUNK_LEN {
+            self.buffer.reserve_exact(AES_CHUNK_LEN - self.buffer.len());
+        }
+        while !buf.is_empty() {
+            let take = (AES_CHUNK_LEN - self.buffer.len()).min(buf.len());
+            self.buffer.extend_from_slice(&buf[..take]);
+            buf = &buf[take..];
+            if self.buffer.len() == AES_CHUNK_LEN {
+                self.write_whole_blocks()?;
             }
         }
-
-        for data in buf.chunks(16) {
-            if data.len() < 16 {
-                self.buffer.extend_from_slice(data);
-                break;
-            }
-            let mut block = [0u8; 16];
-            block.copy_from_slice(data);
-            self.write_block(&mut block)?;
-        }
-
         Ok(len)
     }
 
+    /// Writes every whole block gathered so far, and once the stream is
+    /// finished the zero-padded last one too.
     fn flush(&mut self) -> std::io::Result<()> {
-        if !self.buffer.is_empty() && self.finished {
-            assert!(self.buffer.len() < 16);
-            let mut block = [0u8; 16];
-            block[..self.buffer.len()].copy_from_slice(&self.buffer);
-            self.write_block(&mut block)?;
-            self.buffer.clear();
+        if self.finished && !self.buffer.len().is_multiple_of(AES_BLOCK_LEN) {
+            let padded = self.buffer.len().next_multiple_of(AES_BLOCK_LEN);
+            self.buffer.resize(padded, 0);
         }
-        Ok(())
+        self.write_whole_blocks()
     }
 }
 
@@ -651,17 +653,42 @@ mod tests {
         );
     }
 
-    /// The caller's buffer is now where decryption happens, so its size is a
-    /// code path of its own: under a block it goes through the one-block
-    /// staging buffer, and a size that is not a multiple of 16 has to leave
-    /// the odd tail for the next call rather than lose it.
+    /// More than a few chunks of bytes, none of them repeating.
+    fn long_input() -> Vec<u8> {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        (0..5 * AES_CHUNK_LEN + 1234)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// The caller's buffer is where decryption happens once it is a chunk or
+    /// more, so its size is a code path of its own: under a chunk it goes
+    /// through the staging buffer, and a size that is not a multiple of 16 has
+    /// to leave the odd tail for the next call rather than lose it.
     #[test]
     fn a_caller_reading_in_odd_sizes_gets_the_same_bytes() {
-        let original = include_bytes!("aes.rs");
-        let (encoded, options, password) = encode(original);
+        let original = long_input();
+        let (encoded, options, password) = encode(&original);
         let properties = options.properties();
 
-        for read_size in [1usize, 3, 15, 16, 17, 31, 4096] {
+        for read_size in [
+            1usize,
+            3,
+            15,
+            16,
+            17,
+            31,
+            4096,
+            AES_CHUNK_LEN - 1,
+            AES_CHUNK_LEN,
+            AES_CHUNK_LEN + 17,
+            3 * AES_CHUNK_LEN,
+        ] {
             let mut dec = Aes256Sha256Decoder::new(
                 Cursor::new(encoded.as_slice()),
                 &properties,
@@ -686,6 +713,105 @@ mod tests {
                 "reading {read_size} bytes at a time"
             );
         }
+    }
+
+    /// A small read is served from a chunk decrypted ahead, so the layer
+    /// below is read a chunk at a time however small the caller's reads are.
+    #[test]
+    fn a_small_reader_still_reads_the_layer_below_in_chunks() {
+        struct Counting<R> {
+            inner: R,
+            reads: usize,
+        }
+        impl<R: Read> Read for Counting<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                self.inner.read(buf)
+            }
+        }
+        let original = long_input();
+        let (encoded, options, password) = encode(&original);
+        let mut dec = Aes256Sha256Decoder::new(
+            Counting {
+                inner: Cursor::new(encoded.as_slice()),
+                reads: 0,
+            },
+            &options.properties(),
+            &password,
+            MAX_AES_CYCLES_POWER,
+            u64::MAX,
+        )
+        .unwrap();
+        let mut decoded = Vec::new();
+        let mut byte = [0u8; 1];
+        while dec.read(&mut byte).expect("decrypt") == 1 {
+            decoded.push(byte[0]);
+        }
+        assert_eq!(&decoded[..original.len()], original.as_slice());
+        assert!(
+            dec.input.reads <= encoded.len().div_ceil(AES_CHUNK_LEN) + 1,
+            "{} reads below for {} bytes",
+            dec.input.reads,
+            encoded.len()
+        );
+    }
+
+    /// The ciphertext does not depend on how the plaintext was split into
+    /// writes, and only whole chunks reach the writer below until the end.
+    #[test]
+    fn the_ciphertext_does_not_depend_on_the_write_sizes() {
+        struct Writes(Vec<u8>, Vec<usize>);
+        impl Write for Writes {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if !buf.is_empty() {
+                    self.1.push(buf.len());
+                }
+                self.0.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let original = long_input();
+        let options = AesEncoderOptions::new("1234".into());
+        let mut reference = None;
+        for piece in [
+            original.len(),
+            1,
+            15,
+            17,
+            4096,
+            AES_CHUNK_LEN,
+            AES_CHUNK_LEN + 1,
+        ] {
+            let mut enc =
+                Aes256Sha256Encoder::new(Writes(Vec::new(), Vec::new()), &options).unwrap();
+            for part in original.chunks(piece) {
+                enc.write_all(part).expect("encode");
+            }
+            let _ = enc.write(&[]).unwrap();
+            let Writes(bytes, sizes) =
+                std::mem::replace(&mut enc.output, Writes(Vec::new(), Vec::new()));
+            assert_eq!(bytes.len(), original.len().next_multiple_of(AES_BLOCK_LEN));
+            let (last, rest) = sizes.split_last().expect("something was written");
+            assert!(
+                rest.iter().all(|&n| n == AES_CHUNK_LEN),
+                "{piece}: {sizes:?}"
+            );
+            assert!(*last <= AES_CHUNK_LEN);
+            match &reference {
+                None => reference = Some(bytes),
+                Some(first) => assert!(*first == bytes, "writing {piece} bytes at a time"),
+            }
+        }
+        let password: Password = "1234".into();
+        assert_decodes(
+            Cursor::new(reference.expect("encoded").as_slice()),
+            &options.properties(),
+            &password,
+            &original,
+        );
     }
 
     /// A stream that ends mid-block is a damaged archive, not a short read.

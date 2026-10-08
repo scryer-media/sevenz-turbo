@@ -112,6 +112,8 @@ fn seven_zip_tests_and_extracts_every_encode_method() {
         eprintln!("skipping: neither 7zz nor 7z is on PATH");
         return;
     };
+    // Mutated only by the feature-gated pushes below.
+    #[allow(unused_mut)]
     let mut methods: Vec<(&str, Vec<EncoderConfiguration>)> = vec![
         ("copy", vec![EncoderMethod::COPY.into()]),
         ("lzma", vec![LzmaOptions::from_level(5).into()]),

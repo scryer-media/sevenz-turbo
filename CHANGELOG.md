@@ -534,6 +534,19 @@ Everything here is new surface; no upstream signature changed meaning.
   block declares rather than 4 MiB each, so it no longer zero-fills and
   reserves 4 MiB for the last kilobytes of a stream; large decodes are
   unchanged.
+- The AES-256 encoder encrypts and writes 64 KiB at a time through the
+  selected cryptography backend - AWS-LC's unpadded CBC by default,
+  RustCrypto's under `native-crypto` and on wasm - instead of encrypting
+  each 16-byte block with RustCrypto and writing it on its own. The output
+  is the same CBC ciphertext. An AES-256 LZMA2 level-5 encode of 16 MiB at
+  18 threads went from 5.4 s wall, 1.6 s of it in the kernel, to 4.5 s and
+  0.07 s. Its dead 32-bit `write_size` counter, which overflowed at 4 GiB in
+  a debug build, is gone.
+- The AES-256 decoder serves a caller that reads less than 64 KiB at a time
+  from 64 KiB it decrypted ahead, rather than decrypting and reading one
+  block per call below 16 bytes. A caller reading 64 KiB or more is still
+  decrypted in its own buffer with no copy, so the AES decode rows, which
+  already read in bulk, did not move.
 
 ## 0.26.1 - 2026-09-29
 
