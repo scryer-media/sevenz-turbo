@@ -87,11 +87,9 @@ bzip2 = { version = "0.6", optional = true }
 cbc = { version = "0.2", optional = true }
 flate2 = { version = "1", optional = true, features = ["zlib-rs"] }
 getrandom = { version = "0.4", optional = true }
-# The version is what is published; the path is the sibling checkout used
-# while the two crates are developed together, and is dropped for a release
-# (`cargo xtask release` refuses to tag while it is here). Consumers get both
-# crates from crates.io.
-# TODO(release): lzma-turbo = "0.7"
+# From crates.io. While the two crates are developed together a `path` to the
+# sibling checkout is added here and dropped again before release
+# (`cargo xtask release` refuses to tag while it is here).
 lzma-turbo = { version = "0.7.0", default-features = false, features = ["std", "asm", "crc", "filters"] }
 # Encoders only, behind `lzma-rust2-encoder`, as the alternative to
 # `lzma-turbo`'s. The decode path never reaches lzma-rust2; see AGENTS.md.
