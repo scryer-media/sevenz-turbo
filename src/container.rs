@@ -129,7 +129,8 @@ pub struct ArchiveLimits {
     /// including encoded headers and repeated block decodes. Cache hits and
     /// raw-key mode cost zero; cache eviction does not reset the counter.
     /// Default: 2^28. Checked before each derivation, so payload work can fail
-    /// during extraction. A fresh password or clone starts a fresh budget.
+    /// during extraction. A fresh password or clone starts a fresh budget; a
+    /// clone shares the keys already derived, so a hit on one costs it nothing.
     pub max_aes_kdf_rounds: u64,
     /// Whether an entry whose stored name would escape the extraction
     /// directory makes the archive unreadable.

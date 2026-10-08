@@ -276,41 +276,76 @@ fn derive_key(num_cycles_power: u8, salt: &[u8], password: &[u8]) -> [u8; 32] {
     derive_key_with::<Sha256>(num_cycles_power, salt, password)
 }
 
+/// How many rounds of the derivation go to the hash in one call, as a power
+/// of two: `7zAes.cpp`'s `kUnrPow`.
+const KDF_UNROLL_POWER: u8 = 6;
+
 /// `7zAes.c`'s derivation, over whichever SHA-256 the caller names. Generic so
 /// that a build with both cryptography backends can check they agree; the
 /// crate itself only ever instantiates it at [`Sha256`].
+///
+/// Each round hashes `salt || password || counter`, the counter an 8-byte
+/// little-endian round number. The rounds are laid out
+/// `2^KDF_UNROLL_POWER` at a time in one buffer and handed to the hash in one
+/// call, then every counter in it is advanced by that many, as 7-Zip does:
+/// the hash sees the same bytes, in the same order, as three calls a round,
+/// and the per-call cost (a foreign call, with AWS-LC) is paid 192 times less
+/// often.
 pub(crate) fn derive_key_with<S: Sha256Like>(
     num_cycles_power: u8,
     salt: &[u8],
     password: &[u8],
 ) -> [u8; 32] {
+    let unroll_power = num_cycles_power.min(KDF_UNROLL_POWER);
+    let unroll = 1u64 << unroll_power;
+    let round_len = salt.len() + password.len() + 8;
+    // It holds the password, so it is cleared when dropped.
+    let mut rounds = Zeroizing::new(Vec::with_capacity(round_len * unroll as usize));
+    for counter in 0..unroll {
+        rounds.extend_from_slice(salt);
+        rounds.extend_from_slice(password);
+        rounds.extend_from_slice(&counter.to_le_bytes());
+    }
     let mut sha = S::new();
-    let mut extra = [0u8; 8];
-    for _ in 0..(1u64 << num_cycles_power) {
-        sha.update(salt);
-        sha.update(password);
-        sha.update(&extra);
-        for item in &mut extra {
-            *item = item.wrapping_add(1);
-            if *item != 0 {
-                break;
-            }
+    for _ in 0..(1u64 << (num_cycles_power - unroll_power)) {
+        sha.update(&rounds);
+        for round in rounds.chunks_exact_mut(round_len) {
+            let counter = &mut round[round_len - 8..];
+            let next =
+                u64::from_le_bytes(counter.try_into().expect("8 bytes")).wrapping_add(unroll);
+            counter.copy_from_slice(&next.to_le_bytes());
         }
     }
     sha.finalize()
 }
 
-/// A single cached key owned by one immutable Password, never by the process.
+/// How many derived keys a password keeps. More than one, because the copies
+/// of one password share them and may be reading different archives (one key
+/// per salt); a handful, because each is a key that outlives its archive.
+const KEY_CACHE_ENTRIES: usize = 4;
+
+/// One derived key and what it was derived from. The password is the cache's
+/// owner (see [`KeyCache`]), so salt and work factor complete the identity.
 pub(crate) struct CachedKey {
     power: u8,
     salt: Vec<u8>,
     key: Zeroizing<[u8; 32]>,
 }
 
+/// The keys derived from one password, shared by its clones and by nothing
+/// else, never by the process: [`Password`] holds it behind an `Arc` that only
+/// `clone` copies, and a clone's bytes are the original's.
+///
+/// The lock is held across a derivation, so copies of one password asking for
+/// the same key at once (an encoder's folders, a reader's blocks) derive it
+/// once: the first derives, the rest wait and find it.
 #[derive(Default)]
 pub(crate) struct KeyCache {
-    pub(crate) key: Option<CachedKey>,
-    rounds: u64,
+    /// Least recently used first.
+    entries: Vec<CachedKey>,
+    /// Derivations actually run, for the tests that hold the count to one.
+    #[cfg(test)]
+    pub(crate) derivations: u64,
 }
 
 #[cfg(test)]
@@ -324,15 +359,24 @@ fn derive_key_with_budget(
     password: &Password,
     max_rounds: u64,
 ) -> Result<Zeroizing<[u8; 32]>, crate::Error> {
+    use std::sync::atomic::Ordering::Relaxed;
+
     let mut cache = password.key_cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(cached) = cache.key.as_ref()
-        && cached.power == num_cycles_power
-        && cached.salt == salt
+    if let Some(hit) = cache
+        .entries
+        .iter()
+        .position(|cached| cached.power == num_cycles_power && cached.salt == salt)
     {
-        return Ok(cached.key.clone());
+        let cached = cache.entries.remove(hit);
+        let key = cached.key.clone();
+        cache.entries.push(cached);
+        return Ok(key);
     }
-    let rounds = cache
-        .rounds
+    // `kdf_rounds` is only touched under the lock, so the ordering is the
+    // lock's.
+    let rounds = password
+        .kdf_rounds
+        .load(Relaxed)
         .checked_add(1u64 << num_cycles_power)
         .ok_or_else(|| crate::Error::other("AES KDF work total overflow"))?;
     if rounds > max_rounds {
@@ -343,10 +387,17 @@ fn derive_key_with_budget(
         ));
     }
     // Charge before hashing. The same password spans the header and payload,
-    // and retains the budget even when its one-entry cache is replaced.
-    cache.rounds = rounds;
+    // and retains the budget even when its cache is replaced.
+    password.kdf_rounds.store(rounds, Relaxed);
     let key = Zeroizing::new(derive_key(num_cycles_power, salt, password.as_slice()));
-    cache.key = Some(CachedKey {
+    #[cfg(test)]
+    {
+        cache.derivations += 1;
+    }
+    if cache.entries.len() == KEY_CACHE_ENTRIES {
+        cache.entries.remove(0);
+    }
+    cache.entries.push(CachedKey {
         power: num_cycles_power,
         salt: salt.to_vec(),
         key: key.clone(),
@@ -457,13 +508,23 @@ mod key_derivation_tests {
 
     const CYCLES: u8 = 4;
 
+    fn spent(password: &Password) -> u64 {
+        password
+            .kdf_rounds
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn derivations(password: &Password) -> u64 {
+        password.key_cache.lock().unwrap().derivations
+    }
+
     #[test]
     fn budget_charges_misses_including_evictions_but_not_hits() {
         let password = Password::new("test");
         for _ in 0..513 {
             derive_key_with_budget(2, b"same", &password, 4).unwrap();
         }
-        assert_eq!(password.key_cache.lock().unwrap().rounds, 4);
+        assert_eq!(spent(&password), 4);
         assert_eq!(
             derive_key_with_budget(2, b"other", &password, 4)
                 .unwrap_err()
@@ -471,13 +532,21 @@ mod key_derivation_tests {
             Some(crate::Limit::AesKdfRounds)
         );
         derive_key_with_budget(2, b"other", &password, 8).unwrap();
+        // Enough other salts to push "same" out of the cache: asking for it
+        // again is a derivation, and is charged like one.
+        for salt in [b"a", b"b", b"c"] {
+            derive_key_with_budget(2, salt, &password, u64::MAX).unwrap();
+        }
+        assert_eq!(spent(&password), 20);
         assert_eq!(
-            derive_key_with_budget(2, b"same", &password, 8)
+            derive_key_with_budget(2, b"same", &password, 20)
                 .unwrap_err()
                 .limit_hit(),
             Some(crate::Limit::AesKdfRounds)
         );
-        password.key_cache.lock().unwrap().rounds = u64::MAX;
+        password
+            .kdf_rounds
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         assert!(derive_key_with_budget(0, b"new", &password, u64::MAX).is_err());
     }
 
@@ -487,8 +556,86 @@ mod key_derivation_tests {
         let expected = derive_key(CYCLES, b"salt", password.as_slice());
         assert_eq!(*derive_key_cached(CYCLES, b"salt", &password), expected);
         assert_eq!(*derive_key_cached(CYCLES, b"salt", &password), expected);
-        assert!(password.key_cache.lock().unwrap().key.is_some());
-        assert!(password.clone().key_cache.lock().unwrap().key.is_none());
+        assert_eq!(derivations(&password), 1);
+    }
+
+    /// The derivation 7zAes.c spells out: three hash calls a round.
+    fn derive_key_round_by_round(power: u8, salt: &[u8], password: &[u8]) -> [u8; 32] {
+        let mut sha = Sha256::new();
+        let mut extra = [0u8; 8];
+        for _ in 0..(1u64 << power) {
+            sha.update(salt);
+            sha.update(password);
+            sha.update(&extra);
+            for item in &mut extra {
+                *item = item.wrapping_add(1);
+                if *item != 0 {
+                    break;
+                }
+            }
+        }
+        sha.finalize()
+    }
+
+    /// Below, at and above the unroll width, with and without salt, and a
+    /// password long enough that a batch is many hash blocks.
+    #[test]
+    fn batched_rounds_hash_the_same_bytes() {
+        let long = vec![0xA5u8; 300];
+        for power in [0, 1, 5, 6, 7, 11] {
+            for salt in [&b""[..], b"s", b"0123456789abcdef"] {
+                for password in [&b"p\0w\0"[..], long.as_slice()] {
+                    assert_eq!(
+                        derive_key(power, salt, password),
+                        derive_key_round_by_round(power, salt, password),
+                        "power {power}, salt {} bytes, password {} bytes",
+                        salt.len(),
+                        password.len()
+                    );
+                }
+            }
+        }
+    }
+
+    /// A clone is the same password: the key one copy derived, every copy
+    /// has, and a hit costs the copy that asked nothing. The budget stays
+    /// each copy's own.
+    #[test]
+    fn clones_share_derived_keys_but_not_the_budget() {
+        let password = Password::new("pass");
+        let key = derive_key_cached(CYCLES, b"salt", &password);
+        let copy = password.clone();
+        let copy_of_copy = copy.clone();
+        assert_eq!(derive_key_cached(CYCLES, b"salt", &copy), key);
+        assert_eq!(derive_key_cached(CYCLES, b"salt", &copy_of_copy), key);
+        assert_eq!(derivations(&password), 1);
+        assert_eq!(spent(&password), 1 << CYCLES);
+        assert_eq!(spent(&copy), 0);
+        // A key only the copy needed is charged to the copy alone.
+        derive_key_cached(CYCLES, b"other", &copy);
+        assert_eq!((spent(&password), spent(&copy)), (1 << CYCLES, 1 << CYCLES));
+        // An equal password made separately is not a clone and shares nothing.
+        let separate = Password::new("pass");
+        derive_key_cached(CYCLES, b"salt", &separate);
+        assert_eq!(derivations(&separate), 1);
+        assert_eq!(derivations(&password), 2);
+    }
+
+    /// Copies asking for one key at the same time derive it once.
+    #[test]
+    fn concurrent_clones_derive_once() {
+        let password = Password::new("pass");
+        let keys: Vec<_> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let copy = password.clone();
+                    scope.spawn(move || *derive_key_cached(10, b"salt", &copy))
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+        assert!(keys.iter().all(|key| *key == keys[0]));
+        assert_eq!(derivations(&password), 1);
     }
 
     #[test]
@@ -592,6 +739,10 @@ mod tests {
     use std::io::{Cursor, Read};
 
     use super::*;
+
+    fn derivations(password: &Password) -> u64 {
+        password.key_cache.lock().unwrap().derivations
+    }
 
     struct FragmentedReader<R> {
         inner: R,
@@ -833,6 +984,58 @@ mod tests {
         let mut sink = Vec::new();
         let err = std::io::copy(&mut dec, &mut sink).expect_err("truncated ciphertext");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// The key is derived once per archive, however many folders it has: the
+    /// encoder clones its options for each folder it sizes and for the
+    /// encrypted header, and every clone carries the key. Reading it back
+    /// with an equal password made separately is one derivation too, with
+    /// the reader's blocks sharing it.
+    #[test]
+    fn a_many_folder_archive_derives_its_key_once() {
+        const FOLDERS: usize = 24;
+        let password = Password::new("many folders");
+        let options = AesEncoderOptions::new(password.clone());
+        assert_eq!(
+            options.num_cycles_power,
+            AesEncoderOptions::DEFAULT_NUM_CYCLES_POWER
+        );
+        let mut writer = crate::ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        writer.set_content_methods(vec![
+            options.into(),
+            crate::encoder_options::Lzma2Options::from_level(1).into(),
+        ]);
+        writer.set_encrypt_header(true);
+        let member = |i: usize| format!("member {i} of the many-folder archive\n").repeat(40 + i);
+        for i in 0..FOLDERS {
+            let data = member(i);
+            // A declared size is what makes the encoder size, and so clone,
+            // the folder's methods.
+            let mut entry = crate::ArchiveEntry::new_file(&format!("m{i:02}.txt"));
+            entry.size = data.len() as u64;
+            writer
+                .push_archive_entry(entry, Some(data.as_bytes()))
+                .unwrap();
+        }
+        let archive = writer.finish().unwrap().into_inner();
+        assert_eq!(derivations(&password), 1);
+
+        let reading = Password::new("many folders");
+        let mut reader = crate::ArchiveReader::new(Cursor::new(archive), reading.clone()).unwrap();
+        assert_eq!(reader.archive().blocks.len(), FOLDERS);
+        let mut seen = 0;
+        reader
+            .for_each_entries(|entry, data| {
+                let mut bytes = String::new();
+                data.read_to_string(&mut bytes).unwrap();
+                assert_eq!(entry.name(), format!("m{seen:02}.txt"));
+                assert_eq!(bytes, member(seen));
+                seen += 1;
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(seen, FOLDERS);
+        assert_eq!(derivations(&reading), 1);
     }
 
     #[test]

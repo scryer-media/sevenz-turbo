@@ -557,15 +557,27 @@ pub struct AesEncoderOptions {
     pub iv: [u8; 16],
     /// Salt for key derivation.
     pub salt: [u8; 16],
-    /// Number of cycles power for key derivation.
+    /// The key-derivation work factor: the key is `2^num_cycles_power`
+    /// SHA-256 rounds over the salt and password. Defaults to
+    /// [`Self::DEFAULT_NUM_CYCLES_POWER`]; see [`Self::with_num_cycles_power`].
     pub num_cycles_power: u8,
 }
 
 #[cfg(feature = "aes256")]
 impl AesEncoderOptions {
+    /// The default key-derivation work factor, 19 (`2^19` SHA-256 rounds):
+    /// 7-Zip's `kNumCyclesPower`, what every archive 7-Zip writes uses.
+    ///
+    /// The key is derived once per archive, not per folder, so this is a
+    /// one-off cost of a fraction of a second when an archive is written, and
+    /// the same again for whoever opens it. It is the price a password
+    /// guesser pays per guess too, which is what it is for.
+    pub const DEFAULT_NUM_CYCLES_POWER: u8 = 19;
+
     /// Creates new AES encoder options with the specified password.
     ///
-    /// Generates random IV and salt values automatically.
+    /// Generates random IV and salt values automatically, and derives the key
+    /// with [`Self::DEFAULT_NUM_CYCLES_POWER`] rounds.
     ///
     /// # Arguments
     /// * `password` - Password for encryption
@@ -580,8 +592,21 @@ impl AesEncoderOptions {
             password,
             iv,
             salt,
-            num_cycles_power: 8,
+            num_cycles_power: Self::DEFAULT_NUM_CYCLES_POWER,
         }
+    }
+
+    /// Sets the key-derivation work factor to `2^power` SHA-256 rounds.
+    ///
+    /// Each step down halves what one password guess costs an attacker, so
+    /// lowering it trades the archive's resistance to guessing for a faster
+    /// first read; below the default it is a deliberate choice. Readers
+    /// (this crate's default `ArchiveLimits`, and 7-Zip) refuse a power above
+    /// 24, and so does the encoder. 63 is not a work factor: the format
+    /// reads it as "the key is the salt and password themselves, unhashed".
+    pub fn with_num_cycles_power(mut self, power: u8) -> Self {
+        self.num_cycles_power = power;
+        self
     }
 
     pub(crate) fn properties(&self) -> [u8; 34] {
