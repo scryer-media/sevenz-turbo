@@ -295,19 +295,46 @@ impl Error {
 }
 
 impl Error {
+    /// Whether this is a CRC-32 that did not match, however it travelled.
+    ///
+    /// A verifying reader sits inside a `Read` chain, so its verdict comes out
+    /// as an [`std::io::Error`] carrying [`Error::ChecksumVerificationFailed`],
+    /// and arrives here as [`Error::Io`] once `?` has converted it.
+    pub(crate) fn is_checksum_failure(&self) -> bool {
+        match self {
+            Self::ChecksumVerificationFailed => true,
+            Self::Io(e, _) => e
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<Error>())
+                .is_some_and(|inner| matches!(inner, Self::ChecksumVerificationFailed)),
+            _ => false,
+        }
+    }
+
     /// Adds block context to an error raised while decoding that block.
     pub(crate) fn in_block(self, block_index: usize, packed_offset: u64) -> Self {
         // Already located; do not re-wrap an inner block's context away.
         if matches!(self, Self::BlockDecode { .. }) {
             return self;
         }
+        // A checksum that did not match is one error whichever verifying
+        // reader caught it — the block's, a file's on the consuming thread,
+        // or the workers' folded one — so it is reported as the same
+        // `ChecksumMismatch`, with the same message, on every path. Raised
+        // inside the `Read` chain it arrives wrapped in an `io::Error`, whose
+        // kind (`Other`) says nothing about the archive.
+        let error = if self.is_checksum_failure() {
+            Self::ChecksumVerificationFailed
+        } else {
+            self
+        };
         // A limit is a refusal, not damage: the block is fine, the caller's
         // budget is not. Keep it typed rather than rendering it into a
         // `BlockDecode` message, so `limit_hit` still answers.
-        if matches!(self, Self::LimitExceeded { .. }) {
-            return self;
+        if matches!(error, Self::LimitExceeded { .. }) {
+            return error;
         }
-        let kind = match &self {
+        let kind = match &error {
             Self::Io(..) | Self::FileOpen(..) => BlockErrorKind::Io,
             Self::UnsupportedCompressionMethod(..)
             | Self::Unsupported(..)
@@ -322,7 +349,7 @@ impl Error {
             block_index,
             packed_offset,
             kind,
-            message: self.to_string(),
+            message: error.to_string(),
         }
     }
 }

@@ -24,6 +24,12 @@ pub(crate) struct LzmaSettings {
     level: u32,
     dict_size: Option<u32>,
     nice_len: Option<u32>,
+    /// How many bytes the coder is about to be given, when the writer knows.
+    /// The dictionary never needs to be larger, and a folder that fits one
+    /// block needs no block threads. `None` is "unknown": the full dictionary
+    /// and the configured threads. The writer sets it per folder; the public
+    /// option types never do.
+    input_size: Option<u64>,
 }
 
 #[cfg(feature = "compress")]
@@ -61,6 +67,7 @@ impl LzmaSettings {
             level: if level > 9 { 9 } else { level },
             dict_size: None,
             nice_len: None,
+            input_size: None,
         }
     }
 
@@ -82,11 +89,36 @@ impl LzmaSettings {
         self.nice_len = Some(nice_len.clamp(Self::NICE_LEN_MIN, Self::NICE_LEN_MAX));
     }
 
-    /// The dictionary size the encoder will use: the caller's, or the
-    /// level's.
-    pub(crate) fn dict_size(&self) -> u32 {
+    /// The dictionary size the caller asked for: theirs, or the level's.
+    pub(crate) fn requested_dict_size(&self) -> u32 {
         self.dict_size
             .unwrap_or(Self::LEVEL_DICT_SIZE[self.level as usize])
+    }
+
+    /// The dictionary size the encoder will use: the requested one, shrunk
+    /// to the input when the input is known to be smaller, but never below
+    /// 4 KiB. This is `LzmaEncProps_Normalize`'s `reduceSize` rule, which
+    /// `lzma-turbo` applies to the same numbers, so the size the folder's
+    /// coder record names is the size the encoder ran with.
+    pub(crate) fn dict_size(&self) -> u32 {
+        let dict_size = self.requested_dict_size();
+        match self.input_size {
+            Some(size) if u64::from(dict_size) > size => {
+                // `size` is below a `u32` here.
+                dict_size.min((size as u32).max(Self::DICT_SIZE_MIN))
+            }
+            _ => dict_size,
+        }
+    }
+
+    /// How many bytes the coder will be given, if the writer knows.
+    pub(crate) const fn input_size(&self) -> Option<u64> {
+        self.input_size
+    }
+
+    /// Records how many bytes the coder will be given. See `input_size`.
+    pub(crate) fn set_input_size(&mut self, size: u64) {
+        self.input_size = Some(size);
     }
 
     fn nice_len(&self) -> u32 {
@@ -102,7 +134,7 @@ impl LzmaSettings {
         let fast = self.fast();
         let mut props = lzma_turbo::LzmaEncProps::new()
             .with_level(self.level)
-            .with_dict_size(self.dict_size())
+            .with_dict_size(self.requested_dict_size())
             .with_fast_bytes(self.nice_len())
             .with_fast_mode(fast)
             .with_match_finder(if fast {
@@ -112,6 +144,13 @@ impl LzmaSettings {
             });
         if fast {
             props = props.with_match_cycles(Self::LEVEL_DEPTH[self.level as usize]);
+        }
+        // C: `props.reduceSize`. Only where it shrinks the dictionary, so an
+        // input at least the dictionary's size is coded exactly as before.
+        if let Some(size) = self.input_size
+            && size < u64::from(self.requested_dict_size())
+        {
+            props = props.with_reduce_size(size);
         }
         props
     }
@@ -742,5 +781,145 @@ impl EncoderOptions {
             #[allow(unused)]
             _ => 0,
         }
+    }
+}
+
+impl EncoderConfiguration {
+    /// This coder told that its input is `size` bytes; `None` when the coder
+    /// is not LZMA or LZMA2, which have no use for it.
+    ///
+    /// 7-Zip does the same per folder through `reduceSize`: a dictionary
+    /// larger than the data costs its whole match-finder allocation and hash
+    /// initialisation and can never be reached into, so a small folder is
+    /// coded, and its coder record written, with a dictionary its own size.
+    /// A folder that fits one LZMA2 block is coded on one thread rather than
+    /// through the block-parallel coder, which would start a thread pool and
+    /// buffer the whole block to code it in the same single block. An input
+    /// at least the dictionary's size keeps the configured dictionary, and so
+    /// codes to the same bytes as without the size. An unset option is the
+    /// default the coder would have been built with.
+    pub(crate) fn sized_for(&self, size: u64) -> Option<EncoderConfiguration> {
+        let settings = match (self.method.id(), &self.options) {
+            (crate::EncoderMethod::ID_LZMA, Some(EncoderOptions::Lzma(o))) => o.0,
+            (crate::EncoderMethod::ID_LZMA, _) => LzmaOptions::default().0,
+            (crate::EncoderMethod::ID_LZMA2, Some(EncoderOptions::Lzma2(o))) => o.settings,
+            (crate::EncoderMethod::ID_LZMA2, _) => Lzma2Options::default().settings,
+            _ => return None,
+        };
+        let mut settings = settings;
+        settings.set_input_size(size);
+        let options = match (self.method.id(), &self.options) {
+            (crate::EncoderMethod::ID_LZMA, _) => EncoderOptions::Lzma(LzmaOptions(settings)),
+            (_, Some(EncoderOptions::Lzma2(o))) => EncoderOptions::Lzma2(Lzma2Options {
+                settings,
+                ..o.clone()
+            }),
+            _ => EncoderOptions::Lzma2(Lzma2Options {
+                settings,
+                ..Lzma2Options::default()
+            }),
+        };
+        Some(EncoderConfiguration {
+            method: self.method,
+            options: Some(options),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::EncoderMethod;
+
+    fn dict(config: &EncoderConfiguration) -> u32 {
+        config
+            .options
+            .as_ref()
+            .expect("options")
+            .get_lzma_dict_size()
+    }
+
+    #[test]
+    fn a_folder_smaller_than_the_dictionary_gets_one_its_size() {
+        let config: EncoderConfiguration = Lzma2Options::from_level(5).into();
+        let sized = config.sized_for(100_000).expect("shrunk");
+        assert_eq!(dict(&sized), 100_000);
+        assert_eq!(sized.method, EncoderMethod::LZMA2);
+        // The settings the encoder is built with agree with the coder record.
+        #[cfg(not(feature = "lzma-rust2-encoder"))]
+        match &sized.options {
+            Some(EncoderOptions::Lzma2(o)) => {
+                assert_eq!(o.settings.turbo_props().dict_size(), 100_000);
+            }
+            other => panic!("not LZMA2 options: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_dictionary_never_drops_below_4_kib() {
+        let config: EncoderConfiguration = LzmaOptions::from_level(9).into();
+        for size in [0, 1, 4095, 4096] {
+            let sized = config.sized_for(size).expect("shrunk");
+            assert_eq!(dict(&sized), 4096, "size {size}");
+            assert_eq!(sized.method, EncoderMethod::LZMA);
+        }
+    }
+
+    #[test]
+    fn a_folder_no_smaller_than_the_dictionary_keeps_it() {
+        let mut options = Lzma2Options::from_level(5);
+        options.set_dictionary_size(1 << 16);
+        let config: EncoderConfiguration = options.clone().into();
+        for size in [1 << 16, (1 << 16) + 1, u64::MAX] {
+            let sized = config.sized_for(size).expect("LZMA2");
+            assert_eq!(dict(&sized), 1 << 16, "size {size}");
+            // Not even the encoder's settings move: the same bytes come out.
+            #[cfg(not(feature = "lzma-rust2-encoder"))]
+            match &sized.options {
+                Some(EncoderOptions::Lzma2(o)) => {
+                    assert_eq!(o.settings.turbo_props(), options.settings.turbo_props());
+                }
+                other => panic!("not LZMA2 options: {other:?}"),
+            }
+        }
+        assert_eq!(
+            dict(&config.sized_for((1 << 16) - 1).unwrap()),
+            (1 << 16) - 1
+        );
+    }
+
+    #[test]
+    fn an_unset_option_is_shrunk_from_the_default() {
+        for method in [EncoderMethod::LZMA, EncoderMethod::LZMA2] {
+            let sized = EncoderConfiguration::new(method)
+                .sized_for(5000)
+                .expect("shrunk");
+            assert_eq!(dict(&sized), 5000);
+        }
+    }
+
+    #[test]
+    fn lzma2_threads_and_chunk_survive_the_shrink() {
+        let config: EncoderConfiguration = Lzma2Options::from_level_mt(5, 4, 1 << 22).into();
+        let sized = config.sized_for(1 << 20).expect("shrunk");
+        match sized.options {
+            Some(EncoderOptions::Lzma2(o)) => {
+                assert_eq!(o.threads, 4);
+                assert_eq!(o.chunk_size.map(NonZeroU64::get), Some(1 << 22));
+                assert_eq!(o.settings.dict_size(), 1 << 20);
+            }
+            other => panic!("not LZMA2 options: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_coders_are_left_alone() {
+        assert!(
+            EncoderConfiguration::new(EncoderMethod::COPY)
+                .sized_for(1)
+                .is_none()
+        );
+        let delta: EncoderConfiguration = DeltaOptions::from_distance(4).into();
+        assert!(delta.sized_for(1).is_none());
     }
 }

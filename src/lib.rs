@@ -40,7 +40,7 @@
 //! | BCJ PPC       | ✓             | ✓           |
 //! | BCJ SPARC     | ✓             | ✓           |
 //! | BCJ IA64      | ✓             | ✓           |
-//! | BCJ2          | ✓             |             |
+//! | BCJ2          | ✓             | ✓           |
 //! | DELTA         | ✓             | ✓           |
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
@@ -70,6 +70,36 @@ mod encryption;
 pub fn crypto_backend() -> &'static str {
     crypto_backend::BACKEND
 }
+
+/// The SHA-256 of `data`, computed by the backend [`crypto_backend`] names.
+///
+/// For a consumer that wants one digest routine in its binary and wants it to
+/// be the one this crate's `aes256` coder uses, rather than linking a second
+/// cryptography library (or a second configuration of the same one) beside it.
+#[cfg(feature = "aes256")]
+#[must_use]
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut sha = crypto_backend::Sha256::new();
+    sha.update(data);
+    sha.finalize()
+}
+
+/// Names the LZMA and LZMA2 encoder this build of the crate selected:
+/// `"lzma-turbo"`, or `"lzma-rust2"` when the `lzma-rust2-encoder` feature is
+/// on.
+///
+/// Like [`crypto_backend`], a dependency can turn that feature on without the
+/// top-level crate noticing; this is here to be asserted on.
+#[cfg(feature = "compress")]
+#[must_use]
+pub fn lzma_encoder() -> &'static str {
+    if cfg!(feature = "lzma-rust2-encoder") {
+        "lzma-rust2"
+    } else {
+        "lzma-turbo"
+    }
+}
+
 /// Embedder-supplied delegation hooks for the bulk AES-256-CBC decrypt
 /// (the `crypto-host` feature). See the module documentation for the contract
 /// a host must satisfy.

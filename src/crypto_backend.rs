@@ -42,9 +42,12 @@
 //! AES streams in 16-byte multiples and the caller in `encryption::aes`
 //! buffers a partial tail block either way.
 //!
-//! The encoder (`compress` + `aes256`) stays on RustCrypto's `cbc::Encryptor`
-//! in `encryption::aes`: writing archives is not the hot path this fork
-//! exists for, and one encryptor is simpler than two.
+//! The encoder (`compress` + `aes256`) follows the same switch, over the
+//! same unpadded CBC: [`Aes256CbcEnc`] is AWS-LC's `EncryptingKey::cbc` when
+//! AWS-LC is selected, and RustCrypto's `cbc::Encryptor` otherwise (which
+//! `compress` always carries, so a wasm build encrypts in the guest). Both are
+//! handed whole buffers of blocks, and the next chunk's IV is this chunk's
+//! last *ciphertext* block, so it is copied out after the encrypt.
 //!
 //! # The host-delegated backend (`crypto-host`, wasm only)
 //!
@@ -79,6 +82,8 @@ use aes::Aes256;
 use aes::cipher::{BlockModeDecrypt, KeyIvInit};
 #[cfg(feature = "aws-lc-crypto")]
 use aws_lc_rs::cipher::{AES_256, DecryptingKey, DecryptionContext, UnboundCipherKey};
+#[cfg(all(feature = "aws-lc-crypto", feature = "compress"))]
+use aws_lc_rs::cipher::{EncryptingKey, EncryptionContext};
 #[cfg(feature = "aws-lc-crypto")]
 use aws_lc_rs::iv::FixedLength;
 
@@ -351,6 +356,124 @@ pub(crate) type Aes256Cbc = RustCryptoAes256Cbc;
 ))]
 pub(crate) type Aes256Cbc = AwsLcAes256Cbc;
 
+/// The encrypting half of [`Aes256CbcLike`]: unpadded AES-256-CBC whose
+/// chaining state carries across calls, so a stream can be encrypted in
+/// whatever block-aligned pieces the caller has.
+#[cfg(feature = "compress")]
+pub(crate) trait Aes256CbcEncLike: Sized {
+    /// An encryptor for `key` starting from `iv`.
+    fn new(key: &[u8], iv: &[u8]) -> Result<Self, AesError>;
+    /// Encrypts `data` in place and advances the chaining state.
+    fn encrypt(&mut self, data: &mut [u8]) -> Result<(), AesError>;
+}
+
+/// AES-256-CBC encryption over AWS-LC, unpadded. The key schedule is built
+/// once; the next call's IV is this call's last ciphertext block.
+#[cfg(all(feature = "aws-lc-crypto", feature = "compress"))]
+#[cfg_attr(feature = "native-crypto", allow(dead_code))]
+pub(crate) struct AwsLcAes256CbcEnc {
+    key: EncryptingKey,
+    iv: [u8; AES_BLOCK_LEN],
+}
+
+#[cfg(all(feature = "aws-lc-crypto", feature = "compress"))]
+impl std::fmt::Debug for AwsLcAes256CbcEnc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print key or chaining state.
+        f.write_str("AwsLcAes256CbcEnc(..)")
+    }
+}
+
+#[cfg(all(feature = "aws-lc-crypto", feature = "compress"))]
+impl Aes256CbcEncLike for AwsLcAes256CbcEnc {
+    fn new(key: &[u8], iv: &[u8]) -> Result<Self, AesError> {
+        let key: &[u8; AES256_KEY_LEN] = key.try_into().map_err(|_| AesError::KeyLength)?;
+        let iv: [u8; AES_BLOCK_LEN] = iv.try_into().map_err(|_| AesError::IvLength)?;
+        let unbound = UnboundCipherKey::new(&AES_256, key).map_err(|_| AesError::Backend)?;
+        let key = EncryptingKey::cbc(unbound).map_err(|_| AesError::Backend)?;
+        Ok(Self { key, iv })
+    }
+
+    fn encrypt(&mut self, data: &mut [u8]) -> Result<(), AesError> {
+        if !data.len().is_multiple_of(AES_BLOCK_LEN) {
+            return Err(AesError::BlockAlignment);
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.key
+            .less_safe_encrypt(data, EncryptionContext::Iv128(FixedLength::from(self.iv)))
+            .map_err(|_| AesError::Backend)?;
+        self.iv.copy_from_slice(&data[data.len() - AES_BLOCK_LEN..]);
+        Ok(())
+    }
+}
+
+/// AES-256-CBC encryption over RustCrypto, which `compress` always carries.
+/// `cbc::Encryptor` holds the chaining state itself.
+#[cfg(feature = "compress")]
+#[cfg_attr(
+    all(
+        feature = "aws-lc-crypto",
+        not(feature = "native-crypto"),
+        not(all(target_arch = "wasm32", feature = "crypto-host"))
+    ),
+    allow(dead_code)
+)]
+pub(crate) struct RustCryptoAes256CbcEnc(cbc::Encryptor<aes::Aes256>);
+
+#[cfg(feature = "compress")]
+impl std::fmt::Debug for RustCryptoAes256CbcEnc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print key or chaining state.
+        f.write_str("RustCryptoAes256CbcEnc(..)")
+    }
+}
+
+#[cfg(feature = "compress")]
+impl Aes256CbcEncLike for RustCryptoAes256CbcEnc {
+    fn new(key: &[u8], iv: &[u8]) -> Result<Self, AesError> {
+        use aes::cipher::KeyIvInit;
+        let key: &[u8; AES256_KEY_LEN] = key.try_into().map_err(|_| AesError::KeyLength)?;
+        let iv: &[u8; AES_BLOCK_LEN] = iv.try_into().map_err(|_| AesError::IvLength)?;
+        Ok(Self(cbc::Encryptor::<aes::Aes256>::new(
+            key.into(),
+            iv.into(),
+        )))
+    }
+
+    fn encrypt(&mut self, data: &mut [u8]) -> Result<(), AesError> {
+        use aes::cipher::BlockModeEncrypt;
+        if !data.len().is_multiple_of(AES_BLOCK_LEN) {
+            return Err(AesError::BlockAlignment);
+        }
+        for block in data.chunks_exact_mut(AES_BLOCK_LEN) {
+            let block: &mut [u8; AES_BLOCK_LEN] = block.try_into().expect("exact chunk");
+            self.0.encrypt_block(block.into());
+        }
+        Ok(())
+    }
+}
+
+/// The encryptor this build selected: AWS-LC when it is the selected backend,
+/// RustCrypto otherwise (including every wasm build).
+#[cfg(all(
+    feature = "compress",
+    feature = "aws-lc-crypto",
+    not(feature = "native-crypto"),
+    not(all(target_arch = "wasm32", feature = "crypto-host"))
+))]
+pub(crate) type Aes256CbcEnc = AwsLcAes256CbcEnc;
+#[cfg(all(
+    feature = "compress",
+    not(all(
+        feature = "aws-lc-crypto",
+        not(feature = "native-crypto"),
+        not(all(target_arch = "wasm32", feature = "crypto-host"))
+    ))
+))]
+pub(crate) type Aes256CbcEnc = RustCryptoAes256CbcEnc;
+
 /// The shape both backends' SHA-256 share, so the key derivation can be
 /// written once and run against either one. `lzma-turbo` exposes two concrete
 /// types rather than a trait, and a trait defined here can be implemented for
@@ -440,6 +563,28 @@ mod tests {
             Aes256Cbc::new(&unhex(NIST_KEY), &unhex(NIST_IV)).expect("key and iv are sized");
         cipher.decrypt(&mut data).expect("aligned ciphertext");
         assert_eq!(hex(&data), NIST_PLAINTEXT, "backend {BACKEND}");
+    }
+
+    /// NIST SP 800-38A, F.2.5 (CBC-AES256.Encrypt), on the encryptor this
+    /// build selected, whole and a block at a time.
+    #[cfg(feature = "compress")]
+    #[test]
+    fn nist_cbc_aes256_encrypt() {
+        for chunk in [4 * AES_BLOCK_LEN, AES_BLOCK_LEN] {
+            let mut cipher =
+                Aes256CbcEnc::new(&unhex(NIST_KEY), &unhex(NIST_IV)).expect("key and iv are sized");
+            let mut out = Vec::new();
+            for piece in unhex(NIST_PLAINTEXT).chunks(chunk) {
+                let mut piece = piece.to_vec();
+                cipher.encrypt(&mut piece).expect("aligned plaintext");
+                out.extend_from_slice(&piece);
+            }
+            assert_eq!(
+                hex(&out),
+                NIST_CIPHERTEXT,
+                "backend {BACKEND}, {chunk}-byte pieces"
+            );
+        }
     }
 
     /// The same vector fed one block at a time: CBC chaining has to survive
@@ -583,6 +728,50 @@ mod tests {
                 assert_eq!(out_a, oneshot, "aws-lc differs in {chunk}-byte chunks");
                 assert_eq!(out_b, oneshot, "rustcrypto differs in {chunk}-byte chunks");
             }
+        }
+
+        /// Encryption on both lanes, whole and in uneven pieces, agrees, and
+        /// decrypts back to the input.
+        #[cfg(feature = "compress")]
+        #[test]
+        fn backends_agree_on_aes256_cbc_encryption() {
+            use super::{Aes256CbcEncLike, AwsLcAes256CbcEnc, RustCryptoAes256CbcEnc};
+            let key = sample(32, 51);
+            let iv = sample(AES_BLOCK_LEN, 52);
+            let data = sample(4096 * AES_BLOCK_LEN, 53);
+
+            let mut oneshot = data.clone();
+            AwsLcAes256CbcEnc::new(&key, &iv)
+                .expect("sized")
+                .encrypt(&mut oneshot)
+                .expect("aligned");
+            for chunk_blocks in [1usize, 3, 13, 4096] {
+                let mut aws = AwsLcAes256CbcEnc::new(&key, &iv).expect("sized");
+                let mut rc = RustCryptoAes256CbcEnc::new(&key, &iv).expect("sized");
+                let (mut out_a, mut out_b) = (Vec::new(), Vec::new());
+                for piece in data.chunks(chunk_blocks * AES_BLOCK_LEN) {
+                    let mut a = piece.to_vec();
+                    aws.encrypt(&mut a).expect("aligned");
+                    out_a.extend_from_slice(&a);
+                    let mut b = piece.to_vec();
+                    rc.encrypt(&mut b).expect("aligned");
+                    out_b.extend_from_slice(&b);
+                }
+                assert_eq!(
+                    out_a, oneshot,
+                    "aws-lc differs in {chunk_blocks}-block chunks"
+                );
+                assert_eq!(
+                    out_b, oneshot,
+                    "rustcrypto differs in {chunk_blocks}-block chunks"
+                );
+            }
+            let mut back = oneshot;
+            RustCryptoAes256Cbc::new(&key, &iv)
+                .expect("sized")
+                .decrypt(&mut back)
+                .expect("aligned");
+            assert_eq!(back, data);
         }
 
         /// An empty call must be a no-op on both lanes rather than an error or

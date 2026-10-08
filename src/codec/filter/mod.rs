@@ -14,7 +14,7 @@
 //! 0.5.0, BCJ2 from the same public-domain C, and is tested against the SDK's
 //! own harness for them, so `bcj` and `delta` keep only `lzma-rust2`'s readers
 //! and writers and put `lzma-turbo`'s filters underneath, and `bcj2` is a
-//! `Read` of this crate's own over `lzma_turbo::filters::bcj2`.
+//! `Read` and a `Write` of this crate's own over `lzma_turbo::filters::bcj2`.
 //!
 //! The only changes are mechanical, so a future re-sync stays a diff:
 //!

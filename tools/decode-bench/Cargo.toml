@@ -18,7 +18,8 @@ native-crypto = ["sevenz-turbo/native-crypto"]
 # Timed directly by `--cipher-only`, to price AES-256-CBC on its own against
 # the reader chain that carries it. Same pin as the crate's.
 aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
-# The fork under test.
-sevenz-turbo = { path = "../..", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
-# The baseline the fork has to beat: the exact release weaver ships today.
+# The fork under test. `compress` is for `op encode`, the write lane the Go
+# harness in `bench/sevenz-turbo-bench` times against `7zz a`.
+sevenz-turbo = { path = "../..", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "compress", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
+# The secondary reference: the upstream release the fork was taken from.
 sevenz-rust2 = { version = "=0.22.2", default-features = false, features = ["aes256", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }

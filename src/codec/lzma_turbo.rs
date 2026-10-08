@@ -153,11 +153,46 @@ const MT_INPUT_CHUNK: usize = 1 << 20;
 /// archive at four threads, where the input path is most of the decode.
 const MT_INPUT_READ_BYTES: usize = 4 << 20;
 
+/// The smallest read [`Lzma2MtReader::refill`] makes when the stream is
+/// expected to be nearly over. See [`Lzma2MtReader::input_left`].
+const MT_INPUT_MIN_READ_BYTES: usize = 64 << 10;
+
+/// The most an LZMA2 stream that decodes to `unpacked_len` bytes is expected
+/// to take in, used only to size reads.
+///
+/// An encoder stores a chunk it cannot shrink, so an LZMA2 stream is its
+/// output plus chunk headers: three bytes per stored chunk of up to 64 KiB,
+/// six per LZMA chunk, and the end marker. A thousandth plus 64 KiB covers
+/// that with room to spare. A stream longer than this is still read to its
+/// end, in [`MT_INPUT_MIN_READ_BYTES`] pieces: the bound is a hint and
+/// nothing is refused for exceeding it.
+fn lzma2_packed_bound(unpacked_len: u64) -> u64 {
+    unpacked_len
+        .saturating_add(unpacked_len / 1024)
+        .saturating_add(MT_INPUT_MIN_READ_BYTES as u64)
+}
+
 /// The size of one piece of buffered output. See [`Lzma2MtReader::out`].
 const MT_OUTPUT_CHUNK: usize = 1 << 20;
 
 /// Pieces of buffered output kept for refilling. See [`Lzma2MtReader::spare`].
 const MT_OUTPUT_SPARE_PIECES: usize = 8;
+
+/// Smallest block, in decoded bytes, that is worth decoding in parallel.
+///
+/// Below this the block is decoded single-threaded whatever the caller asked
+/// for. A stream this small is almost always a single run: 7-Zip's and
+/// `lzma-turbo`'s multi-threaded encoders cut a run every `max(4 x dict, 1
+/// MiB)` bytes, so nothing they write is split any finer than this, and a
+/// stream of one run is decoded on the calling thread by the parallel path
+/// too, after it has started workers, allocated its read-ahead and checksummed
+/// through its fold. A non-solid archive of small files is thousands of such
+/// blocks, and paid that setup on every one of them for no parallelism at all.
+///
+/// The block's declared size is what is compared, and it is only a hint here:
+/// a stream that is larger than it says is still decoded correctly by the
+/// single-threaded decoder, just not in parallel.
+const MT_MIN_BLOCK_BYTES: u64 = 1 << 20;
 
 /// Smallest in-flight budget a parallel LZMA2 decode is given. Below this the
 /// coder decodes single-threaded instead: see [`Lzma2Plan::for_block`].
@@ -192,15 +227,20 @@ const MT_BACKSTOP_PER_THREAD_BYTES: u64 = 384 * 1024 * 1024;
 const MT_RUN_WINDOW: usize = 8;
 
 /// Packed bytes per hundred unpacked at or above which a run is taken to hold
-/// data that did not compress.
+/// data that did not compress: a run no smaller than what it decodes to.
 ///
-/// An encoder that cannot beat the data writes it out as it stands — LZMA2
-/// uncompressed chunks, packed a shade *larger* than unpacked — or shaves a
-/// percent or two off it and writes that. Either way the ratio sits against 1,
-/// nowhere near what even barely compressible data reaches, so the line
-/// between the two shapes is a wide one and exactly where it is drawn inside
-/// the gap does not matter.
-const MT_DENSE_PERCENT: u128 = 90;
+/// The shape the narrow decode is for is the stored one. An encoder that
+/// cannot beat a chunk writes it out as it stands — an LZMA2 uncompressed
+/// chunk, packed a shade *larger* than unpacked, because 7-Zip and liblzma
+/// both store a chunk that coding would not shrink — and decoding that is a
+/// copy, bound by the read. A run that is LZMA-coded is the opposite however
+/// little it shrank: data that barely compresses is literal after literal,
+/// the slowest LZMA there is, and decoding it is bound by the decode, so it
+/// wants every thread it can get. Coding shrinks a chunk or the chunk is
+/// stored, so "at least as large as unpacked" is the line between the two;
+/// drawn at 90, it held media archived at an ordinary level — LZMA chunks at
+/// 92 to 99.5 percent — to two threads, five times slower than 7-Zip.
+const MT_DENSE_PERCENT: u128 = 100;
 
 /// Threads an incompressible stream is decoded with, however many the caller
 /// asked for.
@@ -536,6 +576,8 @@ pub(crate) enum Lzma2Plan {
         /// it produces them. Empty when the caller has no boundaries to
         /// declare, in which case no checksum is computed here at all.
         splits: Vec<u64>,
+        /// What the block declares it decodes to, which sizes the reads.
+        unpacked_len: u64,
     },
 }
 
@@ -545,8 +587,11 @@ impl Lzma2Plan {
     /// `threads` is the caller's live ceiling and `adaptive` is whether the
     /// caller asked for a coder that can be widened later even though the
     /// ceiling is one right now. `memory_limit_bytes` is
-    /// [`ArchiveLimits::memory_limit_bytes`], and `dict_size` the dictionary
-    /// this coder declares.
+    /// [`ArchiveLimits::memory_limit_bytes`], `dict_size` the dictionary
+    /// this coder declares, and `unpacked_len` the bytes it declares it
+    /// decodes to: a block smaller than [`MT_MIN_BLOCK_BYTES`] is decoded
+    /// single-threaded, adaptive or not, because there is nothing in it to
+    /// widen to.
     ///
     /// # The rule when the budget is too small
     ///
@@ -554,7 +599,8 @@ impl Lzma2Plan {
     /// number says nothing about. What is left of the caller's budget after
     /// the decoder's own footprint is the in-flight budget; when the caller
     /// set no budget at all it is the backstop, `threads` x
-    /// [`MT_BACKSTOP_PER_THREAD_BYTES`]. Either way it is a ceiling and not a
+    /// [`MT_BACKSTOP_PER_THREAD_BYTES`], where an adaptive coder counts the
+    /// threads it may widen to rather than the one it starts at. Either way it is a ceiling and not a
     /// target: what the decode settles at is its backlog of complete runs,
     /// taken from the size of the runs the stream turns out to have.
     ///
@@ -573,13 +619,15 @@ impl Lzma2Plan {
         adaptive: bool,
         memory_limit_bytes: u64,
         dict_size: u32,
+        unpacked_len: u64,
         control: &Arc<Lzma2Control>,
         splits: &[u64],
     ) -> Self {
-        if threads <= 1 && !adaptive {
+        if (threads <= 1 && !adaptive) || unpacked_len < MT_MIN_BLOCK_BYTES {
             return Self::SingleThreaded;
         }
-        let Some(memory_limit) = Self::mt_budget(threads, memory_limit_bytes, dict_size) else {
+        let budgeted = Self::budgeted_threads(threads, adaptive, memory_limit_bytes);
+        let Some(memory_limit) = Self::mt_budget(budgeted, memory_limit_bytes, dict_size) else {
             return Self::SingleThreaded;
         };
         Self::Adaptive {
@@ -587,6 +635,24 @@ impl Lzma2Plan {
             memory_limit,
             control: Arc::clone(control),
             splits: splits.to_vec(),
+            unpacked_len,
+        }
+    }
+
+    /// The thread count the in-flight budget is sized for.
+    ///
+    /// The budget is fixed when the coder is built, but an adaptive coder is
+    /// widened afterwards, so with no caller limit it is sized for the widest
+    /// it may usefully go: the machine's parallelism, or the threads asked for
+    /// if that is more. Sized for the one thread it starts at, the backstop
+    /// never holds enough runs to widen at all. A caller limit is the budget
+    /// as given, so this only matters without one.
+    fn budgeted_threads(threads: u32, adaptive: bool, memory_limit_bytes: u64) -> u32 {
+        if adaptive && memory_limit_bytes == u64::MAX {
+            let parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
+            threads.max(u32::try_from(parallelism).unwrap_or(u32::MAX).min(256))
+        } else {
+            threads
         }
     }
 
@@ -745,6 +811,11 @@ pub(crate) struct Lzma2MtReader<R: Read> {
     /// Packed bytes handed to the decoder so far, to notice a stream whose
     /// read-ahead is buying nothing. See [`MT_NO_WORKER_GIVE_UP_BYTES`].
     fed_total: u64,
+    /// Packed bytes the stream is still expected to hold, from its declared
+    /// size, so that a read is not sized, and zero-filled, for 4 MiB when a
+    /// fraction of that is left. `u64::MAX` when nothing was declared. See
+    /// [`lzma2_packed_bound`].
+    input_left: u64,
     trace: Option<Box<MtTrace>>,
 }
 
@@ -854,6 +925,7 @@ impl<R: Read> Lzma2MtReader<R> {
             finished: false,
             checksums,
             fed_total: 0,
+            input_left: u64::MAX,
             trace: std::env::var_os("SEVENZ_TURBO_MT_TRACE").map(|_| Box::default()),
         })
     }
@@ -1214,10 +1286,20 @@ impl<R: Read> Lzma2MtReader<R> {
             None => std::mem::take(&mut self.carry),
         };
         let carried = seg.len();
+        // A read is the full piece until the stream is nearly over, and then
+        // what is expected to be left of it. The space is zero-filled before
+        // it is read into, because a `Read` may look at the buffer it is
+        // handed and so must be handed initialised bytes; sizing the read is
+        // what keeps that from being 4 MiB for the last few kilobytes of a
+        // block, and the reservation from being 4 MiB for a block that is
+        // only a little over the smallest one decoded in parallel.
+        let want = usize::try_from(self.input_left)
+            .unwrap_or(usize::MAX)
+            .clamp(MT_INPUT_MIN_READ_BYTES, MT_INPUT_READ_BYTES);
         // A no-op when the reclaimed buffer is already big enough, which is the
         // steady state; exact so that a piece never grows past one read.
-        seg.reserve_exact(MT_INPUT_READ_BYTES);
-        seg.resize(carried + MT_INPUT_READ_BYTES, 0);
+        seg.reserve_exact(want);
+        seg.resize(carried + want, 0);
         let mut filled = carried;
         while filled < seg.len() {
             match self.input.read(&mut seg[filled..])? {
@@ -1226,6 +1308,7 @@ impl<R: Read> Lzma2MtReader<R> {
             }
         }
         seg.truncate(filled);
+        self.input_left = self.input_left.saturating_sub((filled - carried) as u64);
         if filled == carried {
             // Nothing new arrived. The carried bytes are the tail of a header
             // the stream ended in the middle of; the decoder is the one that
@@ -1875,14 +1958,13 @@ pub(crate) fn lzma2_decoder<R: Read>(
             memory_limit,
             control,
             splits,
-        } => Ok(Lzma2Coder::Adaptive(Box::new(Lzma2MtReader::new(
-            input,
-            dict_prop,
-            threads,
-            memory_limit,
-            control,
-            &splits,
-        )?))),
+            unpacked_len,
+        } => {
+            let mut rd =
+                Lzma2MtReader::new(input, dict_prop, threads, memory_limit, control, &splits)?;
+            rd.input_left = lzma2_packed_bound(unpacked_len);
+            Ok(Lzma2Coder::Adaptive(Box::new(rd)))
+        }
     }
 }
 
@@ -1945,6 +2027,7 @@ mod tests {
             false,
             (32 << 20) + (64 << 20) + LZ_STATE_BYTES,
             dict,
+            u64::MAX,
             &control,
             &[],
         );
@@ -1952,7 +2035,15 @@ mod tests {
 
         // Room for the dictionary and almost nothing else: single-threaded,
         // not a memory-limit error.
-        let plan = Lzma2Plan::for_block(8, false, (32 << 20) + (1 << 20), dict, &control, &[]);
+        let plan = Lzma2Plan::for_block(
+            8,
+            false,
+            (32 << 20) + (1 << 20),
+            dict,
+            u64::MAX,
+            &control,
+            &[],
+        );
         assert!(matches!(plan, Lzma2Plan::SingleThreaded));
     }
 
@@ -1962,13 +2053,51 @@ mod tests {
     fn one_thread_is_the_plain_reader_unless_the_caller_asks_to_widen_later() {
         let control = Arc::new(Lzma2Control::new(1));
         assert!(matches!(
-            Lzma2Plan::for_block(1, false, u64::MAX, 1 << 20, &control, &[]),
+            Lzma2Plan::for_block(1, false, u64::MAX, 1 << 20, u64::MAX, &control, &[]),
             Lzma2Plan::SingleThreaded
         ));
         assert!(matches!(
-            Lzma2Plan::for_block(1, true, u64::MAX, 1 << 20, &control, &[]),
+            Lzma2Plan::for_block(1, true, u64::MAX, 1 << 20, u64::MAX, &control, &[]),
             Lzma2Plan::Adaptive { threads: 1, .. }
         ));
+    }
+
+    /// A block too small to hold a second run is decoded single-threaded,
+    /// whatever was asked for; one that can is not.
+    #[test]
+    fn a_block_smaller_than_a_run_is_single_threaded() {
+        let control = Arc::new(Lzma2Control::new(8));
+        for (threads, adaptive) in [(8, false), (8, true), (1, true)] {
+            for len in [0, 16 << 10, MT_MIN_BLOCK_BYTES - 1] {
+                assert!(
+                    matches!(
+                        Lzma2Plan::for_block(
+                            threads,
+                            adaptive,
+                            u64::MAX,
+                            1 << 20,
+                            len,
+                            &control,
+                            &[]
+                        ),
+                        Lzma2Plan::SingleThreaded
+                    ),
+                    "{threads} threads, adaptive {adaptive}, {len} bytes"
+                );
+            }
+            assert!(matches!(
+                Lzma2Plan::for_block(
+                    threads,
+                    adaptive,
+                    u64::MAX,
+                    1 << 20,
+                    MT_MIN_BLOCK_BYTES,
+                    &control,
+                    &[]
+                ),
+                Lzma2Plan::Adaptive { .. }
+            ));
+        }
     }
 
     /// With no caller budget the in-flight ceiling is the backstop, which
@@ -1985,6 +2114,32 @@ mod tests {
             Lzma2Plan::mt_budget(2, u64::MAX, 32 << 20),
             Some(2 * MT_BACKSTOP_PER_THREAD_BYTES)
         );
+    }
+
+    /// An adaptive coder starts at one thread and is widened later, so with
+    /// no caller limit its budget holds runs for every thread it may widen
+    /// to, not just the one it starts at. A fixed coder, or any coder under a
+    /// caller limit, is budgeted exactly as before.
+    #[test]
+    fn an_unset_budget_lets_an_adaptive_coder_widen_to_the_machine() {
+        let parallelism = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(256) as u32;
+        let control = Arc::new(Lzma2Control::new(1));
+        let Lzma2Plan::Adaptive { memory_limit, .. } =
+            Lzma2Plan::for_block(1, true, u64::MAX, 1 << 20, u64::MAX, &control, &[])
+        else {
+            panic!("an adaptive coder over a large block is the parallel one");
+        };
+        assert_eq!(
+            memory_limit,
+            u64::from(parallelism) * MT_BACKSTOP_PER_THREAD_BYTES
+        );
+        assert_eq!(Lzma2Plan::budgeted_threads(1, true, u64::MAX), parallelism);
+        assert_eq!(Lzma2Plan::budgeted_threads(300, true, u64::MAX), 300);
+        assert_eq!(Lzma2Plan::budgeted_threads(1, false, u64::MAX), 1);
+        assert_eq!(Lzma2Plan::budgeted_threads(8, false, u64::MAX), 8);
+        assert_eq!(Lzma2Plan::budgeted_threads(1, true, 4 << 30), 1);
     }
 
     #[test]
@@ -2061,6 +2216,54 @@ mod stall_tests {
         // The end marker.
         packed.push(0x00);
         (packed, plain)
+    }
+
+    /// A source that records the largest buffer it was asked to fill.
+    struct Widest<'a> {
+        inner: &'a [u8],
+        widest: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl Read for Widest<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.widest.set(self.widest.get().max(buf.len()));
+            self.inner.read(buf)
+        }
+    }
+
+    /// A block a little over the smallest one decoded in parallel is read in
+    /// pieces sized to what it declares, not in the 4 MiB pieces of a long
+    /// stream, and decodes to the same bytes.
+    #[test]
+    fn a_short_block_is_not_read_four_mebibytes_at_a_time() {
+        let (packed, plain) = stream(4, 6);
+        let widest = std::rc::Rc::new(std::cell::Cell::new(0));
+        let control = Arc::new(Lzma2Control::new(4));
+        let plan = super::Lzma2Plan::for_block(
+            4,
+            false,
+            u64::MAX,
+            1 << 19,
+            plain.len() as u64,
+            &control,
+            &[],
+        );
+        assert!(matches!(plan, super::Lzma2Plan::Adaptive { .. }));
+        let input = Widest {
+            inner: &packed,
+            widest: std::rc::Rc::clone(&widest),
+        };
+        let mut rd = super::lzma2_decoder(input, DICT_PROP, plan).expect("build the reader");
+        let mut out = Vec::new();
+        rd.read_to_end(&mut out).expect("decode");
+        assert!(out == plain, "the decode differs");
+        assert!(
+            widest.get() <= super::lzma2_packed_bound(plain.len() as u64) as usize,
+            "read {} bytes at once for a {} byte stream",
+            widest.get(),
+            packed.len()
+        );
+        assert!(widest.get() < super::MT_INPUT_READ_BYTES);
     }
 
     fn reader<R: Read>(input: R, threads: u32) -> (Lzma2MtReader<R>, Arc<Lzma2Control>) {
@@ -2971,6 +3174,69 @@ mod stall_tests {
             }
         }
 
+        /// One run of data LZMA still codes but barely shrinks — media
+        /// archived at an ordinary level — and the bytes it decodes to. The
+        /// payload is pseudo-random bytes with a short run of zeros every
+        /// 4 KiB, so each chunk comes out a couple of percent smaller than
+        /// its input: coded, not stored, and above the old 90 percent line.
+        fn barely_compressible_run(len: usize, seed: u64) -> (Vec<u8>, Vec<u8>) {
+            let mut x = seed | 1;
+            let plain: Vec<u8> = (0..len)
+                .map(|i| {
+                    if i % 4096 >= 4016 {
+                        return 0;
+                    }
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 24) as u8
+                })
+                .collect();
+            let props = LzmaEncProps::new().with_level(1).with_dict_size(1 << 16);
+            let mut w = LzmaTurboWriter::new(
+                Vec::new(),
+                &props,
+                Coder::Lzma2 {
+                    block_size: BLOCK_SIZE_SOLID,
+                    threads: 1,
+                },
+            )
+            .expect("build the encoder");
+            w.write_all(&plain).expect("encode");
+            let mut packed = w.finish().expect("finish the encode");
+            assert_eq!(packed.pop(), Some(0x00), "an encode ends in its end marker");
+            let (p, u) = (packed.len() as u64, len as u64);
+            assert!(
+                p < u && p * 100 >= u * 90,
+                "the fixture has to be coded and barely smaller: {p} of {u}",
+            );
+            (packed, plain)
+        }
+
+        /// A stream of LZMA-coded runs that barely shrank is decode-bound,
+        /// not read-bound, and keeps every thread the caller asked for: only
+        /// runs no smaller than their output — stored chunks — are the shape
+        /// the narrow decode is for. At the old 90 percent line this stream
+        /// was held to two threads.
+        #[test]
+        fn a_barely_compressible_coded_stream_is_not_narrowed() {
+            let mut packed = Vec::new();
+            let mut plain = Vec::new();
+            for seed in 0..6u64 {
+                let (run, run_plain) = barely_compressible_run(256 << 10, 0x9e37_79b9 + seed);
+                packed.extend_from_slice(&run);
+                plain.extend_from_slice(&run_plain);
+            }
+            packed.push(0x00);
+            let threads = 8;
+            let (mut rd, control) = reader_limited(Cursor::new(packed), threads, LIMIT);
+            let (out, _peak, widest) = drain_watching(&mut rd, &control);
+            assert_eq!(out, plain);
+            assert!(!rd.dense, "narrowed on coded runs");
+            assert_eq!(rd.applied_threads, threads);
+            assert!(widest <= threads, "{widest} workers");
+        }
+
         /// An archive of a film beside a text file: compressible runs, then a span
         /// of runs that did not compress, then compressible ones again. The decode
         /// should narrow for the middle and widen again after it, and hand back
@@ -3037,7 +3303,7 @@ mod stall_tests {
             assert_eq!(out, plain);
             assert!(rd.dense, "one compressible run should not have widened it");
             assert!(widest <= MT_DENSE_THREADS, "{widest} workers");
-            assert!(MT_SHAPE_RUNS > 1, "one run in a row would flap the count");
+            const { assert!(MT_SHAPE_RUNS > 1, "one run in a row would flap the count") };
         }
     }
 }

@@ -63,10 +63,15 @@ fn pseudo_x86(len: usize) -> Vec<u8> {
 }
 
 /// The members every archive in the matrix holds.
+///
+/// The text member alone is larger than the smallest block the reader decodes
+/// in parallel, so the eight-thread and adaptive lanes take the parallel path
+/// for every block that holds it, solid or not, rather than all being decoded
+/// single-threaded as too small to be worth it.
 fn members() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         ("silver_horizon/noise.bin", noise(300 * 1024, 7)),
-        ("silver_horizon/text.txt", text(200 * 1024)),
+        ("silver_horizon/text.txt", text(1280 * 1024)),
         ("silver_horizon/inner/code.bin", pseudo_x86(128 * 1024)),
         ("silver_horizon/tiny.txt", b"one line\n".to_vec()),
     ]
@@ -287,16 +292,19 @@ differential_case!(
 differential_case!(lzma2_delta, ["-m0=delta:4", "-m1=lzma2", "-mx5"]);
 differential_case!(lzma_solid_bcj, ["-m0=BCJ", "-m1=lzma", "-mx9", "-ms=on"]);
 differential_case!(multi_volume, ["-m0=lzma2", "-mx1", "-v256k"]);
+#[cfg(feature = "aes256")]
 differential_case!(
     aes_encrypted,
     ["-m0=lzma2", "-mx5"],
     Some("silver-horizon-passphrase")
 );
+#[cfg(feature = "aes256")]
 differential_case!(
     aes_encrypted_header,
     ["-m0=lzma2", "-mx5", "-mhe=on"],
     Some("silver-horizon-passphrase")
 );
+#[cfg(feature = "aes256")]
 differential_case!(
     aes_encrypted_solid_lzma,
     ["-m0=lzma", "-mx9", "-ms=on"],

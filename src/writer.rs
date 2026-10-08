@@ -22,7 +22,10 @@ use lzma_turbo::crc::{Crc32, crc32 as crc32_of};
 pub(crate) use self::lazy_file_reader::LazyFileReader;
 pub(crate) use self::seq_reader::SeqReader;
 pub use self::source_reader::SourceReader;
-use self::{pack_info::PackInfo, unpack_info::UnpackInfo};
+use self::{
+    pack_info::PackInfo,
+    unpack_info::{Bcj2SideSizes, UnpackInfo},
+};
 use crate::{
     ArchiveEntry, AutoFinish, AutoFinisher, ByteWriter, Error,
     archive::*,
@@ -94,6 +97,81 @@ impl ArchiveWriter<File> {
             .map_err(|e| Error::file_open(e, path.as_ref().to_string_lossy().to_string()))?;
         Self::new(file)
     }
+}
+
+/// `methods` for a folder of `size` bytes: every LZMA and LZMA2 coder is told the size (see
+/// `EncoderConfiguration::sized_for`), so one whose dictionary is larger than the folder gets one
+/// the folder's size, and a folder that fits one LZMA2 block skips the block-parallel coder. `None`
+/// is `methods` itself: an unsized folder is coded exactly as it always was, and so, byte for byte,
+/// is one no smaller than the dictionary.
+fn sized_methods(
+    methods: &Arc<Vec<EncoderConfiguration>>,
+    size: Option<u64>,
+) -> Arc<Vec<EncoderConfiguration>> {
+    let Some(size) = size else {
+        return Arc::clone(methods);
+    };
+    if methods.iter().all(|mc| mc.sized_for(size).is_none()) {
+        return Arc::clone(methods);
+    }
+    Arc::new(
+        methods
+            .iter()
+            .map(|mc| mc.sized_for(size).unwrap_or_else(|| mc.clone()))
+            .collect(),
+    )
+}
+
+/// What the entries of one folder declare they hold, or `None` unless every file declares it.
+///
+/// An entry's `size` before it is pushed is read as how many bytes its reader will yield.
+/// [`ArchiveEntry::from_path`] fills it from the file's metadata; zero is "unknown". One file
+/// saying zero makes the whole folder unknown - a sum over the rest would understate it and shrink
+/// its coder - so the folder is sized by reading ahead instead; see [`folder_size`]. Directories
+/// hold no bytes and declare nothing.
+fn declared_size<'a>(entries: impl IntoIterator<Item = &'a ArchiveEntry>) -> Option<u64> {
+    let mut total = 0u64;
+    for entry in entries.into_iter().filter(|entry| !entry.is_directory) {
+        if entry.size == 0 {
+            return None;
+        }
+        total = total.saturating_add(entry.size);
+    }
+    (total > 0).then_some(total)
+}
+
+/// How far the writer reads into a folder whose size no entry declared, to learn it. A folder
+/// that ends within it is sized exactly; one that does not is no smaller than this, which is past
+/// where a dictionary-sized setup costs more than coding the bytes.
+const READ_AHEAD: u64 = 1 << 20;
+
+/// How much of an entry's source is read in one go and handed to the coder chain.
+///
+/// Large enough that a chain whose first coder hands its input to another thread pays one
+/// message per mebibyte rather than one per page.
+const SOURCE_READ_LEN: usize = 1 << 20;
+
+/// What a folder's compressed bytes are gathered into before they reach the archive's writer.
+///
+/// Coders write what they produce as they produce it - PPMd a byte at a time, the BCJ2 range
+/// coder a few - and the archive's writer is often a bare `File`, so without this a folder costs
+/// one write call per byte or two of output. The buffer is flushed when the folder is done,
+/// explicitly, so that a failed write is an error of that push and not lost in a drop.
+const OUTPUT_BUF_LEN: usize = 256 << 10;
+
+/// The folder's size, as the entries declare it or, failing that, as reading up to
+/// [`READ_AHEAD`] bytes of it finds: the bytes read, which the caller codes first, and the size
+/// when it is known.
+fn folder_size<'a, R: Read>(
+    entries: impl IntoIterator<Item = &'a ArchiveEntry>,
+    reader: &mut R,
+) -> std::io::Result<(Vec<u8>, Option<u64>)> {
+    if let Some(size) = declared_size(entries) {
+        return Ok((Vec::new(), Some(size)));
+    }
+    let mut head = Vec::new();
+    let n = reader.by_ref().take(READ_AHEAD).read_to_end(&mut head)? as u64;
+    Ok((head, (n < READ_AHEAD).then_some(n)))
 }
 
 /// Names of the entries in a block, for an error message. Truncated at ~512 bytes, since a solid
@@ -173,16 +251,23 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         {
             let mut compressed_len = 0;
             let mut compressed = CompressWrapWriter::new(&mut self.output, &mut compressed_len);
+            let mut out = std::io::BufWriter::with_capacity(OUTPUT_BUF_LEN, &mut compressed);
 
             let mut more_sizes: Vec<Rc<Cell<usize>>> =
                 Vec::with_capacity(self.content_methods.len() - 1);
+            let (head, folder) = folder_size([&entry], &mut r)
+                .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+            let methods = sized_methods(&self.content_methods, folder);
+            let mut bcj2 = None;
 
             let (crc, size) = {
-                let mut w =
-                    Self::create_writer(&self.content_methods, &mut compressed, &mut more_sizes)?;
+                let mut w = Self::create_writer(&methods, &mut out, &mut more_sizes, &mut bcj2)?;
                 let mut write_len = 0;
                 let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
-                let mut buf = [0u8; 4096];
+                w.write_all(&head)
+                    .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+                drop(head);
+                let mut buf = vec![0u8; SOURCE_READ_LEN];
                 loop {
                     match r.read(&mut buf) {
                         Ok(n) => {
@@ -205,22 +290,29 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
                 (w.crc_value(), write_len)
             };
+            out.flush()
+                .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+            drop(out);
             let compressed_crc = compressed.crc_value();
+            self.pack_info
+                .add_stream(compressed_len as u64, compressed_crc);
+            let bcj2 = Bcj2Packed::take(bcj2);
+            let tail_len = match &bcj2 {
+                Some(bcj2) => self.write_bcj2_tail(bcj2)?,
+                None => 0,
+            };
             entry.has_stream = true;
             entry.size = size as u64;
             entry.crc = crc as u64;
             entry.has_crc = true;
             entry.compressed_crc = compressed_crc as u64;
-            entry.compressed_size = compressed_len as u64;
-            self.pack_info
-                .add_stream(compressed_len as u64, compressed_crc);
+            entry.compressed_size = compressed_len as u64 + tail_len;
 
             let mut sizes = Vec::with_capacity(more_sizes.len() + 1);
             sizes.extend(more_sizes.iter().map(|s| s.get() as u64));
             sizes.push(size as u64);
 
-            self.unpack_info
-                .add(self.content_methods.clone(), sizes, crc);
+            self.unpack_info.add(methods, sizes, crc).bcj2 = bcj2.map(|b| b.sizes);
 
             self.files.push(entry);
             return Ok(self.files.last().unwrap());
@@ -255,6 +347,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             crc,
             sub_stream_sizes,
             sub_stream_crcs,
+            bcj2,
         } = block;
 
         let compressed_len = compressed.len() as u64;
@@ -263,14 +356,19 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             .map_err(|e| Error::io_msg(e, "push_prepared_block: write".to_string()))?;
 
         self.pack_info.add_stream(compressed_len, compressed_crc);
-        self.unpack_info.add_multiple(
-            methods,
-            sizes,
-            crc,
-            entries.len() as u64,
-            sub_stream_sizes,
-            sub_stream_crcs,
-        );
+        if let Some(bcj2) = &bcj2 {
+            self.write_bcj2_tail(bcj2)?;
+        }
+        self.unpack_info
+            .add_multiple(
+                methods,
+                sizes,
+                crc,
+                entries.len() as u64,
+                sub_stream_sizes,
+                sub_stream_crcs,
+            )
+            .bcj2 = bcj2.map(|b| b.sizes);
         self.files.extend(entries);
         Ok(self)
     }
@@ -289,14 +387,22 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         assert_eq!(r.reader_len(), entries.len());
         let mut compressed_len = 0;
         let mut compressed = CompressWrapWriter::new(&mut self.output, &mut compressed_len);
-        let content_methods = &self.content_methods;
+        let mut out = std::io::BufWriter::with_capacity(OUTPUT_BUF_LEN, &mut compressed);
+        let (head, folder) = folder_size(&entries, &mut r)
+            .map_err(|e| Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries))))?;
+        let content_methods = &sized_methods(&self.content_methods, folder);
         let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(content_methods.len() - 1);
+        let mut bcj2 = None;
 
         let (crc, size) = {
-            let mut w = Self::create_writer(content_methods, &mut compressed, &mut more_sizes)?;
+            let mut w = Self::create_writer(content_methods, &mut out, &mut more_sizes, &mut bcj2)?;
             let mut write_len = 0;
             let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
-            let mut buf = [0u8; 4096];
+            w.write_all(&head).map_err(|e| {
+                Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries)))
+            })?;
+            drop(head);
+            let mut buf = vec![0u8; SOURCE_READ_LEN];
 
             loop {
                 match r.read(&mut buf) {
@@ -333,6 +439,9 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
             (w.crc_value(), write_len)
         };
+        out.flush()
+            .map_err(|e| Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries))))?;
+        drop(out);
         let compressed_crc = compressed.crc_value();
         let mut sub_stream_crcs = Vec::with_capacity(entries.len());
         let mut sub_stream_sizes = Vec::with_capacity(entries.len());
@@ -348,32 +457,56 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
         self.pack_info
             .add_stream(compressed_len as u64, compressed_crc);
+        let content_methods = Arc::clone(content_methods);
+        let bcj2 = Bcj2Packed::take(bcj2);
+        if let Some(bcj2) = &bcj2 {
+            self.write_bcj2_tail(bcj2)?;
+        }
 
         let mut sizes = Vec::with_capacity(more_sizes.len() + 1);
         sizes.extend(more_sizes.iter().map(|s| s.get() as u64));
         sizes.push(size as u64);
 
-        self.unpack_info.add_multiple(
-            content_methods.clone(),
-            sizes,
-            crc,
-            entries.len() as u64,
-            sub_stream_sizes,
-            sub_stream_crcs,
-        );
+        self.unpack_info
+            .add_multiple(
+                content_methods,
+                sizes,
+                crc,
+                entries.len() as u64,
+                sub_stream_sizes,
+                sub_stream_crcs,
+            )
+            .bcj2 = bcj2.map(|b| b.sizes);
 
         self.files.extend(entries);
         Ok(self)
     }
 
+    /// Builds the coder chain for `methods` over `out`.
+    ///
+    /// A chain ending in BCJ2 is a four-stream block: the methods before it
+    /// code the main stream, as a linear chain does, and BCJ2 brings its own
+    /// coders for the call and jump streams. Its tail - the three pack
+    /// streams that follow the main one - lands in `bcj2` once the chain is
+    /// finished.
     fn create_writer<'a, O: Write + 'a>(
         methods: &[EncoderConfiguration],
         out: O,
         more_sized: &mut Vec<Rc<Cell<usize>>>,
+        bcj2: &mut Option<encoder::Bcj2Slot>,
     ) -> Result<Box<dyn Write + 'a>> {
         let mut encoder: Box<dyn Write> = Box::new(out);
         let mut first = true;
-        for mc in methods.iter() {
+        for (i, mc) in methods.iter().enumerate() {
+            if mc.method.id() == EncoderMethod::ID_BCJ2 {
+                Self::check_bcj2_methods(methods, i)?;
+                let counting = CountingWriter::new(encoder);
+                more_sized.push(counting.counting());
+                let (bcj2_encoder, slot) = encoder::add_bcj2_encoder(counting)?;
+                *bcj2 = Some(slot);
+                encoder = Box::new(bcj2_encoder);
+                continue;
+            }
             if !first {
                 let counting = CountingWriter::new(encoder);
                 more_sized.push(counting.counting());
@@ -385,6 +518,46 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             first = false;
         }
         Ok(encoder)
+    }
+
+    /// BCJ2 is written only where 7-Zip puts it: last in the method list,
+    /// which makes it the first coder the data meets, over at least one coder
+    /// for its main stream. It is not combined with AES, which would leave
+    /// the call, jump and rc streams unencrypted.
+    fn check_bcj2_methods(methods: &[EncoderConfiguration], index: usize) -> Result<()> {
+        if index + 1 != methods.len() {
+            return Err(Error::unsupported(
+                "BCJ2 must be the last content method: it is the first coder the data meets",
+            ));
+        }
+        if index == 0 {
+            return Err(Error::unsupported(
+                "BCJ2 needs a coder for its main stream before it in the content methods",
+            ));
+        }
+        if methods
+            .iter()
+            .any(|mc| mc.method.id() == EncoderMethod::ID_AES256_SHA256)
+        {
+            return Err(Error::unsupported(
+                "BCJ2 cannot be combined with AES-256 encryption when writing",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Appends a BCJ2 block's rc, call and jump pack streams after its main
+    /// one, and returns how many bytes they took.
+    fn write_bcj2_tail(&mut self, bcj2: &Bcj2Packed) -> Result<u64> {
+        let mut total = 0;
+        for (bytes, crc) in &bcj2.streams {
+            self.output
+                .write_all(bytes)
+                .map_err(|e| Error::io_msg(e, "write BCJ2 stream".to_string()))?;
+            self.pack_info.add_stream(bytes.len() as u64, *crc);
+            total += bytes.len() as u64;
+        }
+        Ok(total)
     }
 
     /// Finishes the compression.
@@ -456,15 +629,17 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
         methods.push(EncoderConfiguration::new(EncoderMethod::LZMA));
 
-        let methods = Arc::new(methods);
+        // The header's length is known: a dictionary larger than it is never used.
+        let methods = sized_methods(&Arc::new(methods), Some(size));
 
         let mut encoded_data = Vec::with_capacity(size as usize / 2);
 
         let mut compress_size = 0;
         let mut compressed = CompressWrapWriter::new(&mut encoded_data, &mut compress_size);
         {
-            let mut encoder = Self::create_writer(&methods, &mut compressed, &mut more_sizes)
-                .map_err(std::io::Error::other)?;
+            let mut encoder =
+                Self::create_writer(&methods, &mut compressed, &mut more_sizes, &mut None)
+                    .map_err(std::io::Error::other)?;
             encoder.write_all(&raw_header)?;
             encoder.flush()?;
             let _ = encoder.write(&[])?;
@@ -670,7 +845,6 @@ pub(crate) fn write_u64<W: Write>(header: &mut W, mut value: u64) -> std::io::Re
 struct CompressWrapWriter<'a, W> {
     writer: W,
     crc: Crc32,
-    cache: Vec<u8>,
     bytes_written: &'a mut usize,
 }
 
@@ -679,7 +853,6 @@ impl<'a, W: Write> CompressWrapWriter<'a, W> {
         Self {
             writer,
             crc: Crc32::new(),
-            cache: Vec::with_capacity(8192),
             bytes_written,
         }
     }
@@ -692,7 +865,6 @@ impl<'a, W: Write> CompressWrapWriter<'a, W> {
 
 impl<W: Write> Write for CompressWrapWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.cache.resize(buf.len(), Default::default());
         let len = self.writer.write(buf)?;
         self.crc.update(&buf[..len]);
         *self.bytes_written += len;
@@ -721,12 +893,44 @@ pub struct PreparedBlock {
     crc: u32,
     sub_stream_sizes: Vec<u64>,
     sub_stream_crcs: Vec<u32>,
+    bcj2: Option<Bcj2Packed>,
+}
+
+/// The three pack streams a BCJ2 block has after its main one, in the order
+/// 7-Zip writes them - rc, call, jump - each with its CRC, and the call and
+/// jump streams' sizes before their coders.
+#[derive(Debug)]
+struct Bcj2Packed {
+    streams: [(Vec<u8>, u32); 3],
+    sizes: Bcj2SideSizes,
+}
+
+impl Bcj2Packed {
+    /// Takes the tail a finished BCJ2 chain left in its slot, checksumming it
+    /// here, on the thread that encoded the block.
+    fn take(slot: Option<encoder::Bcj2Slot>) -> Option<Self> {
+        let tail = slot?.borrow_mut().take()?;
+        let sizes = Bcj2SideSizes {
+            call: tail.call_size,
+            jump: tail.jump_size,
+        };
+        let streams = [tail.rc, tail.call, tail.jump].map(|bytes| {
+            let crc = crc32_of(&bytes);
+            (bytes, crc)
+        });
+        Some(Self { streams, sizes })
+    }
+
+    fn len(&self) -> usize {
+        self.streams.iter().map(|(bytes, _)| bytes.len()).sum()
+    }
 }
 
 impl PreparedBlock {
-    /// Compressed size in bytes, before it is appended.
+    /// Compressed size in bytes, before it is appended: every pack stream
+    /// the block will add, which for a BCJ2 block is four.
     pub fn compressed_len(&self) -> usize {
-        self.compressed.len()
+        self.compressed.len() + self.bcj2.as_ref().map_or(0, Bcj2Packed::len)
     }
 
     /// Number of entries in the block.
@@ -766,8 +970,16 @@ pub fn prepare_block<R: Read>(
         )));
     }
 
+    let (head, folder) = folder_size(&entries, &mut r).map_err(|e| {
+        Error::io_msg(
+            e,
+            format!("prepare_block: read source:{}", entries_names(&entries)),
+        )
+    })?;
+    let methods = sized_methods(&methods, folder);
     let mut out: Vec<u8> = Vec::new();
     let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(methods.len() - 1);
+    let mut bcj2 = None;
 
     let (crc, size, compressed_crc) = {
         // Outer wrapper: the CRC of the compressed bytes, computed as they are produced on this
@@ -780,10 +992,18 @@ pub fn prepare_block<R: Read>(
                 &methods,
                 &mut compressed,
                 &mut more_sizes,
+                &mut bcj2,
             )?;
             let mut write_len = 0;
             let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
-            let mut buf = [0u8; 4096];
+            w.write_all(&head).map_err(|e| {
+                Error::io_msg(
+                    e,
+                    format!("prepare_block: encode:{}", entries_names(&entries)),
+                )
+            })?;
+            drop(head);
+            let mut buf = vec![0u8; SOURCE_READ_LEN];
             loop {
                 let n = r.read(&mut buf).map_err(|e| {
                     Error::io_msg(
@@ -843,5 +1063,150 @@ pub fn prepare_block<R: Read>(
         crc,
         sub_stream_sizes,
         sub_stream_crcs,
+        bcj2: Bcj2Packed::take(bcj2),
     })
+}
+
+#[cfg(test)]
+mod bcj2_tests {
+    use std::io::Cursor;
+
+    use crate::{
+        ArchiveEntry, ArchiveReader, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password,
+        block::BindPair, encoder_options::DeltaOptions,
+    };
+
+    fn pseudo_x86(len: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut out: Vec<u8> = (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect();
+        let mut i = 0;
+        while i + 5 <= out.len() {
+            out[i] = if i % 3 == 0 { 0xE9 } else { 0xE8 };
+            out[i + 1..i + 5].copy_from_slice(&((i as u32 * 5) % 0x8000).to_le_bytes());
+            i += 11;
+        }
+        out
+    }
+
+    fn archive(methods: Vec<EncoderConfiguration>, data: &[u8]) -> Vec<u8> {
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        writer.set_content_methods(methods);
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("amber_quarry/tool.exe"), Some(data))
+            .unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn bp(in_index: u64, out_index: u64) -> BindPair {
+        BindPair {
+            in_index,
+            out_index,
+        }
+    }
+
+    /// The folder is the one 7-Zip writes for `-mf=BCJ2`: two LZMA coders
+    /// with `lc0 lp2` and a 1 MiB dictionary for jump and call, the main
+    /// coder, then BCJ2 with four inputs; BCJ2's inputs bound to coders 2, 1
+    /// and 0; pack streams main, rc, call, jump.
+    #[test]
+    fn the_folder_is_seven_zips_four_stream_layout() {
+        let data = pseudo_x86(200 * 1024);
+        let bytes = archive(
+            vec![
+                EncoderMethod::LZMA2.into(),
+                EncoderMethod::BCJ2_FILTER.into(),
+            ],
+            &data,
+        );
+        let reader = ArchiveReader::new(Cursor::new(bytes.as_slice()), Password::empty()).unwrap();
+        let block = &reader.archive().blocks[0];
+
+        let ids: Vec<&[u8]> = block.coders.iter().map(|c| c.encoder_method_id()).collect();
+        assert_eq!(
+            ids,
+            [
+                EncoderMethod::ID_LZMA,
+                EncoderMethod::ID_LZMA,
+                EncoderMethod::ID_LZMA2,
+                EncoderMethod::ID_BCJ2
+            ]
+        );
+        for side in &block.coders[..2] {
+            assert_eq!(side.properties(), [0x6C, 0x00, 0x00, 0x10, 0x00]);
+            assert_eq!((side.num_in_streams, side.num_out_streams), (1, 1));
+        }
+        let bcj2 = &block.coders[3];
+        assert_eq!((bcj2.num_in_streams, bcj2.num_out_streams), (4, 1));
+        assert!(bcj2.properties().is_empty());
+        assert_eq!(block.total_input_streams, 7);
+        assert_eq!(block.total_output_streams, 4);
+        assert_eq!(block.bind_pairs, [bp(5, 0), bp(4, 1), bp(3, 2)]);
+        assert_eq!(block.packed_streams, [2, 6, 1, 0]);
+
+        let [jump, call, main, total] = block.unpack_sizes[..] else {
+            panic!("four unpack sizes: {:?}", block.unpack_sizes);
+        };
+        assert_eq!(total, data.len() as u64);
+        assert!(jump > 0 && call > 0, "jump {jump} call {call}");
+        assert_eq!(jump % 4, 0);
+        assert_eq!(call % 4, 0);
+        // Every converted branch moves its four-byte target out of main.
+        assert_eq!(main + call + jump, total);
+        assert_eq!(reader.archive().block_pack_streams(0).len(), 4);
+    }
+
+    /// Two coders on the main stream chain to each other below BCJ2, and the
+    /// archive still decodes.
+    #[test]
+    fn a_main_chain_of_two_coders_is_bound_in_line() {
+        let data = pseudo_x86(64 * 1024);
+        let bytes = archive(
+            vec![
+                EncoderMethod::LZMA2.into(),
+                DeltaOptions::from_distance(4).into(),
+                EncoderMethod::BCJ2_FILTER.into(),
+            ],
+            &data,
+        );
+        let mut reader =
+            ArchiveReader::new(Cursor::new(bytes.as_slice()), Password::empty()).unwrap();
+        let block = &reader.archive().blocks[0];
+        assert_eq!(block.coders.len(), 5);
+        assert_eq!(block.coders[4].num_in_streams, 4);
+        assert_eq!(block.bind_pairs, [bp(6, 0), bp(5, 1), bp(4, 3), bp(3, 2)]);
+        assert_eq!(block.packed_streams, [2, 7, 1, 0]);
+        assert!(reader.read_file("amber_quarry/tool.exe").unwrap() == data);
+    }
+}
+
+#[cfg(test)]
+mod folder_size_tests {
+    use super::declared_size;
+    use crate::ArchiveEntry;
+
+    fn file(size: u64) -> ArchiveEntry {
+        let mut entry = ArchiveEntry::new_file("f");
+        entry.size = size;
+        entry
+    }
+
+    #[test]
+    fn a_folder_is_sized_only_when_every_file_declares_its_size() {
+        assert_eq!(declared_size(&[file(10), file(20)]), Some(30));
+        assert_eq!(
+            declared_size(&[file(10), ArchiveEntry::new_directory("d"), file(5)]),
+            Some(15)
+        );
+        // `new_file`'s zero is "unknown": the folder may hold far more than 10 bytes.
+        assert_eq!(declared_size(&[file(10), file(0)]), None);
+        assert_eq!(declared_size(&[file(0)]), None);
+        assert_eq!(declared_size(&[ArchiveEntry::new_directory("d")]), None);
+    }
 }

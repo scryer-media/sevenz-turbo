@@ -11,7 +11,11 @@ fn assert_dictionary_rejected(config: EncoderConfiguration) {
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
     writer.set_content_methods(vec![config]);
 
-    let result = writer.push_archive_entry(ArchiveEntry::new_file("data"), Some(&b"x"[..]));
+    // Longer than the writer reads ahead to size a folder and with no declared size, so the
+    // folder is unsized and the coder is built with the configured dictionary; a folder known to
+    // be small would get a dictionary its own size instead.
+    let data = vec![0u8; (1 << 20) + 1];
+    let result = writer.push_archive_entry(ArchiveEntry::new_file("data"), Some(&data[..]));
     assert!(matches!(
         result,
         Err(Error::Io(error, _)) if error.kind() == ErrorKind::InvalidInput

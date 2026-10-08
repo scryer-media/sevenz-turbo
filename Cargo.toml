@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/scryer-media/sevenz-turbo"
 # Raised from upstream's 1.93: `lzma-turbo` requires 1.97.1.
 rust-version = "1.97.1"
-version = "0.26.1"
+version = "0.27.0"
 # Repository scaffolding that has no business in the crate archive.
 exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml"]
 
@@ -35,8 +35,8 @@ aes256_wasm = ["aes256", "getrandom/wasm_js"]
 # not turn `aws-lc-crypto` off — it takes precedence over it. A build that
 # wants no AWS-LC asks for `default-features = false` plus `native-crypto`.
 # Enabling `aes256` with neither is a compile error, not a silent choice. The
-# encoder's AES stays on RustCrypto's `cbc::Encryptor`, so `compress` pulls
-# `aes`/`cbc` in regardless of the backend.
+# encoder's AES follows the same choice; `compress` still pulls `aes`/`cbc`
+# in regardless, as the encryptor of every build that does not select AWS-LC.
 aws-lc-crypto = ["dep:aws-lc-rs", "lzma-turbo/crypto"]
 native-crypto = ["dep:aes", "dep:cbc", "lzma-turbo/native-crypto"]
 # Delegate the bulk AES-256-CBC *decrypt* to an embedder-installed hook (see
@@ -62,7 +62,7 @@ brotli = ["dep:brotli"]
 bzip2 = ["dep:bzip2"]
 # Writing archives. LZMA and LZMA2 are encoded by `lzma-turbo`'s port of the
 # SDK encoder (see `src/codec/lzma_turbo/writer.rs`); the AES-256 encryptor
-# stays on RustCrypto.
+# is RustCrypto's unless AWS-LC is the selected backend.
 compress = ["lzma-turbo/enc", "dep:aes", "dep:cbc"]
 # The alternative: encode LZMA and LZMA2 with `lzma-rust2`'s pure-Rust
 # encoders instead. Off by default; with it on, `lzma-turbo`'s encoder is not

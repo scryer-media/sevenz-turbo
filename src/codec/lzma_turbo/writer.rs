@@ -43,6 +43,36 @@ pub(crate) enum Coder {
     Lzma2 { block_size: u64, threads: usize },
 }
 
+/// The fixed settings of a single-threaded LZMA side coder, such as BCJ2's
+/// call and jump coders: the level's match finder with an explicit
+/// dictionary, fast bytes and literal/position bits.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SideCoder {
+    pub(crate) level: u32,
+    pub(crate) dict_size: u32,
+    pub(crate) fast_bytes: u32,
+    pub(crate) lc: u8,
+    pub(crate) lp: u8,
+    pub(crate) pb: u8,
+}
+
+impl SideCoder {
+    /// A raw LZMA writer (no header, no end marker) with these settings.
+    ///
+    /// # Errors
+    ///
+    /// As [`LzmaTurboWriter::new`].
+    pub(crate) fn writer<W: Write>(&self, inner: W) -> io::Result<LzmaTurboWriter<W>> {
+        let props = LzmaEncProps::new()
+            .with_level(self.level)
+            .with_dict_size(self.dict_size)
+            .with_fast_bytes(self.fast_bytes)
+            .with_lclppb(self.lc, self.lp, self.pb)
+            .with_num_threads(1);
+        LzmaTurboWriter::new(inner, &props, Coder::Lzma)
+    }
+}
+
 /// The encoder, built up front so that a bad setting is refused where the
 /// coder is added and not later on a thread.
 enum Encoder {

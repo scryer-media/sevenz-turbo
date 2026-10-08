@@ -65,6 +65,11 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   only through the non-default `lzma-rust2-encoder` feature; with
   `--no-default-features` the graph is `sevenz-turbo → lzma-turbo → crc-fast`
   and nothing else.
+- The writer sizes each folder's LZMA or LZMA2 coder to the folder, the way
+  7-Zip reduces its dictionary: a folder known to be smaller than the
+  dictionary is coded with one its size (never below 4 KiB), and one that fits
+  a single LZMA2 block is coded on one thread. `ArchiveEntry::from_path`
+  records the file's length so the size is known before the push.
 - The BCJ and delta filters are `lzma-turbo`'s, and BCJ2 is vendored into
   `src/codec/filter/` from `lzma-rust2` 0.20.1 (Apache-2.0, same licence),
   which together are what let `lzma-rust2` leave the decode graph rather than
@@ -272,6 +277,11 @@ Everything here is new surface; no upstream signature changed meaning.
   in a serialised section of the multi-threaded path, and thread counts
   default to one.
 
+### Encoding
+
+- BCJ2 is written as well as read (0.27.0). Upstream reads BCJ2 folders but
+  cannot write one.
+
 ### Cryptography
 
 - **The AES decoder decrypts in the caller's buffer.** It used to read the
@@ -305,7 +315,10 @@ Everything here is new surface; no upstream signature changed meaning.
   cryptography extensions on aarch64. Neither lane needs a streaming API: a
   chunk is decrypted with the current IV and that chunk's last ciphertext
   block, copied out before the in-place decrypt, is the next chunk's IV. The
-  encoder (`compress`) keeps RustCrypto's `cbc::Encryptor`.
+  encoder (`compress`) follows the same switch over the same unpadded CBC:
+  AWS-LC's `EncryptingKey::cbc` by default, RustCrypto's `cbc::Encryptor`
+  under `native-crypto` and wherever AWS-LC is not selected (a wasm build
+  encrypts in the guest).
   `aws-lc-rs` is a direct optional dependency on the pin and features
   `lzma-turbo` uses, so a build with both crates resolves one copy of AWS-LC.
 - `aes256` no longer implies a backend: enabling it with neither
@@ -385,6 +398,200 @@ Everything here is new surface; no upstream signature changed meaning.
 - The vendored BCJ round-trip tests generate their sample data instead of
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
+
+## 0.27.0 - 2026-10-07
+
+- Bench harness: `run` refuses an `--out` whose `scratch` directory already
+  exists instead of deleting it at the end of the run.
+- `sevenz_turbo::sha256` digests with the backend `crypto_backend` names.
+  decode-bench takes its `Cargo.lock` digest through it, so the
+  `native-crypto` candidate no longer links AWS-LC's SHA-256 beside
+  RustCrypto's for that one digest.
+- The memory limit charges a PPMd coder for the 64 KiB input buffer it reads
+  through as well as its model, in the per-coder check and the chain check
+  alike, so the buffer is counted before the coder is built.
+- decode-bench reports the Cargo profile it was built under as
+  `build_profile`, and the bench harness refuses a candidate that does not
+  report `release` and counts the profile in the identity the native
+  candidate must share with the primary one.
+- Each folder's LZMA and LZMA2 coder is sized to the folder. Every folder was
+  set up with the full dictionary and, with more than one thread allowed, a
+  multi-threaded LZMA2 coder that buffers a whole 32 MiB block, so a
+  non-solid archive of small files paid that setup per file. A folder whose
+  size is known and smaller than the dictionary now gets a dictionary its own
+  size (7-Zip's rule, never below 4 KiB), recorded in the coder's properties,
+  and a folder that fits one LZMA2 block is coded on one thread. The encoded
+  header is sized the same way. Archives whose folders are no smaller than
+  the dictionary are written byte for byte as before. On Apple M5 Max, 512
+  non-solid 16 KiB files went from 0.70 s CPU and 101 MB peak RSS to 0.50 s
+  and 8.5 MB, at the same archive size.
+- The writer learns a folder's size from its entries: `ArchiveEntry::size` is
+  read as a size hint before a push (zero means unknown), `from_path` now
+  fills it in from the file's length, and a solid block is sized by the sum
+  when every file in it declares a size. When any file says zero, the writer
+  reads up to 1 MiB ahead instead and sizes a shorter stream by what it read,
+  so a block mixing `from_path` and `new_file` entries is never sized by its
+  known entries alone. A wrong hint costs ratio or threads, never
+  correctness; the push records the bytes actually read, as before.
+- BCJ2 can be written. It is asked for as the single-stream filters are, as
+  the last content method after the coder for its main stream:
+  `set_content_methods(vec![EncoderMethod::LZMA2.into(),
+  EncoderMethod::BCJ2_FILTER.into()])` (LZMA in place of LZMA2 works too, as
+  do filters between them). It is opt-in: the default method stays LZMA2
+  alone, for executables as for anything else.
+- The block is the four-stream folder 7-Zip writes for `-mf=BCJ2`, coder for
+  coder: an LZMA coder each for the jump and call streams, the main stream's
+  coders, then BCJ2 with four inputs; BCJ2's main, call and jump inputs bound
+  to those coders; and four pack streams in 7-Zip's file order - main, the
+  range-coded stream stored raw, call, jump. The call and jump coders take
+  7-Zip's settings from `AddBcj2Methods` in `7zUpdate.cpp`: a 1 MiB
+  dictionary, 128 fast bytes, one thread, `lc0 lp2`. The conversion is
+  `lzma-turbo`'s port of the SDK's `Bcj2Enc.c`, run with its defaults.
+- The main stream is coded as it arrives. The call and jump streams are coded
+  as they arrive too, into memory, and appended after the main stream with
+  the range-coded stream when the block ends, so a block holds its coded call
+  and jump streams in memory until then - as 7-Zip does with the streams
+  after the first.
+- All three ways of writing a block take it: `push_archive_entry`,
+  `push_archive_entries` (solid) and `prepare_block` /
+  `push_prepared_block`. A `PreparedBlock`'s `compressed_len` counts all four
+  pack streams, and so does a BCJ2 entry's `compressed_size`.
+- A method list that puts BCJ2 anywhere but last, gives it no coder for the
+  main stream, or combines it with AES-256 is refused with
+  `Error::Unsupported` when the first entry is written. Encrypting a BCJ2
+  block would need an AES coder on every pack stream, which this writer does
+  not build.
+- Fixed: a header whose pack-stream CRCs were not all defined (a pack stream
+  whose CRC32 is 0) wrote the defined-bits vector but not the CRC values
+  that 7-Zip's `WriteHashDigests` puts after it, so the header did not parse.
+  The values are now written. One pack stream in four billion hits this; a
+  BCJ2 block has four.
+- Tested: the folder layout, bind pairs and pack-stream order against the
+  ones 7-Zip writes; round trips through this crate's reader single- and
+  multi-threaded, in all three layouts, for empty and one-to-five-byte
+  inputs and for x86 code whose call and jump streams are not empty; that how
+  the source is read cannot change a byte of the archive; and, where `7zz` or
+  `7z` is on `PATH`, that 7-Zip tests and extracts the archives to their
+  inputs.
+- Fixed: the reader set a BCJ2 entry's `compressed_size` to its block's first
+  pack stream alone, so the same entry reported a smaller size after the
+  archive was reopened than the writer reported when it was pushed. The
+  first entry of a block now carries the sum of every pack stream the block
+  reads.
+- New `sevenz_turbo::lzma_encoder() -> &'static str` (behind `compress`):
+  `"lzma-turbo"`, or `"lzma-rust2"` when the `lzma-rust2-encoder` feature
+  is on, which a dependency can turn on unnoticed - the encoder's
+  counterpart of `crypto_backend()`.
+- The one-block rule applies to the `lzma-rust2-encoder` build as well: a
+  folder known to fit one LZMA2 block is coded by `lzma-rust2`'s
+  single-threaded writer instead of starting its multi-threaded one.
+- The parallel LZMA2 reader no longer holds LZMA-coded data that barely
+  compressed to two threads. A run counted as incompressible, and was
+  decoded on two threads however many were asked for, once it packed to 90
+  percent of its size or more; that line was meant for stored chunks, whose
+  decode is a copy bound by the read, but it also caught media archived at an
+  ordinary level, whose chunks are LZMA-coded at 92 to 99.5 percent and are
+  the slowest LZMA there is to decode. A run is now taken as incompressible
+  only when it is no smaller than what it decodes to, which an encoder that
+  codes a chunk only when coding shrinks it makes the stored case. On Apple
+  M5 Max at 18 threads, a gigabyte of such data written by `7zz -mx5` went
+  from 17.0 s to 4.0 s (7zz: 3.9 s) and by `-mx1` from 13.4 s to 2.2 s
+  (7zz: 2.4 s); a gigabyte of random data, stored chunks, still decodes on
+  two threads, in 0.2 s.
+- Fixed: a CRC-32 that does not match is one error on every path:
+  `Error::BlockDecode` with `BlockErrorKind::ChecksumMismatch`, located in
+  its block, with the same message. Only the parallel path's folded check
+  said so. A block holding one file - every block of a non-solid store
+  archive, where a damaged byte shows up as nothing but a CRC mismatch -
+  reported `BlockDecode` of kind `Io` around an `io::Error` of kind `Other`,
+  and a file of a solid block decoded on one thread came out as a bare
+  `Error::Io` with no block at all, so a consumer that keeps a damaged set
+  for repair on a checksum mismatch gave those up as fatal.
+  `ArchiveReader::read_file` reports the same error. An encrypted block's
+  mismatch is still `BlockErrorKind::Password` on every path, `read_file`
+  included, since a wrong password looks the same.
+- Fixed: `set_verify_checksums(false)` turns off the block checksum as well.
+  A block holding one file was still checked against the file's CRC, which
+  the block borrows, and a block's own CRC was checked on the consuming
+  thread even where the parallel decoder's workers already fold it. A
+  one-file block read through `for_each_entries` or `read_file` is now
+  checked once, against the file's CRC, instead of twice over the same
+  bytes; the block check stays wherever it is the only one.
+- Fixed: a PPMd block this crate wrote failed `7zz t` with "Data Error",
+  although `7zz x` and this crate's reader both gave the right bytes back.
+  The writer flushes a block's coder chain before finishing it, and
+  `ppmd-rust`'s `flush` ends the range coder, which `finish` then ended a
+  second time, so every PPMd pack stream carried five bytes after its end
+  that 7-Zip's strict end-of-stream check refuses. A flush now only passes
+  down to the sink, and the stream ends once. Tested: where `7zz` or `7z` is
+  on `PATH`, 7-Zip tests and extracts what every encode method writes -
+  Copy, LZMA, LZMA2, LZMA2 with BCJ and with delta, PPMd, BZip2 and Deflate,
+  solid and not, with and without AES-256.
+- PPMd decodes as fast as 7-Zip. Its range decoder takes its input a byte
+  at a time, and nothing between it and the archive buffered, so every
+  compressed byte was a read call on the source; a PPMd block now reads
+  through a 64 KiB buffer wherever it sits, under AES or in a BCJ2 graph
+  included, and AES under it decrypts 64 KiB at a time instead of one
+  16-byte block per call. On Apple M5 Max (heavily loaded), a 15 MB PPMd
+  block went from 12.5 s, 4.4 s of it in the kernel, to 5.8 s with none
+  (`7zz t -mmt=1`: 6.1 s), and an AES-256 PPMd block of 30 MB from 1.86
+  million reads to 454 and from 13.1 s to 12.4 s (7zz: 12.6 s).
+- The BCJ filters read and filter 64 KiB at a time rather than 4 KiB,
+  Brotli reads 64 KiB of input at a time, and every block's pack stream is
+  read through a 64 KiB buffer, so a chain whose first coder reads whatever
+  it is asked for - Copy, delta - makes no more read calls than that however
+  small the caller's reads are. 7-Zip's filter coders read at least as
+  much. A Copy+BCJ block of 4 MiB went from 1,033 reads to 69. A coder that
+  already reads large pieces - LZMA, LZMA2 - goes through the buffer
+  without a second copy, and no other row moved. The buffer counts against
+  `memory_limit_bytes`: `Archive::decoder_memory_estimate` charges every
+  block 64 KiB for it, and so does the chain check of a block read through
+  it, so a Copy block no longer estimates at zero.
+- An LZMA2 block that declares less than 1 MiB of output is decoded
+  single-threaded whatever thread count or adaptive mode was asked for.
+  7-Zip's and lzma-turbo's multi-threaded encoders never cut a run finer
+  than `max(4 x dict, 1 MiB)`, so such a block is one run, and the parallel
+  path decoded it on the calling thread anyway after starting workers and
+  reserving its read-ahead. A non-solid archive of 512 blocks of 16 KiB went
+  from 0.24 s, 12.7 MiB peak RSS and 27,000 involuntary context switches at
+  18 threads to 0.14 s, 4.2 MiB and 1,100: the same as one thread. The
+  parallel path reads the remainder of a block in pieces sized to what the
+  block declares rather than 4 MiB each, so it no longer zero-fills and
+  reserves 4 MiB for the last kilobytes of a stream; large decodes are
+  unchanged.
+- An adaptive LZMA2 decode with no memory limit widens. Its in-flight
+  budget is set when the block's coder is built, and with no limit it was
+  the backstop for the one thread the decode starts at, so it never held
+  enough runs to widen past two. It is now the backstop for the threads it
+  may widen to: the machine's parallelism, or the threads asked for if that
+  is more. A decode under a memory limit is unchanged. On Apple M5 Max, a
+  1 GiB near-incompressible `-mx5` archive decoded adaptively at 18 threads
+  went from 17.3 s at a widest of 2 threads and 443 MB peak RSS to 4.6 s at
+  9 and 2.06 GB, the same as with a 4 GiB limit.
+- The AES-256 encoder encrypts and writes 64 KiB at a time through the
+  selected cryptography backend - AWS-LC's unpadded CBC by default,
+  RustCrypto's under `native-crypto` and on wasm - instead of encrypting
+  each 16-byte block with RustCrypto and writing it on its own. The output
+  is the same CBC ciphertext. An AES-256 LZMA2 level-5 encode of 16 MiB at
+  18 threads went from 5.4 s wall, 1.6 s of it in the kernel, to 4.5 s and
+  0.07 s. Its dead 32-bit `write_size` counter, which overflowed at 4 GiB in
+  a debug build, is gone.
+- The AES-256 decoder serves a caller that reads less than 64 KiB at a time
+  from 64 KiB it decrypted ahead, rather than decrypting and reading one
+  block per call below 16 bytes. A caller reading 64 KiB or more is still
+  decrypted in its own buffer with no copy, so the AES decode rows, which
+  already read in bulk, did not move.
+- `push_archive_entry` and `push_archive_entries` gather a folder's
+  compressed bytes in a 256 KiB buffer before they reach the archive's
+  writer, and flush it, reporting a failure, when the folder is done. A
+  coder that writes a byte or two at a time - PPMd, the BCJ2 range coder -
+  no longer makes a write call per byte on a bare `File`: a solid PPMd
+  encode of 16 MiB to `ArchiveWriter::create` went from 37.3 s, 27 s of it
+  in the kernel, to 5.1 s and 0.03 s. Entry sources are read 1 MiB at a
+  time rather than 4 KiB, which also hands a multi-threaded LZMA2 coder one
+  message per mebibyte. The output is byte-identical (LZMA2 level 5, BCJ2
+  and PPMd checked), and `ArchiveWriter::create` still returns
+  `ArchiveWriter<File>`.
 
 ## 0.26.1 - 2026-09-29
 

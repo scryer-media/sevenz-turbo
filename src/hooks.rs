@@ -44,9 +44,9 @@
 //! silent in-guest fallback would quietly defeat the whole point of
 //! delegation.
 //!
-//! Only the *decrypt* is delegated. The encoder (`compress` + `aes256`) keeps
-//! RustCrypto's `cbc::Encryptor` in `encryption::aes`; writing archives is not
-//! the path this seam exists for. SHA-256 (the 7z key derivation) and CRC-32
+//! Only the *decrypt* is delegated. The encoder (`compress` + `aes256`) uses
+//! RustCrypto's `cbc::Encryptor` in the guest; writing archives is not the
+//! path this seam exists for. SHA-256 (the 7z key derivation) and CRC-32
 //! come from `lzma-turbo` and are not routed through this module.
 
 use std::sync::RwLock;

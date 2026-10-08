@@ -1,12 +1,16 @@
-use std::io::Write;
+use std::{cell::RefCell, io::Write, rc::Rc};
 
 #[cfg(feature = "lzma-rust2-encoder")]
 use lzma_rust2::{Lzma2Writer, Lzma2WriterMt, LzmaWriter};
 
 #[cfg(not(feature = "lzma-rust2-encoder"))]
-use crate::codec::lzma_turbo::writer::{Coder, LzmaTurboWriter};
+use crate::codec::lzma_turbo::writer::{Coder, LzmaTurboWriter, SideCoder};
 
-use crate::codec::filter::{bcj::BcjWriter, delta::DeltaWriter};
+use crate::codec::filter::{
+    bcj::BcjWriter,
+    bcj2::{Bcj2Finished, Bcj2Writer},
+    delta::DeltaWriter,
+};
 
 #[cfg(feature = "brotli")]
 use crate::codec::brotli::BrotliEncoder;
@@ -33,6 +37,10 @@ use crate::{
     writer::CountingWriter,
 };
 
+/// A BCJ2 coder in a chain: its main stream goes on down the chain, and its
+/// call and jump streams into coders of their own.
+pub(crate) type Bcj2ChainWriter<W> = Bcj2Writer<CountingWriter<W>, Box<dyn Write>>;
+
 // One of these is built per coder in a chain and boxed there as a
 // `dyn Write`; its variants range from a counting writer to a brotli state
 // of several KiB, and the difference costs nothing.
@@ -40,6 +48,7 @@ use crate::{
 pub(crate) enum Encoder<W: Write> {
     Copy(CountingWriter<W>),
     Bcj(Option<BcjWriter<CountingWriter<W>>>),
+    Bcj2(Option<Box<Bcj2ChainWriter<W>>>, Bcj2Side),
     Delta(DeltaWriter<CountingWriter<W>>),
     // LZMA and LZMA2 are `lzma-turbo`'s encoders unless the build asked for
     // `lzma-rust2`'s; see `Cargo.toml`. Both fronts have the same shape here.
@@ -85,6 +94,36 @@ impl<W: Write> Write for Encoder<W> {
                     let writer = w.take().unwrap();
                     let mut inner = writer.finish()?;
                     inner.write(buf)?;
+                    Ok(0)
+                }
+                false => w.as_mut().unwrap().write(buf),
+            },
+            Encoder::Bcj2(w, side) => match buf.is_empty() {
+                true => {
+                    let writer = w.take().unwrap();
+                    let Bcj2Finished {
+                        mut main,
+                        mut call,
+                        mut jump,
+                        rc,
+                        call_len,
+                        jump_len,
+                    } = writer.finish()?;
+                    // Finish the call and jump coders, whose output lands in
+                    // the buffers `side` shares with them, before the main
+                    // chain: the archive writer appends these streams after
+                    // the main one, once the chain has unwound.
+                    call.write(&[])?;
+                    jump.write(&[])?;
+                    drop((call, jump));
+                    *side.tail.borrow_mut() = Some(Bcj2Tail {
+                        rc,
+                        call: side.call.take(),
+                        jump: side.jump.take(),
+                        call_size: call_len,
+                        jump_size: jump_len,
+                    });
+                    main.write(buf)?;
                     Ok(0)
                 }
                 false => w.as_mut().unwrap().write(buf),
@@ -179,6 +218,7 @@ impl<W: Write> Write for Encoder<W> {
         match self {
             Encoder::Copy(w) => w.flush(),
             Encoder::Bcj(w) => w.as_mut().unwrap().flush(),
+            Encoder::Bcj2(w, _) => w.as_mut().unwrap().flush(),
             Encoder::Delta(w) => w.flush(),
             Encoder::Lzma(w) => w.as_mut().unwrap().flush(),
             Encoder::Lzma2(w) => w.as_mut().unwrap().flush(),
@@ -186,8 +226,12 @@ impl<W: Write> Write for Encoder<W> {
             Encoder::Lzma2Mt(w) => w.as_mut().unwrap().flush(),
             #[cfg(feature = "brotli")]
             Encoder::Brotli(w) => w.flush(),
+            // Not `Ppmd7Encoder::flush`: that one ends the range coder, and
+            // `finish` ends it again, which left the five bytes of a second
+            // end after the stream and made `7zz t` call the block a data
+            // error. A flush here only passes down to the sink.
             #[cfg(feature = "ppmd")]
-            Encoder::Ppmd(w) => w.as_mut().unwrap().flush(),
+            Encoder::Ppmd(w) => w.as_mut().unwrap().get_mut().flush(),
             #[cfg(feature = "bzip2")]
             Encoder::Bzip2(w) => w.as_mut().unwrap().flush(),
             #[cfg(feature = "deflate")]
@@ -200,6 +244,130 @@ impl<W: Write> Write for Encoder<W> {
             Encoder::Aes(w) => w.flush(),
         }
     }
+}
+
+/// A byte buffer that outlives the writer it is handed to: the call and jump
+/// coders of a BCJ2 block write into one each, and the block's tail is taken
+/// out of them once those coders are finished.
+#[derive(Clone, Default)]
+pub(crate) struct SharedBuf(Rc<RefCell<Vec<u8>>>);
+
+impl SharedBuf {
+    fn take(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.0.borrow_mut())
+    }
+}
+
+impl Write for SharedBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What a BCJ2 block produces besides its main stream, available once the
+/// coder chain has been finished.
+#[derive(Debug, Default)]
+pub(crate) struct Bcj2Tail {
+    /// The range-coded stream, which 7-Zip stores without a coder.
+    pub(crate) rc: Vec<u8>,
+    /// The call stream, LZMA-coded.
+    pub(crate) call: Vec<u8>,
+    /// The jump stream, LZMA-coded.
+    pub(crate) jump: Vec<u8>,
+    /// The call stream's size before its coder.
+    pub(crate) call_size: u64,
+    /// The jump stream's size before its coder.
+    pub(crate) jump_size: u64,
+}
+
+/// Where a BCJ2 coder leaves its [`Bcj2Tail`] when it is finished.
+pub(crate) type Bcj2Slot = Rc<RefCell<Option<Bcj2Tail>>>;
+
+/// The handles a BCJ2 coder in the chain keeps on the buffers its call and
+/// jump coders write into, and on the slot its tail goes to.
+pub(crate) struct Bcj2Side {
+    call: SharedBuf,
+    jump: SharedBuf,
+    tail: Bcj2Slot,
+}
+
+/// The dictionary 7-Zip gives the call and jump streams' LZMA coders.
+///
+/// `AddBcj2Methods` in 7-Zip's `CPP/7zip/Archive/7z/7zUpdate.cpp` sets
+/// `kDictionarySize = 1 << 20`, `kNumFastBytes = 128`, `kNumThreads = 1`,
+/// `kLitPosBits = 2` and `kLitContextBits = 0` (pb stays at its 2): the two
+/// streams are four-byte big-endian addresses, which a byte of literal
+/// context does not predict and their position in the word does.
+pub(crate) const BCJ2_SIDE_DICT_SIZE: u32 = 1 << 20;
+const BCJ2_SIDE_FAST_BYTES: u32 = 128;
+const BCJ2_SIDE_LC: u8 = 0;
+const BCJ2_SIDE_LP: u8 = 2;
+const BCJ2_SIDE_PB: u8 = 2;
+
+/// The LZMA property bytes of the call and jump coders: `(pb * 5 + lp) * 9 +
+/// lc`, then the dictionary.
+pub(crate) fn bcj2_side_properties() -> [u8; 5] {
+    let mut props = [0u8; 5];
+    props[0] = (BCJ2_SIDE_PB * 5 + BCJ2_SIDE_LP) * 9 + BCJ2_SIDE_LC;
+    props[1..].copy_from_slice(&BCJ2_SIDE_DICT_SIZE.to_le_bytes());
+    props
+}
+
+/// An LZMA coder for a BCJ2 call or jump stream, writing into `sink`.
+fn bcj2_side_encoder(sink: SharedBuf) -> Result<Box<dyn Write>, Error> {
+    let input = CountingWriter::new(sink);
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    let lz = {
+        // 7-Zip's side coders run its default level (5, the binary-tree
+        // match finder) with the settings above.
+        SideCoder {
+            level: 5,
+            dict_size: BCJ2_SIDE_DICT_SIZE,
+            fast_bytes: BCJ2_SIDE_FAST_BYTES,
+            lc: BCJ2_SIDE_LC,
+            lp: BCJ2_SIDE_LP,
+            pb: BCJ2_SIDE_PB,
+        }
+        .writer(input)?
+    };
+    #[cfg(feature = "lzma-rust2-encoder")]
+    let lz = {
+        let mut options = lzma_rust2::LzmaOptions::with_preset(5);
+        options.dict_size = BCJ2_SIDE_DICT_SIZE;
+        options.nice_len = BCJ2_SIDE_FAST_BYTES;
+        options.lc = u32::from(BCJ2_SIDE_LC);
+        options.lp = u32::from(BCJ2_SIDE_LP);
+        options.pb = u32::from(BCJ2_SIDE_PB);
+        LzmaWriter::new_no_header(input, &options, false)?
+    };
+    Ok(Box::new(Encoder::Lzma(Some(lz))))
+}
+
+/// A BCJ2 coder whose main stream goes on to `main`, with the call and jump
+/// streams' LZMA coders built here. The returned slot is filled when the
+/// coder is finished.
+pub(crate) fn add_bcj2_encoder<W: Write>(
+    main: CountingWriter<W>,
+) -> Result<(Encoder<W>, Bcj2Slot), Error> {
+    let call = SharedBuf::default();
+    let jump = SharedBuf::default();
+    let tail = Bcj2Slot::default();
+    let writer = Bcj2Writer::new(
+        main,
+        bcj2_side_encoder(call.clone())?,
+        bcj2_side_encoder(jump.clone())?,
+    );
+    let side = Bcj2Side {
+        call,
+        jump,
+        tail: Rc::clone(&tail),
+    };
+    Ok((Encoder::Bcj2(Some(Box::new(writer)), side), tail))
 }
 
 fn validate_lzma_dictionary_size(dict_size: u32) -> Result<(), Error> {
@@ -230,6 +398,43 @@ fn lzma2_property_for(dict_size: u32) -> u8 {
             crate::codec::lzma_turbo::lzma2_dictionary_size(&[prop]).is_ok_and(|d| d >= dict_size)
         })
         .unwrap_or(40)
+}
+
+/// Whether the folder these options were sized for is known to fit one LZMA2
+/// block.
+///
+/// Such a folder is that block on one thread, whichever encoder codes it: the
+/// same bytes the block-parallel coder would produce, without starting its
+/// pool and buffering the block per folder.
+fn lzma2_fits_one_block(options: &Lzma2Options) -> bool {
+    options.block_size().is_some_and(|block_size| {
+        options
+            .settings
+            .input_size()
+            .is_some_and(|size| size <= block_size)
+    })
+}
+
+/// The block size and block-thread count `lzma-turbo`'s LZMA2 coder runs with.
+///
+/// One thread is the solid stream; block threads need a block size, and a
+/// chunk size without threads changes nothing. A folder that fits one block
+/// (see [`lzma2_fits_one_block`]) runs on one thread.
+#[cfg(not(feature = "lzma-rust2-encoder"))]
+fn lzma2_block_plan(options: &Lzma2Options) -> (u64, usize) {
+    match (options.threads, options.block_size()) {
+        (0 | 1, _) | (_, None) => (lzma_turbo::BLOCK_SIZE_SOLID, 1),
+        (_, Some(block_size)) if lzma2_fits_one_block(options) => (block_size, 1),
+        (threads, Some(block_size)) => (block_size, threads as usize),
+    }
+}
+
+/// Whether `lzma-rust2`'s multi-threaded LZMA2 writer codes a folder: only
+/// with more than one thread, and not for a folder that fits one block (see
+/// [`lzma2_fits_one_block`]).
+#[cfg(feature = "lzma-rust2-encoder")]
+fn lzma2_rust2_uses_mt(options: &Lzma2Options) -> bool {
+    options.threads > 1 && !lzma2_fits_one_block(options)
 }
 
 pub(crate) fn add_encoder<W: Write>(
@@ -279,13 +484,7 @@ pub(crate) fn add_encoder<W: Write>(
             validate_lzma_dictionary_size(lzma2_options.settings.dict_size())?;
             #[cfg(not(feature = "lzma-rust2-encoder"))]
             let encoder = {
-                // One thread is the solid stream; block threads need a block
-                // size, and a chunk size without threads changes nothing.
-                let (block_size, threads) =
-                    match (lzma2_options.threads, lzma2_options.block_size()) {
-                        (0 | 1, _) | (_, None) => (lzma_turbo::BLOCK_SIZE_SOLID, 1),
-                        (threads, Some(block_size)) => (block_size, threads as usize),
-                    };
+                let (block_size, threads) = lzma2_block_plan(&lzma2_options);
                 Encoder::Lzma2(Some(LzmaTurboWriter::new(
                     input,
                     &lzma2_options.settings.turbo_props(),
@@ -305,9 +504,14 @@ pub(crate) fn add_encoder<W: Write>(
                         .block_size()
                         .and_then(std::num::NonZeroU64::new),
                 );
-                match lzma2_options.threads {
-                    0 | 1 => Encoder::Lzma2(Some(Lzma2Writer::new(input, options))),
-                    threads => Encoder::Lzma2Mt(Some(Lzma2WriterMt::new(input, options, threads)?)),
+                if lzma2_rust2_uses_mt(&lzma2_options) {
+                    Encoder::Lzma2Mt(Some(Lzma2WriterMt::new(
+                        input,
+                        options,
+                        lzma2_options.threads,
+                    )?))
+                } else {
+                    Encoder::Lzma2(Some(Lzma2Writer::new(input, options)))
                 }
             };
 
@@ -497,6 +701,8 @@ pub(crate) fn get_options_as_properties<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    use super::lzma2_block_plan;
     use super::lzma2_property_for;
     use crate::codec::lzma_turbo::lzma2_dictionary_size;
 
@@ -524,5 +730,55 @@ mod tests {
         assert_eq!(lzma2_property_for(1 << 20), 16);
         assert_eq!(lzma2_property_for(3 << 20), 19);
         assert_eq!(lzma2_property_for(5 << 20), 21);
+    }
+
+    /// A folder that fits one block skips the block-parallel coder; one that
+    /// does not, or whose size is unknown, keeps the threads it was given.
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    #[test]
+    fn a_folder_that_fits_one_block_is_coded_on_one_thread() {
+        use crate::{EncoderConfiguration, encoder_options::EncoderOptions};
+
+        let options = crate::encoder_options::Lzma2Options::from_level_mt(5, 8, 32 << 20);
+        let sized = |size: u64| {
+            let config: EncoderConfiguration = options.clone().into();
+            match config.sized_for(size).expect("LZMA2").options {
+                Some(EncoderOptions::Lzma2(o)) => o,
+                other => panic!("not LZMA2 options: {other:?}"),
+            }
+        };
+        assert_eq!(lzma2_block_plan(&options), (32 << 20, 8));
+        assert_eq!(lzma2_block_plan(&sized(16 << 20)), (32 << 20, 1));
+        assert_eq!(lzma2_block_plan(&sized(32 << 20)), (32 << 20, 1));
+        assert_eq!(lzma2_block_plan(&sized((32 << 20) + 1)), (32 << 20, 8));
+        // A small folder is one block of its own dictionary's size.
+        assert_eq!(lzma2_block_plan(&sized(1000)), (32 << 20, 1));
+        let solid = crate::encoder_options::Lzma2Options::from_level(5);
+        assert_eq!(lzma2_block_plan(&solid), (lzma_turbo::BLOCK_SIZE_SOLID, 1));
+    }
+
+    /// The `lzma-rust2` encoder makes the same one-block decision: a folder
+    /// that fits one block is not handed to its multi-threaded writer.
+    #[cfg(feature = "lzma-rust2-encoder")]
+    #[test]
+    fn a_folder_that_fits_one_block_skips_the_rust2_mt_writer() {
+        use super::lzma2_rust2_uses_mt;
+        use crate::{EncoderConfiguration, encoder_options::EncoderOptions};
+
+        let options = crate::encoder_options::Lzma2Options::from_level_mt(5, 8, 32 << 20);
+        let sized = |size: u64| {
+            let config: EncoderConfiguration = options.clone().into();
+            match config.sized_for(size).expect("LZMA2").options {
+                Some(EncoderOptions::Lzma2(o)) => o,
+                other => panic!("not LZMA2 options: {other:?}"),
+            }
+        };
+        assert!(lzma2_rust2_uses_mt(&options));
+        assert!(!lzma2_rust2_uses_mt(&sized(16 << 20)));
+        assert!(!lzma2_rust2_uses_mt(&sized(32 << 20)));
+        assert!(lzma2_rust2_uses_mt(&sized((32 << 20) + 1)));
+        assert!(!lzma2_rust2_uses_mt(&sized(1000)));
+        let solid = crate::encoder_options::Lzma2Options::from_level(5);
+        assert!(!lzma2_rust2_uses_mt(&solid));
     }
 }

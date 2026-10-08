@@ -77,7 +77,10 @@ impl BcjFilter {
     }
 }
 
-const FILTER_BUF_SIZE: usize = 4096;
+/// How much of its input the reader filters at a time, which off a pack
+/// stream is also how much it reads per call: 7-Zip's filter coders use at
+/// least this much.
+const FILTER_BUF_SIZE: usize = crate::decoder::INPUT_BUF_SIZE;
 
 /// Reader that applies BCJ (Branch/Call/Jump) filtering to compressed data.
 pub struct BcjReader<R> {
