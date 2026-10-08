@@ -2491,9 +2491,13 @@ impl<R: Read + Seek> ArchiveReader<R> {
 
                 decoder.read_to_end(&mut data).map_err(|e| {
                     // A checksum that did not match is reported located and
-                    // typed, as `for_each_entries` reports it.
+                    // typed, as `for_each_entries` reports it: under a
+                    // password it may be the wrong key decrypting to garbage,
+                    // so it stays `Password` there, never repairable damage.
                     let e = Error::from(e);
-                    if e.is_checksum_failure() {
+                    let checksum = e.is_checksum_failure();
+                    let e = e.maybe_bad_password(!self.password.is_empty());
+                    if checksum {
                         let packed_offset = self
                             .archive
                             .block_pack_streams(block_index)

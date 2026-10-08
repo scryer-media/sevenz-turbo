@@ -315,7 +315,10 @@ Everything here is new surface; no upstream signature changed meaning.
   cryptography extensions on aarch64. Neither lane needs a streaming API: a
   chunk is decrypted with the current IV and that chunk's last ciphertext
   block, copied out before the in-place decrypt, is the next chunk's IV. The
-  encoder (`compress`) keeps RustCrypto's `cbc::Encryptor`.
+  encoder (`compress`) follows the same switch over the same unpadded CBC:
+  AWS-LC's `EncryptingKey::cbc` by default, RustCrypto's `cbc::Encryptor`
+  under `native-crypto` and wherever AWS-LC is not selected (a wasm build
+  encrypts in the guest).
   `aws-lc-rs` is a direct optional dependency on the pin and features
   `lzma-turbo` uses, so a build with both crates resolves one copy of AWS-LC.
 - `aes256` no longer implies a backend: enabling it with neither
@@ -492,8 +495,8 @@ Everything here is new surface; no upstream signature changed meaning.
   `Error::Io` with no block at all, so a consumer that keeps a damaged set
   for repair on a checksum mismatch gave those up as fatal.
   `ArchiveReader::read_file` reports the same error. An encrypted block's
-  mismatch is still `BlockErrorKind::Password`, since a wrong password looks
-  the same.
+  mismatch is still `BlockErrorKind::Password` on every path, `read_file`
+  included, since a wrong password looks the same.
 - Fixed: `set_verify_checksums(false)` turns off the block checksum as well.
   A block holding one file was still checked against the file's CRC, which
   the block borrows, and a block's own CRC was checked on the consuming
