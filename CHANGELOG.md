@@ -534,6 +534,15 @@ Everything here is new surface; no upstream signature changed meaning.
   block declares rather than 4 MiB each, so it no longer zero-fills and
   reserves 4 MiB for the last kilobytes of a stream; large decodes are
   unchanged.
+- An adaptive LZMA2 decode with no memory limit widens. Its in-flight
+  budget is set when the block's coder is built, and with no limit it was
+  the backstop for the one thread the decode starts at, so it never held
+  enough runs to widen past two. It is now the backstop for the threads it
+  may widen to: the machine's parallelism, or the threads asked for if that
+  is more. A decode under a memory limit is unchanged. On Apple M5 Max, a
+  1 GiB near-incompressible `-mx5` archive decoded adaptively at 18 threads
+  went from 17.3 s at a widest of 2 threads and 443 MB peak RSS to 4.6 s at
+  9 and 2.06 GB, the same as with a 4 GiB limit.
 - The AES-256 encoder encrypts and writes 64 KiB at a time through the
   selected cryptography backend - AWS-LC's unpadded CBC by default,
   RustCrypto's under `native-crypto` and on wasm - instead of encrypting

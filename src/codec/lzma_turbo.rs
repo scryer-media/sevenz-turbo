@@ -599,7 +599,8 @@ impl Lzma2Plan {
     /// number says nothing about. What is left of the caller's budget after
     /// the decoder's own footprint is the in-flight budget; when the caller
     /// set no budget at all it is the backstop, `threads` x
-    /// [`MT_BACKSTOP_PER_THREAD_BYTES`]. Either way it is a ceiling and not a
+    /// [`MT_BACKSTOP_PER_THREAD_BYTES`], where an adaptive coder counts the
+    /// threads it may widen to rather than the one it starts at. Either way it is a ceiling and not a
     /// target: what the decode settles at is its backlog of complete runs,
     /// taken from the size of the runs the stream turns out to have.
     ///
@@ -625,7 +626,8 @@ impl Lzma2Plan {
         if (threads <= 1 && !adaptive) || unpacked_len < MT_MIN_BLOCK_BYTES {
             return Self::SingleThreaded;
         }
-        let Some(memory_limit) = Self::mt_budget(threads, memory_limit_bytes, dict_size) else {
+        let budgeted = Self::budgeted_threads(threads, adaptive, memory_limit_bytes);
+        let Some(memory_limit) = Self::mt_budget(budgeted, memory_limit_bytes, dict_size) else {
             return Self::SingleThreaded;
         };
         Self::Adaptive {
@@ -634,6 +636,23 @@ impl Lzma2Plan {
             control: Arc::clone(control),
             splits: splits.to_vec(),
             unpacked_len,
+        }
+    }
+
+    /// The thread count the in-flight budget is sized for.
+    ///
+    /// The budget is fixed when the coder is built, but an adaptive coder is
+    /// widened afterwards, so with no caller limit it is sized for the widest
+    /// it may usefully go: the machine's parallelism, or the threads asked for
+    /// if that is more. Sized for the one thread it starts at, the backstop
+    /// never holds enough runs to widen at all. A caller limit is the budget
+    /// as given, so this only matters without one.
+    fn budgeted_threads(threads: u32, adaptive: bool, memory_limit_bytes: u64) -> u32 {
+        if adaptive && memory_limit_bytes == u64::MAX {
+            let parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
+            threads.max(u32::try_from(parallelism).unwrap_or(u32::MAX).min(256))
+        } else {
+            threads
         }
     }
 
@@ -2095,6 +2114,32 @@ mod tests {
             Lzma2Plan::mt_budget(2, u64::MAX, 32 << 20),
             Some(2 * MT_BACKSTOP_PER_THREAD_BYTES)
         );
+    }
+
+    /// An adaptive coder starts at one thread and is widened later, so with
+    /// no caller limit its budget holds runs for every thread it may widen
+    /// to, not just the one it starts at. A fixed coder, or any coder under a
+    /// caller limit, is budgeted exactly as before.
+    #[test]
+    fn an_unset_budget_lets_an_adaptive_coder_widen_to_the_machine() {
+        let parallelism = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(256) as u32;
+        let control = Arc::new(Lzma2Control::new(1));
+        let Lzma2Plan::Adaptive { memory_limit, .. } =
+            Lzma2Plan::for_block(1, true, u64::MAX, 1 << 20, u64::MAX, &control, &[])
+        else {
+            panic!("an adaptive coder over a large block is the parallel one");
+        };
+        assert_eq!(
+            memory_limit,
+            u64::from(parallelism) * MT_BACKSTOP_PER_THREAD_BYTES
+        );
+        assert_eq!(Lzma2Plan::budgeted_threads(1, true, u64::MAX), parallelism);
+        assert_eq!(Lzma2Plan::budgeted_threads(300, true, u64::MAX), 300);
+        assert_eq!(Lzma2Plan::budgeted_threads(1, false, u64::MAX), 1);
+        assert_eq!(Lzma2Plan::budgeted_threads(8, false, u64::MAX), 8);
+        assert_eq!(Lzma2Plan::budgeted_threads(1, true, 4 << 30), 1);
     }
 
     #[test]
