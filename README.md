@@ -311,8 +311,8 @@ writer.finish().expect("compress ok");
 | Codec       | Decompression | Compression | Implemented by |
 |-------------|---------------|-------------|----------------|
 | COPY        | ✓            | ✓          | this crate |
-| LZMA        | ✓            | ✓          | `lzma-turbo` (encode: `lzma-rust2` with `lzma-rust2-encoder`) |
-| LZMA2       | ✓            | ✓          | `lzma-turbo`, including the parallel decoder (encode: `lzma-rust2` with `lzma-rust2-encoder`) |
+| LZMA        | ✓            | ✓          | `lzma-turbo`, decoder and encoder (the `lzma-rust2-encoder` feature swaps in `lzma-rust2`'s encoder instead) |
+| LZMA2       | ✓            | ✓          | `lzma-turbo`, decoder, parallel decoder and encoder (the `lzma-rust2-encoder` feature swaps in `lzma-rust2`'s encoder instead) |
 | BROTLI (*)  | ✓            | ✓          | `brotli` crate |
 | BZIP2       | ✓            | ✓          | `bzip2` crate |
 | DEFLATE (*) | ✓            | ✓          | `flate2` crate (`zlib-rs`) |
