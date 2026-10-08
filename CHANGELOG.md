@@ -530,7 +530,10 @@ Everything here is new surface; no upstream signature changed meaning.
   small the caller's reads are. 7-Zip's filter coders read at least as
   much. A Copy+BCJ block of 4 MiB went from 1,033 reads to 69. A coder that
   already reads large pieces - LZMA, LZMA2 - goes through the buffer
-  without a second copy, and no other row moved.
+  without a second copy, and no other row moved. The buffer counts against
+  `memory_limit_bytes`: `Archive::decoder_memory_estimate` charges every
+  block 64 KiB for it, and so does the chain check of a block read through
+  it, so a Copy block no longer estimates at zero.
 - An LZMA2 block that declares less than 1 MiB of output is decoded
   single-threaded whatever thread count or adaptive mode was asked for.
   7-Zip's and lzma-turbo's multi-threaded encoders never cut a run finer

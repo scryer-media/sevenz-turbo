@@ -212,17 +212,21 @@ fn sized_coder_memory_kb(coder: &Coder, uncompressed_len: usize) -> Option<usize
 /// [`Error::MaxMemLimited`] the per-coder check raises, with `actaul_kb` the
 /// chain's total.
 ///
-/// Returns the kilobytes the chain's sized coders take, for
+/// `base_kb` is what the chain's caller holds under it whatever its coders
+/// are: a block's pack-stream buffer ([`INPUT_BUF_SIZE`]), or nothing.
+///
+/// Returns the kilobytes the chain's sized coders take, with `base_kb`, for
 /// [`DecodeOptions::reserving`].
 pub(crate) fn check_chain_memory<'c>(
     coders: impl IntoIterator<Item = (&'c Coder, u64)>,
     limits: &ArchiveLimits,
+    base_kb: usize,
 ) -> Result<usize, Error> {
     let max_kb = limits.memory_limit_kb();
     let total_kb = coders
         .into_iter()
         .filter_map(|(coder, len)| sized_coder_memory_kb(coder, len as usize))
-        .fold(0usize, usize::saturating_add);
+        .fold(base_kb, usize::saturating_add);
     if total_kb > max_kb {
         return Err(Error::MaxMemLimited {
             max_kb,

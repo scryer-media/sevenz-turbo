@@ -647,6 +647,7 @@ impl Archive {
                 .ordered_coder_iter()
                 .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index))),
             opts.limits,
+            0,
         )?;
         let opts = &opts.reserving(reserved_kb);
         let pack_size = archive.pack_sizes[first_pack_stream_index] as usize;
@@ -2013,13 +2014,16 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     .enumerate()
                     .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index))),
                 opts.limits,
+                0,
             )?
         } else {
+            // Under the chain, the pack stream's read buffer (below).
             check_chain_memory(
                 block
                     .ordered_coder_iter()
                     .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index))),
                 opts.limits,
+                crate::decoder::INPUT_BUF_SIZE / 1024,
             )?
         };
         let opts = &opts.reserving(reserved_kb);
