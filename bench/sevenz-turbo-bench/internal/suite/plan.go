@@ -36,11 +36,16 @@ const (
 	OpEncode = "encode"
 )
 
+// FullOnlyGroups have no scenario in the quick matrix: their fixtures are
+// only worth timing at the full corpus's size.
+var FullOnlyGroups = map[string]bool{"lzma2 near-incompressible": true}
+
 // Groups, in report order.
 var Groups = []string{
 	"container parse",
 	"lzma2 single-stream",
 	"lzma2 parallel",
+	"lzma2 near-incompressible",
 	"lzma",
 	"memory budget",
 	"solid vs non-solid",
@@ -62,13 +67,16 @@ type Scenario struct {
 	Threads string `json:"threads"`
 	Level   int    `json:"level,omitempty"`
 	// MemoryLimit is the decode budget passed to ArchiveLimits::memory.
-	MemoryLimit int64  `json:"memory_limit,omitempty"`
-	NonSolid    bool   `json:"non_solid,omitempty"`
-	Encrypted   bool   `json:"encrypted,omitempty"`
-	NoVerify    bool   `json:"no_verify,omitempty"`
-	Stream      bool   `json:"stream,omitempty"`
-	Note        string `json:"note,omitempty"`
-	Variants    []Run  `json:"variants"`
+	MemoryLimit int64 `json:"memory_limit,omitempty"`
+	NonSolid    bool  `json:"non_solid,omitempty"`
+	Encrypted   bool  `json:"encrypted,omitempty"`
+	NoVerify    bool  `json:"no_verify,omitempty"`
+	// Adaptive is weaver's chase decode: the parallel LZMA2 decoder started
+	// at one thread and widened as runs queue up.
+	Adaptive bool   `json:"adaptive,omitempty"`
+	Stream   bool   `json:"stream,omitempty"`
+	Note     string `json:"note,omitempty"`
+	Variants []Run  `json:"variants"`
 }
 
 // Run is one variant's command for a scenario.
@@ -219,6 +227,18 @@ func Plan(manifest *fixtures.Manifest, dir, scratch string, tools Tools, setting
 	}
 	p.decode("lzma2 parallel", "mt.7z", "all", decodeOpts{noVerify: true, note: "CRC-32 verification off: the cost of checking"})
 	p.decode("lzma2 parallel", "mt.7z", "all", decodeOpts{stream: true, note: "the single-parse streaming consumer path (block_decoder per block, sub-stream CRC hook)"})
+	p.decode("lzma2 parallel", "mt.7z", "all", decodeOpts{adaptive: true, note: adaptiveNote})
+	if !settings.Quick {
+		for _, name := range []string{"media_mx1.7z", "media_mx5.7z"} {
+			for _, threads := range []string{"1", "all"} {
+				p.decode("lzma2 near-incompressible", name, threads, decodeOpts{upstream: threads == "1",
+					note: "near-incompressible LZMA2 in parallel blocks: the shape of a usenet download's media"})
+			}
+		}
+		p.decode("lzma2 near-incompressible", "media_mx5.7z", "all", decodeOpts{adaptive: true, note: adaptiveNote})
+		p.decode("lzma2 near-incompressible", "media_mx5.7z", "all", decodeOpts{adaptive: true, memoryLimit: 4 << 30,
+			note: adaptiveNote + "; under an explicit 4 GiB limit, as weaver passes its granted decode budget"})
+	}
 	p.decode("lzma", "lzma.7z", "1", decodeOpts{upstream: true})
 	for _, budget := range settings.Budgets {
 		p.decode("memory budget", "mt.7z", settings.BudgetThreads, decodeOpts{memoryLimit: budget,
@@ -321,10 +341,13 @@ func (p *planner) list(name string) {
 	})
 }
 
+// adaptiveNote describes the adaptive rows.
+const adaptiveNote = "weaver's chase decode: set_adaptive_lzma2 + set_threads(1), widened every 100 ms to the queued runs + 1, up to the thread count; 7zz runs fixed at the same threads"
+
 type decodeOpts struct {
-	upstream, native, noVerify, stream bool
-	memoryLimit                        int64
-	note                               string
+	upstream, native, noVerify, stream, adaptive bool
+	memoryLimit                                  int64
+	note                                         string
 }
 
 func (p *planner) decode(group, name, threads string, o decodeOpts) {
@@ -339,6 +362,10 @@ func (p *planner) decode(group, name, threads string, o decodeOpts) {
 	case o.stream:
 		id += "/stream"
 		ours = append(ours, "--stream")
+	}
+	if o.adaptive {
+		id += "/adaptive"
+		ours = append(ours, "--adaptive")
 	}
 	if o.memoryLimit > 0 {
 		id += fmt.Sprintf("/budget-%dMiB", o.memoryLimit>>20)
@@ -372,7 +399,7 @@ func (p *planner) decode(group, name, threads string, o decodeOpts) {
 	p.add(Scenario{
 		ID: id, Group: group, Op: OpDecode, Fixture: name, Threads: threads,
 		MemoryLimit: o.memoryLimit, Encrypted: record.Encrypted, NoVerify: o.noVerify, Stream: o.stream,
-		Note: o.note, Variants: variants,
+		Adaptive: o.adaptive, Note: o.note, Variants: variants,
 	})
 }
 

@@ -194,6 +194,34 @@ func WriteAudio(w io.Writer, bytes int64) error {
 	return out.Flush()
 }
 
+// mediaPage and mediaRandom shape WriteMedia: each page is random bytes with
+// a short run of zeros at its end, so LZMA2 stores most chunks uncompressed
+// and the decoder's copy path, not its range coder, carries the bytes.
+const (
+	mediaPage   = 4096
+	mediaRandom = 4016
+)
+
+// WriteMedia writes `bytes` of near-incompressible data, the shape of the
+// already-compressed video and audio a usenet download is mostly made of:
+// pages of 4016 random bytes and 80 zeros, so an encoder finds next to
+// nothing and a decoder spends its time on uncompressed LZMA2 chunks.
+func WriteMedia(w io.Writer, bytes int64) error {
+	rng := NewRng(0x3ED1A)
+	out := bufio.NewWriterSize(w, MiB)
+	page := make([]byte, 0, mediaPage)
+	for written := int64(0); written < bytes; {
+		page = rng.Fill(page[:0], mediaRandom)
+		page = append(page, make([]byte, mediaPage-mediaRandom)...)
+		take := min(int64(len(page)), bytes-written)
+		if _, err := out.Write(page[:take]); err != nil {
+			return err
+		}
+		written += take
+	}
+	return out.Flush()
+}
+
 // TreeFile is one member of a generated tree.
 type TreeFile struct {
 	Path string

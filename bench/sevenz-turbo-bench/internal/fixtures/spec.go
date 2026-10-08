@@ -16,6 +16,7 @@ const (
 	KindCodeX86   = "code-x86"
 	KindCodeARM64 = "code-arm64"
 	KindAudio     = "audio"
+	KindMedia     = "media"
 	KindTree      = "tree"
 )
 
@@ -77,10 +78,10 @@ const mib = int64(1) << 20
 
 // sizes is what differs between the full corpus and the quick one.
 type sizes struct {
-	payload, sub, code, audio int64
-	treeFiles                 int
-	treeAverage               int64
-	kdfFiles                  int
+	payload, sub, code, audio, media int64
+	treeFiles                        int
+	treeAverage                      int64
+	kdfFiles                         int
 	// chunk is the explicit LZMA2 block size of the multi-threaded fixtures,
 	// or "" for 7zz's own (four dictionaries, 64 MiB at -mx5). The quick
 	// corpus is too small for 64 MiB blocks to cut it at all.
@@ -92,7 +93,7 @@ type sizes struct {
 // milliseconds.
 func Full() Profile {
 	return build("full", sizes{
-		payload: 1024 * mib, sub: 256 * mib, code: 64 * mib, audio: 256 * mib,
+		payload: 1024 * mib, sub: 256 * mib, code: 64 * mib, audio: 256 * mib, media: 1024 * mib,
 		treeFiles: 8192, treeAverage: 32 << 10, kdfFiles: 2048,
 	})
 }
@@ -101,7 +102,7 @@ func Full() Profile {
 // run in a few minutes, to prove a host and a build work end to end.
 func Quick() Profile {
 	return build("quick", sizes{
-		payload: 32 * mib, sub: 16 * mib, code: 4 * mib, audio: 8 * mib,
+		payload: 32 * mib, sub: 16 * mib, code: 4 * mib, audio: 8 * mib, media: 16 * mib,
 		treeFiles: 512, treeAverage: 16 << 10, kdfFiles: 128, chunk: "4m",
 	})
 }
@@ -131,6 +132,7 @@ func build(name string, s sizes) Profile {
 			{Name: "code-x86", Kind: KindCodeX86, Bytes: s.code, Note: "synthetic x86-64-shaped code with dense E8/E9 rel32 branches"},
 			{Name: "code-arm64", Kind: KindCodeARM64, Bytes: s.code, Note: "synthetic AArch64-shaped code with dense BL branches"},
 			{Name: "audio", Kind: KindAudio, Bytes: s.audio, Note: "synthetic 16-bit stereo PCM, two tones plus noise"},
+			{Name: "media", Kind: KindMedia, Bytes: s.media, Note: "near-incompressible pages (4016 random bytes, 80 zeros): the already-compressed video and audio of a usenet download"},
 			{Name: "tree", Kind: KindTree, Files: s.treeFiles, AverageBytes: s.treeAverage, Seed: 0x7EE, Note: "many small text members under invented directories"},
 			{Name: "kdf-tree", Kind: KindTree, Files: s.kdfFiles, AverageBytes: 2 << 10, Seed: 0xCDF, Note: "many tiny members, for the per-folder key-derivation cost"},
 		},
@@ -147,6 +149,8 @@ func build(name string, s sizes) Profile {
 			{Name: "bcj_arm64.7z", Source: "code-arm64", Args: []string{"-mx=5", "-mmt=1", "-mf=ARM64"}, Note: "BCJ ARM64 + LZMA2"},
 			{Name: "bcj2.7z", Source: "code-x86", Args: []string{"-mx=5", "-mmt=1", "-mf=BCJ2"}, Note: "BCJ2 (four streams) + LZMA2/LZMA"},
 			{Name: "delta.7z", Source: "audio", Args: []string{"-mx=5", "-mmt=1", "-mf=Delta:4"}, Note: "delta distance 4 + LZMA2"},
+			{Name: "media_mx1.7z", Source: "media", Args: []string{"-mx=1", lzma2MT, "-mmt=8"}, Note: "near-incompressible LZMA2 -mx1 in parallel blocks: mostly uncompressed chunks, the download-shaped decode"},
+			{Name: "media_mx5.7z", Source: "media", Args: []string{"-mx=5", lzma2MT, "-mmt=8"}, Note: "the same at -mx5: fewer, larger blocks, so the parallel decoder holds fewer runs at once"},
 			{Name: "ppmd.7z", Source: "payload-sub", Args: []string{"-mx=5", "-m0=PPMd", "-mmt=1"}, Note: "PPMd (decoded through the external ppmd-rust crate): secondary row"},
 		},
 	}

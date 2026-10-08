@@ -278,6 +278,9 @@ func describe(scenario suite.Scenario, result map[string]any) string {
 				parts = append(parts, fmt.Sprintf("spawned=%d", int(spawned)))
 			}
 		}
+		if widest, ok := result["widest_threads"].(float64); ok && scenario.Adaptive {
+			parts = append(parts, fmt.Sprintf("widest=%d", int(widest)))
+		}
 	case suite.OpList:
 		if memory, ok := result["decoder_memory_estimate"].(float64); ok && memory > 0 {
 			parts = append(parts, fmt.Sprintf("decoder_memory_estimate=%s MiB", procmeasure.MiB(int64(memory))))

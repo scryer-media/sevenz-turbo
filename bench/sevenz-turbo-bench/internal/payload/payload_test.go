@@ -43,6 +43,7 @@ func TestGeneratorsAreSizedAndDeterministic(t *testing.T) {
 		"x86":   func(b *bytes.Buffer) error { return WriteCodeX86(b, 100003) },
 		"arm64": func(b *bytes.Buffer) error { return WriteCodeARM64(b, 100000) },
 		"audio": func(b *bytes.Buffer) error { return WriteAudio(b, 100000) },
+		"media": func(b *bytes.Buffer) error { return WriteMedia(b, 100000) },
 		"tree":  func(b *bytes.Buffer) error { return WriteTreeFile(b, 3, 100000) },
 	}
 	for name, generate := range cases {
@@ -80,5 +81,24 @@ func TestTreeLayout(t *testing.T) {
 		if file.Size < 1024 || file.Size > 4096*7/4 {
 			t.Fatalf("%s size %d out of range", file.Path, file.Size)
 		}
+	}
+}
+
+// The media source is near-incompressible: a page holds its random bytes and
+// then the zero tail, and no two pages are alike.
+func TestMediaIsNearIncompressible(t *testing.T) {
+	var buffer bytes.Buffer
+	if err := WriteMedia(&buffer, 4*mediaPage); err != nil {
+		t.Fatal(err)
+	}
+	data := buffer.Bytes()
+	for page := range 4 {
+		tail := data[page*mediaPage+mediaRandom : (page+1)*mediaPage]
+		if !bytes.Equal(tail, make([]byte, len(tail))) {
+			t.Fatalf("page %d: the tail is not zeros", page)
+		}
+	}
+	if bytes.Equal(data[:mediaRandom], data[mediaPage:mediaPage+mediaRandom]) {
+		t.Fatal("two pages are the same")
 	}
 }

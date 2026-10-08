@@ -12,6 +12,7 @@
 //! decode-bench op list   --archive A [--password P]
 //! decode-bench op decode --archive A [--threads N] [--password P]
 //!                        [--memory-limit BYTES] [--no-verify] [--stream]
+//!                        [--adaptive [--poll-ms MS]]
 //!                        [--engine turbo|upstream] [--digest]
 //! decode-bench op encode --input DIR --out FILE [--level L] [--threads N]
 //!                        [--non-solid] [--password P]
@@ -45,6 +46,8 @@ struct Opts {
     memory_limit: Option<u64>,
     no_verify: bool,
     stream: bool,
+    adaptive: bool,
+    poll_ms: u64,
     digest: bool,
     engine: String,
     level: u32,
@@ -101,6 +104,7 @@ fn parse(args: &[String]) -> Opts {
     let mut opts = Opts {
         threads: 1,
         level: 5,
+        poll_ms: ADAPTIVE_POLL_MS,
         ..Opts::default()
     };
     let mut args = args.iter();
@@ -133,6 +137,12 @@ fn parse(args: &[String]) -> Opts {
             }
             "--no-verify" => opts.no_verify = true,
             "--stream" => opts.stream = true,
+            "--adaptive" => opts.adaptive = true,
+            "--poll-ms" => {
+                opts.poll_ms = value()
+                    .parse()
+                    .unwrap_or_else(|_| usage("--poll-ms takes milliseconds"));
+            }
             "--digest" => opts.digest = true,
             "--engine" => opts.engine = value(),
             "--level" => {
@@ -336,6 +346,77 @@ fn list(opts: &Opts) -> Result<Fields, String> {
 /// sub-stream sizes are asked of the parsed archive, every block is decoded
 /// through `ArchiveReader::block_decoder` on the same source, and each file's
 /// CRC-32 is taken from the sub-stream hook rather than recomputed.
+/// How often the adaptive lane's governor looks at the decode: the interval
+/// weaver's direct-unpack chase polls at.
+const ADAPTIVE_POLL_MS: u64 = 100;
+
+/// The adaptive lane's governor: weaver's chase decode. The reader starts at
+/// one thread with the adaptive coder engaged, and a thread beside it polls
+/// the decode and sets the ceiling to one more than the complete runs waiting,
+/// up to `--threads`. Weaver also pays for each widening from a shared memory
+/// budget first; this lane leaves that out, so it shows the decoder's side of
+/// the chase on an archive that is all there.
+struct Governor {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    widest: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Governor {
+    fn start(handle: sevenz_turbo::Lzma2Handle, ceiling: u32, poll: std::time::Duration) -> Self {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let widest = Arc::new(AtomicU32::new(1));
+        let thread = (ceiling > 1).then(|| {
+            let (stop, widest) = (Arc::clone(&stop), Arc::clone(&widest));
+            std::thread::spawn(move || {
+                let mut applied = 1u32;
+                while !stop.load(Ordering::Acquire) {
+                    std::thread::park_timeout(poll);
+                    let Some(progress) = handle.progress() else {
+                        continue;
+                    };
+                    let target = u32::try_from(progress.pending_runs)
+                        .unwrap_or(u32::MAX)
+                        .saturating_add(1)
+                        .clamp(1, ceiling);
+                    if target != applied {
+                        handle.set_threads(target);
+                        applied = target;
+                        widest.fetch_max(target, Ordering::AcqRel);
+                    }
+                }
+            })
+        });
+        Self {
+            stop,
+            widest,
+            thread,
+        }
+    }
+
+    /// Stops the governor and returns the widest ceiling it set.
+    fn finish(mut self) -> u32 {
+        self.stop_thread();
+        self.widest.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn stop_thread(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for Governor {
+    fn drop(&mut self) {
+        self.stop_thread();
+    }
+}
+
 fn decode_turbo(opts: &Opts) -> Result<Fields, String> {
     let path = archive_path(opts);
     let file = File::open(path).map_err(|e| e.to_string())?;
@@ -347,9 +428,22 @@ fn decode_turbo(opts: &Opts) -> Result<Fields, String> {
     )
     .map_err(|e| e.to_string())?;
     let parse = started.elapsed().as_secs_f64();
-    reader.set_threads(opts.threads.max(1));
+    let ceiling = opts.threads.max(1);
+    if opts.adaptive {
+        reader.set_adaptive_lzma2(ceiling > 1);
+        reader.set_threads(1);
+    } else {
+        reader.set_threads(ceiling);
+    }
     reader.set_verify_checksums(!opts.no_verify);
     let handle = reader.lzma2_handle();
+    let governor = opts.adaptive.then(|| {
+        Governor::start(
+            handle.clone(),
+            ceiling,
+            std::time::Duration::from_millis(opts.poll_ms),
+        )
+    });
 
     let mut sink = Output::new(opts.digest);
     let mut buf = vec![0u8; 1 << 20];
@@ -410,6 +504,7 @@ fn decode_turbo(opts: &Opts) -> Result<Fields, String> {
             .for_each_entries(&mut each)
             .map_err(|e| e.to_string())?;
     }
+    let widest = governor.map(Governor::finish);
     let crcs_reported = if opts.stream {
         let reported = reported
             .lock()
@@ -435,6 +530,10 @@ fn decode_turbo(opts: &Opts) -> Result<Fields, String> {
     ]);
     if let Some(limit) = opts.memory_limit {
         fields.push(("memory_limit", Json::Int(limit)));
+    }
+    if let Some(widest) = widest {
+        fields.push(("adaptive", Json::Bool(true)));
+        fields.push(("widest_threads", Json::Int(u64::from(widest))));
     }
     if opts.stream {
         fields.push(("stream", Json::Bool(true)));

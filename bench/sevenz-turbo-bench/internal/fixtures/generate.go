@@ -392,6 +392,7 @@ func generateSource(root string, source SourceSpec, reason string, logf func(str
 			KindCodeX86:   func(w io.Writer) error { return payload.WriteCodeX86(w, source.Bytes) },
 			KindCodeARM64: func(w io.Writer) error { return payload.WriteCodeARM64(w, source.Bytes) },
 			KindAudio:     func(w io.Writer) error { return payload.WriteAudio(w, source.Bytes) },
+			KindMedia:     func(w io.Writer) error { return payload.WriteMedia(w, source.Bytes) },
 		}[source.Kind]
 		if generate == nil {
 			return fmt.Errorf("unknown source kind %q", source.Kind)

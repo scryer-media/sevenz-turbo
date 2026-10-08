@@ -67,17 +67,19 @@ func TestPlanCoversTheMatrix(t *testing.T) {
 			}
 		}
 		for _, group := range Groups {
-			if !groups[group] {
-				t.Errorf("quick=%t: no scenario in group %q", quick, group)
+			want := !quick || !FullOnlyGroups[group]
+			if groups[group] != want {
+				t.Errorf("quick=%t: group %q planned=%t, want %t", quick, group, groups[group], want)
 			}
 		}
-		for _, want := range []string{"decode/mt/T1", "decode/mt/Tall", "list/tree_solid", "decode/aes_kdf/T1", "encode/payload-sub/L1/T1"} {
+		for _, want := range []string{"decode/mt/T1", "decode/mt/Tall", "list/tree_solid", "decode/aes_kdf/T1", "encode/payload-sub/L1/T1", "decode/mt/Tall/adaptive"} {
 			if !ids[want] {
 				t.Errorf("quick=%t: missing %s", quick, want)
 			}
 		}
 		if !quick {
-			for _, want := range []string{"decode/mt/T2", "decode/mt/T16", "encode/payload-sub/L9/Tall", "encode/payload-sub/L5/T8"} {
+			for _, want := range []string{"decode/mt/T2", "decode/mt/T16", "encode/payload-sub/L9/Tall", "encode/payload-sub/L5/T8",
+				"decode/media_mx1/T1", "decode/media_mx5/Tall", "decode/media_mx5/Tall/adaptive", "decode/media_mx5/Tall/adaptive/budget-4096MiB"} {
 				if !ids[want] {
 					t.Errorf("full: missing %s", want)
 				}
