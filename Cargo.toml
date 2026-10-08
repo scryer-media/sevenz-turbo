@@ -92,12 +92,13 @@ getrandom = { version = "0.4", optional = true }
 # (`cargo xtask release` refuses to tag while it is here). Consumers get both
 # crates from crates.io.
 # TODO(release): lzma-turbo = "0.7"
-lzma-turbo = { version = "0.7.0", path = "../../../lzma-turbo/.worktrees/push-encoder", default-features = false, features = ["std", "asm", "crc", "filters"] }
+lzma-turbo = { version = "0.7.0", default-features = false, features = ["std", "asm", "crc", "filters"] }
 # Encoders only, behind `lzma-rust2-encoder`, as the alternative to
 # `lzma-turbo`'s. The decode path never reaches lzma-rust2; see AGENTS.md.
 lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "encoder", "optimization"], optional = true }
-# TODO(release): ppmd-turbo = "0.1"
-ppmd-turbo = { path = "../../../ppmd-turbo/.worktrees/fold-0.1.0", optional = true }
+# TODO(release): drop `path` once ppmd-turbo 0.1.1 is on crates.io (0.1.0 there is
+# an empty skeleton, published from the wrong commit).
+ppmd-turbo = { version = "0.1.1", path = "../../../ppmd-turbo/.worktrees/apache-only", optional = true }
 lz4_flex = { version = "0.14", optional = true }
 nt-time = { version = "0.15", optional = true }
 zstd = { version = "0.14", optional = true }
