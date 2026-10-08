@@ -122,15 +122,21 @@ fn sized_methods(
     )
 }
 
-/// What the entries of one folder declare they hold, or `None` when they declare nothing.
+/// What the entries of one folder declare they hold, or `None` unless every file declares it.
 ///
 /// An entry's `size` before it is pushed is read as how many bytes its reader will yield.
-/// [`ArchiveEntry::from_path`] fills it from the file's metadata; zero is "unknown". A folder
-/// whose entries all say zero is sized by reading ahead instead; see [`folder_size`].
+/// [`ArchiveEntry::from_path`] fills it from the file's metadata; zero is "unknown". One file
+/// saying zero makes the whole folder unknown - a sum over the rest would understate it and shrink
+/// its coder - so the folder is sized by reading ahead instead; see [`folder_size`]. Directories
+/// hold no bytes and declare nothing.
 fn declared_size<'a>(entries: impl IntoIterator<Item = &'a ArchiveEntry>) -> Option<u64> {
-    let total = entries
-        .into_iter()
-        .fold(0u64, |sum, entry| sum.saturating_add(entry.size));
+    let mut total = 0u64;
+    for entry in entries.into_iter().filter(|entry| !entry.is_directory) {
+        if entry.size == 0 {
+            return None;
+        }
+        total = total.saturating_add(entry.size);
+    }
     (total > 0).then_some(total)
 }
 
@@ -1177,5 +1183,30 @@ mod bcj2_tests {
         assert_eq!(block.bind_pairs, [bp(6, 0), bp(5, 1), bp(4, 3), bp(3, 2)]);
         assert_eq!(block.packed_streams, [2, 7, 1, 0]);
         assert!(reader.read_file("amber_quarry/tool.exe").unwrap() == data);
+    }
+}
+
+#[cfg(test)]
+mod folder_size_tests {
+    use super::declared_size;
+    use crate::ArchiveEntry;
+
+    fn file(size: u64) -> ArchiveEntry {
+        let mut entry = ArchiveEntry::new_file("f");
+        entry.size = size;
+        entry
+    }
+
+    #[test]
+    fn a_folder_is_sized_only_when_every_file_declares_its_size() {
+        assert_eq!(declared_size(&[file(10), file(20)]), Some(30));
+        assert_eq!(
+            declared_size(&[file(10), ArchiveEntry::new_directory("d"), file(5)]),
+            Some(15)
+        );
+        // `new_file`'s zero is "unknown": the folder may hold far more than 10 bytes.
+        assert_eq!(declared_size(&[file(10), file(0)]), None);
+        assert_eq!(declared_size(&[file(0)]), None);
+        assert_eq!(declared_size(&[ArchiveEntry::new_directory("d")]), None);
     }
 }

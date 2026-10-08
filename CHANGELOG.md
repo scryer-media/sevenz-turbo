@@ -411,9 +411,11 @@ Everything here is new surface; no upstream signature changed meaning.
   and 8.5 MB, at the same archive size.
 - The writer learns a folder's size from its entries: `ArchiveEntry::size` is
   read as a size hint before a push (zero means unknown), `from_path` now
-  fills it in from the file's length, and a solid block is sized by the sum.
-  When no entry says, the writer reads up to 1 MiB ahead and sizes a shorter
-  stream by what it read. A wrong hint costs ratio or threads, never
+  fills it in from the file's length, and a solid block is sized by the sum
+  when every file in it declares a size. When any file says zero, the writer
+  reads up to 1 MiB ahead instead and sizes a shorter stream by what it read,
+  so a block mixing `from_path` and `new_file` entries is never sized by its
+  known entries alone. A wrong hint costs ratio or threads, never
   correctness; the push records the bytes actually read, as before.
 - BCJ2 can be written. It is asked for as the single-stream filters are, as
   the last content method after the coder for its main stream:
