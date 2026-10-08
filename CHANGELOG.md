@@ -284,6 +284,11 @@ Everything here is new surface; no upstream signature changed meaning.
 
 ### Cryptography
 
+- Archives are encrypted with 7-Zip's key-derivation work factor, 2^19
+  SHA-256 rounds (0.28.0); upstream writes 2^8. A derived key is shared by
+  the clones of its `Password`, so it is derived once per archive rather than
+  once per folder.
+
 - **The AES decoder decrypts in the caller's buffer.** It used to read the
   packed stream 512 bytes at a time into a fixed array, decrypt into a `Vec`
   and copy that into the caller's buffer — two million reads and two full
@@ -410,6 +415,33 @@ Everything here is new surface; no upstream signature changed meaning.
   folder's IV.
   Two writes of the same encrypted input therefore no longer produce the same
   bytes; the archives decode the same, and 7-Zip extracts them.
+- **Security fix: archives this crate encrypts use 7-Zip's key-derivation
+  work factor.** `AesEncoderOptions::new` defaulted `num_cycles_power` to 8
+  (2^8 = 256 SHA-256 rounds per key), against the 19 (2^19 = 524,288 rounds)
+  that 7-Zip writes, so a password guess against an archive written here was
+  2048 times cheaper than against one 7-Zip wrote. The default is now 19,
+  `AesEncoderOptions::DEFAULT_NUM_CYCLES_POWER`; archives written before
+  0.28.0 are as weak as they were and should be re-encrypted if the password
+  matters. A lower work factor can still be chosen deliberately, with
+  `with_num_cycles_power` or the public field. Both directions are held to
+  7-Zip: `7zz t` passes what is written at 19 and at a lowered power and `7zz
+  l` reports `7zAES:19`, and archives 7-Zip writes (at 19) decode here.
+- A derived AES key travels with every clone of its `Password`. The cache
+  was per `Password` value and a clone started empty, so the encoder, which
+  clones its options for each folder it sizes and for the encrypted header,
+  derived the key once per folder; that is why the default could not be
+  raised on its own. Clones now share the cache (an `Arc`, keyed by salt and
+  work factor, up to four keys; the bytes of a password never change, so the
+  password is the cache's owner), and the derivation runs under its lock, so
+  copies asking at once derive once. The `max_aes_kdf_rounds` budget stays
+  each copy's own, as before; a key a clone already derived costs a copy
+  nothing. On Apple M5 Max, encoding 64 one-folder members with AES at 2^19
+  takes 30 ms instead of the 691 ms per-folder derivation would have cost, and
+  the 2049-folder bench tree 451 ms instead of 21.7 s: the work factor is a
+  one-off 8.5 ms per archive.
+- The key derivation hands the hash 64 rounds at a time (`7zAes.cpp`'s
+  unrolled buffer) instead of three calls a round; the bytes hashed are the
+  same. One 2^19 derivation is about 2 ms faster with AWS-LC on Apple M5 Max.
 - The folders of a non-solid archive decode in parallel. A new `ReadAt` trait
   reads archive bytes at an offset with no shared cursor; it is implemented
   for `std::fs::File` (`pread` on Unix, `seek_read` on Windows), for bytes in
@@ -513,6 +545,12 @@ Everything here is new surface; no upstream signature changed meaning.
   algorithm with a binary-tree finder; one for the fast algorithm and hash
   chains). A single-threaded encode and the LZMA coder are unchanged. The
   memory estimate does not yet count that thread's buffers.
+- Bench tooling: `decode-bench op version` reports `ppmd_crates`, every
+  `ppmd-*` crate in the `Cargo.lock` the binary embeds with its version, and
+  `ppmd_turbo` (its version, or `absent`), in place of `ppmd_rust`; the
+  harness report's toolchain line prints the PPMd crates and still reads a
+  binary that reports only `ppmd_rust`. Nothing names the PPMd engine by
+  crate any more, so the record survives a change of engine.
 
 ## 0.27.0 - 2026-10-07
 

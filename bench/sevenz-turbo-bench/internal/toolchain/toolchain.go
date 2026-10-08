@@ -33,7 +33,8 @@ type Candidate struct {
 	Binary
 	Label string `json:"label"`
 	// Version is the `op version` object: crypto_backend, lzma_turbo,
-	// sevenz_rust2, aws_lc_rs, crc_fast, ppmd_rust, available_parallelism.
+	// sevenz_rust2, aws_lc_rs, crc_fast, ppmd_crates, ppmd_turbo,
+	// available_parallelism.
 	Version map[string]any `json:"version"`
 }
 
@@ -43,6 +44,20 @@ func (c Candidate) Field(name string) string {
 		return value
 	}
 	return ""
+}
+
+// PPMdCrates is every `ppmd-*` crate the candidate's Cargo.lock carries, as
+// "name version" joined by ", " (ppmd_crates). A binary built before that
+// field reported only ppmd-rust's version (ppmd_rust), and is read the same
+// way; one that reports neither gives "unknown".
+func (c Candidate) PPMdCrates() string {
+	if crates := c.Field("ppmd_crates"); crates != "" {
+		return crates
+	}
+	if version := c.Field("ppmd_rust"); version != "" {
+		return "ppmd-rust " + version
+	}
+	return "unknown"
 }
 
 // Oracle is the 7-Zip the candidate is measured against.

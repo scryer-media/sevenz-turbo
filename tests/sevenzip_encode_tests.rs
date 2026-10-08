@@ -258,3 +258,47 @@ fn every_aes_folder_and_the_header_has_its_own_iv() {
     check_with_7zip(bin, tmp.path(), "aes-iv-parallel", &parallel, Some("pw"));
     check_with_7zip(bin, tmp.path(), "aes-iv-solid", &solid, Some("pw"));
 }
+
+/// An archive this crate encrypts carries 7-Zip's own key-derivation work
+/// factor, 2^19 rounds, unless the caller asked for less; either way 7-Zip
+/// reads it. Before 0.28.0 the default was 2^8, which made every password
+/// guess 2048 times cheaper than against an archive 7-Zip wrote.
+#[cfg(feature = "aes256")]
+#[test]
+fn seven_zip_sees_the_work_factor_an_encrypted_archive_was_written_with() {
+    let Some(bin) = seven_zip() else {
+        eprintln!("skipping: neither 7zz nor 7z is on PATH");
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let files = inputs();
+    let default = AesEncoderOptions::new(Password::from("pw"));
+    assert_eq!(default.num_cycles_power, 19);
+    for (label, options, power) in [
+        ("kdf-default", default, 19),
+        (
+            "kdf-lowered",
+            AesEncoderOptions::new(Password::from("pw")).with_num_cycles_power(12),
+            12,
+        ),
+    ] {
+        let methods = vec![options.into(), Lzma2Options::from_level(1).into()];
+        let bytes = write(methods, false, &files);
+        check_with_7zip(bin, tmp.path(), label, &bytes, Some("pw"));
+        let list = Command::new(bin)
+            .args(["l", "-slt", "-ppw"])
+            .arg(tmp.path().join(format!("{label}.7z")))
+            .output()
+            .expect("run 7-Zip");
+        assert!(list.status.success(), "{label}: `{bin} l` failed");
+        let listing = String::from_utf8_lossy(&list.stdout);
+        let want = format!("7zAES:{power}");
+        assert!(
+            listing
+                .lines()
+                .filter(|line| line.starts_with("Method = "))
+                .any(|line| line.split_whitespace().any(|word| word == want)),
+            "{label}: no `{want}` in\n{listing}"
+        );
+    }
+}

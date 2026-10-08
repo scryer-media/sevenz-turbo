@@ -24,7 +24,6 @@ fn main() {
         ("sevenz-rust2", "DECODE_BENCH_SEVENZ_RUST2_VERSION"),
         ("aws-lc-rs", "DECODE_BENCH_AWS_LC_RS_VERSION"),
         ("crc-fast", "DECODE_BENCH_CRC_FAST_VERSION"),
-        ("ppmd-rust", "DECODE_BENCH_PPMD_RUST_VERSION"),
     ] {
         println!(
             "cargo:rustc-env={env}={}",

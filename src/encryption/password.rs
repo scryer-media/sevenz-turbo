@@ -16,9 +16,19 @@ use zeroize::Zeroizing;
 #[derive(Default)]
 pub struct Password {
     bytes: Zeroizing<Vec<u8>>,
-    // Bound derived-key retention to this password's owner (normally a reader).
+    /// The keys derived from these bytes, shared by every clone: the bytes of
+    /// a password never change after it is made, so a clone is the same
+    /// password and the key derived for one of them is the key for all. The
+    /// encoder clones its options for every folder and the header; without
+    /// this each clone paid the whole derivation again.
     #[cfg(feature = "aes256")]
-    pub(crate) key_cache: std::sync::Mutex<super::aes::KeyCache>,
+    pub(crate) key_cache: std::sync::Arc<std::sync::Mutex<super::aes::KeyCache>>,
+    /// SHA-256 rounds this copy has spent deriving keys, against
+    /// `ArchiveLimits::max_aes_kdf_rounds`. Per copy, not shared: a clone
+    /// starts a fresh budget, as it always has. Only read and written with
+    /// `key_cache` locked.
+    #[cfg(feature = "aes256")]
+    pub(crate) kdf_rounds: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for Password {
@@ -29,8 +39,15 @@ impl std::fmt::Debug for Password {
 
 impl Clone for Password {
     fn clone(&self) -> Self {
-        // Each copy owns its clearing buffer; cached keys are not cloned.
-        Self::from_raw(self.as_slice())
+        // Each copy owns its clearing buffer and its budget; the derived keys
+        // travel with it.
+        Self {
+            bytes: Zeroizing::new(self.as_slice().to_vec()),
+            #[cfg(feature = "aes256")]
+            key_cache: std::sync::Arc::clone(&self.key_cache),
+            #[cfg(feature = "aes256")]
+            kdf_rounds: Default::default(),
+        }
     }
 }
 
@@ -54,6 +71,8 @@ impl Password {
             bytes: Zeroizing::new(bytes.to_vec()),
             #[cfg(feature = "aes256")]
             key_cache: Default::default(),
+            #[cfg(feature = "aes256")]
+            kdf_rounds: Default::default(),
         }
     }
 
@@ -90,6 +109,8 @@ impl From<&str> for Password {
             bytes: result,
             #[cfg(feature = "aes256")]
             key_cache: Default::default(),
+            #[cfg(feature = "aes256")]
+            kdf_rounds: Default::default(),
         }
     }
 }

@@ -222,6 +222,48 @@ fn cargo_lock_sha256() -> String {
         .collect()
 }
 
+/// The `[[package]]` entries of [`CARGO_LOCK`], as `(name, version)`.
+fn locked_packages() -> impl Iterator<Item = (&'static str, &'static str)> {
+    let lock = std::str::from_utf8(CARGO_LOCK).unwrap_or_default();
+    let mut lines = lock.lines().map(str::trim);
+    std::iter::from_fn(move || {
+        loop {
+            let name = lines
+                .next()?
+                .strip_prefix("name = \"")
+                .and_then(|rest| rest.strip_suffix('"'));
+            let Some(name) = name else { continue };
+            let version = lines
+                .next()?
+                .strip_prefix("version = \"")
+                .and_then(|rest| rest.strip_suffix('"'));
+            if let Some(version) = version {
+                return Some((name, version));
+            }
+        }
+    })
+}
+
+/// The version locked for `name`: the first, if the lock carries two.
+fn locked_version(name: &str) -> Option<&'static str> {
+    locked_packages()
+        .find(|(locked, _)| *locked == name)
+        .map(|(_, v)| v)
+}
+
+/// `name version` for every `ppmd-*` package locked, sorted: whichever PPMd
+/// engine the crate links (`ppmd-rust` today, `ppmd-turbo` next), and the
+/// one upstream `sevenz-rust2` brings with it, without naming either here.
+fn locked_ppmd_crates() -> Vec<String> {
+    let mut crates: Vec<String> = locked_packages()
+        .filter(|(name, _)| name.starts_with("ppmd-"))
+        .map(|(name, version)| format!("{name} {version}"))
+        .collect();
+    crates.sort();
+    crates.dedup();
+    crates
+}
+
 /// What the binary is: the crate version, the cryptography backend the build
 /// selected, the commit and `Cargo.lock` it was built from, and the versions
 /// locked when it was built.
@@ -242,7 +284,13 @@ fn version() -> Fields {
         ),
         ("aws_lc_rs", str(env!("DECODE_BENCH_AWS_LC_RS_VERSION"))),
         ("crc_fast", str(env!("DECODE_BENCH_CRC_FAST_VERSION"))),
-        ("ppmd_rust", str(env!("DECODE_BENCH_PPMD_RUST_VERSION"))),
+        // Every PPMd crate the lock carries, by name, so the field means the
+        // same thing before and after the PPMd engine changes crates.
+        ("ppmd_crates", Json::Str(locked_ppmd_crates().join(", "))),
+        (
+            "ppmd_turbo",
+            str(locked_version("ppmd-turbo").unwrap_or("absent")),
+        ),
         (
             "available_parallelism",
             Json::Int(u64::from(super::all_threads())),
@@ -824,7 +872,26 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use super::{Opts, check_reported_crcs, encode, source_members};
+    use super::{
+        Opts, check_reported_crcs, encode, locked_packages, locked_ppmd_crates, locked_version,
+        source_members,
+    };
+
+    /// The PPMd record comes from the embedded lock, by prefix: whatever
+    /// PPMd crates it holds are listed, sorted, each with a version the lock
+    /// gives it.
+    #[test]
+    fn the_ppmd_record_lists_every_locked_ppmd_crate() {
+        let crates = locked_ppmd_crates();
+        assert!(!crates.is_empty(), "the lock carries no ppmd-* crate");
+        assert!(crates.is_sorted());
+        for entry in &crates {
+            let (name, version) = entry.split_once(' ').expect("name version");
+            assert!(name.starts_with("ppmd-"));
+            assert!(locked_packages().any(|locked| locked == (name, version)));
+        }
+        assert_eq!(locked_version("no-such-crate"), None);
+    }
 
     /// A scratch directory under the system temp dir, removed on drop.
     struct Scratch(PathBuf);
