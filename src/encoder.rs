@@ -492,7 +492,7 @@ pub(crate) fn add_encoder<W: Write>(
             };
             validate_lzma_dictionary_size(options.0.dict_size())?;
             #[cfg(not(feature = "lzma-rust2-encoder"))]
-            let lz = LzmaTurboWriter::new(input, &options.0.turbo_props(), Coder::Lzma)?;
+            let lz = LzmaTurboWriter::new(input, &options.0.turbo_props(1), Coder::Lzma)?;
             #[cfg(feature = "lzma-rust2-encoder")]
             let lz = LzmaWriter::new_no_header(input, &options.0.rust2_options(), false)?;
             Ok(Encoder::Lzma(Some(lz)))
@@ -509,7 +509,7 @@ pub(crate) fn add_encoder<W: Write>(
                 let (block_size, threads) = lzma2_block_plan(&lzma2_options);
                 Encoder::Lzma2(Some(LzmaTurboWriter::new(
                     input,
-                    &lzma2_options.settings.turbo_props(),
+                    &lzma2_options.settings.turbo_props(lzma2_options.threads),
                     Coder::Lzma2 {
                         block_size,
                         threads,

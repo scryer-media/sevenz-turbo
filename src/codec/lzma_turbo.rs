@@ -17,7 +17,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use lzma_turbo::crc::CrcFolder;
 use lzma_turbo::{
     Checksum, ChecksumPlan, DrainStatus, Lzma2AdaptiveDecoder, Lzma2MtOptions, Lzma2Reader,
-    Lzma2RunScanner, LzmaProps, LzmaReader,
+    Lzma2Run, Lzma2RunScanner, LzmaProps, LzmaReader,
 };
 
 use crate::error::Error;
@@ -230,24 +230,74 @@ const MT_BACKSTOP_PER_THREAD_BYTES: u64 = 384 * 1024 * 1024;
 /// for the gigabytes after it.
 const MT_RUN_WINDOW: usize = 8;
 
-/// Packed bytes per hundred unpacked at or above which a run is taken to hold
-/// data that did not compress: a run no smaller than what it decodes to.
+/// The share of a run's output, as one part in this many, that may come from
+/// LZMA-coded chunks for the run still to count as stored.
 ///
 /// The shape the narrow decode is for is the stored one. An encoder that
 /// cannot beat a chunk writes it out as it stands — an LZMA2 uncompressed
-/// chunk, packed a shade *larger* than unpacked, because 7-Zip and liblzma
-/// both store a chunk that coding would not shrink — and decoding that is a
-/// copy, bound by the read. A run that is LZMA-coded is the opposite however
-/// little it shrank: data that barely compresses is literal after literal,
-/// the slowest LZMA there is, and decoding it is bound by the decode, so it
-/// wants every thread it can get. Coding shrinks a chunk or the chunk is
-/// stored, so "at least as large as unpacked" is the line between the two;
-/// drawn at 90, it held media archived at an ordinary level — LZMA chunks at
-/// 92 to 99.5 percent — to two threads, five times slower than 7-Zip.
-const MT_DENSE_PERCENT: u128 = 100;
+/// chunk — and decoding that is a copy, bound by the read. A chunk that is
+/// LZMA-coded is the opposite however little it shrank: data that barely
+/// compresses is literal after literal, the slowest LZMA there is, and
+/// decoding it is bound by the decode, so it wants every thread it can get.
+///
+/// Which of the two a chunk is, its header says, and [`RunShape`] carries the
+/// count from the run record: the split is exact, not read off a ratio. The
+/// ratio was what this used to go by — a run packed at least as large as it
+/// unpacked was taken to be stored — and it is the wrong question, because an
+/// LZMA chunk of media packed at 99.5 percent and a stored chunk at 100.005
+/// are a few hundredths apart in size and two orders of magnitude apart in
+/// what they cost to decode. Drawn at 90 percent, the ratio held media at an
+/// ordinary level to two threads, five times slower than 7-Zip.
+///
+/// The cost gap is also why a run is not split down the middle: decoding a
+/// byte of incompressible LZMA costs about a hundred times what copying one
+/// does, so a run with a few percent of its output LZMA-coded already spends
+/// as long decoding as copying. At one part in 64 the LZMA chunks cost about
+/// as much as the copy, and past it they are what the decode is waiting on.
+const MT_STORED_LZMA_SHARE: u64 = 64;
 
-/// Threads an incompressible stream is decoded with, however many the caller
-/// asked for.
+/// What one run of an LZMA2 stream is made of, as the decode's shape is
+/// decided from it: the classification input of [`Lzma2MtReader`].
+///
+/// It is the run record's own figures — the packed and unpacked sizes and how
+/// much of the output comes from LZMA-coded rather than stored chunks — so
+/// that whatever decides how wide a decode goes asks the chunk headers and
+/// not a ratio. [`RunShape::is_stored`] is the one rule this module applies
+/// to it; a planner that wants another can read the same fields.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RunShape {
+    /// The run's length in the packed stream, chunk headers included.
+    pub(crate) packed: u64,
+    /// What the run decodes to.
+    pub(crate) unpacked: u64,
+    /// The part of [`Self::unpacked`] that LZMA-coded chunks decode to. The
+    /// rest comes from stored chunks, whose decode is a copy.
+    pub(crate) lzma_unpacked: u64,
+}
+
+impl RunShape {
+    /// The shape of a run the scanner closed.
+    pub(crate) fn of(run: &Lzma2Run) -> Self {
+        Self {
+            packed: run.packed_len,
+            unpacked: run.unpacked_len,
+            lzma_unpacked: run.chunks.lzma_unpacked,
+        }
+    }
+
+    /// Whether decoding the run is a copy rather than a decode: no more than
+    /// one part in [`MT_STORED_LZMA_SHARE`] of its output is LZMA-coded. An
+    /// empty run is not stored; it is nothing at all.
+    pub(crate) fn is_stored(&self) -> bool {
+        self.unpacked > 0
+            && u128::from(self.lzma_unpacked) * u128::from(MT_STORED_LZMA_SHARE)
+                <= u128::from(self.unpacked)
+    }
+}
+
+/// Threads an incompressible stream — one whose runs are stored chunks, see
+/// [`RunShape::is_stored`] — is decoded with, however many the caller asked
+/// for.
 ///
 /// Such a stream is read-bound rather than decode-bound: its runs are large,
 /// every byte of them has to be moved, and the decoding between the reads is
@@ -321,6 +371,34 @@ const MT_IDLE_TURNS_BEFORE_STALLED: u32 = 1000;
 /// point the reader stops getting ahead and lets the decoder stream, and it
 /// starts again the moment a worker does appear.
 const MT_NO_WORKER_GIVE_UP_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The longest run an LZMA2 encoder that cuts its stream into runs writes for
+/// a dictionary of `dict_size`, in decoded bytes.
+///
+/// C: the `LZMA2_ENC_PROPS_BLOCK_SIZE_AUTO` case of `Lzma2EncProps_Normalize`:
+/// four dictionaries, clamped to 1..=256 MiB, never less than one dictionary,
+/// rounded up to a whole mebibyte. `lzma-turbo`'s encoder and this crate's
+/// writer cut runs by the same rule, and xz's three dictionaries are shorter.
+///
+/// It is what lets a reader call a stream single-run long before
+/// [`MT_NO_WORKER_GIVE_UP_BYTES`] or [`MT_INPUT_HOLD_BYTES`] would: a first run
+/// that has gone on past this without a dictionary reset was not written to be
+/// decoded in parallel, and every byte read ahead waiting for its end is held
+/// for nothing. That was 192 MiB of a single-run archive held for a parallel
+/// plan that never happened, and a single-run block under that size read
+/// whole before a byte of it was decoded. The dictionary is the one the coder
+/// declares, which is never smaller than the one the encoder used, so the cap
+/// errs long.
+///
+/// A caller-chosen block size (`7zz -m0=lzma2:c=…`) can be longer than this.
+/// Such a stream's first run is then decoded on the calling thread, as a run
+/// longer than [`MT_INPUT_HOLD_BYTES`] already is, and the decode goes wide
+/// again from the second run, whose boundary the scan still finds.
+fn lzma2_encoder_run_cap(dict_size: u32) -> u64 {
+    const MIB: u64 = 1 << 20;
+    let dict = u64::from(dict_size);
+    (dict * 4).clamp(MIB, 256 * MIB).max(dict).div_ceil(MIB) * MIB
+}
 
 /// Packed bytes this reader will hold that it has not been able to hand to the
 /// decoder, because they are part of a run whose end has not been seen yet.
@@ -800,14 +878,14 @@ pub(crate) struct Lzma2MtReader<R: Read> {
     /// Run boundaries [`Self::scanner`] has found. Zero of them after a good
     /// look is what a stream that cannot be parallelised at all looks like.
     runs_seen: u64,
-    /// Packed and unpacked sizes of the last [`MT_RUN_WINDOW`] runs the
-    /// scanner closed, and where the next one goes. This is what sizes the
-    /// decode: see [`Lzma2MtReader::affordable_threads`].
-    recent_runs: [(u64, u64); MT_RUN_WINDOW],
+    /// The shapes of the last [`MT_RUN_WINDOW`] runs the scanner closed, and
+    /// where the next one goes. Their sizes are what sizes the decode: see
+    /// [`Lzma2MtReader::affordable_threads`].
+    recent_runs: [RunShape; MT_RUN_WINDOW],
     recent_at: usize,
-    /// Whether the runs going past are holding data that did not compress,
-    /// which is what decides how wide this decode is allowed to be. See
-    /// [`MT_DENSE_THREADS`].
+    /// Whether the runs going past are stored chunks — data that did not
+    /// compress — which is what decides how wide this decode is allowed to
+    /// be. See [`RunShape::is_stored`] and [`MT_DENSE_THREADS`].
     dense: bool,
     /// Closed runs in a row that disagreed with [`Self::dense`]. Reset by any
     /// run that agrees, so it counts a run of disagreement and not a total.
@@ -865,6 +943,9 @@ pub(crate) struct Lzma2MtReader<R: Read> {
     /// [`MT_NO_WORKER_GIVE_UP_BYTES`], as a field so that a test can reach the
     /// single-run path without a quarter-gigabyte fixture.
     give_up_bytes: u64,
+    /// [`lzma2_encoder_run_cap`] for this stream's dictionary: decoded bytes
+    /// of a first run past which the stream is taken to be a single run.
+    run_cap: u64,
     /// [`MT_INPUT_HOLD_BYTES`], a field for the same reason.
     hold_bytes: usize,
     /// [`MT_BACKLOG_BYTES_PER_THREAD`], a field for the same reason: the three
@@ -958,6 +1039,9 @@ impl<R: Read> Lzma2MtReader<R> {
         };
         let mut decoder = Lzma2AdaptiveDecoder::new(dict_prop, &options).map_err(decode_error)?;
         decoder.set_threads(Self::decoder_threads(threads));
+        // The property was accepted by the decoder just now, so this cannot
+        // fail; a cap of "never" would only cost the early give-up.
+        let run_cap = lzma2_dictionary_size(&[dict_prop]).map_or(u64::MAX, lzma2_encoder_run_cap);
         // This reader hands over whole runs and nothing else, so the run at
         // the decoder's cursor is incomplete only because the rest of it has
         // not been fed yet. Feeding it is cheaper than decoding it here with
@@ -986,7 +1070,7 @@ impl<R: Read> Lzma2MtReader<R> {
             carry: Vec::new(),
             scanner: Lzma2RunScanner::new(),
             runs_seen: 0,
-            recent_runs: [(0, 0); MT_RUN_WINDOW],
+            recent_runs: [RunShape::default(); MT_RUN_WINDOW],
             recent_at: 0,
             dense: false,
             shape_streak: 0,
@@ -1004,6 +1088,7 @@ impl<R: Read> Lzma2MtReader<R> {
             runs_delivered: 0,
             scan_broken: false,
             give_up_bytes: MT_NO_WORKER_GIVE_UP_BYTES,
+            run_cap,
             hold_bytes: MT_INPUT_HOLD_BYTES,
             backlog_bytes: MT_BACKLOG_BYTES_PER_THREAD,
             input_done: false,
@@ -1274,11 +1359,9 @@ impl<R: Read> Lzma2MtReader<R> {
     /// the largest of the last [`MT_RUN_WINDOW`] the scanner closed. `(0, 0)`
     /// until the first one has closed.
     fn run_size(&self) -> (u64, u64) {
-        self.recent_runs
-            .iter()
-            .fold((0, 0), |(p, u), &(run_p, run_u)| {
-                (p.max(run_p), u.max(run_u))
-            })
+        self.recent_runs.iter().fold((0, 0), |(p, u), run| {
+            (p.max(run.packed), u.max(run.unpacked))
+        })
     }
 
     /// How many threads this decode can actually keep decoding at once.
@@ -1562,12 +1645,12 @@ impl<R: Read> Lzma2MtReader<R> {
                         self.run_ends.push_back(run.in_offset + run.packed_len);
                         self.unpacked_seen += run.unpacked_len;
                         self.unpacked_ends.push_back(self.unpacked_seen);
-                        self.recent_runs[self.recent_at] = (run.packed_len, run.unpacked_len);
+                        let shape = RunShape::of(&run);
+                        self.recent_runs[self.recent_at] = shape;
                         self.recent_at = (self.recent_at + 1) % MT_RUN_WINDOW;
                         // What shape this run is, and whether enough of them
                         // in a row have been that shape to change the decode.
-                        let dense = u128::from(run.packed_len) * 100
-                            >= u128::from(run.unpacked_len) * MT_DENSE_PERCENT;
+                        let dense = shape.is_stored();
                         if dense == self.dense {
                             self.shape_streak = 0;
                         } else {
@@ -1876,8 +1959,14 @@ impl<R: Read> Lzma2MtReader<R> {
             // decoding it as it arrives and gigabytes more expensive. The test
             // is made again every time round because it only becomes true part
             // way through a batch this loop would otherwise finish.
+            //
+            // A good look is the longest run an encoder writes for this
+            // dictionary, in decoded bytes, which the chunk headers say
+            // exactly; the packed give-up is the backstop for a dictionary so
+            // large that the cap says nothing. See [`lzma2_encoder_run_cap`].
             let one_run = self.runs_seen == 0
-                && self.scanner.in_position() > self.give_up_bytes
+                && (self.scanner.out_position() > self.run_cap
+                    || self.scanner.in_position() > self.give_up_bytes)
                 && !self.input_done;
             // Two of the three modes in which the front of a run is handed
             // over deliberately: a stream that is one run from beginning to
@@ -1893,7 +1982,13 @@ impl<R: Read> Lzma2MtReader<R> {
             // chase wants no read-ahead at all: it decodes what it is given,
             // on this thread, and more input only sits there. Everything else
             // stops on its backlog.
-            let far_enough = if one_run || self.scan_broken {
+            //
+            // A first run chased because it outgrew the hold allowance before
+            // the give-up fired is the same stream seen earlier, and wants the
+            // same: fed as it is decoded, not read into the decoder until the
+            // budget refuses it.
+            let first_run_chased = self.chasing && self.runs_seen == 0;
+            let far_enough = if one_run || self.scan_broken || first_run_chased {
                 self.decoder.in_flight_bytes() >= MT_INPUT_CHUNK as u64
             } else {
                 self.backlog_full()
@@ -1939,7 +2034,20 @@ impl<R: Read> Lzma2MtReader<R> {
                 if (self.chasing || self.nothing_left_to_decode()) && self.held > 0 {
                     self.chasing = true;
                     self.set_chase(true);
-                    end = self.read_to().min(self.fed_to + MT_INPUT_CHUNK as u64);
+                    // Before any run has closed every queued byte is the
+                    // first run's — each piece is walked before it is queued
+                    // — so the front piece goes over whole rather than cut at
+                    // a ration: cutting a 4 MiB read into 1 MiB feeds copied
+                    // the rest of it every time, which on a single-run
+                    // gigabyte was 1.3 GiB moved for nothing. Past the first
+                    // run the ration stands, because a piece there can run on
+                    // past the end of the run being chased.
+                    let ration = if self.runs_seen == 0 {
+                        self.segs.front().map_or(0, Vec::len).max(MT_INPUT_CHUNK)
+                    } else {
+                        MT_INPUT_CHUNK
+                    };
+                    end = self.read_to().min(self.fed_to + ration as u64);
                     if let Some(t) = self.trace.as_mut() {
                         t.chased += end - self.fed_to;
                     }
@@ -3316,12 +3424,20 @@ mod stall_tests {
         // A run of this stream costs more than the whole allowance. Whatever
         // is read, no worker can be given one, so reading further ahead is
         // only spending.
-        rd.recent_runs[0] = (LIMIT, LIMIT);
+        rd.recent_runs[0] = super::RunShape {
+            packed: LIMIT,
+            unpacked: LIMIT,
+            lzma_unpacked: 0,
+        };
         assert!(!rd.room_for_a_run());
         assert!(rd.backlog_full(), "a spent budget is a full backlog");
         // The control: a run the allowance can pay for leaves the floor in
         // charge, and the floor keeps the feed open.
-        rd.recent_runs[0] = (run_packed(16), run_unpacked(16));
+        rd.recent_runs[0] = super::RunShape {
+            packed: run_packed(16),
+            unpacked: run_unpacked(16),
+            lzma_unpacked: 0,
+        };
         assert!(rd.room_for_a_run());
         assert!(!rd.backlog_full(), "the floor should hold the feed open");
     }
@@ -3462,6 +3578,217 @@ mod stall_tests {
             "published a backlog of {}",
             seen.most_backlog
         );
+    }
+
+    /// A source that counts what it has handed over, so a test can see how
+    /// far ahead of the output the reader has read: the input it is holding,
+    /// measured from outside it.
+    struct Counted<R> {
+        inner: R,
+        read: std::rc::Rc<std::cell::Cell<u64>>,
+    }
+
+    impl<R: Read> Read for Counted<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read.set(self.read.get() + n as u64);
+            Ok(n)
+        }
+    }
+
+    /// The most a decode of `packed` has read ahead of its output, in bytes.
+    /// The streams here are stored chunks, so a byte of output is a byte of
+    /// input give or take three header bytes per 64 KiB chunk.
+    fn most_read_ahead(packed: &[u8], plain: &[u8], threads: u32) -> u64 {
+        let read = std::rc::Rc::new(std::cell::Cell::new(0));
+        let input = Counted {
+            inner: Cursor::new(packed),
+            read: std::rc::Rc::clone(&read),
+        };
+        let (mut rd, _control) = reader_limited(input, threads, u64::MAX >> 1);
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 64 << 10];
+        let mut most = 0;
+        loop {
+            let n = rd.read(&mut buf).expect("decode");
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+            most = most.max(read.get().saturating_sub(out.len() as u64));
+        }
+        assert!(out == plain, "the decode differs");
+        most
+    }
+
+    /// The longest run an encoder writes is four dictionaries, kept to
+    /// 1..=256 MiB, never under one dictionary, in whole mebibytes.
+    #[test]
+    fn the_run_cap_is_the_encoders_block_size() {
+        const MIB: u64 = 1 << 20;
+        let cap = super::lzma2_encoder_run_cap;
+        assert_eq!(cap(64 << 10), MIB);
+        assert_eq!(cap(512 << 10), 2 * MIB);
+        assert_eq!(cap(3 << 19), 6 * MIB);
+        assert_eq!(cap(16 << 20), 64 * MIB);
+        assert_eq!(cap(64 << 20), 256 * MIB);
+        assert_eq!(cap(128 << 20), 256 * MIB);
+        assert_eq!(cap(1536 << 20), 1536 * MIB);
+        assert_eq!(cap(u32::MAX), u64::from(u32::MAX).div_ceil(MIB) * MIB);
+    }
+
+    /// A stream that is one run from start to end is streamed once its first
+    /// run has gone past the longest one an encoder writes for its
+    /// dictionary. It is not read ahead waiting for a boundary that is not
+    /// coming: the input the reader holds stays at a few reads, where it used
+    /// to be the whole hold allowance, or the whole block when that was
+    /// smaller — 192 MiB of a single-run archive, all of a 158 MiB one.
+    ///
+    /// Asserted from outside, against what the source handed over and the
+    /// caller got back, so the bound covers the decoder's own input as well
+    /// as this reader's queue.
+    #[test]
+    fn a_single_run_stream_is_streamed_rather_than_read_ahead() {
+        // 32 MiB in one run; the dictionary's cap is 2 MiB.
+        let (packed, plain) = stream(1, 512);
+        let cap = super::lzma2_encoder_run_cap(1 << 19);
+        let bound = cap + 2 * super::MT_INPUT_READ_BYTES as u64;
+        assert!(
+            bound * 2 < packed.len() as u64,
+            "the stream must dwarf the bound"
+        );
+        for threads in [2, 8] {
+            let most = most_read_ahead(&packed, &plain, threads);
+            assert!(
+                most <= bound,
+                "threads={threads}: read {most} bytes ahead of the output, bound {bound}",
+            );
+        }
+        // The control: runs no longer than the cap are still read ahead for
+        // the workers, which is what the hold exists for.
+        let (packed, plain) = stream(16, 32);
+        assert_eq!(run_packed(32) - 32 * 3, cap);
+        let ahead = most_read_ahead(&packed, &plain, 8);
+        assert!(
+            ahead > bound,
+            "a multi-run stream was not read ahead: {ahead} <= {bound}"
+        );
+    }
+
+    /// A run made of LZMA chunk headers over filler, which the scan walks
+    /// and nothing here decodes: what is being tested is the classification,
+    /// and the scan never looks at a payload.
+    fn lzma_chunk(out: &mut Vec<u8>, control: u8, unpacked: u32, packed: u32) {
+        let u = unpacked - 1;
+        out.push(control | ((u >> 16) as u8 & 0x1F));
+        out.extend_from_slice(&(u as u16).to_be_bytes());
+        out.extend_from_slice(&((packed - 1) as u16).to_be_bytes());
+        if control >= 0xC0 {
+            out.push(0x5D);
+        }
+        out.resize(out.len() + packed as usize, 0xAA);
+    }
+
+    fn copy_chunks(out: &mut Vec<u8>, first: u8, len: usize) {
+        let mut control = first;
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(CHUNK);
+            out.push(control);
+            out.extend_from_slice(&((n - 1) as u16).to_be_bytes());
+            out.resize(out.len() + n, 0x55);
+            control = 0x02;
+            left -= n;
+        }
+    }
+
+    /// Scans `packed` as far as the reader will on its own, without handing
+    /// a byte to the decoder, and returns the reader to look at.
+    fn scanned(packed: Vec<u8>, threads: u32) -> Lzma2MtReader<Cursor<Vec<u8>>> {
+        let (mut rd, _control) = reader_limited(Cursor::new(packed), threads, u64::MAX >> 1);
+        while !rd.input_done {
+            rd.refill().expect("scan");
+        }
+        rd
+    }
+
+    /// Stored runs go narrow, LZMA-coded runs stay wide, and a mixed run is
+    /// classified by the exact share of its output that is LZMA-coded, as
+    /// the chunk headers declare it — not by how its packed size compares
+    /// with its unpacked size.
+    #[test]
+    fn runs_are_classified_by_their_chunk_kinds_not_their_ratio() {
+        const RUNS: usize = 4;
+        // All stored: narrow.
+        let mut packed = Vec::new();
+        for _ in 0..RUNS {
+            copy_chunks(&mut packed, 0x01, 200_000);
+        }
+        packed.push(0);
+        let rd = scanned(packed, 8);
+        assert_eq!(rd.runs_seen, RUNS as u64);
+        for shape in &rd.recent_runs[..RUNS] {
+            assert_eq!(
+                *shape,
+                super::RunShape {
+                    packed: 200_000 + 4 * 3,
+                    unpacked: 200_000,
+                    lzma_unpacked: 0,
+                }
+            );
+            assert!(shape.is_stored());
+        }
+        assert!(rd.dense);
+        assert_eq!(rd.applied_threads, super::MT_DENSE_THREADS);
+
+        // All LZMA-coded, and packed *larger* than it unpacks — which the
+        // ratio called incompressible and sent narrow. It is a decode, and
+        // stays as wide as it was asked to be.
+        let mut packed = Vec::new();
+        for _ in 0..RUNS {
+            lzma_chunk(&mut packed, 0xE0, 60_000, 65_536);
+            lzma_chunk(&mut packed, 0x80, 60_000, 65_536);
+        }
+        packed.push(0);
+        let rd = scanned(packed, 8);
+        assert_eq!(rd.runs_seen, RUNS as u64);
+        for shape in &rd.recent_runs[..RUNS] {
+            assert_eq!(
+                *shape,
+                super::RunShape {
+                    packed: 2 * 65_536 + 6 + 5,
+                    unpacked: 120_000,
+                    lzma_unpacked: 120_000,
+                }
+            );
+            assert!(shape.packed > shape.unpacked && !shape.is_stored());
+        }
+        assert!(!rd.dense);
+        assert_eq!(rd.applied_threads, 8);
+
+        // Mixed: one LZMA chunk ahead of stored ones. 10 000 of 650 000 is
+        // under one part in 64 and the run is a copy; 20 000 of 660 000 is
+        // over it and the run is a decode.
+        for (lzma, stored) in [(10_000u32, true), (20_000, false)] {
+            let mut packed = Vec::new();
+            for _ in 0..RUNS {
+                lzma_chunk(&mut packed, 0xE0, lzma, lzma / 2);
+                copy_chunks(&mut packed, 0x02, 640_000);
+            }
+            packed.push(0);
+            let rd = scanned(packed, 8);
+            assert_eq!(rd.runs_seen, RUNS as u64);
+            let want = super::RunShape {
+                packed: u64::from(lzma / 2) + 6 + 640_000 + 10 * 3,
+                unpacked: u64::from(lzma) + 640_000,
+                lzma_unpacked: u64::from(lzma),
+            };
+            for shape in &rd.recent_runs[..RUNS] {
+                assert_eq!(*shape, want, "lzma={lzma}");
+                assert_eq!(shape.is_stored(), stored, "lzma={lzma}");
+            }
+            assert_eq!(rd.dense, stored, "lzma={lzma}");
+        }
     }
 
     /// The shape rule against streams an encoder actually produced, which is
