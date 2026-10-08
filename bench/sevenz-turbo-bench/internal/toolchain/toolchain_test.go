@@ -92,21 +92,67 @@ func TestCheckBackend(t *testing.T) {
 
 func TestBindRustOnlyAttachesAMatchingCheckout(t *testing.T) {
 	checkout := Rust{Rustc: "rustc 1.97.1", Cargo: "cargo 1.97.1", Commit: "abc", CargoLock: "lock1"}
-	matching := Candidate{Version: map[string]any{"git_commit": "abc", "cargo_lock_sha256": "lock1", "lzma_turbo": "0.6.0"}}
+	matching := Candidate{Version: map[string]any{"git_commit": "abc", "git_dirty": "false", "cargo_lock_sha256": "lock1", "lzma_turbo": "0.6.0"}}
 	if bound := BindRust(checkout, matching); bound.Source != "checkout" || bound.Rustc != "rustc 1.97.1" {
 		t.Fatalf("matching checkout not attached: %+v", bound)
 	}
+	editedCheckout := checkout
+	editedCheckout.BuildDirty = true
+	if bound := BindRust(editedCheckout, matching); bound.Source != "candidate" || bound.Note == "" {
+		t.Fatalf("a checkout with uncommitted build changes was attached: %+v", bound)
+	}
 	for name, candidate := range map[string]Candidate{
-		"other commit": {Version: map[string]any{"git_commit": "def", "cargo_lock_sha256": "lock1"}},
-		"other lock":   {Version: map[string]any{"git_commit": "abc", "cargo_lock_sha256": "lock2"}},
-		"no record":    {Version: map[string]any{}},
+		"other commit":    {Version: map[string]any{"git_commit": "def", "git_dirty": "false", "cargo_lock_sha256": "lock1"}},
+		"other lock":      {Version: map[string]any{"git_commit": "abc", "git_dirty": "false", "cargo_lock_sha256": "lock2"}},
+		"built dirty":     {Version: map[string]any{"git_commit": "abc", "git_dirty": "true", "cargo_lock_sha256": "lock1"}},
+		"no dirty record": {Version: map[string]any{"git_commit": "abc", "cargo_lock_sha256": "lock1"}},
+		"no record":       {Version: map[string]any{}},
 	} {
 		bound := BindRust(checkout, candidate)
 		if bound.Source != "candidate" || bound.Rustc != "not-collected" || bound.Note == "" {
 			t.Errorf("%s: checkout attached: %+v", name, bound)
 		}
-		if bound.Commit == "abc" && name != "other lock" {
+		if bound.Commit == "abc" && name == "other commit" {
 			t.Errorf("%s: kept the checkout's commit: %+v", name, bound)
 		}
+	}
+}
+
+func TestCheckEncoder(t *testing.T) {
+	if CheckEncoder(Candidate{Version: map[string]any{"lzma_encoder": "lzma-turbo"}}, "--candidate") != nil {
+		t.Fatal("the default encoder was refused")
+	}
+	for _, version := range []map[string]any{{"lzma_encoder": "lzma-rust2"}, {}} {
+		if CheckEncoder(Candidate{Version: version}, "--candidate") == nil {
+			t.Errorf("%v was accepted", version)
+		}
+	}
+}
+
+func TestSameBuild(t *testing.T) {
+	build := func(change func(map[string]any)) Candidate {
+		version := map[string]any{"git_commit": "abc", "git_dirty": "false", "cargo_lock_sha256": "l1", "sevenz_turbo": "0.27.0", "lzma_turbo": "0.7.0"}
+		if change != nil {
+			change(version)
+		}
+		return Candidate{Version: version}
+	}
+	if err := SameBuild(build(nil), build(nil)); err != nil {
+		t.Fatalf("one build was refused: %v", err)
+	}
+	for name, change := range map[string]func(map[string]any){
+		"commit":  func(v map[string]any) { v["git_commit"] = "def" },
+		"lock":    func(v map[string]any) { v["cargo_lock_sha256"] = "l2" },
+		"version": func(v map[string]any) { v["lzma_turbo"] = "0.6.0" },
+		"dirty":   func(v map[string]any) { v["git_dirty"] = "true" },
+		"missing": func(v map[string]any) { delete(v, "git_commit") },
+	} {
+		if SameBuild(build(nil), build(change)) == nil {
+			t.Errorf("%s differs but the pair was accepted", name)
+		}
+	}
+	dirty := func(v map[string]any) { v["git_dirty"] = "true" }
+	if SameBuild(build(dirty), build(dirty)) == nil {
+		t.Error("a pair built from uncommitted changes was accepted")
 	}
 }

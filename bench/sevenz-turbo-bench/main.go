@@ -196,6 +196,9 @@ func (f toolFlags) collect(ctx context.Context) (toolchain.Toolchain, suite.Tool
 	if err := toolchain.CheckBackend(primary, "--candidate", toolchain.BackendDefault); err != nil {
 		return toolchain.Toolchain{}, suite.Tools{}, prerequisite{fmt.Errorf("%w: build it with default features", err)}
 	}
+	if err := toolchain.CheckEncoder(primary, "--candidate"); err != nil {
+		return toolchain.Toolchain{}, suite.Tools{}, prerequisite{err}
+	}
 	// The checkout's rustc, commit and Cargo.lock describe the candidate only
 	// when the candidate says it was built from that commit and lock.
 	chain := toolchain.Toolchain{Candidates: []toolchain.Candidate{primary}, Rust: toolchain.BindRust(rust, primary), LinkedLzmaTurbo: primary.Field("lzma_turbo")}
@@ -207,6 +210,12 @@ func (f toolFlags) collect(ctx context.Context) (toolchain.Toolchain, suite.Tool
 		}
 		if err := toolchain.CheckBackend(native, "--candidate-native", toolchain.BackendNative); err != nil {
 			return toolchain.Toolchain{}, suite.Tools{}, prerequisite{fmt.Errorf("%w: build it with --features native-crypto", err)}
+		}
+		if err := toolchain.CheckEncoder(native, "--candidate-native"); err != nil {
+			return toolchain.Toolchain{}, suite.Tools{}, prerequisite{err}
+		}
+		if err := toolchain.SameBuild(primary, native); err != nil {
+			return toolchain.Toolchain{}, suite.Tools{}, prerequisite{err}
 		}
 		chain.Candidates = append(chain.Candidates, native)
 		tools.Native = *f.native

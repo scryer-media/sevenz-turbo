@@ -66,13 +66,16 @@ type Rust struct {
 	// checkout's commit and Cargo.lock digest match the ones the candidate
 	// binary embeds (so its rustc and cargo describe the build too), or
 	// "candidate" when only the binary's own record is trusted.
-	Source        string `json:"source,omitempty"`
-	Note          string `json:"note,omitempty"`
-	Rustc         string `json:"rustc"`
-	RustcHost     string `json:"rustc_host,omitempty"`
-	Cargo         string `json:"cargo"`
-	Commit        string `json:"commit"`
-	Dirty         bool   `json:"dirty"`
+	Source    string `json:"source,omitempty"`
+	Note      string `json:"note,omitempty"`
+	Rustc     string `json:"rustc"`
+	RustcHost string `json:"rustc_host,omitempty"`
+	Cargo     string `json:"cargo"`
+	Commit    string `json:"commit"`
+	Dirty     bool   `json:"dirty"`
+	// BuildDirty is whether the paths compiled into decode-bench (BuildPaths)
+	// differ from Commit in the checkout now.
+	BuildDirty    bool   `json:"build_dirty,omitempty"`
 	CargoLock     string `json:"cargo_lock_sha256,omitempty"`
 	LockedTurbo   string `json:"locked_lzma_turbo,omitempty"`
 	LockedVersion string `json:"locked_sevenz_turbo,omitempty"`
@@ -202,6 +205,42 @@ const (
 	BackendNative  = "rustcrypto"
 )
 
+// LzmaEncoder is the encoder every candidate must report: a build with
+// sevenz-turbo's lzma-rust2-encoder feature measures another encoder.
+const LzmaEncoder = "lzma-turbo"
+
+// BuildPaths are the checkout paths compiled into decode-bench; its build
+// script records whether they had uncommitted changes as git_dirty.
+var BuildPaths = []string{"src", "Cargo.toml", "Cargo.lock", "tools/decode-bench"}
+
+// CheckEncoder fails unless the candidate reports the default LZMA encoder.
+func CheckEncoder(candidate Candidate, flag string) error {
+	if got := candidate.Field("lzma_encoder"); got != LzmaEncoder {
+		return fmt.Errorf("%s %s reports LZMA encoder %q, want %q (build without sevenz-turbo/lzma-rust2-encoder; an older decode-bench reports none)", flag, candidate.Path, got, LzmaEncoder)
+	}
+	return nil
+}
+
+// buildIdentity are the op version fields that say which source a binary was
+// built from.
+var buildIdentity = []string{"git_commit", "git_dirty", "cargo_lock_sha256", "sevenz_turbo", "lzma_turbo"}
+
+// SameBuild fails unless native was built from the same committed source as
+// primary, so the two rows differ only by the crypto backend: the same
+// commit, Cargo.lock and locked versions, and neither built from uncommitted
+// changes (whose content no field identifies).
+func SameBuild(primary, native Candidate) error {
+	for _, field := range buildIdentity {
+		if a, b := primary.Field(field), native.Field(field); a == "" || a != b {
+			return fmt.Errorf("--candidate and --candidate-native differ in %s (%q vs %q); build both from the same commit", field, a, b)
+		}
+	}
+	if primary.Field("git_dirty") != "false" {
+		return fmt.Errorf("--candidate and --candidate-native were built from uncommitted changes (git_dirty %q), so nothing shows they are the same source; build both from a clean commit", primary.Field("git_dirty"))
+	}
+	return nil
+}
+
 // CheckBackend fails unless the candidate reports the backend its role
 // requires, so a swapped or misbuilt pair cannot label one backend's rows as
 // the other's.
@@ -215,11 +254,15 @@ func CheckBackend(candidate Candidate, flag, want string) error {
 // BindRust attaches the checkout's provenance to the candidate only when the
 // checkout is the one the binary was built from: the commit and Cargo.lock
 // digest the binary embeds (`op version`'s git_commit and cargo_lock_sha256)
-// must equal the checkout's. Otherwise the record keeps only what the binary
-// says about itself, and says why.
+// must equal the checkout's, and neither the binary's sources when it was
+// built (git_dirty) nor the checkout's build paths now may differ from that
+// commit, since no field identifies uncommitted content. Otherwise the record
+// keeps only what the binary says about itself, and says why.
 func BindRust(checkout Rust, candidate Candidate) Rust {
 	commit, lock := candidate.Field("git_commit"), candidate.Field("cargo_lock_sha256")
-	if commit != "" && commit != "unknown" && commit == checkout.Commit && lock != "" && lock == checkout.CargoLock {
+	dirty := candidate.Field("git_dirty")
+	matches := commit != "" && commit != "unknown" && commit == checkout.Commit && lock != "" && lock == checkout.CargoLock
+	if matches && dirty == "false" && !checkout.BuildDirty {
 		checkout.Source = "checkout"
 		return checkout
 	}
@@ -229,6 +272,12 @@ func BindRust(checkout Rust, candidate Candidate) Rust {
 		LockedTurbo: candidate.Field("lzma_turbo"), LockedVersion: candidate.Field("sevenz_turbo"),
 	}
 	switch {
+	case matches && dirty == "true":
+		bound.Note = "the candidate was built from uncommitted changes at the checkout's commit; nothing identifies that content, so the checkout's provenance is not attached"
+	case matches && checkout.BuildDirty:
+		bound.Note = "the checkout's build paths have uncommitted changes, so it is not shown to be the source the candidate was built from; its provenance is not attached"
+	case matches:
+		bound.Note = "the candidate does not record whether its sources were committed (built before decode-bench recorded git_dirty); the checkout's provenance is not attached"
 	case commit == "" || lock == "":
 		bound.Note = "the candidate does not embed its commit and Cargo.lock digest (built before decode-bench recorded them); the checkout's provenance is not attached"
 	case checkout.Commit == "not-collected":
@@ -337,6 +386,7 @@ func ProbeRust(ctx context.Context, repo string) Rust {
 	if output := run(repo, "git", "rev-parse", "HEAD"); output != "" {
 		rust.Commit = output
 		rust.Dirty = run(repo, "git", "status", "--porcelain", "--untracked-files=no") != ""
+		rust.BuildDirty = run(repo, "git", append([]string{"status", "--porcelain", "--untracked-files=no", "--"}, BuildPaths...)...) != ""
 	}
 	if lock, err := os.ReadFile(filepath.Join(repo, "Cargo.lock")); err == nil {
 		sum := sha256.Sum256(lock)

@@ -2,9 +2,10 @@
 //! the workspace `Cargo.lock` it was built from, so `decode-bench op version`
 //! can report which `lzma-turbo` a measured binary actually carried rather
 //! than which one somebody expected it to. It also records the commit the
-//! binary was built from, so the harness can tell whether the checkout it runs
-//! next to is the one the binary came from (the lock's digest is taken at run
-//! time, over the lock the binary embeds).
+//! binary was built from, and whether the sources compiled into it had
+//! uncommitted changes then, so the harness can tell whether the checkout it
+//! runs next to is the one the binary came from (the lock's digest is taken at
+//! run time, over the lock the binary embeds).
 
 use std::path::Path;
 use std::process::Command;
@@ -16,6 +17,10 @@ fn main() {
     println!(
         "cargo:rustc-env=DECODE_BENCH_GIT_COMMIT={}",
         git_commit(manifest_dir)
+    );
+    println!(
+        "cargo:rustc-env=DECODE_BENCH_GIT_DIRTY={}",
+        git_dirty(manifest_dir)
     );
     let text = std::fs::read_to_string(&lock).unwrap_or_default();
     for (name, env) in [
@@ -63,6 +68,38 @@ fn git_commit(dir: &Path) -> String {
         );
     }
     git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The sources compiled into this binary, relative to the workspace root:
+/// the crate and this tool. An edit to any of them reruns the build script, so
+/// the dirty state below is the one the binary was compiled from.
+const BUILD_PATHS: [&str; 4] = ["src", "Cargo.toml", "Cargo.lock", "tools/decode-bench"];
+
+/// `true` when [`BUILD_PATHS`] differ from `HEAD` (staged or not), `false`
+/// when they match it, `unknown` outside a git checkout. A build from a source
+/// tree without git sets `DECODE_BENCH_GIT_DIRTY` itself.
+fn git_dirty(dir: &Path) -> String {
+    println!("cargo:rerun-if-env-changed=DECODE_BENCH_GIT_DIRTY");
+    if let Ok(dirty) = std::env::var("DECODE_BENCH_GIT_DIRTY")
+        && !dirty.is_empty()
+    {
+        return dirty;
+    }
+    let root = dir.join("../..");
+    for path in BUILD_PATHS {
+        println!("cargo:rerun-if-changed={}", root.join(path).display());
+    }
+    Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=no", "--"])
+        .args(BUILD_PATHS)
+        .current_dir(&root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map_or_else(
+            || "unknown".to_string(),
+            |output| (!output.stdout.is_empty()).to_string(),
+        )
 }
 
 /// The version of the first `[[package]]` named `name`. A lock that carries
