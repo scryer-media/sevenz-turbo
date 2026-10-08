@@ -20,8 +20,8 @@ use crate::{
     container::{ArchiveLimits, BlockCompletion, SubStreamCompletion},
     decoder::{DecodeOptions, add_decoder, check_chain_memory},
     error::{Error, Limit},
-    positional::{ReadAt, ReadAtCursor},
     pipeline::{Chain, Stage},
+    positional::{ReadAt, ReadAtCursor},
 };
 
 /// Upper bound for eagerly pre-allocating an output buffer from an archive-declared
