@@ -1808,8 +1808,20 @@ impl<R: Read + Seek> ArchiveReader<R> {
     ///   sequential path; only the decoding happens elsewhere.
     /// - **Memory.** At most two staged folders per worker, each at most
     ///   8 MiB, are held between the workers and the callback. Under a memory
-    ///   limit the worker count is cut until every worker's decoder plus its
-    ///   staging fits the limit, and each folder then decodes on one thread.
+    ///   limit the worker count is cut until what the workers hold fits the
+    ///   limit together with the 1 MiB piece the callback is reading — for
+    ///   each worker its decoder and input buffer, its two stages and the
+    ///   1 MiB piece it is filling — and each folder then decodes on one
+    ///   thread. A run with room for one worker only is decoded on the
+    ///   calling thread.
+    /// - **Threads.** A run starts at the reader's thread count, as a block's
+    ///   coder does, and [`Lzma2Handle::set_threads`] is followed while it
+    ///   decodes: the ceiling bounds how many of the run's folders decode at
+    ///   once, and the threads of each folder's own coder, from the next
+    ///   folder to start. A run never has more workers than it was planned
+    ///   with, so a ceiling raised past the reader's thread count widens
+    ///   nothing here. [`Lzma2Handle::progress`] is `None` for as long as
+    ///   the run lasts: no one coder is decoding for the reader then.
     /// - **Checks.** Every member's CRC is verified on the worker that decoded
     ///   it, and a failure is the same located [`Error::BlockDecode`] naming
     ///   the same folder. A worker reads each member in full, so a damaged
@@ -2117,9 +2129,9 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 crate::decoder::INPUT_BUF_SIZE / 1024,
             )?
         };
-        let opts = &opts.reserving(reserved_kb);
+        let mut opts = opts.reserving(reserved_kb);
         if block.total_input_streams > block.total_output_streams {
-            return Self::build_decode_stack2(source, archive, block_index, password, opts);
+            return Self::build_decode_stack2(source, archive, block_index, password, &opts);
         }
         let first_pack_stream_index = archive.stream_map.block_first_pack_stream_index[block_index];
         let block_offset = SIGNATURE_HEADER_SIZE
@@ -2160,7 +2172,10 @@ impl<R: Read + Seek> ArchiveReader<R> {
         // reader stops the read-ahead at the pack stream's end, so nothing
         // beyond the block is consumed.
         let block = &archive.blocks[block_index];
-        let mut chain = Chain::new(block, opts);
+        // Before any coder is built: the plan's pipes are reserved with the
+        // coders, so one that fits itself to what the limit leaves sees them.
+        let mut chain = Chain::new(block, &mut opts);
+        let opts = &opts;
         let mut stage = Stage::Leaf(Box::new(BoundedReader::new(source, pack_size)));
         for (index, coder) in block.ordered_coder_iter() {
             if coder.num_in_streams != 1 || coder.num_out_streams != 1 {
@@ -2176,6 +2191,12 @@ impl<R: Read + Seek> ArchiveReader<R> {
         // block's is folded with them rather than taken again here, on the
         // thread delivering the bytes. A caller that said not to verify gets
         // no verifying reader at all.
+        //
+        // A chain with stages on threads of their own is checked here too.
+        // Its top coder runs on this thread whatever the plan, so this is
+        // the thread the bytes are made on, and the checksum is taken where
+        // they are made: handing them to another thread for it would cost a
+        // pipe and a copy, more than the checksum does.
         if has_crc && opts.verify_checksums && !opts.folding_checksums() {
             decoder = Box::new(Crc32VerifyingReader::new(
                 decoder,
@@ -2262,7 +2283,9 @@ impl<R: Read + Seek> ArchiveReader<R> {
         // output stream. `get_in_stream2` recursively wires up the whole coder graph,
         // so this also handles single-input filters (e.g. Delta) layered on top of a
         // BCJ2 coder's output, not just a bare BCJ2 main coder.
-        let mut chain = Chain::new(block, opts);
+        let mut opts = *opts;
+        let mut chain = Chain::new(block, &mut opts);
+        let opts = &opts;
         let stage = Self::get_in_stream2(
             block,
             &sources,
@@ -2274,6 +2297,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
             &mut chain,
         )?;
         let mut decoder = chain.pipeline.here(stage);
+        // On this thread, where the graph's last coder makes the bytes: see
+        // `build_decode_stack`.
         if block.has_crc && opts.verify_checksums {
             decoder = Box::new(Crc32VerifyingReader::new(
                 decoder,
@@ -2570,23 +2595,32 @@ impl<R: Read + Seek> ArchiveReader<R> {
         };
         let first = blocks.start;
         let workers = workers as usize;
+        // No one coder is the reader's while the run lasts, so what the last
+        // block reported stops being true here, and nothing is reported in
+        // its place. The ceiling still holds. It starts at the reader's own
+        // count, where a block's coder puts it as it is built, and follows
+        // the handle from there: see `FolderWorker::folders_at_once`.
+        self.lzma2.set_block_index(first);
+        self.lzma2.set_threads(self.thread_count);
         let worker_side = FolderWorker {
             archive: &self.archive,
             password: &self.password,
             limits: self.limits,
             verify_checksums: self.verify_checksums,
             threads: threads_per_folder,
+            ceiling: &self.lzma2,
             source: &source,
         };
         let archive = &self.archive;
         let encrypted = !self.password.is_empty();
         let on_block = &mut self.on_block_complete;
         let on_sub = &mut self.on_sub_stream_complete;
-        let outcome = crate::ordered::run(
+        let outcome = crate::ordered::run_paced(
             blocks.len(),
             workers,
             FOLDER_WINDOW_PER_WORKER * workers,
             FOLDER_STAGE_BYTES as usize,
+            &|| worker_side.folders_at_once(),
             |job, tx| worker_side.decode(first + job, tx),
             |job, rx| {
                 let block_index = first + job;
@@ -3138,8 +3172,14 @@ pub(crate) const FOLDER_STAGE_BYTES: u64 = 8 << 20;
 pub(crate) const FOLDER_WINDOW_PER_WORKER: usize = 2;
 
 /// How much of a member a folder worker reads at once and hands over.
-#[cfg(not(target_arch = "wasm32"))]
 const FOLDER_CHUNK_BYTES: usize = 1 << 20;
+
+/// What a folder worker holds beyond its folder's coders: their input buffer,
+/// the stages of the folders it may be ahead by, and the piece it is filling
+/// for the stage, which it holds on to while the stage has no room for it.
+const FOLDER_WORKER_BYTES: u64 = crate::container::BLOCK_INPUT_BYTES
+    + FOLDER_STAGE_BYTES * FOLDER_WINDOW_PER_WORKER as u64
+    + FOLDER_CHUNK_BYTES as u64;
 
 /// What a message costs in the stage beyond its bytes, so that a folder of
 /// many empty members still fills its stage and waits.
@@ -3174,6 +3214,10 @@ pub(crate) enum FolderPhase {
 /// gives each folder an equal share of the rest; with one, each folder decodes
 /// on one thread, because a parallel LZMA2 coder sizes what it holds from the
 /// limit and several of them would each take the whole of it.
+///
+/// Under a memory limit a worker is charged the largest decoder of its run and
+/// [`FOLDER_WORKER_BYTES`], and the calling thread the piece its callback is
+/// reading, so everything live at once in a parallel run is inside the limit.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn plan_folders(
     folders: impl Iterator<Item = (u64, u64)>,
@@ -3189,9 +3233,10 @@ pub(crate) fn plan_folders(
         let by_memory = if memory_limit_bytes == u64::MAX {
             u64::MAX
         } else {
-            let per_worker = largest
-                .saturating_add(FOLDER_STAGE_BYTES.saturating_mul(FOLDER_WINDOW_PER_WORKER as u64));
-            memory_limit_bytes / per_worker.max(1)
+            // The piece the callback is reading has left its stage, and is
+            // the calling thread's whatever the number of workers.
+            let shared = memory_limit_bytes.saturating_sub(FOLDER_CHUNK_BYTES as u64);
+            shared / largest.saturating_add(FOLDER_WORKER_BYTES)
         };
         let workers = u64::from(threads).min(len as u64).min(by_memory).max(1) as u32;
         if len < 2 || workers < 2 {
@@ -3264,12 +3309,25 @@ struct FolderWorker<'a> {
     password: &'a Password,
     limits: ArchiveLimits,
     verify_checksums: bool,
+    /// The threads the plan gave each folder's own coder.
     threads: u32,
+    /// The reader's live thread ceiling, which [`Lzma2Handle::set_threads`]
+    /// moves while the run goes on.
+    ceiling: &'a Lzma2Control,
     source: &'a Arc<dyn ReadAt>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl FolderWorker<'_> {
+    /// How many folders may be decoding at once under the live ceiling: as
+    /// many as it has threads for, at the threads each folder was planned.
+    /// Asked as each folder is about to start, so a ceiling moved while the
+    /// run goes on is followed from the next folder; the plan's own worker
+    /// count, which the memory limit had a say in, bounds it from above.
+    fn folders_at_once(&self) -> usize {
+        (self.ceiling.threads() / self.threads.max(1)).max(1) as usize
+    }
+
     /// Decodes one folder through the ordinary [`BlockDecoder`] over a cursor
     /// of its own, sending what the callback would have been given.
     fn decode(&self, block_index: usize, tx: &mut crate::ordered::Sender<'_, FolderMessage>) {
@@ -3281,7 +3339,9 @@ impl FolderWorker<'_> {
             }
         };
         let mut decoder = BlockDecoder::with_limits(
-            self.threads,
+            // A ceiling below the plan's share narrows this folder's own
+            // coder too: one folder at a time, on no more threads than that.
+            self.threads.min(self.ceiling.threads()),
             block_index,
             self.archive,
             self.password,
@@ -3435,6 +3495,17 @@ where
                     })?;
                 let unseen = entry.finish();
                 if !outcome {
+                    // The worker read the file to its end whatever the
+                    // callback did, so its checksum is final and its
+                    // completion, when it has one, is the worker's next
+                    // message. The hook hears it before the callback's
+                    // `false` is honoured, as on the sequential path.
+                    if entry.state == ReplayState::Ended
+                        && let Some(FolderMessage::Completion(completion)) = rx.recv()
+                        && let Some(hook) = on_sub_stream_complete.as_deref_mut()
+                    {
+                        hook(completion);
+                    }
                     return Ok(false);
                 }
                 if let Some(error) = unseen {
@@ -3811,11 +3882,12 @@ mod folder_plan_tests {
                                     assert_eq!(*threads_per_folder, 1);
                                     let largest =
                                         folders[blocks.clone()].iter().map(|f| f.1).max().unwrap();
-                                    let per_worker = largest.saturating_add(
-                                        FOLDER_STAGE_BYTES * FOLDER_WINDOW_PER_WORKER as u64,
-                                    );
+                                    let per_worker = largest.saturating_add(FOLDER_WORKER_BYTES);
                                     assert!(
-                                        u64::from(*workers).saturating_mul(per_worker) <= limit
+                                        u64::from(*workers)
+                                            .saturating_mul(per_worker)
+                                            .saturating_add(FOLDER_CHUNK_BYTES as u64)
+                                            <= limit
                                     );
                                 }
                                 for &(unpacked, _) in &folders[blocks.clone()] {
@@ -3836,6 +3908,34 @@ mod folder_plan_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_run_is_charged_everything_its_workers_and_the_caller_hold() {
+        // Two stored folders of the largest size that is staged, which have
+        // no decoder to speak of: what a worker holds is its two stages, the
+        // piece it is filling and its input buffer.
+        let folders = [(FOLDER_STAGE_BYTES, 0), (FOLDER_STAGE_BYTES, 0)];
+        let plan = |limit| plan_folders(folders.into_iter(), 8, limit);
+        let alone = vec![
+            FolderPhase::Alone { block: 0 },
+            FolderPhase::Alone { block: 1 },
+        ];
+        let together = vec![FolderPhase::Parallel {
+            blocks: 0..2,
+            workers: 2,
+            threads_per_folder: 1,
+        }];
+        // The stages alone are the whole of 32 MiB.
+        assert_eq!(plan(32 << 20), alone);
+        let fits = 2 * FOLDER_WORKER_BYTES + FOLDER_CHUNK_BYTES as u64;
+        assert_eq!(plan(fits), together);
+        assert_eq!(plan(fits - 1), alone);
+        // A decoder is charged to each worker as well.
+        let folders = [(1 << 20, 4 << 20), (1 << 20, 1 << 20)];
+        let plan = |limit| plan_folders(folders.into_iter(), 8, limit);
+        assert_eq!(plan(fits + (8 << 20)), together);
+        assert_eq!(plan(fits + (8 << 20) - 1), alone);
     }
 
     #[test]

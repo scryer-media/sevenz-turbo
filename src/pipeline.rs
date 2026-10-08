@@ -27,7 +27,7 @@ use std::collections::VecDeque;
 use std::io::{self, Read};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
 
 use crate::archive::EncoderMethod;
@@ -41,6 +41,11 @@ pub(crate) const PIPE_CHUNK: usize = 256 << 10;
 
 /// Pieces a pipe holds before the stage writing it waits.
 pub(crate) const PIPE_DEPTH: usize = 4;
+
+/// The most one pipe holds: its queued pieces and the one its reader is
+/// working through. A piece being filled is one the reader handed back, or
+/// one the queue has room for.
+pub(crate) const PIPE_BYTES: usize = (PIPE_DEPTH + 1) * PIPE_CHUNK;
 
 /// The least output a coder must have to be worth a thread: below this the
 /// thread costs more to start than the coder takes to run.
@@ -71,6 +76,37 @@ pub(crate) fn with_any_stage_size<T>(f: impl FnOnce() -> T) -> T {
     out
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many more stage threads this thread's decodes may start, when a
+    /// test is running a chain that cannot have every thread it planned.
+    static STAGE_THREADS_LEFT: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Takes one of the stage threads a test allowed; `false` when none is left.
+#[cfg(test)]
+fn take_stage_thread() -> bool {
+    STAGE_THREADS_LEFT.with(|cell| match cell.get() {
+        None => true,
+        Some(0) => false,
+        Some(left) => {
+            cell.set(Some(left - 1));
+            true
+        }
+    })
+}
+
+/// Runs `f` with only `allowed` stage threads to be had: every one asked for
+/// after those is refused, as a system out of threads refuses it.
+#[cfg(test)]
+pub(crate) fn with_stage_threads<T>(allowed: usize, f: impl FnOnce() -> T) -> T {
+    STAGE_THREADS_LEFT.with(|cell| cell.set(Some(allowed)));
+    let out = f();
+    STAGE_THREADS_LEFT.with(|cell| cell.set(None));
+    out
+}
+
 /// Whether a coder spends real CPU on every byte. The filters (BCJ, BCJ2's
 /// combiner, Delta) and Copy run at memory speed and never are.
 fn is_heavy(method: &[u8]) -> bool {
@@ -94,10 +130,10 @@ fn is_heavy(method: &[u8]) -> bool {
 ///
 /// None of them unless at least two coders that cost real CPU would otherwise
 /// share the caller's thread, and there is more than one thread to run them
-/// on. An LZMA2 coder that will decode in parallel is not one of the two: its
-/// work is on its own workers already, and the caller's thread only hands its
-/// output on. That is the AES-over-LZMA2 chain, where the cipher alone was
-/// left on the caller's thread and a thread of its own measured as a wash.
+/// on. None either in a chain holding an LZMA2 coder large enough to decode in
+/// parallel: that coder's workers are already the whole of `threads`, and they
+/// follow the reader's live ceiling, which a stage's thread would not. A stage
+/// beside them would be a thread more than the caller asked for.
 /// The top coder is never given a thread: the caller's thread runs it. Of the
 /// rest, those with at least [`MIN_STAGE_BYTES`] of output are given the
 /// threads beyond the caller's, largest first, each once every coder it reads
@@ -113,8 +149,11 @@ pub(crate) fn offload_plan(block: &Block, threads: u32) -> u64 {
         coders[index].encoder_method_id() == EncoderMethod::ID_LZMA2
             && size(index) > MT_MIN_BLOCK_BYTES
     };
+    if (0..count).any(parallel) {
+        return 0;
+    }
     let heavy: Vec<bool> = (0..count)
-        .map(|index| is_heavy(coders[index].encoder_method_id()) && !parallel(index))
+        .map(|index| is_heavy(coders[index].encoder_method_id()))
         .collect();
     if heavy.iter().filter(|&&h| h).count() < 2 {
         return 0;
@@ -163,6 +202,22 @@ pub(crate) fn offload_plan(block: &Block, threads: u32) -> u64 {
         }
     }
     chosen
+}
+
+/// Pipes a plan opens: one for the output of each coder given a thread, and
+/// one more for each of those that reads a pack stream, which the caller's
+/// thread fills.
+fn plan_pipes(block: &Block, offload: u64) -> usize {
+    let mut stream = 0u64;
+    let mut pipes = 0;
+    for (index, coder) in block.coders.iter().enumerate() {
+        // A coder given a thread has one input: see `offload_plan`.
+        if index < 64 && offload & (1 << index) != 0 {
+            pipes += 1 + usize::from(block.packed_streams.contains(&stream));
+        }
+        stream = stream.saturating_add(coder.num_in_streams);
+    }
+    pipes
 }
 
 /// Where a coder's input comes from while a chain is being assembled.
@@ -549,13 +604,30 @@ impl<'r> Pipeline<'r> {
         }))
     }
 
-    /// Starts `coder` on a thread of its own.
-    pub(crate) fn spawn(&mut self, mut coder: Box<dyn Read + Send>) -> io::Result<Stage<'r>> {
-        let pipe = self.new_pipe();
+    /// Starts a thread for a coder that is still to be built.
+    ///
+    /// The thread comes first because building the coder takes its input,
+    /// and a pack stream given to a stage cannot be taken back: a thread that
+    /// cannot be had has to be known while the coder can still be built on
+    /// the caller's.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the system refused the thread with.
+    pub(crate) fn reserve(&mut self) -> io::Result<Reserved> {
+        #[cfg(test)]
+        if !take_stage_thread() {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let (coder, waiting) = mpsc::channel::<(usize, Box<dyn Read + Send>)>();
         let shared = Arc::clone(&self.inner().shared);
         let worker = std::thread::Builder::new()
             .name("sevenz-coder".into())
             .spawn(move || {
+                // No coder: its chain failed to build, and is gone.
+                let Ok((pipe, mut coder)) = waiting.recv() else {
+                    return;
+                };
                 let ran = catch_unwind(AssertUnwindSafe(|| run_stage(&shared, pipe, &mut *coder)));
                 if ran.is_err() {
                     let mut state = shared.lock();
@@ -564,8 +636,35 @@ impl<'r> Pipeline<'r> {
                 }
             })?;
         self.inner().workers.borrow_mut().push(worker);
-        Ok(Stage::There(pipe))
+        Ok(Reserved { coder })
     }
+
+    /// Hands `coder` to the thread reserved for it.
+    pub(crate) fn start(&mut self, thread: Reserved, coder: Box<dyn Read + Send>) -> Stage<'r> {
+        let pipe = self.new_pipe();
+        if thread.coder.send((pipe, coder)).is_err() {
+            // The thread waits for exactly this and cannot have gone. Were
+            // it gone all the same, the pipe's reader is told so and is not
+            // left waiting for a writer.
+            let shared = &self.inner().shared;
+            let mut state = shared.lock();
+            state.pipes[pipe].end = End::Failed(io::Error::other("a coder stage did not start"));
+            shared.changed(&mut state);
+        }
+        Stage::There(pipe)
+    }
+
+    /// Starts `coder` on a thread of its own.
+    #[cfg(test)]
+    fn spawn(&mut self, coder: Box<dyn Read + Send>) -> io::Result<Stage<'r>> {
+        let thread = self.reserve()?;
+        Ok(self.start(thread, coder))
+    }
+}
+
+/// A thread waiting for the coder it will run. Dropped without one, it ends.
+pub(crate) struct Reserved {
+    coder: mpsc::Sender<(usize, Box<dyn Read + Send>)>,
 }
 
 /// One block's chain of coders as it is assembled, bottom up: each coder is
@@ -577,10 +676,29 @@ pub(crate) struct Chain<'r> {
 }
 
 impl<'r> Chain<'r> {
-    pub(crate) fn new(block: &Block, opts: &DecodeOptions<'_>) -> Self {
+    /// Plans `block`'s chain for `opts.threads`.
+    ///
+    /// The pipes of a plan are memory the chain holds beyond its coders'.
+    /// They are added to `opts.reserved_kb`, where the coders' own share
+    /// already is, and a plan whose pipes do not fit under
+    /// `memory_limit_bytes` beside the coders is given up: the block then
+    /// decodes on the caller's thread, as it would with one thread.
+    pub(crate) fn new(block: &Block, opts: &mut DecodeOptions<'_>) -> Self {
+        let mut offload = offload_plan(block, opts.threads);
+        if offload != 0 {
+            let pipes_kb = plan_pipes(block, offload)
+                .saturating_mul(PIPE_BYTES)
+                .div_ceil(1024);
+            let chain_kb = opts.reserved_kb.saturating_add(pipes_kb);
+            if chain_kb > opts.limits.memory_limit_kb() {
+                offload = 0;
+            } else {
+                opts.reserved_kb = chain_kb;
+            }
+        }
         Self {
             pipeline: Pipeline::default(),
-            offload: offload_plan(block, opts.threads),
+            offload,
         }
     }
 
@@ -596,9 +714,17 @@ impl<'r> Chain<'r> {
         let coder = &block.coders[index];
         let len = block.get_unpack_size_at_index(index) as usize;
         if index < 64 && self.offload & (1 << index) != 0 {
-            let input = self.pipeline.there(input)?;
-            let decoder = add_decoder(input, len, coder, password, opts)?;
-            return Ok(self.pipeline.spawn(Box::new(decoder))?);
+            match self.pipeline.reserve() {
+                Ok(thread) => {
+                    let input = self.pipeline.there(input)?;
+                    let decoder = add_decoder(input, len, coder, password, opts)?;
+                    return Ok(self.pipeline.start(thread, Box::new(decoder)));
+                }
+                // No thread to be had. This coder and every one after it is
+                // built on the caller's thread, reading the stages already
+                // started through their pipes: slower, and the same bytes.
+                Err(_) => self.offload = 0,
+            }
         }
         // A pack stream read on this thread is buffered, for a coder that
         // reads it in small pieces: see `INPUT_BUF_SIZE`.
@@ -757,8 +883,8 @@ mod tests {
             offload_plan(&aes_under(EncoderMethod::ID_LZMA, 64 * MIB, 32 * MIB), 2),
             0b10
         );
-        // AES under an LZMA2 coder that decodes in parallel: the cipher is
-        // alone on the caller's thread, and stays there.
+        // AES under an LZMA2 coder that decodes in parallel: its workers are
+        // the whole thread count, and the cipher stays on the caller's.
         assert_eq!(
             offload_plan(&aes_under(EncoderMethod::ID_LZMA2, 64 * MIB, 32 * MIB), 8),
             0
@@ -775,11 +901,22 @@ mod tests {
             0
         );
 
-        // BCJ2 over parallel LZMA2: the call and jump coders get threads,
-        // the main stream's coder has its own workers already.
+        // BCJ2 over an LZMA2 coder that decodes in parallel: no stage gets a
+        // thread, whatever the call and jump streams' sizes. The main coder's
+        // workers are already every thread the caller gave.
         assert_eq!(
             offload_plan(&bcj2(EncoderMethod::ID_LZMA2, 64 * MIB, 2 * MIB), 8),
-            0b1100
+            0
+        );
+        assert_eq!(
+            offload_plan(&bcj2(EncoderMethod::ID_LZMA2, 64 * MIB, 2 * MIB), 2),
+            0
+        );
+        // BCJ2 over an LZMA2 coder of one run, which decodes on the caller's
+        // thread: all three coders, as over LZMA.
+        assert_eq!(
+            offload_plan(&bcj2(EncoderMethod::ID_LZMA2, MIB, 2 * MIB), 8),
+            0b1110
         );
         // BCJ2 over LZMA: all three, as the threads allow, largest first.
         assert_eq!(
@@ -794,11 +931,62 @@ mod tests {
             offload_plan(&bcj2(EncoderMethod::ID_LZMA, 64 * MIB, 2 * MIB), 3).count_ones(),
             2
         );
-        // Side streams too small for a thread leave the main coder alone on
-        // the caller's thread with BCJ2, which is a filter: nothing to do.
+        // Call and jump streams too small for a thread: only the main coder
+        // is given one.
         assert_eq!(
-            offload_plan(&bcj2(EncoderMethod::ID_LZMA2, 64 * MIB, MIB / 4), 8),
-            0
+            offload_plan(&bcj2(EncoderMethod::ID_LZMA, 64 * MIB, MIB / 4), 8),
+            0b0010
+        );
+    }
+
+    /// The pipes of a plan are charged to the memory limit with the coders,
+    /// and a plan they do not fit beside is given up for the caller's thread.
+    #[test]
+    fn a_plan_whose_pipes_do_not_fit_the_memory_limit_is_given_up() {
+        const MIB: u64 = 1 << 20;
+        let pipe_kb = PIPE_BYTES / 1024;
+        // What the chain's coders were already granted.
+        let coders_kb = 4096;
+        let plan = |block: &Block, threads: u32, limit_kb: Option<usize>| {
+            let limits = crate::ArchiveLimits {
+                memory_limit_bytes: limit_kb.map_or(u64::MAX, |kb| kb as u64 * 1024),
+                ..crate::ArchiveLimits::default()
+            };
+            let mut opts = DecodeOptions::header(&limits);
+            opts.threads = threads;
+            opts.reserved_kb = coders_kb;
+            let chain = Chain::new(block, &mut opts);
+            (chain.offload, opts.reserved_kb)
+        };
+
+        // AES under LZMA at two threads: the cipher's own pipe, and the pack
+        // stream's that the caller's thread fills for it.
+        let aes = aes_under(EncoderMethod::ID_LZMA, 64 * MIB, 32 * MIB);
+        assert_eq!(plan_pipes(&aes, 0b10), 2);
+        assert_eq!(
+            plan(&aes, 2, Some(coders_kb + 2 * pipe_kb)),
+            (0b10, coders_kb + 2 * pipe_kb)
+        );
+        assert_eq!(
+            plan(&aes, 2, Some(coders_kb + 2 * pipe_kb - 1)),
+            (0, coders_kb)
+        );
+        // Without a limit the plan stands, and what it holds is still said.
+        assert_eq!(plan(&aes, 2, None), (0b10, coders_kb + 2 * pipe_kb));
+        // One thread plans nothing and reserves nothing.
+        assert_eq!(plan(&aes, 1, Some(coders_kb)), (0, coders_kb));
+
+        // BCJ2 over LZMA at eight threads: three coders, each off a pack
+        // stream of its own.
+        let graph = bcj2(EncoderMethod::ID_LZMA, 64 * MIB, 2 * MIB);
+        assert_eq!(plan_pipes(&graph, 0b1110), 6);
+        assert_eq!(
+            plan(&graph, 8, Some(coders_kb + 6 * pipe_kb)),
+            (0b1110, coders_kb + 6 * pipe_kb)
+        );
+        assert_eq!(
+            plan(&graph, 8, Some(coders_kb + 6 * pipe_kb - 1)),
+            (0, coders_kb)
         );
     }
 
@@ -831,6 +1019,9 @@ mod tests {
     }
 
     fn fixtures() -> Vec<(&'static str, &'static [u8], &'static str)> {
+        // Only the codec features below add to the list, so with none of them
+        // it is never changed.
+        #[allow(unused_mut)]
         let mut fixtures: Vec<(&'static str, &'static [u8], &'static str)> = vec![
             (
                 "lzma2_bcj2",
@@ -907,6 +1098,37 @@ mod tests {
                 assert!(piped == alone, "{name} at {threads} threads");
             }
         }
+    }
+
+    /// A stage thread the system refuses is not an error. The coder it was
+    /// for and those after it are built on the caller's thread, beside the
+    /// stages that did start, and the bytes are the same however many
+    /// threads were to be had.
+    #[test]
+    fn a_chain_refused_its_threads_decodes_on_the_callers() {
+        for (name, archive, password) in fixtures() {
+            let alone = decode_all(archive, password, 1);
+            for allowed in 0..3 {
+                let short = with_stage_threads(allowed, || {
+                    with_any_stage_size(|| decode_all(archive, password, 8))
+                });
+                assert!(short == alone, "{name} with {allowed} stage threads");
+            }
+        }
+    }
+
+    /// The refusal is the system's own error, and it comes before the coder
+    /// is built: the pack stream is still the chain's to read.
+    #[test]
+    fn a_refused_stage_thread_is_reported_before_the_coder_is_built() {
+        let mut pipeline = Pipeline::default();
+        let refused = with_stage_threads(0, || pipeline.reserve());
+        assert!(refused.is_err());
+        // A thread reserved and never given a coder ends on its own, and the
+        // pipeline it belonged to still joins it.
+        let unused = pipeline.reserve().unwrap();
+        drop(unused);
+        drop(pipeline);
     }
 
     /// The chains with two coders that cost CPU are the ones that run as a

@@ -468,7 +468,13 @@ impl Archive {
     /// crate currently uses for every coder. A multi-threaded LZMA2 reader
     /// buffers a whole run of dependent chunks before decoding any of it, so
     /// its footprint scales with the block rather than with the dictionary,
-    /// and this estimate would not describe it.
+    /// and this estimate would not describe it. Nor does it count the pipes
+    /// of a block decoded as a pipeline on more than one thread, 1.25 MiB
+    /// each and one or two for every coder given a thread of its own: those
+    /// are charged to [`ArchiveLimits::memory_limit_bytes`] when the block
+    /// is decoded, and a block they do not fit decodes without them.
+    ///
+    /// [`ArchiveLimits::memory_limit_bytes`]: crate::ArchiveLimits::memory_limit_bytes
     ///
     /// # Errors
     ///

@@ -282,7 +282,13 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         if !entry.is_directory
             && let Some(mut r) = reader
         {
-            let folder = encode_entry(&self.content_methods, entry, &mut r, &mut self.output)?;
+            let folder = encode_entry(
+                &self.content_methods,
+                entry,
+                &mut r,
+                &mut self.output,
+                encoder::Bcj2Sides::Threads,
+            )?;
             return self.record_folder(folder);
         }
         entry.has_stream = false;
@@ -353,7 +359,16 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     /// what is held between the workers and the output is bounded by the
     /// thread count, whatever the folders' sizes; on top of that each worker
     /// holds one folder's coder. A folder larger than the stage streams
-    /// through it as the writer catches up.
+    /// through it as the writer catches up. A BCJ2 folder's three other pack
+    /// streams are held whole by its coder until the folder ends, as
+    /// [`ArchiveWriter::push_archive_entry`] holds them, and then count
+    /// against the stage: a worker whose stage has no room for them waits
+    /// for the writer rather than starting another folder, so no worker has
+    /// more than one folder's waiting.
+    ///
+    /// **Threads.** A folder is coded by its worker and that worker's one
+    /// coder thread. A BCJ2 folder's call and jump coders run on the worker
+    /// itself here, where a folder coded alone gives each a thread.
     ///
     /// With `threads` at one, and on targets without threads, this is the
     /// loop of `push_archive_entry` itself.
@@ -456,7 +471,15 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                                 tx: &mut *tx,
                                 cancelled: false,
                             };
-                            let encoded = encode_entry(&methods, entry, &mut reader, &mut sink);
+                            // The worker is the folder's thread: a BCJ2 chain's
+                            // call and jump coders run on it, not beside it.
+                            let encoded = encode_entry(
+                                &methods,
+                                entry,
+                                &mut reader,
+                                &mut sink,
+                                encoder::Bcj2Sides::Inline,
+                            );
                             if sink.cancelled {
                                 return;
                             }
@@ -464,7 +487,17 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                         }
                     }
                 };
-                let _ = tx.send(EncodeMessage::Done(Box::new(result)), 0);
+                // A BCJ2 folder's other three pack streams ride on this
+                // message, whole, and count against the stage like the main
+                // stream's bytes did: the worker waits here for the writer
+                // rather than leave them queued and start its next folder.
+                let weight = match &result {
+                    Ok(FolderOut::Encoded(folder)) => {
+                        folder.bcj2.as_ref().map_or(0, Bcj2Packed::len)
+                    }
+                    _ => 0,
+                };
+                let _ = tx.send(EncodeMessage::Done(Box::new(result)), weight);
             },
             |_, rx| loop {
                 match rx.recv() {
@@ -591,7 +624,13 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let mut bcj2 = None;
 
         let (crc, size) = {
-            let mut w = Self::create_writer(content_methods, &mut out, &mut more_sizes, &mut bcj2)?;
+            let mut w = Self::create_writer(
+                content_methods,
+                &mut out,
+                &mut more_sizes,
+                &mut bcj2,
+                encoder::Bcj2Sides::Threads,
+            )?;
             let mut write_len = 0;
             let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
             w.write_all(&head).map_err(|e| {
@@ -684,12 +723,13 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     /// code the main stream, as a linear chain does, and BCJ2 brings its own
     /// coders for the call and jump streams. Its tail - the three pack
     /// streams that follow the main one - lands in `bcj2` once the chain is
-    /// finished.
+    /// finished. `sides` is where those two coders run.
     fn create_writer<'a, O: Write + 'a>(
         methods: &[EncoderConfiguration],
         out: O,
         more_sized: &mut Vec<Rc<Cell<usize>>>,
         bcj2: &mut Option<encoder::Bcj2Slot>,
+        sides: encoder::Bcj2Sides,
     ) -> Result<Box<dyn Write + 'a>> {
         let mut encoder: Box<dyn Write> = Box::new(out);
         let mut first = true;
@@ -698,7 +738,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 Self::check_bcj2_methods(methods, i)?;
                 let counting = CountingWriter::new(encoder);
                 more_sized.push(counting.counting());
-                let (bcj2_encoder, slot) = encoder::add_bcj2_encoder(counting)?;
+                let (bcj2_encoder, slot) = encoder::add_bcj2_encoder(counting, sides)?;
                 *bcj2 = Some(slot);
                 encoder = Box::new(bcj2_encoder);
                 continue;
@@ -834,9 +874,14 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let mut compress_size = 0;
         let mut compressed = CompressWrapWriter::new(&mut encoded_data, &mut compress_size);
         {
-            let mut encoder =
-                Self::create_writer(&methods, &mut compressed, &mut more_sizes, &mut None)
-                    .map_err(std::io::Error::other)?;
+            let mut encoder = Self::create_writer(
+                &methods,
+                &mut compressed,
+                &mut more_sizes,
+                &mut None,
+                encoder::Bcj2Sides::Threads,
+            )
+            .map_err(std::io::Error::other)?;
             encoder.write_all(&raw_header)?;
             encoder.flush()?;
             let _ = encoder.write(&[])?;
@@ -1055,7 +1100,8 @@ struct EncodedFolder {
 }
 
 /// Codes `entry`'s data from `r` as one folder with `content_methods`, sized
-/// for the folder, writing the main pack stream to `output`.
+/// for the folder, writing the main pack stream to `output`. `sides` is where
+/// a BCJ2 chain's call and jump coders run.
 ///
 /// The checksums of the data and of the compressed bytes are taken here, on
 /// the thread doing the coding, which is what lets a worker do all of it.
@@ -1064,6 +1110,7 @@ fn encode_entry<R: Read, O: Write>(
     entry: ArchiveEntry,
     r: &mut R,
     output: O,
+    sides: encoder::Bcj2Sides,
 ) -> Result<EncodedFolder> {
     let mut compressed_len = 0;
     let mut compressed = CompressWrapWriter::new(output, &mut compressed_len);
@@ -1081,6 +1128,7 @@ fn encode_entry<R: Read, O: Write>(
             &mut out,
             &mut more_sizes,
             &mut bcj2,
+            sides,
         )?;
         let mut write_len = 0;
         let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
@@ -1332,6 +1380,7 @@ pub fn prepare_block<R: Read>(
                 &mut compressed,
                 &mut more_sizes,
                 &mut bcj2,
+                encoder::Bcj2Sides::Threads,
             )?;
             let mut write_len = 0;
             let mut w = CompressWrapWriter::new(&mut w, &mut write_len);

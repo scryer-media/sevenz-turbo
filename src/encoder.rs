@@ -320,23 +320,45 @@ pub(crate) fn bcj2_side_properties() -> [u8; 5] {
     props
 }
 
+/// Where the LZMA coders of a BCJ2 chain's call and jump streams run.
+///
+/// The streams are the same bytes either way: the choice is only whether the
+/// two coders overlap the main stream's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bcj2Sides {
+    /// Each on a thread of its own, beside the main stream's coder: what a
+    /// folder coded by itself does.
+    Threads,
+    /// On the thread that writes into the chain. For folders coded several at
+    /// once on a thread budget, where two more threads to a folder would be
+    /// threads nobody asked for.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Inline,
+}
+
 /// An LZMA coder for a BCJ2 call or jump stream, writing into `sink`.
-fn bcj2_side_encoder(sink: SharedBuf) -> Result<Box<dyn Write>, Error> {
+fn bcj2_side_encoder(sink: SharedBuf, sides: Bcj2Sides) -> Result<Box<dyn Write>, Error> {
     let input = CountingWriter::new(sink);
     #[cfg(not(feature = "lzma-rust2-encoder"))]
     let lz = {
         // 7-Zip's side coders run its default level (5, the binary-tree
         // match finder) with the settings above.
-        SideCoder {
+        let coder = SideCoder {
             level: 5,
             dict_size: BCJ2_SIDE_DICT_SIZE,
             fast_bytes: BCJ2_SIDE_FAST_BYTES,
             lc: BCJ2_SIDE_LC,
             lp: BCJ2_SIDE_LP,
             pb: BCJ2_SIDE_PB,
+        };
+        match sides {
+            Bcj2Sides::Threads => coder.writer(input)?,
+            Bcj2Sides::Inline => coder.inline_writer(input)?,
         }
-        .writer(input)?
     };
+    // This encoder never starts a thread of its own.
+    #[cfg(feature = "lzma-rust2-encoder")]
+    let _ = sides;
     #[cfg(feature = "lzma-rust2-encoder")]
     let lz = {
         let mut options = lzma_rust2::LzmaOptions::with_preset(5);
@@ -351,18 +373,19 @@ fn bcj2_side_encoder(sink: SharedBuf) -> Result<Box<dyn Write>, Error> {
 }
 
 /// A BCJ2 coder whose main stream goes on to `main`, with the call and jump
-/// streams' LZMA coders built here. The returned slot is filled when the
-/// coder is finished.
+/// streams' LZMA coders built here, to run where `sides` says. The returned
+/// slot is filled when the coder is finished.
 pub(crate) fn add_bcj2_encoder<W: Write>(
     main: CountingWriter<W>,
+    sides: Bcj2Sides,
 ) -> Result<(Encoder<W>, Bcj2Slot), Error> {
     let call = SharedBuf::default();
     let jump = SharedBuf::default();
     let tail = Bcj2Slot::default();
     let writer = Bcj2Writer::new(
         main,
-        bcj2_side_encoder(call.clone())?,
-        bcj2_side_encoder(jump.clone())?,
+        bcj2_side_encoder(call.clone(), sides)?,
+        bcj2_side_encoder(jump.clone(), sides)?,
     );
     let side = Bcj2Side {
         call,
@@ -451,6 +474,10 @@ fn lzma2_rust2_uses_mt(options: &Lzma2Options) -> bool {
 /// The threads coding one folder with `methods` keeps busy: more than one
 /// only for a block-parallel LZMA2 coder, which starts block threads of its
 /// own. `methods` are the folder's, already sized for it.
+///
+/// BCJ2's call and jump coders are not counted here: a caller that counts its
+/// folders against a thread budget builds the chain with
+/// [`Bcj2Sides::Inline`], which starts no thread for them.
 pub(crate) fn folder_threads(methods: &[EncoderConfiguration]) -> u32 {
     methods
         .iter()

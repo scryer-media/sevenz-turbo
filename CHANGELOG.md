@@ -128,6 +128,13 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   there is nothing to cut, and a block whose memory budget has no room to hold
   runs in flight **degrades to single-threaded rather than failing** — a limit
   states what the caller can afford, not that the archive must be refused.
+- The folders of a non-solid archive decode several at a time (0.27.0): with
+  a positional source (`ReadAt`) and more than one thread, runs of folders of
+  at most 8 MiB decode on workers and reach the callback in archive order,
+  inside the thread count and the memory limit. A block whose heavy coders
+  would share one thread, and that has no parallel LZMA2 coder, decodes as a
+  pipeline of stages on threads of their own. Upstream decodes every folder
+  and every coder chain on the calling thread.
 - LZMA1 is now subject to the same dictionary memory limit as LZMA2. Upstream
   bounded only LZMA2, so an archive declaring a 4 GiB LZMA1 dictionary would
   try to allocate it.
@@ -237,7 +244,9 @@ Everything here is new surface; no upstream signature changed meaning.
   `ArchiveReader::lzma2_progress()` report an `Lzma2Progress { block_index,
   threads, spawned_threads, pending_runs, runs_claimed, in_flight_bytes }` —
   `pending_runs` is the backlog of complete runs an adaptive caller widens on,
-  and `runs_claimed` is the run index of the block being decoded.
+  and `runs_claimed` is the run index of the block being decoded. While a run
+  of small folders decodes several at a time (0.27.0), `set_threads` bounds
+  how many of them decode at once and `progress()` is `None`.
 - `ArchiveReader::set_sub_stream_complete_hook` / `clear_…`, called with a
   `SubStreamCompletion { block_index, sub_stream_index, file_index,
   unpacked_offset, len, crc32 }` as each file's checksum becomes final. The
@@ -281,6 +290,9 @@ Everything here is new surface; no upstream signature changed meaning.
 
 - BCJ2 is written as well as read (0.27.0). Upstream reads BCJ2 folders but
   cannot write one.
+- `ArchiveWriter::push_archive_entries_non_solid` codes a non-solid archive's
+  folders on several workers and writes them in order (0.27.0), the bytes a
+  loop of `push_archive_entry` writes.
 
 ### Cryptography
 
@@ -431,7 +443,12 @@ Everything here is new surface; no upstream signature changed meaning.
   matters. A lower work factor can still be chosen deliberately, with
   `with_num_cycles_power` or the public field. Both directions are held to
   7-Zip: `7zz t` passes what is written at 19 and at a lowered power and `7zz
-  l` reports `7zAES:19`, and archives 7-Zip writes (at 19) decode here.
+  l` reports `7zAES:19`, and archives 7-Zip writes (at 19) decode here. The
+  coder properties hold six bits of the value, and a work factor they cannot
+  say - anything above 24 other than 63, the format's value for a key used
+  as it stands - is refused with `Limit::AesCyclesPower` when the archive is
+  written, before those bits are taken: cut down to them, 64 would have been
+  written as one round and 127 as no derivation at all.
 - A derived AES key travels with every clone of its `Password`. The cache
   was per `Password` value and a clone started empty, so the encoder, which
   clones its options for each folder it sizes and for the encrypted header,
@@ -467,17 +484,33 @@ Everything here is new surface; no upstream signature changed meaning.
   reported as `Error::BlockDecode` naming the folder it is in and its packed
   offset; a folder past it is never shown to the callback. The one visible
   difference is that a worker reads each member to its end, so a member the
-  callback skipped is still checked.
+  callback skipped is still checked. A callback that reads a member to its
+  end and then answers `false` still has that member's sub-stream hook called
+  first. A callback that panics unwinds out of `for_each_entries` once the
+  workers have been stopped, and likewise the writer of
+  `push_archive_entries_non_solid`.
 - The thread count is a budget, not a per-folder count: workers x threads
-  per folder never exceeds it (with a memory limit, each folder gets one
-  thread, and the number of workers is capped by the limit over the largest
-  folder's decoder plus its staging). A folder larger than 8 MiB is decoded
-  alone on the calling thread with the whole thread count, so a media-sized
-  archive takes the multi-threaded LZMA2 path as before. What is staged
-  between the workers and the caller is bounded: two folders per worker, at
-  most 8 MiB each, so at most 16 MiB per worker, whatever the archive says.
-  Without a positional source, with one thread, or on `wasm32`, every folder
-  decodes on the calling thread as before.
+  per folder never exceeds it. A folder larger than 8 MiB is decoded alone on
+  the calling thread with the whole thread count, so a media-sized archive
+  takes the multi-threaded LZMA2 path as before. What is staged between the
+  workers and the caller is bounded: two folders per worker, at most 8 MiB
+  each, so at most 16 MiB per worker, whatever the archive says. Without a
+  positional source, with one thread, or on `wasm32`, every folder decodes on
+  the calling thread as before.
+- Under a memory limit each folder of a run gets one thread, and the run gets
+  as many workers as fit the limit together. A worker is charged the largest
+  decoder of its run, the 64 KiB input buffer under it, its two 8 MiB stages
+  and the 1 MiB piece it is filling for them; the calling thread is charged
+  the 1 MiB piece its callback is reading. A run the limit leaves one worker
+  for is decoded on the calling thread, a folder at a time.
+- `Lzma2Handle::set_threads` is followed while a run of small folders
+  decodes. A run starts at the reader's thread count, as a block's coder
+  does; from there the ceiling bounds how many of the run's folders decode
+  at once and the threads of each one's own coder, from the next folder to
+  start. A run never has more workers than it was planned with.
+  `Lzma2Handle::progress` and `ArchiveReader::lzma2_progress` are `None` for
+  as long as such a run lasts, since no one coder is decoding for the reader
+  then.
 - `ArchiveWriter::push_archive_entries_non_solid(entries, open, threads)`
   codes each entry as a folder of its own on up to `threads` workers and
   writes them in the order given: the archive a loop of
@@ -487,7 +520,13 @@ Everything here is new surface; no upstream signature changed meaning.
   folders of at most 8 MiB of compressed bytes before it waits for the
   writer, so memory is bounded by threads x (one coder + 16 MiB), however
   large the inputs. A folder whose coder would start block threads of its
-  own is coded alone on the calling thread, after the folders before it.
+  own is coded alone on the calling thread, after the folders before it. A
+  BCJ2 folder coded on a worker runs its call and jump coders on that worker
+  rather than on two threads of their own, and writes the same bytes. Its
+  three other pack streams, held whole until the folder ends as on every
+  path, count against the worker's stage like the main stream's bytes: a
+  worker whose stage has no room for them waits for the writer instead of
+  starting another folder.
 - On Apple M5 Max (18 threads), the 8192-member non-solid tree (256 MiB
   unpacked, 32 KiB average, written by `7zz -mx=5 -ms=off`) decodes in
   0.30 s at all threads, from 3.35 s (11.2x; `7zz t` takes 3.43 s, as it
@@ -500,14 +539,18 @@ Everything here is new surface; no upstream signature changed meaning.
   a pipeline when more than one thread is allowed: each coder below the top
   with at least 1 MiB of output gets a thread of its own (at most one fewer
   than the threads allowed, largest first), and the stages are joined by
-  bounded pipes of four 256 KiB pieces. An LZMA2 coder that decodes in
-  parallel already has its own workers and does not count, so AES over
-  parallel LZMA2 stays sequential: a thread for the cipher measured as a
-  wash. A coder's error arrives after the bytes it produced and unchanged,
-  so the block it is reported against is the same as before. One thread,
-  and wasm32, keep the sequential chain. A BCJ2 archive written by 7-Zip
-  (LZMA2 main stream, LZMA call and jump streams) decodes 1.07-1.08x faster
-  at 2-18 threads on Apple M5 Max and 1.09-1.11x at 2-8 threads on x86.
+  bounded pipes of four 256 KiB pieces. A block with an LZMA2 coder large
+  enough to decode in parallel keeps the sequential chain: that coder's
+  workers are the whole thread count already, and they follow the live
+  ceiling, so a stage beside them would be a thread more than was asked for.
+  A coder's error arrives after the bytes it produced and unchanged, so the
+  block it is reported against is the same as before. A pipe holds up to
+  1.25 MiB, and a block's pipes are charged to the memory limit with its
+  coders before any of them is built; a block whose pipes do not fit keeps
+  the sequential chain. So does the rest of a chain from the first coder
+  whose thread cannot be started: it decodes on the caller's thread, reading
+  the stages already running. One thread, and wasm32, keep the sequential
+  chain.
 - An adaptive LZMA2 decode reaches the fixed plan's width. It started at one
   thread with the first run decoded on the calling thread, which held the
   stream's cursor; a widening was only heard once a whole run had landed;

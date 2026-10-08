@@ -166,6 +166,16 @@ fn decode(
     source: Source,
     threads: u32,
 ) -> Result<Vec<Seen>, (Error, Vec<Seen>)> {
+    decode_driven(archive, password, source, threads, Drive::PLAIN)
+}
+
+fn decode_driven(
+    archive: &[u8],
+    password: &Password,
+    source: Source,
+    threads: u32,
+    drive: Drive<'_>,
+) -> Result<Vec<Seen>, (Error, Vec<Seen>)> {
     let tmp;
     let mut reader: Box<dyn DecodeAll> = match source {
         Source::Sequential => Box::new(
@@ -193,18 +203,54 @@ fn decode(
             Box::new(ArchiveReader::open(tmp.path(), password.clone()).expect("header"))
         }
     };
-    reader.decode_all(threads)
+    reader.decode_driven(threads, drive)
+}
+
+/// What a decode loop does besides reading every entry to its end.
+#[derive(Clone, Copy)]
+struct Drive<'a> {
+    /// The ceiling the reader's LZMA2 handle is set to, given how many
+    /// entries have been delivered: before the decode starts, where the first
+    /// block or run puts it back at the reader's count, and again after each
+    /// entry. `None` leaves the handle alone.
+    ceiling: Option<&'a dyn Fn(usize) -> u32>,
+    /// What the callback answers once it has read an entry.
+    keep_going: bool,
+}
+
+impl Drive<'_> {
+    const PLAIN: Self = Self {
+        ceiling: None,
+        keep_going: true,
+    };
 }
 
 /// One decode loop over any reader type.
 trait DecodeAll {
-    fn decode_all(&mut self, threads: u32) -> Result<Vec<Seen>, (Error, Vec<Seen>)>;
+    fn decode_all(&mut self, threads: u32) -> Result<Vec<Seen>, (Error, Vec<Seen>)> {
+        self.decode_driven(threads, Drive::PLAIN)
+    }
+
+    fn decode_driven(
+        &mut self,
+        threads: u32,
+        drive: Drive<'_>,
+    ) -> Result<Vec<Seen>, (Error, Vec<Seen>)>;
 }
 
 impl<R: Read + std::io::Seek> DecodeAll for ArchiveReader<R> {
-    fn decode_all(&mut self, threads: u32) -> Result<Vec<Seen>, (Error, Vec<Seen>)> {
+    fn decode_driven(
+        &mut self,
+        threads: u32,
+        drive: Drive<'_>,
+    ) -> Result<Vec<Seen>, (Error, Vec<Seen>)> {
         let seen = Arc::new(Mutex::new(Vec::new()));
         self.set_threads(threads);
+        let handle = self.lzma2_handle();
+        if let Some(ceiling) = drive.ceiling {
+            handle.set_threads(ceiling(0));
+        }
+        let mut delivered = 0;
         let hook = Arc::clone(&seen);
         self.set_sub_stream_complete_hook(move |done| {
             hook.lock().unwrap().push(Seen::SubStream(
@@ -232,7 +278,11 @@ impl<R: Read + std::io::Seek> DecodeAll for ArchiveReader<R> {
                 .lock()
                 .unwrap()
                 .push(Seen::Entry(entry.name().to_string(), bytes));
-            Ok(true)
+            delivered += 1;
+            if let Some(ceiling) = drive.ceiling {
+                handle.set_threads(ceiling(delivered));
+            }
+            Ok(drive.keep_going)
         });
         self.clear_sub_stream_complete_hook();
         self.clear_block_complete_hook();
@@ -497,6 +547,112 @@ fn a_callback_that_stops_a_folder_moves_on_to_the_next() {
         .expect("decode");
     let expected: Vec<String> = tree.iter().map(|m| m.name.clone()).collect();
     assert_eq!(names, expected);
+}
+
+#[test]
+fn a_callback_that_stops_a_folder_it_read_still_hears_its_checksum() {
+    // The member was read to its end, so its checksum is final and the
+    // sub-stream hook is owed it, whatever the callback then answers.
+    let (archive, tree) = stored_archive(24);
+    let stop = Drive {
+        keep_going: false,
+        ..Drive::PLAIN
+    };
+    let reference = decode_driven(&archive, &Password::empty(), Source::Sequential, 1, stop)
+        .expect("sequential decode");
+    let completions = reference
+        .iter()
+        .filter(|seen| matches!(seen, Seen::SubStream(..)))
+        .count();
+    assert_eq!(
+        completions,
+        tree.len(),
+        "the sequential path tells the hook"
+    );
+    assert!(
+        !reference.iter().any(|seen| matches!(seen, Seen::Block(..))),
+        "a folder the callback stopped is not reported complete"
+    );
+    for source in POSITIONAL {
+        for threads in [2, 8] {
+            let got = decode_driven(&archive, &Password::empty(), source, threads, stop)
+                .unwrap_or_else(|(e, _)| panic!("{source:?} at {threads} threads: {e}"));
+            assert!(
+                got == reference,
+                "{source:?} at {threads} threads differs from the sequential decode"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_ceiling_moved_through_the_handle_changes_nothing_that_is_decoded() {
+    // Small folders either side of one decoded alone, so the handle is moved
+    // inside parallel runs, across the folder between them and before the
+    // first of them starts.
+    let methods = vec![Lzma2Options::from_level(3).into()];
+    let tree = members(90, Some(45), false);
+    let archive = write_sequential(&methods, &tree);
+    let reference = decode(&archive, &Password::empty(), Source::Sequential, 1).expect("decode");
+    let narrow = |_: usize| 1u32;
+    let moving = |delivered: usize| [1u32, 8, 2, 64, 3][delivered % 5];
+    let ceilings: [&dyn Fn(usize) -> u32; 2] = [&narrow, &moving];
+    for source in POSITIONAL {
+        for threads in [2, 8] {
+            for (which, ceiling) in ceilings.into_iter().enumerate() {
+                let drive = Drive {
+                    ceiling: Some(ceiling),
+                    ..Drive::PLAIN
+                };
+                let got = decode_driven(&archive, &Password::empty(), source, threads, drive)
+                    .unwrap_or_else(|(e, _)| {
+                        panic!("{source:?} at {threads} threads, ceiling {which}: {e}")
+                    });
+                assert!(
+                    got == reference,
+                    "{source:?} at {threads} threads, ceiling {which}, differs"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_handle_reports_no_coder_while_small_folders_decode_together() {
+    // A folder decoded alone with a parallel LZMA2 coder leaves its report
+    // readable until the next block starts. The run of small folders after
+    // it has no one coder to report, and must not answer with the last one.
+    let methods = vec![Lzma2Options::from_level(3).into()];
+    let mut tree = vec![Member {
+        name: "slate_ledger/large.bin".into(),
+        directory: false,
+        data: Some(payload(9 << 20, 0xBEEF)),
+    }];
+    tree.extend(
+        members(12, None, false)
+            .into_iter()
+            .filter(|m| m.data.as_ref().is_some_and(|data| !data.is_empty())),
+    );
+    let archive = write_sequential(&methods, &tree);
+    let mut reader =
+        ArchiveReader::from_read_at(archive, Password::empty(), ArchiveLimits::default())
+            .expect("header");
+    reader.set_threads(4);
+    let handle = reader.lzma2_handle();
+    let mut reports = Vec::new();
+    reader
+        .for_each_entries(|_, rd| {
+            std::io::copy(rd, &mut std::io::sink())?;
+            reports.push(handle.progress().map(|progress| progress.block_index));
+            Ok(true)
+        })
+        .expect("decode");
+    assert_eq!(reports.len(), tree.len());
+    assert_eq!(reports[0], Some(0), "the large folder's own coder reports");
+    assert!(
+        reports[1..].iter().all(Option::is_none),
+        "nothing is reported for the run after it: {reports:?}"
+    );
 }
 
 #[test]

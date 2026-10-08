@@ -608,6 +608,15 @@ impl Lzma2Control {
 /// [`progress`](Lzma2Handle::progress) as `None` and its
 /// [`set_threads`](Lzma2Handle::set_threads) applies to the next block that
 /// can use it.
+///
+/// A reader with a [positional source] and more than one thread decodes runs
+/// of small folders several at a time. No one coder is the reader's during
+/// such a run, so `progress` is `None` then. The run starts at the reader's
+/// thread count, as a block's coder does, and `set_threads` bounds how many
+/// of its folders decode at once and on how many threads each, from the next
+/// folder to start.
+///
+/// [positional source]: crate::ArchiveReader::set_positional_source
 #[derive(Debug, Clone)]
 pub struct Lzma2Handle {
     pub(crate) control: Arc<Lzma2Control>,

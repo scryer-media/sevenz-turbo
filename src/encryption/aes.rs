@@ -429,6 +429,8 @@ impl<W> Drop for Aes256Sha256Encoder<W> {
 #[cfg(feature = "compress")]
 impl<W> Aes256Sha256Encoder<W> {
     pub(crate) fn new(output: W, options: &AesEncoderOptions) -> Result<Self, crate::Error> {
+        // Before the properties are built: they keep six bits of the value.
+        options.checked_num_cycles_power()?;
         let (key, iv) = crate::encryption::aes::get_aes_key(
             &options.properties(),
             &options.password,
@@ -984,6 +986,42 @@ mod tests {
         let mut sink = Vec::new();
         let err = std::io::copy(&mut dec, &mut sink).expect_err("truncated ciphertext");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    /// A work factor the six bits of the coder properties cannot hold is
+    /// refused where the encoder is built, before anything is written: cut
+    /// down to those bits, 64 would be one round and 127 no derivation at
+    /// all.
+    #[test]
+    fn a_work_factor_the_properties_cannot_hold_is_refused() {
+        for power in [MAX_AES_CYCLES_POWER + 1, 62, 64, 64 + 19, 127, 128, 255] {
+            let options = AesEncoderOptions::new(Password::new("pw")).with_num_cycles_power(power);
+            let refused = Aes256Sha256Encoder::new(Vec::<u8>::new(), &options)
+                .err()
+                .unwrap_or_else(|| panic!("a work factor of {power} was accepted"));
+            assert_eq!(
+                refused.limit_hit(),
+                Some(crate::Limit::AesCyclesPower),
+                "{power}: {refused:?}"
+            );
+
+            // Through the writer too: the folder is refused, not written weak.
+            let mut writer = crate::ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+            writer.set_content_methods(vec![options.into()]);
+            let pushed = writer.push_archive_entry(
+                crate::ArchiveEntry::new_file("member.txt"),
+                Some(b"member bytes".as_slice()),
+            );
+            assert_eq!(
+                pushed.err().and_then(|e| e.limit_hit()),
+                Some(crate::Limit::AesCyclesPower),
+                "{power} through the writer"
+            );
+        }
+        // A work factor the format can say is written as it was given.
+        let options = AesEncoderOptions::new(Password::new("pw")).with_num_cycles_power(6);
+        assert_eq!(options.properties()[0] & 0x3F, 6);
+        assert!(Aes256Sha256Encoder::new(Vec::<u8>::new(), &options).is_ok());
     }
 
     /// The key is derived once per archive, however many folders it has: the

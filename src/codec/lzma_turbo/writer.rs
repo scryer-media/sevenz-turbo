@@ -68,13 +68,26 @@ impl SideCoder {
     ///
     /// As [`LzmaTurboWriter::new`].
     pub(crate) fn writer<W: Write>(&self, inner: W) -> io::Result<LzmaTurboWriter<W>> {
-        let props = LzmaEncProps::new()
+        LzmaTurboWriter::new(inner, &self.props(), Coder::Lzma)
+    }
+
+    /// The same writer with its encoder on the thread that writes to it: the
+    /// same stream, and no thread started for it.
+    ///
+    /// # Errors
+    ///
+    /// As [`LzmaTurboWriter::new`].
+    pub(crate) fn inline_writer<W: Write>(&self, inner: W) -> io::Result<LzmaTurboWriter<W>> {
+        LzmaTurboWriter::inline(inner, &self.props(), Coder::Lzma)
+    }
+
+    fn props(&self) -> LzmaEncProps {
+        LzmaEncProps::new()
             .with_level(self.level)
             .with_dict_size(self.dict_size)
             .with_fast_bytes(self.fast_bytes)
             .with_lclppb(self.lc, self.lp, self.pb)
-            .with_num_threads(1);
-        LzmaTurboWriter::new(inner, &props, Coder::Lzma)
+            .with_num_threads(1)
     }
 }
 
@@ -273,6 +286,23 @@ impl<W: Write> LzmaTurboWriter<W> {
         })
     }
 
+    /// The writer of [`LzmaTurboWriter::new`] with no encoder thread: the
+    /// encoder runs inside `write`, on whichever thread calls it, as it does
+    /// where a thread cannot be started.
+    ///
+    /// # Errors
+    ///
+    /// As [`LzmaTurboWriter::new`].
+    pub(crate) fn inline(inner: W, props: &LzmaEncProps, coder: Coder) -> io::Result<Self> {
+        Ok(LzmaTurboWriter {
+            inner: Some(inner),
+            state: State::Pushed {
+                encoder: Pusher::new(props, coder).map_err(io_error)?,
+                out: Vec::new(),
+            },
+        })
+    }
+
     /// Hands what the encoder has produced so far to the inner writer.
     fn drain(&mut self) -> io::Result<()> {
         let State::Streaming { output, .. } = &self.state else {
@@ -372,7 +402,7 @@ mod tests {
 
     use lzma_turbo::{BLOCK_SIZE_SOLID, Lzma2Reader, LzmaEncProps, LzmaProps, LzmaReader};
 
-    use super::{CHUNK, Coder, LzmaTurboWriter, Pusher, State};
+    use super::{CHUNK, Coder, LzmaTurboWriter, SideCoder, State};
 
     fn sample(len: usize) -> Vec<u8> {
         // Compressible but not trivial: a short period with a slow drift.
@@ -462,15 +492,12 @@ mod tests {
         assert_eq!(decode_lzma2(&packed, data.len()), data);
     }
 
-    /// The writer a target without threads gets.
+    /// The writer a target without threads gets, and the one a caller asks
+    /// for to keep the encoder on its own thread.
     fn unthreaded(coder: Coder) -> LzmaTurboWriter<Vec<u8>> {
-        LzmaTurboWriter {
-            inner: Some(Vec::new()),
-            state: State::Pushed {
-                encoder: Pusher::new(&props(), coder).expect("encoder"),
-                out: Vec::new(),
-            },
-        }
+        let w = LzmaTurboWriter::inline(Vec::new(), &props(), coder).expect("encoder");
+        assert!(matches!(w.state, State::Pushed { .. }));
+        w
     }
 
     fn streamed(coder: Coder, data: &[u8]) -> Vec<u8> {
@@ -510,6 +537,33 @@ mod tests {
             &data,
         );
         assert_eq!(decode_lzma2(&packed, data.len()), data);
+    }
+
+    /// A side coder asked to run inline starts no thread, and writes the
+    /// stream its threaded writer writes.
+    #[test]
+    fn an_inline_side_coder_writes_the_threaded_coders_stream() {
+        let coder = SideCoder {
+            level: 5,
+            dict_size: 1 << 20,
+            fast_bytes: 128,
+            lc: 0,
+            lp: 2,
+            pb: 2,
+        };
+        for len in [0, 1, CHUNK - 1, 3 * CHUNK + 77] {
+            let data = sample(len);
+            let mut threaded = coder.writer(Vec::new()).expect("writer");
+            threaded.write_all(&data).expect("write");
+            let want = threaded.finish().expect("finish");
+
+            let mut inline = coder.inline_writer(Vec::new()).expect("writer");
+            assert!(matches!(inline.state, State::Pushed { .. }));
+            for piece in data.chunks(1000) {
+                inline.write_all(piece).expect("write");
+            }
+            assert_eq!(inline.finish().expect("finish"), want, "{len} bytes");
+        }
     }
 
     /// Block threads cannot run without threads: the unthreaded path writes

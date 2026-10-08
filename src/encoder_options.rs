@@ -609,9 +609,39 @@ impl AesEncoderOptions {
     /// (this crate's default `ArchiveLimits`, and 7-Zip) refuse a power above
     /// 24, and so does the encoder. 63 is not a work factor: the format
     /// reads it as "the key is the salt and password themselves, unhashed".
+    ///
+    /// The format has six bits for the value. Anything above 24 other than
+    /// 63 is refused when the archive is written, with
+    /// [`Limit::AesCyclesPower`](crate::Limit::AesCyclesPower); a value over
+    /// 63 is never cut down to the six bits it would leave.
     pub fn with_num_cycles_power(mut self, power: u8) -> Self {
         self.num_cycles_power = power;
         self
+    }
+
+    /// What the format reads as "no derivation": see
+    /// [`Self::with_num_cycles_power`].
+    #[cfg(feature = "compress")]
+    const RAW_KEY_POWER: u8 = 0x3F;
+
+    /// The work factor, refused when the coder properties cannot say it.
+    ///
+    /// They hold its low six bits, so a larger value written as it stands
+    /// would be another work factor altogether: 64 would be written as zero,
+    /// one round, and 127 as 63, no derivation at all. The field is public,
+    /// so this is checked where the value is used and not where it is set.
+    #[cfg(feature = "compress")]
+    pub(crate) fn checked_num_cycles_power(&self) -> Result<u8, crate::Error> {
+        let power = self.num_cycles_power;
+        let max = crate::encryption::MAX_AES_CYCLES_POWER;
+        if power > max && power != Self::RAW_KEY_POWER {
+            return Err(crate::Error::limit(
+                crate::Limit::AesCyclesPower,
+                u64::from(max),
+                u64::from(power),
+            ));
+        }
+        Ok(power)
     }
 
     pub(crate) fn properties(&self) -> [u8; 34] {
