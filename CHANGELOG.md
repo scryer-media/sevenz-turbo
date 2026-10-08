@@ -587,6 +587,10 @@ Everything here is new surface; no upstream signature changed meaning.
   input and from 1382 to 67 MiB for 1 GiB, with wall and CPU time no worse.
   Building with `--cfg sevenz_turbo_unthreaded` sends every writer down that
   path, for tests and measurement on a host with threads.
+- The `wasm32-unknown-unknown` clippy gate (`--no-default-features --features
+  default_wasm`, `-D warnings`) passes: `Decoder::Delta` boxes its reader,
+  whose filter history would otherwise size every variant, and two closures
+  in `util::wasm` became the functions they wrapped. No behaviour changed.
 
 ## 0.27.0 - 2026-10-07
 
