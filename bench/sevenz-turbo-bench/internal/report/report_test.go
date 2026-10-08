@@ -109,7 +109,7 @@ func TestMergeRefusesDifferentWorkloads(t *testing.T) {
 		raw := sampleRaw()
 		raw.Fixtures.Sources = []fixtures.SourceRecord{{SourceSpec: fixtures.SourceSpec{Name: "text"}, SHA256: "aaa"}}
 		raw.Fixtures.Archives = []fixtures.ArchiveRecord{{ArchiveSpec: fixtures.ArchiveSpec{Name: "mt.7z", Source: "text", Args: []string{"-mx=5"}}, SHA256: "host-specific"}}
-		raw.Toolchain.Candidates = []toolchain.Candidate{{Label: "sevenz-turbo", Version: map[string]any{"git_commit": "c1", "cargo_lock_sha256": "l1"}}}
+		raw.Toolchain.Candidates = []toolchain.Candidate{{Label: "sevenz-turbo", Version: map[string]any{"git_commit": "c1", "git_dirty": "false", "cargo_lock_sha256": "l1"}}}
 		return raw
 	}
 	first := Build(base())
@@ -128,6 +128,8 @@ func TestMergeRefusesDifferentWorkloads(t *testing.T) {
 		"oracle":  func(r *suite.Raw) { r.Toolchain.Oracle.Version = "99.0" },
 		"quick":   func(r *suite.Raw) { r.Quick = !r.Quick },
 		"pinning": func(r *suite.Raw) { r.PinCPUs = "0-7" },
+		"dirty":   func(r *suite.Raw) { r.Toolchain.Candidates[0].Version["git_dirty"] = "true" },
+		"unknown": func(r *suite.Raw) { delete(r.Toolchain.Candidates[0].Version, "git_dirty") },
 	} {
 		raw := base()
 		raw.Machine.Label = "other-host"

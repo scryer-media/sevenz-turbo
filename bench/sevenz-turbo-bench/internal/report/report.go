@@ -329,10 +329,20 @@ func Load(path string) (*Report, error) {
 // and run shape, the same CPU pinning, the same source content and archive recipes, the same 7zz
 // release, and every candidate built from the same commit and Cargo.lock.
 // Archive digests are not compared: 7zz writes random AES salts and records
-// host file attributes, so equal recipes give different bytes per host.
+// host file attributes, so equal recipes give different bytes per host. Every
+// candidate must be a clean build (git_dirty false): uncommitted changes have
+// no fingerprint, so two dirty builds of one commit are not shown equal.
 func Comparable(reports []*Report) error {
 	if len(reports) < 2 {
 		return nil
+	}
+	for _, r := range reports {
+		for _, candidate := range r.Toolchain.Candidates {
+			if dirty := candidate.Field("git_dirty"); dirty != "false" {
+				return fmt.Errorf("%s: candidate %s was not a clean build (git_dirty %q); merged reports must come from binaries built from a committed tree",
+					r.Machine.Label, candidate.Label, dash(dirty))
+			}
+		}
 	}
 	base := reports[0]
 	baseKey, err := workload(base)
@@ -375,6 +385,7 @@ func workload(r *Report) (map[string]string, error) {
 	for _, candidate := range r.Toolchain.Candidates {
 		key["candidate "+candidate.Label+" commit"] = candidate.Field("git_commit")
 		key["candidate "+candidate.Label+" Cargo.lock"] = candidate.Field("cargo_lock_sha256")
+		key["candidate "+candidate.Label+" git_dirty"] = candidate.Field("git_dirty")
 	}
 	return key, nil
 }
