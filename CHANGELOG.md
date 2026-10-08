@@ -398,6 +398,18 @@ Everything here is new surface; no upstream signature changed meaning.
 
 ## 0.28.0 - 2026-10-09
 
+- Security fix: every AES-256 folder, and the encrypted header, is now
+  encrypted under its own random IV, as 7-Zip's writer does.
+  `AesEncoderOptions::new` drew one IV, and every folder written with those
+  options - and the header - reused it under the same key, so two folders that
+  began with the same bytes began with the same ciphertext. The IV is drawn
+  per folder and written into that folder's coder properties; the salt and
+  cycle count stay the configured ones, so every folder's key is the same
+  one, derived as before.
+  `ArchiveWriter` no longer uses the `iv` field of `AesEncoderOptions` as any
+  folder's IV.
+  Two writes of the same encrypted input therefore no longer produce the same
+  bytes; the archives decode the same, and 7-Zip extracts them.
 - The folders of a non-solid archive decode in parallel. A new `ReadAt` trait
   reads archive bytes at an offset with no shared cursor; it is implemented
   for `std::fs::File` (`pread` on Unix, `seek_read` on Windows), for bytes in
@@ -431,7 +443,8 @@ Everything here is new surface; no upstream signature changed meaning.
 - `ArchiveWriter::push_archive_entries_non_solid(entries, open, threads)`
   codes each entry as a folder of its own on up to `threads` workers and
   writes them in the order given: the archive a loop of
-  `push_archive_entry` writes, byte for byte. `open(index, entry)` is called on the coding thread, so no
+  `push_archive_entry` writes, byte for byte apart from the encrypted
+  folders' IVs. `open(index, entry)` is called on the coding thread, so no
   more files are open than folders in flight. Each worker stages at most two
   folders of at most 8 MiB of compressed bytes before it waits for the
   writer, so memory is bounded by threads x (one coder + 16 MiB), however

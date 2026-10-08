@@ -122,6 +122,39 @@ fn sized_methods(
     )
 }
 
+/// The methods one new folder (or the encrypted header) is coded with: sized
+/// for it by [`sized_methods`], and with a fresh random AES IV.
+///
+/// Every folder, and the header, draws its own IV, as 7-Zip does. The salt and
+/// the cycle count stay those of the configured options, so the key is the
+/// same for every folder; only the IV, which is written
+/// into each folder's own coder properties, differs. Reusing one IV under one
+/// key would make the ciphertexts of two folders that begin with the same
+/// bytes begin the same.
+fn folder_methods(
+    methods: &Arc<Vec<EncoderConfiguration>>,
+    size: Option<u64>,
+) -> Result<Arc<Vec<EncoderConfiguration>>> {
+    let sized = sized_methods(methods, size);
+    #[cfg(feature = "aes256")]
+    {
+        use crate::encoder_options::EncoderOptions;
+        let encrypted =
+            |mc: &EncoderConfiguration| matches!(mc.options, Some(EncoderOptions::Aes(_)));
+        if sized.iter().any(encrypted) {
+            let mut fresh = Vec::clone(&sized);
+            for mc in &mut fresh {
+                if let Some(EncoderOptions::Aes(options)) = &mut mc.options {
+                    getrandom::fill(&mut options.iv)
+                        .map_err(|e| Error::other(format!("AES IV: {e}")))?;
+                }
+            }
+            return Ok(Arc::new(fresh));
+        }
+    }
+    Ok(sized)
+}
+
 /// What the entries of one folder declare they hold, or `None` when they declare nothing.
 ///
 /// An entry's `size` before it is pushed is read as how many bytes its reader will yield.
@@ -294,7 +327,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     ///
     /// The archive is the one a loop of [`ArchiveWriter::push_archive_entry`]
     /// over `entries` writes - the same folders, in the same order, with the
-    /// same bytes - only built faster. `open(index, entry)` is called for each
+    /// same bytes (but for the random IV each encrypted folder draws) - only
+    /// built faster. `open(index, entry)` is called for each
     /// entry that is not a directory, on the thread that will code it, just
     /// before it is coded: it returns that entry's reader, or `None` for an
     /// entry with no data. So no more files are open at once than there are
@@ -546,7 +580,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let mut out = std::io::BufWriter::with_capacity(OUTPUT_BUF_LEN, &mut compressed);
         let (head, folder) = folder_size(&entries, &mut r)
             .map_err(|e| Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries))))?;
-        let content_methods = &sized_methods(&self.content_methods, folder);
+        let content_methods = &folder_methods(&self.content_methods, folder)?;
         let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(content_methods.len() - 1);
         let mut bcj2 = None;
 
@@ -786,7 +820,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         methods.push(EncoderConfiguration::new(EncoderMethod::LZMA));
 
         // The header's length is known: a dictionary larger than it is never used.
-        let methods = sized_methods(&Arc::new(methods), Some(size));
+        let methods =
+            folder_methods(&Arc::new(methods), Some(size)).map_err(std::io::Error::other)?;
 
         let mut encoded_data = Vec::with_capacity(size as usize / 2);
 
@@ -1031,7 +1066,7 @@ fn encode_entry<R: Read, O: Write>(
     let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(content_methods.len() - 1);
     let (head, folder) = folder_size([&entry], r)
         .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
-    let methods = sized_methods(content_methods, folder);
+    let methods = folder_methods(content_methods, folder)?;
     let mut bcj2 = None;
 
     let (crc, size) = {
@@ -1274,7 +1309,7 @@ pub fn prepare_block<R: Read>(
             format!("prepare_block: read source:{}", entries_names(&entries)),
         )
     })?;
-    let methods = sized_methods(&methods, folder);
+    let methods = folder_methods(&methods, folder)?;
     let mut out: Vec<u8> = Vec::new();
     let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(methods.len() - 1);
     let mut bcj2 = None;

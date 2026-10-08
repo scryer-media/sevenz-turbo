@@ -325,7 +325,10 @@ fn aes_members_decode_and_encode_the_same_in_parallel() {
     let tree = members(80, Some(40), false);
     let sequential = write_sequential(&methods, &tree);
     let parallel = write_parallel(&methods, &tree, 6);
-    // What must match is what the two writes decode to.
+    // Every folder draws its own random IV, so two writes never match byte
+    // for byte (even in length: the IVs in the header do not compress alike);
+    // what must match is what they decode to. `sevenzip_encode_tests` checks
+    // the IVs themselves.
     let reference =
         decode(&sequential, &password, Source::Sequential, 1).expect("sequential decode");
     let got = decode(&parallel, &password, Source::Sequential, 1).expect("parallel write");
