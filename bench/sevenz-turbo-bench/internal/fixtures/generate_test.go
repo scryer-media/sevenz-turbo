@@ -49,6 +49,34 @@ func TestATreeIsReusedOnlyWhenItIsExactlyTheRecipe(t *testing.T) {
 	}
 }
 
+func TestASourceEditedInPlaceIsRegenerated(t *testing.T) {
+	dir := t.TempDir()
+	source := SourceSpec{Name: "audio-small", Kind: KindAudio, Bytes: 64 << 10}
+	first, err := ensureSource(dir, source, func(string, ...any) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(SourceDir(dir, source.Name), source.FileName())
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[len(data)/2] ^= 0xff
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if problem := sourceProblem(SourceDir(dir, source.Name), source); problem == "" {
+		t.Fatal("a member changed in place (same size) was accepted")
+	}
+	again, err := ensureSource(dir, source, func(string, ...any) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.SHA256 != first.SHA256 {
+		t.Fatal("regeneration did not restore the recipe's bytes")
+	}
+}
+
 func TestATreeWithANonRegularMemberIsRefused(t *testing.T) {
 	dir := t.TempDir()
 	source := smallTree()
