@@ -400,7 +400,8 @@ const ZSTD_BYTES: u64 = 160 * MIB;
 /// An LZ4 frame block is at most 4 MiB, plus a 64 KiB dictionary.
 const LZ4_BYTES: u64 = 16 * MIB;
 /// Branch/call/jump filters and the delta filter keep a few hundred bytes of
-/// state; AES keeps a block. One megabyte covers any of them with room.
+/// state; AES keeps a block and, for a caller reading under 64 KiB at a time,
+/// a 64 KiB plaintext buffer. One megabyte covers any of them with room.
 const FILTER_BYTES: u64 = MIB;
 /// BCJ2 reads four streams at once and keeps a range coder over one of them.
 /// Its sub-streams' own decoders are separate coders in the same block and are

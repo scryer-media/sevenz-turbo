@@ -294,10 +294,13 @@ Everything here is new surface; no upstream signature changed meaning.
   and copy that into the caller's buffer — two million reads and two full
   copies of the payload for a 1 GiB store-mode archive. It now fills the
   caller's buffer with ciphertext and decrypts it in place, so reads are the
-  caller's size and the payload is copied zero extra times. The only state kept
-  is the ≤15 ciphertext bytes that did not complete a block, plus one block of
-  plaintext for callers that read less than 16 bytes at a time; neither grows
-  with the stream, so the memory estimate is unchanged. On the Linux bench box
+  caller's size and the payload is copied zero extra times. The state kept is
+  the ≤15 ciphertext bytes that did not complete a block and, only for a caller
+  that reads less than 64 KiB at a time (PPMd's range decoder, BCJ2's side
+  streams), a 64 KiB plaintext buffer filled a chunk at a time so the cipher
+  is never driven a block per call. Neither grows with the stream, and the
+  buffer is within the megabyte the memory estimate charges a filter, so the
+  estimate is unchanged. On the Linux bench box
   a 1 GiB store-mode AES archive went from 0.862 s to 0.282 s, which is under
   half of `7zz t -p` on the same fixture and the sum of what the cipher, the
   read and the CRC cost on their own.
@@ -592,7 +595,14 @@ Everything here is new surface; no upstream signature changed meaning.
   whose filter history would otherwise size every variant, and two closures
   in `util::wasm` became the functions they wrapped. No behaviour changed.
 - Bench harness: `run` refuses an `--out` whose `scratch` directory already
-  exists instead of deleting it at the end of the run.
+  exists instead of deleting it at the end of the run, and removes the one
+  it made however the run ends, so a planning failure no longer leaves a
+  directory that refuses the next run.
+- Under a memory limit, a block's parallel LZMA2 decoder is sized against
+  what the limit leaves after the rest of the chain: the pack-stream buffer
+  and the other coders' memory the chain check reserved. The plan was handed
+  the whole limit and subtracted only its own dictionary and state, so its
+  in-flight runs could take the chain past the limit by the reserved amount.
 - `sevenz_turbo::sha256` digests with the backend `crypto_backend` names.
   decode-bench takes its `Cargo.lock` digest through it, so the
   `native-crypto` candidate no longer links AWS-LC's SHA-256 beside
