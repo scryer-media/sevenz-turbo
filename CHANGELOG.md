@@ -401,6 +401,8 @@ Everything here is new surface; no upstream signature changed meaning.
 
 ## 0.27.0 - 2026-10-07
 
+- Bench harness: `run` refuses an `--out` whose `scratch` directory already
+  exists instead of deleting it at the end of the run.
 - Each folder's LZMA and LZMA2 coder is sized to the folder. Every folder was
   set up with the full dictionary and, with more than one thread allowed, a
   multi-threaded LZMA2 coder that buffers a whole 32 MiB block, so a

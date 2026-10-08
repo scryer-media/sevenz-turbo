@@ -353,6 +353,14 @@ func cmdRun(ctx context.Context, args []string) int {
 	scratch := filepath.Join(os.TempDir(), "sevenz-turbo-bench-list-scratch")
 	if !*list {
 		scratch = filepath.Join(*out, "scratch")
+		// The run creates this directory and removes it when it finishes,
+		// so one that already exists was not ours and may hold the
+		// operator's files; refuse it rather than delete it.
+		if _, err := os.Stat(scratch); err == nil {
+			return fail(fmt.Errorf("%s already exists; remove it or choose another --out", scratch))
+		} else if !os.IsNotExist(err) {
+			return fail(err)
+		}
 		if err := os.MkdirAll(scratch, 0o755); err != nil {
 			return fail(err)
 		}
