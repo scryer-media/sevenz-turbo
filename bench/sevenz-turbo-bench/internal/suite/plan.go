@@ -6,7 +6,6 @@ package suite
 import (
 	"fmt"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 
@@ -104,12 +103,20 @@ type Settings struct {
 	Budgets []int64
 	// BudgetThreads is the thread count the budget rows ask for.
 	BudgetThreads string
+	// CPUs is what "all" resolves to: the host's cores, or the size of the
+	// --pin-cpus range when the run is pinned, so "all" never asks for more
+	// threads than the processes may run on.
+	CPUs int
+	// Only, when set, keeps the scenarios whose id contains one of these
+	// substrings. It is applied before a scenario's fixture is looked up, so a
+	// corpus generated with `fixtures --only` serves a matching `run --only`.
+	Only []string
 }
 
-// DefaultSettings is the full matrix, or its --quick subset, for a host with
-// cpus cores.
+// DefaultSettings is the full matrix, or its --quick subset, for cpus usable
+// cores (the host's, or the pinned range's).
 func DefaultSettings(quick bool, cpus int) Settings {
-	settings := Settings{Quick: quick}
+	settings := Settings{Quick: quick, CPUs: max(cpus, 1)}
 	if quick {
 		settings.Threads = []string{"1", "all"}
 		settings.Levels = []int{1, 5}
@@ -173,19 +180,32 @@ func Processes(scenarios []Scenario, repeats, warmups int) int {
 	return n
 }
 
-// ResolveThreads turns "all" into the core count, as both sides are given a
-// number.
-func ResolveThreads(threads string) string {
+// ResolveThreads turns "all" into the usable core count, as both sides are
+// given a number.
+func (s Settings) ResolveThreads(threads string) string {
 	if threads == "all" {
-		return strconv.Itoa(runtime.NumCPU())
+		return strconv.Itoa(max(s.CPUs, 1))
 	}
 	return threads
+}
+
+// Keeps reports whether --only selects the scenario id.
+func (s Settings) Keeps(id string) bool {
+	if len(s.Only) == 0 {
+		return true
+	}
+	for _, part := range s.Only {
+		if part != "" && strings.Contains(id, part) {
+			return true
+		}
+	}
+	return false
 }
 
 // Plan builds the matrix over the corpus in dir. scratch is where encode rows
 // write their archives.
 func Plan(manifest *fixtures.Manifest, dir, scratch string, tools Tools, settings Settings) ([]Scenario, error) {
-	p := planner{manifest: manifest, dir: dir, scratch: scratch, tools: tools}
+	p := planner{manifest: manifest, dir: dir, scratch: scratch, tools: tools, settings: settings}
 	for _, name := range []string{"tree_solid.7z", "tree_nonsolid.7z", "mt.7z", "aes_kdf.7z"} {
 		p.list(name)
 	}
@@ -247,6 +267,7 @@ type planner struct {
 	dir       string
 	scratch   string
 	tools     Tools
+	settings  Settings
 	scenarios []Scenario
 	seen      map[string]bool
 	err       error
@@ -274,6 +295,9 @@ func (p *planner) archive(name string) (fixtures.ArchiveRecord, bool) {
 func stem(name string) string { return name[:len(name)-len(filepath.Ext(name))] }
 
 func (p *planner) list(name string) {
+	if !p.settings.Keeps("list/" + stem(name)) {
+		return
+	}
 	record, ok := p.archive(name)
 	if !ok {
 		return
@@ -304,12 +328,8 @@ type decodeOpts struct {
 }
 
 func (p *planner) decode(group, name, threads string, o decodeOpts) {
-	record, ok := p.archive(name)
-	if !ok {
-		return
-	}
 	path := filepath.Join(p.dir, name)
-	n := ResolveThreads(threads)
+	n := p.settings.ResolveThreads(threads)
 	id := fmt.Sprintf("decode/%s/T%s", stem(name), threads)
 	ours := []string{"op", "decode", "--archive", path, "--threads", n}
 	switch {
@@ -323,6 +343,13 @@ func (p *planner) decode(group, name, threads string, o decodeOpts) {
 	if o.memoryLimit > 0 {
 		id += fmt.Sprintf("/budget-%dMiB", o.memoryLimit>>20)
 		ours = append(ours, "--memory-limit", strconv.FormatInt(o.memoryLimit, 10))
+	}
+	if !p.settings.Keeps(id) {
+		return
+	}
+	record, ok := p.archive(name)
+	if !ok {
+		return
 	}
 	oracle := []string{"t", "-bso0", "-bsp0", "-mmt=" + n}
 	if record.Encrypted {
@@ -380,24 +407,30 @@ func OracleLZMA2Method(level int) string {
 }
 
 func (p *planner) encode(group, source string, level int, threads string, o encodeOpts) {
-	record, ok := p.manifest.Source(source)
-	if !ok {
-		if p.err == nil {
-			p.err = fmt.Errorf("source %s is not in the manifest: run `sevenz-turbo-bench fixtures` first", source)
-		}
-		return
-	}
-	n := ResolveThreads(threads)
+	// The id names solid or non-solid for a tree source. The kind is the
+	// recipe's (both corpus profiles share it), so the id is known before the
+	// manifest is asked for the source.
+	spec, _ := fixtures.Full().Source(source)
+	n := p.settings.ResolveThreads(threads)
 	id := fmt.Sprintf("encode/%s/L%d/T%s", source, level, threads)
 	solid := "solid"
 	if o.nonSolid {
 		solid = "non-solid"
 	}
-	if record.Kind == fixtures.KindTree {
+	if spec.Kind == fixtures.KindTree {
 		id += "/" + solid
 	}
 	if o.encrypted {
 		id += "/aes"
+	}
+	if !p.settings.Keeps(id) {
+		return
+	}
+	if _, ok := p.manifest.Source(source); !ok {
+		if p.err == nil {
+			p.err = fmt.Errorf("source %s is not in the manifest: run `sevenz-turbo-bench fixtures` first", source)
+		}
+		return
 	}
 	slug := filepath.Base(id)
 	ourOut := filepath.Join(p.scratch, fmt.Sprintf("%d-%s-ours.7z", len(p.scenarios), slug))

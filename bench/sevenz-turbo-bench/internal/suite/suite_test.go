@@ -113,7 +113,7 @@ func TestPlanEncodeArgsMatch7zz(t *testing.T) {
 		}
 		ours := strings.Join(scenario.Variants[0].Args, " ")
 		oracle := strings.Join(scenario.Variants[1].Args, " ")
-		all := ResolveThreads("all")
+		all := DefaultSettings(true, 4).ResolveThreads("all")
 		for _, want := range []string{"--level 5", "--threads " + all, "--non-solid"} {
 			if !strings.Contains(ours, want) {
 				t.Errorf("ours %q lacks %q", ours, want)
@@ -165,5 +165,53 @@ func TestRunProfiles(t *testing.T) {
 	scenarios := []Scenario{{Variants: make([]Run, 2)}, {Variants: make([]Run, 4)}}
 	if n := Processes(scenarios, 3, 1); n != 24 {
 		t.Errorf("Processes = %d, want 24", n)
+	}
+}
+
+// "all" is the usable core count the settings were built with (the pinned
+// range's under --pin-cpus), not the host's.
+func TestAllResolvesToTheSettingsCPUs(t *testing.T) {
+	dir, manifest := fakeCorpus(t, fixtures.Quick())
+	scenarios, err := Plan(manifest, dir, t.TempDir(), Tools{Candidate: "c", Oracle: "o"}, DefaultSettings(true, 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scenario := range scenarios {
+		if scenario.Threads != "all" {
+			continue
+		}
+		for _, run := range scenario.Variants {
+			args := strings.Join(run.Args, " ")
+			if !strings.Contains(args, "--threads 3") && !strings.Contains(args, "-mmt=3") {
+				t.Errorf("%s / %s: %q does not ask for 3 threads", scenario.ID, run.Variant, args)
+			}
+		}
+	}
+}
+
+// --only applies before fixtures are looked up: a corpus holding only mt.7z
+// plans the mt rows, and still refuses a selection that needs a missing one.
+func TestOnlyFiltersBeforeFixturesAreRequired(t *testing.T) {
+	dir, manifest := fakeCorpus(t, fixtures.Quick())
+	mt, _ := manifest.Archive("mt.7z")
+	manifest.Archives = []fixtures.ArchiveRecord{mt}
+	manifest.Sources = nil
+	settings := DefaultSettings(true, 4)
+	settings.Only = []string{"decode/mt"}
+	scenarios, err := Plan(manifest, dir, t.TempDir(), Tools{Candidate: "c", Oracle: "o"}, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scenarios) == 0 {
+		t.Fatal("no scenarios planned")
+	}
+	for _, scenario := range scenarios {
+		if !strings.HasPrefix(scenario.ID, "decode/mt/") {
+			t.Errorf("unselected scenario %s planned", scenario.ID)
+		}
+	}
+	settings.Only = []string{"decode/st"}
+	if _, err := Plan(manifest, dir, t.TempDir(), Tools{Candidate: "c", Oracle: "o"}, settings); err == nil {
+		t.Error("a selection whose fixture is missing was planned")
 	}
 }

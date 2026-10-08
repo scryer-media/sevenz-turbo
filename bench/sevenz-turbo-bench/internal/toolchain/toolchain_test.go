@@ -1,6 +1,11 @@
 package toolchain
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func TestParseBanner(t *testing.T) {
 	cases := []struct{ text, version string }{
@@ -36,5 +41,72 @@ func TestLastJSON(t *testing.T) {
 	}
 	if _, err := LastJSON([]byte("not json\n")); err == nil {
 		t.Fatal("want an error")
+	}
+}
+
+func TestIsP7zipReadsTheWholeOutput(t *testing.T) {
+	output := "\n7-Zip [64] 16.02 : Copyright (c) 1999-2016 Igor Pavlov : 2016-05-21\np7zip Version 16.02 (locale=utf8,Utf16=on,HugeFiles=on,64 bits)\n"
+	banner, _ := ParseBanner(output)
+	if strings.Contains(strings.ToLower(banner), "p7zip") {
+		t.Fatalf("the banner line itself carries the marker (%q); the test needs it on the next line", banner)
+	}
+	if !IsP7zip(output) {
+		t.Fatal("p7zip output not recognised")
+	}
+	if IsP7zip("7-Zip (z) 26.01 (arm64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-04-27") {
+		t.Fatal("official 7-Zip taken for p7zip")
+	}
+}
+
+func TestFindOracleReturnsAnAbsolutePath(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "7zz"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	t.Setenv("SEVENZ_BENCH_ORACLE", "")
+	path, err := FindOracle(filepath.Join(".", "7zz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(path) {
+		t.Fatalf("FindOracle returned relative %q", path)
+	}
+	t.Setenv("SEVENZ_BENCH_ORACLE", "7zz")
+	if path, err = FindOracle(""); err != nil || !filepath.IsAbs(path) {
+		t.Fatalf("env oracle: %q, %v", path, err)
+	}
+}
+
+func TestCheckBackend(t *testing.T) {
+	aws := Candidate{Binary: Binary{Path: "a"}, Version: map[string]any{"crypto_backend": BackendDefault}}
+	native := Candidate{Binary: Binary{Path: "n"}, Version: map[string]any{"crypto_backend": BackendNative}}
+	if CheckBackend(aws, "--candidate", BackendDefault) != nil || CheckBackend(native, "--candidate-native", BackendNative) != nil {
+		t.Fatal("a correct pair was refused")
+	}
+	// Swapped: each differs from the other, and each is refused.
+	if CheckBackend(native, "--candidate", BackendDefault) == nil || CheckBackend(aws, "--candidate-native", BackendNative) == nil {
+		t.Fatal("a swapped pair was accepted")
+	}
+}
+
+func TestBindRustOnlyAttachesAMatchingCheckout(t *testing.T) {
+	checkout := Rust{Rustc: "rustc 1.97.1", Cargo: "cargo 1.97.1", Commit: "abc", CargoLock: "lock1"}
+	matching := Candidate{Version: map[string]any{"git_commit": "abc", "cargo_lock_sha256": "lock1", "lzma_turbo": "0.6.0"}}
+	if bound := BindRust(checkout, matching); bound.Source != "checkout" || bound.Rustc != "rustc 1.97.1" {
+		t.Fatalf("matching checkout not attached: %+v", bound)
+	}
+	for name, candidate := range map[string]Candidate{
+		"other commit": {Version: map[string]any{"git_commit": "def", "cargo_lock_sha256": "lock1"}},
+		"other lock":   {Version: map[string]any{"git_commit": "abc", "cargo_lock_sha256": "lock2"}},
+		"no record":    {Version: map[string]any{}},
+	} {
+		bound := BindRust(checkout, candidate)
+		if bound.Source != "candidate" || bound.Rustc != "not-collected" || bound.Note == "" {
+			t.Errorf("%s: checkout attached: %+v", name, bound)
+		}
+		if bound.Commit == "abc" && name != "other lock" {
+			t.Errorf("%s: kept the checkout's commit: %+v", name, bound)
+		}
 	}
 }

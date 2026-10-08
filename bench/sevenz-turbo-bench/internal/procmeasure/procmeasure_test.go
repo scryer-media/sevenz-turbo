@@ -141,3 +141,16 @@ func TestPeakStats(t *testing.T) {
 		t.Fatalf("empty got %d %d %d", median, low, high)
 	}
 }
+
+func TestParsePinRange(t *testing.T) {
+	for pin, want := range map[string]int{"0-7": 8, "3": 1, "8-15": 8, "0-63": 64} {
+		if got, err := PinCount(pin); err != nil || got != want {
+			t.Errorf("PinCount(%q) = %d, %v; want %d", pin, got, err, want)
+		}
+	}
+	for _, pin := range []string{"", "7-0", "-1", "a-b", "0-64", "1,2"} {
+		if _, err := PinCount(pin); err == nil {
+			t.Errorf("PinCount(%q) accepted", pin)
+		}
+	}
+}

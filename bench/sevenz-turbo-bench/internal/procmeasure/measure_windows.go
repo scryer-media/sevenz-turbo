@@ -6,8 +6,6 @@ import (
 	"errors"
 	"os"
 	"os/exec"
-	"strconv"
-	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -125,13 +123,8 @@ func affinityMask(pin string) (uintptr, bool) {
 	if pin == "" {
 		return 0, false
 	}
-	low, high, found := strings.Cut(pin, "-")
-	if !found {
-		high = low
-	}
-	first, err1 := strconv.Atoi(low)
-	last, err2 := strconv.Atoi(high)
-	if err1 != nil || err2 != nil || first < 0 || last < first || last >= 64 {
+	first, last, err := ParsePinRange(pin)
+	if err != nil {
 		return 0, false
 	}
 	var mask uintptr

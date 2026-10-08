@@ -16,9 +16,35 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// ParsePinRange validates an inclusive CPU range, "0-7" or a single "3", and
+// returns its ends. The Windows affinity mask is 64 bits wide, so the last CPU
+// must be below 64 everywhere, for one range to mean the same on every host.
+func ParsePinRange(pin string) (first, last int, err error) {
+	low, high, found := strings.Cut(pin, "-")
+	if !found {
+		high = low
+	}
+	first, err1 := strconv.Atoi(strings.TrimSpace(low))
+	last, err2 := strconv.Atoi(strings.TrimSpace(high))
+	if err1 != nil || err2 != nil || first < 0 || last < first || last >= 64 {
+		return 0, 0, fmt.Errorf("CPU range %q: want an inclusive range such as 0-7, CPUs 0 to 63", pin)
+	}
+	return first, last, nil
+}
+
+// PinCount is how many CPUs a valid range names.
+func PinCount(pin string) (int, error) {
+	first, last, err := ParsePinRange(pin)
+	if err != nil {
+		return 0, err
+	}
+	return last - first + 1, nil
+}
 
 // Measurement is what one timed process run costs. Wall time is the parent's
 // monotonic clock around start-to-exit; CPU and memory come from the kernel's

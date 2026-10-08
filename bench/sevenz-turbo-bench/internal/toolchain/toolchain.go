@@ -62,6 +62,12 @@ type Oracle struct {
 
 // Rust is the build environment, when the run is next to a checkout.
 type Rust struct {
+	// Source says where Commit and CargoLock come from: "checkout" when the
+	// checkout's commit and Cargo.lock digest match the ones the candidate
+	// binary embeds (so its rustc and cargo describe the build too), or
+	// "candidate" when only the binary's own record is trusted.
+	Source        string `json:"source,omitempty"`
+	Note          string `json:"note,omitempty"`
 	Rustc         string `json:"rustc"`
 	RustcHost     string `json:"rustc_host,omitempty"`
 	Cargo         string `json:"cargo"`
@@ -86,22 +92,31 @@ type Toolchain struct {
 var ErrNoOracle = errors.New("no 7-Zip oracle found: pass --oracle or set SEVENZ_BENCH_ORACLE (the official 7zz/7zz.exe from https://www.7-zip.org/download.html)")
 
 // FindOracle resolves the oracle: the explicit path, $SEVENZ_BENCH_ORACLE,
-// then 7zz, 7zz.exe, 7z, 7za on PATH.
+// then 7zz, 7zz.exe, 7z, 7za on PATH. The path returned is absolute: fixture
+// generation and encode rows start the oracle with its working directory set
+// to a source directory, where a relative path would no longer resolve.
 func FindOracle(explicit string) (string, error) {
 	for _, candidate := range []string{explicit, os.Getenv("SEVENZ_BENCH_ORACLE")} {
 		if candidate != "" {
 			if _, err := os.Stat(candidate); err != nil {
 				return "", fmt.Errorf("oracle %s: %w", candidate, err)
 			}
-			return candidate, nil
+			return filepath.Abs(candidate)
 		}
 	}
 	for _, name := range []string{"7zz", "7zz.exe", "7z", "7za"} {
 		if path, err := exec.LookPath(name); err == nil {
-			return path, nil
+			return filepath.Abs(path)
 		}
 	}
 	return "", ErrNoOracle
+}
+
+// IsP7zip reports whether a 7-Zip's startup output is p7zip's. The marker is
+// on a line of its own after the banner ("p7zip Version 16.02"), so the whole
+// output is searched, not only the banner line.
+func IsP7zip(output string) bool {
+	return strings.Contains(strings.ToLower(output), "p7zip")
 }
 
 // ParseBanner returns the banner line and release of 7-Zip's startup text.
@@ -139,7 +154,7 @@ func ProbeOracle(ctx context.Context, path string, allowP7zip bool) (Oracle, err
 	if banner == "" {
 		return Oracle{}, fmt.Errorf("%s: no 7-Zip banner in its output", path)
 	}
-	if strings.Contains(strings.ToLower(banner), "p7zip") && !allowP7zip {
+	if IsP7zip(string(output)) && !allowP7zip {
 		return Oracle{}, fmt.Errorf("%s is p7zip (%s), not the official 7-Zip; install 7zz from https://www.7-zip.org/download.html or pass --allow-p7zip", path, banner)
 	}
 	oracle := Oracle{Binary: binary, Banner: banner, Version: version}
@@ -178,6 +193,66 @@ func Identify(path string) (Binary, error) {
 		return Binary{}, err
 	}
 	return Binary{Path: path, ResolvedPath: resolved, SHA256: hex.EncodeToString(digest.Sum(nil))}, nil
+}
+
+// Backends the two candidate builds must report: the default build is
+// AWS-LC, the native-crypto one RustCrypto.
+const (
+	BackendDefault = "aws-lc"
+	BackendNative  = "rustcrypto"
+)
+
+// CheckBackend fails unless the candidate reports the backend its role
+// requires, so a swapped or misbuilt pair cannot label one backend's rows as
+// the other's.
+func CheckBackend(candidate Candidate, flag, want string) error {
+	if got := candidate.Field("crypto_backend"); got != want {
+		return fmt.Errorf("%s %s reports crypto backend %q, want %q", flag, candidate.Path, got, want)
+	}
+	return nil
+}
+
+// BindRust attaches the checkout's provenance to the candidate only when the
+// checkout is the one the binary was built from: the commit and Cargo.lock
+// digest the binary embeds (`op version`'s git_commit and cargo_lock_sha256)
+// must equal the checkout's. Otherwise the record keeps only what the binary
+// says about itself, and says why.
+func BindRust(checkout Rust, candidate Candidate) Rust {
+	commit, lock := candidate.Field("git_commit"), candidate.Field("cargo_lock_sha256")
+	if commit != "" && commit != "unknown" && commit == checkout.Commit && lock != "" && lock == checkout.CargoLock {
+		checkout.Source = "checkout"
+		return checkout
+	}
+	bound := Rust{
+		Source: "candidate", Rustc: "not-collected", Cargo: "not-collected",
+		Commit: firstNonEmpty(commit, "unknown"), CargoLock: lock,
+		LockedTurbo: candidate.Field("lzma_turbo"), LockedVersion: candidate.Field("sevenz_turbo"),
+	}
+	switch {
+	case commit == "" || lock == "":
+		bound.Note = "the candidate does not embed its commit and Cargo.lock digest (built before decode-bench recorded them); the checkout's provenance is not attached"
+	case checkout.Commit == "not-collected":
+		bound.Note = "no checkout to compare with; commit and Cargo.lock digest are the candidate's own"
+	default:
+		bound.Note = fmt.Sprintf("the checkout (commit %s, Cargo.lock %s) is not the one the candidate was built from; its provenance is not attached", checkout.Commit, short(checkout.CargoLock))
+	}
+	return bound
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func short(digest string) string {
+	if len(digest) > 12 {
+		return digest[:12]
+	}
+	return digest
 }
 
 // ProbeCandidate runs `<path> op version`.

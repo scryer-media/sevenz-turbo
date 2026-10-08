@@ -3,6 +3,7 @@ package suite
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -50,7 +51,12 @@ type RunRecord struct {
 	Result map[string]any `json:"result,omitempty"`
 	// Verified is the untimed `7zz t` of a candidate's encoded archive
 	// (first measured repeat only): "ok" or the failure.
-	Verified   string `json:"verified,omitempty"`
+	Verified string `json:"verified,omitempty"`
+	// Digest is the order-sensitive digest of a decode's output, from an
+	// untimed `--digest` rerun of the same command (first measured repeat
+	// only). The timed runs only count their output, as `7zz t` does, so
+	// hashing every byte is never charged to the candidate's row.
+	Digest     string `json:"digest,omitempty"`
 	Status     string `json:"status"`
 	Failure    string `json:"failure,omitempty"`
 	Error      string `json:"error,omitempty"`
@@ -125,10 +131,17 @@ func Execute(ctx context.Context, raw *Raw, options Options) {
 				record := measure(ctx, raw, scenario, run, options)
 				record.Warmup, record.Repeat, record.Position = warmup, repeat, position
 				if !warmup && repeat == 0 && run.Role == RoleCandidate && scenario.Op == OpEncode && record.Status == StatusOK {
-					record.Verified = verify(ctx, options.Oracle, run.Output, scenario.Encrypted)
+					record.Verified = verify(ctx, options.Oracle, run.Output, scenario.Encrypted, options.Timeout)
 					if record.Verified != "ok" {
 						record.Status, record.Failure, record.Error = StatusFailed, "7zz-rejects-output", record.Verified
 					}
+				}
+				if !warmup && repeat == 0 && run.JSON && scenario.Op == OpDecode && record.Status == StatusOK {
+					digest, err := outputDigest(ctx, run, options.Timeout)
+					if err != nil {
+						record.Status, record.Failure, record.Error = StatusFailed, "digest-run", err.Error()
+					}
+					record.Digest = digest
 				}
 				if run.Output != "" {
 					_ = os.Remove(run.Output)
@@ -151,10 +164,10 @@ func Execute(ctx context.Context, raw *Raw, options Options) {
 // checkDigest holds every decode of the same archive by any of this crate's
 // engines to one output digest (7zz t reports no digest; it checks CRCs).
 func checkDigest(digests map[string]string, scenario Scenario, record *RunRecord) {
-	if scenario.Op != OpDecode || record.Status != StatusOK || record.Result == nil {
+	if scenario.Op != OpDecode || record.Status != StatusOK {
 		return
 	}
-	digest, _ := record.Result["digest"].(string)
+	digest := record.Digest
 	if digest == "" {
 		return
 	}
@@ -254,17 +267,66 @@ func number(value any) float64 {
 	return 0
 }
 
+// untimed runs a command outside the measurements, bounded by the same
+// per-process timeout as a measured run, so a stalled helper cannot hang the
+// whole run before raw.json is written. stdout alone is returned when
+// combined is false.
+func untimed(ctx context.Context, timeout time.Duration, dir, path string, args []string, combined bool) ([]byte, error) {
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	cmd := exec.CommandContext(ctx, path, args...)
+	cmd.Dir = dir
+	cmd.WaitDelay = 5 * time.Second
+	var output []byte
+	var err error
+	if combined {
+		output, err = cmd.CombinedOutput()
+	} else {
+		output, err = cmd.Output()
+	}
+	if ctx.Err() == context.DeadlineExceeded {
+		return output, fmt.Errorf("timed out after %s", timeout)
+	}
+	return output, err
+}
+
 // verify runs an untimed `7zz t` over an archive this crate wrote.
-func verify(ctx context.Context, oracle, path string, encrypted bool) string {
+func verify(ctx context.Context, oracle, path string, encrypted bool, timeout time.Duration) string {
 	args := []string{"t", "-bso0", "-bsp0"}
 	if encrypted {
 		args = append(args, "-p"+fixtures.Password)
 	}
-	output, err := exec.CommandContext(ctx, oracle, append(args, path)...).CombinedOutput()
+	output, err := untimed(ctx, timeout, "", oracle, append(args, path), true)
 	if err != nil {
 		return fmt.Sprintf("7zz t: %v: %s", err, lastLine(string(output), ""))
 	}
 	return "ok"
+}
+
+// outputDigest reruns a decode-bench decode untimed with --digest and returns
+// the digest of its output.
+func outputDigest(ctx context.Context, run Run, timeout time.Duration) (string, error) {
+	args := append(append([]string(nil), run.Args...), "--digest")
+	output, err := untimed(ctx, timeout, run.Dir, run.Tool, args, false)
+	if err != nil {
+		return "", fmt.Errorf("digest run: %v: %s", err, lastLine(string(output), ""))
+	}
+	object, err := toolchain.LastJSON(output)
+	if err != nil {
+		return "", fmt.Errorf("digest run: %w", err)
+	}
+	if ok, _ := object["ok"].(bool); !ok {
+		message, _ := object["error"].(string)
+		return "", fmt.Errorf("digest run: %s", message)
+	}
+	digest, _ := object["digest"].(string)
+	if digest == "" {
+		return "", errors.New("digest run: no digest reported (is the candidate decode-bench from this branch?)")
+	}
+	return digest, nil
 }
 
 func lastLine(texts ...string) string {

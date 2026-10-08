@@ -248,6 +248,8 @@ func memoryBytes(ctx context.Context) uint64 {
 				}
 			}
 		}
+	case "windows":
+		return platformMemoryBytes()
 	}
 	return 0
 }
