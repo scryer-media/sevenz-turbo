@@ -60,6 +60,21 @@ func TestBuildRatiosAndOrientation(t *testing.T) {
 			t.Errorf("report.md lacks %q", want)
 		}
 	}
+	if strings.Contains(md, "CPU pinning") {
+		t.Error("an unpinned run's report.md mentions pinning")
+	}
+}
+
+func TestPinnedRunIsReported(t *testing.T) {
+	raw := sampleRaw()
+	raw.PinCPUs = "0-7"
+	built := Build(raw)
+	if built.PinCPUs != "0-7" {
+		t.Fatalf("report.json pin_cpus %q, want 0-7", built.PinCPUs)
+	}
+	if md := Markdown(built); !strings.Contains(md, "confined to CPUs 0-7") {
+		t.Error("report.md does not state the pinned CPU range")
+	}
 }
 
 func TestCandidateFailureIsReported(t *testing.T) {
@@ -112,6 +127,7 @@ func TestMergeRefusesDifferentWorkloads(t *testing.T) {
 		"lock":    func(r *suite.Raw) { r.Toolchain.Candidates[0].Version["cargo_lock_sha256"] = "l2" },
 		"oracle":  func(r *suite.Raw) { r.Toolchain.Oracle.Version = "99.0" },
 		"quick":   func(r *suite.Raw) { r.Quick = !r.Quick },
+		"pinning": func(r *suite.Raw) { r.PinCPUs = "0-7" },
 	} {
 		raw := base()
 		raw.Machine.Label = "other-host"

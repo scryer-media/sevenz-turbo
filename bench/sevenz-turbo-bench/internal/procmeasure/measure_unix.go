@@ -29,7 +29,11 @@ func PinSupported() bool {
 	return err == nil
 }
 
-type probe struct{ pinned string }
+// probe is empty here: taskset applies a pin before the tool starts.
+type probe struct {
+	pinned string
+	pinErr error
+}
 
 func attachProbe(*exec.Cmd, string) probe { return probe{} }
 

@@ -49,6 +49,24 @@ func TestATreeIsReusedOnlyWhenItIsExactlyTheRecipe(t *testing.T) {
 	}
 }
 
+func TestATreeWithANonRegularMemberIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	source := smallTree()
+	if _, err := ensureSource(dir, source, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	root := SourceDir(dir, source.Name)
+	if err := os.Symlink("elsewhere", filepath.Join(root, "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if problem := sourceProblem(root, source); problem == "" {
+		t.Fatal("a tree with a symlink member was accepted")
+	}
+	if _, err := measureSource(dir, source); err == nil {
+		t.Fatal("verification accepted a tree with a symlink member")
+	}
+}
+
 func TestASingleFileSourceIsBoundToItsRecipe(t *testing.T) {
 	dir := t.TempDir()
 	source := SourceSpec{Name: "audio-small", Kind: KindAudio, Bytes: 64 << 10}

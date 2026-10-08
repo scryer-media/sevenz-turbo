@@ -138,6 +138,10 @@ func Track(cmd *exec.Cmd, pin string) *Tracker {
 	return &Tracker{probe: attachProbe(cmd, pin)}
 }
 
+// PinError reports why a requested CPU pin could not be applied after start;
+// the child was then killed, and its run must not count.
+func (t *Tracker) PinError() error { return t.probe.pinErr }
+
 // Finish fills measurement from the exited command: CPU time, exit code, the
 // peak resident set and its source, and the I/O counters. It releases the
 // tracker's handle and must be called exactly once, after Wait.
@@ -200,6 +204,11 @@ func Run(ctx context.Context, command Command) Result {
 	tracker.Finish(cmd, &result.Measurement)
 	if result.MaxRSSBytes <= 0 {
 		result.RSSSource = ""
+	}
+	if err := tracker.PinError(); err != nil {
+		result.Failure = "pin-failed"
+		result.Err = err
+		return result
 	}
 	if ctx.Err() != nil {
 		result.Failure = "timeout"

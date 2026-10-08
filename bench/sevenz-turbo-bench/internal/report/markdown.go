@@ -45,6 +45,9 @@ func Markdown(report *Report) string {
 	}
 	fmt.Fprintf(&b, "- OS / arch: %s / %s (%s)\n", m.OS, m.Architecture, m.Kernel)
 	fmt.Fprintf(&b, "- CPU: %s, %d logical cores\n", m.CPU, m.CPUCount)
+	if report.PinCPUs != "" {
+		fmt.Fprintf(&b, "- CPU pinning: every measured process confined to CPUs %s\n", report.PinCPUs)
+	}
 	if m.MemoryBytes > 0 {
 		fmt.Fprintf(&b, "- memory: %.1f GiB\n", float64(m.MemoryBytes)/(1<<30))
 	}
@@ -226,12 +229,12 @@ func Merge(reports []*Report) (string, error) {
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "## Hosts")
 	fmt.Fprintln(&b)
-	fmt.Fprintln(&b, "| label | instance | OS/arch | CPU | cores | ISA | lzma-turbo | 7zz | quick | failures |")
-	fmt.Fprintln(&b, "|---|---|---|---|---|---|---|---|---|---|")
+	fmt.Fprintln(&b, "| label | instance | OS/arch | CPU | cores | pinned CPUs | ISA | lzma-turbo | 7zz | quick | failures |")
+	fmt.Fprintln(&b, "|---|---|---|---|---|---|---|---|---|---|---|")
 	for _, r := range reports {
 		m := r.Machine
-		fmt.Fprintf(&b, "| %s | %s | %s/%s | %s | %d | %s | %s | %s | %t | %d |\n", m.Label, dash(m.InstanceType), m.OS, m.Architecture, m.CPU,
-			m.CPUCount, strings.Join(m.ISA, " "), r.Toolchain.LinkedLzmaTurbo, r.Toolchain.Oracle.Version, r.Quick, len(r.Failures))
+		fmt.Fprintf(&b, "| %s | %s | %s/%s | %s | %d | %s | %s | %s | %s | %t | %d |\n", m.Label, dash(m.InstanceType), m.OS, m.Architecture, m.CPU,
+			m.CPUCount, dash(r.PinCPUs), strings.Join(m.ISA, " "), r.Toolchain.LinkedLzmaTurbo, r.Toolchain.Oracle.Version, r.Quick, len(r.Failures))
 	}
 	fmt.Fprintln(&b)
 

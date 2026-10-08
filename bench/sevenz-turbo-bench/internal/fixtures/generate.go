@@ -258,7 +258,9 @@ func expectedMembers(source SourceSpec) map[string]int64 {
 }
 
 // diskMembers lists the regular files under root as expectedMembers does,
-// skipping top-level dot names (the marker), as Entries does.
+// skipping top-level dot names (the marker), as Entries does. Any other
+// entry (a symlink, a FIFO, a device) is an error: 7zz and decode-bench would
+// treat it differently, and a FIFO could stall either.
 func diskMembers(root string) (map[string]int64, error) {
 	members := map[string]int64{}
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
@@ -279,13 +281,17 @@ func diskMembers(root string) (map[string]int64, error) {
 			}
 			return nil
 		}
-		if entry.Type().IsRegular() {
-			info, err := entry.Info()
-			if err != nil {
-				return err
-			}
-			members[relative] = info.Size()
+		if entry.IsDir() {
+			return nil
 		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("%s is not a regular file", relative)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		members[relative] = info.Size()
 		return nil
 	})
 	return members, err

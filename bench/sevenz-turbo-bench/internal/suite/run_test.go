@@ -6,6 +6,8 @@ import (
 	"os"
 	"slices"
 	"testing"
+
+	"github.com/scryer-media/sevenz-turbo/bench/sevenz-turbo-bench/internal/fixtures"
 )
 
 // TestMain doubles as a stand-in decode-bench: with SUITE_FAKE_DECODE set the
@@ -54,5 +56,31 @@ func TestCheckDigestComparesTheUntimedDigests(t *testing.T) {
 	checkDigest(digests, scenario, &other)
 	if other.Status != StatusFailed || other.Failure != "digest-mismatch" {
 		t.Fatalf("a mismatch passed: %+v", other)
+	}
+}
+
+func TestAListMustReportTheWholeFixture(t *testing.T) {
+	raw := &Raw{Fixtures: &fixtures.Manifest{Archives: []fixtures.ArchiveRecord{
+		{ArchiveSpec: fixtures.ArchiveSpec{Name: "mt.7z"}, Bytes: 10, UnpackedBytes: 100},
+	}}}
+	scenario := Scenario{ID: "list/mt", Op: OpList, Fixture: "mt.7z"}
+	run := Run{Variant: VariantTurbo, Role: RoleCandidate, JSON: true}
+
+	whole := RunRecord{Status: StatusOK, Result: map[string]any{"ok": true, "bytes_out": float64(100)}}
+	fillBytes(raw, scenario, run, &whole)
+	if whole.Status != StatusOK || whole.BytesIn != 10 || whole.BytesOut != 0 {
+		t.Fatalf("a complete list: %+v", whole)
+	}
+
+	short := RunRecord{Status: StatusOK, Result: map[string]any{"ok": true, "bytes_out": float64(60)}}
+	fillBytes(raw, scenario, run, &short)
+	if short.Status != StatusFailed || short.Failure != "short-output" {
+		t.Fatalf("a list missing members passed: %+v", short)
+	}
+
+	oracle := RunRecord{Status: StatusOK}
+	fillBytes(raw, scenario, Run{Variant: VariantOracle, Role: RoleReference}, &oracle)
+	if oracle.Status != StatusOK {
+		t.Fatalf("7zz l, which reports no JSON, failed: %+v", oracle)
 	}
 }

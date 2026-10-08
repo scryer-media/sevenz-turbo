@@ -238,15 +238,22 @@ func fillBytes(raw *Raw, scenario Scenario, run Run, record *RunRecord) {
 		}
 		record.BytesIn = archive.Bytes
 		record.BytesOut = archive.UnpackedBytes
-		if scenario.Op == OpList {
-			record.BytesOut = 0
-		}
-		if record.Status == StatusOK && record.Result != nil && scenario.Op == OpDecode {
+		// A list reports the sum of the entry sizes it parsed; a decode, the
+		// bytes it wrote. Either must be the whole fixture.
+		if record.Status == StatusOK && record.Result != nil {
 			got := int64(number(record.Result["bytes_out"]))
 			if got != archive.UnpackedBytes {
+				verb := "decoded"
+				if scenario.Op == OpList {
+					verb = "listed"
+				}
 				record.Status, record.Failure = StatusFailed, "short-output"
-				record.Error = fmt.Sprintf("decoded %d bytes, the fixture holds %d", got, archive.UnpackedBytes)
+				record.Error = fmt.Sprintf("%s %d bytes, the fixture holds %d", verb, got, archive.UnpackedBytes)
 			}
+		}
+		// A list writes nothing, so it has no output throughput.
+		if scenario.Op == OpList {
+			record.BytesOut = 0
 		}
 	case OpEncode:
 		if source, ok := raw.Fixtures.Source(scenario.Fixture); ok {
