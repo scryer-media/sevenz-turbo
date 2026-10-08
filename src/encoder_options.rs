@@ -123,6 +123,15 @@ impl LzmaSettings {
             .unwrap_or(Self::LEVEL_NICE_LEN[self.level as usize])
     }
 
+    /// The threads one LZMA coder of these settings runs on when the caller
+    /// allowed `threads`: two, the coder's and its match finder's, for the
+    /// normal mode's binary-tree finder with more than one thread allowed;
+    /// otherwise one. C++: `numThreads = (algo == 0 || btMode == 0) ? 1 : 2`.
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    pub(crate) const fn match_finder_threads(&self, threads: u32) -> u32 {
+        if !self.fast() && threads > 1 { 2 } else { 1 }
+    }
+
     /// The `lzma-turbo` setting, for a coder the caller allowed `threads`
     /// threads.
     ///
@@ -148,7 +157,7 @@ impl LzmaSettings {
             });
         if fast {
             props = props.with_match_cycles(Self::LEVEL_DEPTH[self.level as usize]);
-        } else if threads > 1 {
+        } else if self.match_finder_threads(threads) > 1 {
             props = props.with_num_threads(2);
         }
         // C: `props.reduceSize`. Only where it shrinks the dictionary, so an
