@@ -398,6 +398,28 @@ Everything here is new surface; no upstream signature changed meaning.
 
 ## 0.28.0 - 2026-10-09
 
+- A multi-threaded LZMA2 decode of a stream that is a single run no longer
+  holds its input. The reader looked ahead for a run boundary to hand whole
+  runs to its workers, and a stream written as one run has none: it read up
+  to 192 MiB ahead and then went on feeding the decoder in 1 MiB slices
+  copied out of that hold, and a stream smaller than its 256 MiB give-up was
+  read whole first. Once a first run has decoded past the longest run an
+  encoder writes for that dictionary (7-Zip's block size: four dictionaries,
+  kept to 1..=256 MiB and never under one dictionary), the reader takes the
+  stream as one run and streams it, reading a few MiB ahead of the decoder.
+  On Apple M5 Max at 18 threads, peak RSS went from 398 to 148 MiB on a
+  900 MiB single-run archive with a 16 MiB dictionary (7-Zip: 156 MiB) and
+  from 424 to 116 MiB on a 160 MiB delta-filtered one (7-Zip: 122 MiB), at
+  the same wall time; multi-run archives decode as before.
+- Which runs decode on fewer threads is decided from the chunk headers, not
+  from the ratio. A run whose packed size was no smaller than its unpacked
+  size was taken for stored data, and decoded narrow because a copy has
+  nothing to gain from more threads; but LZMA-coded data that barely
+  compresses has the same ratio and decodes about as slowly as anything. A
+  run is now narrowed when under one part in 64 of its output comes from
+  LZMA-coded chunks, by the counts `lzma-turbo` 0.7.0 records for each run;
+  stored data still goes narrow, and an LZMA-coded run stays as wide as it
+  was asked to be whatever its ratio.
 - `lzma-turbo` 0.7.0.
 - An LZMA2 encode on more than one thread gives the binary-tree match finder
   a thread of its own, as 7-Zip does (`numThreads = 2` for the normal
