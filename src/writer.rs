@@ -139,6 +139,20 @@ fn declared_size<'a>(entries: impl IntoIterator<Item = &'a ArchiveEntry>) -> Opt
 /// where a dictionary-sized setup costs more than coding the bytes.
 const READ_AHEAD: u64 = 1 << 20;
 
+/// How much of an entry's source is read in one go and handed to the coder chain.
+///
+/// Large enough that a chain whose first coder hands its input to another thread pays one
+/// message per mebibyte rather than one per page.
+const SOURCE_READ_LEN: usize = 1 << 20;
+
+/// What a folder's compressed bytes are gathered into before they reach the archive's writer.
+///
+/// Coders write what they produce as they produce it - PPMd a byte at a time, the BCJ2 range
+/// coder a few - and the archive's writer is often a bare `File`, so without this a folder costs
+/// one write call per byte or two of output. The buffer is flushed when the folder is done,
+/// explicitly, so that a failed write is an error of that push and not lost in a drop.
+const OUTPUT_BUF_LEN: usize = 256 << 10;
+
 /// The folder's size, as the entries declare it or, failing that, as reading up to
 /// [`READ_AHEAD`] bytes of it finds: the bytes read, which the caller codes first, and the size
 /// when it is known.
@@ -231,6 +245,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         {
             let mut compressed_len = 0;
             let mut compressed = CompressWrapWriter::new(&mut self.output, &mut compressed_len);
+            let mut out = std::io::BufWriter::with_capacity(OUTPUT_BUF_LEN, &mut compressed);
 
             let mut more_sizes: Vec<Rc<Cell<usize>>> =
                 Vec::with_capacity(self.content_methods.len() - 1);
@@ -240,14 +255,13 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             let mut bcj2 = None;
 
             let (crc, size) = {
-                let mut w =
-                    Self::create_writer(&methods, &mut compressed, &mut more_sizes, &mut bcj2)?;
+                let mut w = Self::create_writer(&methods, &mut out, &mut more_sizes, &mut bcj2)?;
                 let mut write_len = 0;
                 let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
                 w.write_all(&head)
                     .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
                 drop(head);
-                let mut buf = [0u8; 4096];
+                let mut buf = vec![0u8; SOURCE_READ_LEN];
                 loop {
                     match r.read(&mut buf) {
                         Ok(n) => {
@@ -270,6 +284,9 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
                 (w.crc_value(), write_len)
             };
+            out.flush()
+                .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+            drop(out);
             let compressed_crc = compressed.crc_value();
             self.pack_info
                 .add_stream(compressed_len as u64, compressed_crc);
@@ -364,6 +381,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         assert_eq!(r.reader_len(), entries.len());
         let mut compressed_len = 0;
         let mut compressed = CompressWrapWriter::new(&mut self.output, &mut compressed_len);
+        let mut out = std::io::BufWriter::with_capacity(OUTPUT_BUF_LEN, &mut compressed);
         let (head, folder) = folder_size(&entries, &mut r)
             .map_err(|e| Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries))))?;
         let content_methods = &sized_methods(&self.content_methods, folder);
@@ -371,15 +389,14 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let mut bcj2 = None;
 
         let (crc, size) = {
-            let mut w =
-                Self::create_writer(content_methods, &mut compressed, &mut more_sizes, &mut bcj2)?;
+            let mut w = Self::create_writer(content_methods, &mut out, &mut more_sizes, &mut bcj2)?;
             let mut write_len = 0;
             let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
             w.write_all(&head).map_err(|e| {
                 Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries)))
             })?;
             drop(head);
-            let mut buf = [0u8; 4096];
+            let mut buf = vec![0u8; SOURCE_READ_LEN];
 
             loop {
                 match r.read(&mut buf) {
@@ -416,6 +433,9 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
             (w.crc_value(), write_len)
         };
+        out.flush()
+            .map_err(|e| Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries))))?;
+        drop(out);
         let compressed_crc = compressed.crc_value();
         let mut sub_stream_crcs = Vec::with_capacity(entries.len());
         let mut sub_stream_sizes = Vec::with_capacity(entries.len());
@@ -819,7 +839,6 @@ pub(crate) fn write_u64<W: Write>(header: &mut W, mut value: u64) -> std::io::Re
 struct CompressWrapWriter<'a, W> {
     writer: W,
     crc: Crc32,
-    cache: Vec<u8>,
     bytes_written: &'a mut usize,
 }
 
@@ -828,7 +847,6 @@ impl<'a, W: Write> CompressWrapWriter<'a, W> {
         Self {
             writer,
             crc: Crc32::new(),
-            cache: Vec::with_capacity(8192),
             bytes_written,
         }
     }
@@ -841,7 +859,6 @@ impl<'a, W: Write> CompressWrapWriter<'a, W> {
 
 impl<W: Write> Write for CompressWrapWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.cache.resize(buf.len(), Default::default());
         let len = self.writer.write(buf)?;
         self.crc.update(&buf[..len]);
         *self.bytes_written += len;
@@ -980,7 +997,7 @@ pub fn prepare_block<R: Read>(
                 )
             })?;
             drop(head);
-            let mut buf = [0u8; 4096];
+            let mut buf = vec![0u8; SOURCE_READ_LEN];
             loop {
                 let n = r.read(&mut buf).map_err(|e| {
                     Error::io_msg(

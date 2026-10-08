@@ -547,6 +547,17 @@ Everything here is new surface; no upstream signature changed meaning.
   block per call below 16 bytes. A caller reading 64 KiB or more is still
   decrypted in its own buffer with no copy, so the AES decode rows, which
   already read in bulk, did not move.
+- `push_archive_entry` and `push_archive_entries` gather a folder's
+  compressed bytes in a 256 KiB buffer before they reach the archive's
+  writer, and flush it, reporting a failure, when the folder is done. A
+  coder that writes a byte or two at a time - PPMd, the BCJ2 range coder -
+  no longer makes a write call per byte on a bare `File`: a solid PPMd
+  encode of 16 MiB to `ArchiveWriter::create` went from 37.3 s, 27 s of it
+  in the kernel, to 5.1 s and 0.03 s. Entry sources are read 1 MiB at a
+  time rather than 4 KiB, which also hands a multi-threaded LZMA2 coder one
+  message per mebibyte. The output is byte-identical (LZMA2 level 5, BCJ2
+  and PPMd checked), and `ArchiveWriter::create` still returns
+  `ArchiveWriter<File>`.
 
 ## 0.26.1 - 2026-09-29
 
