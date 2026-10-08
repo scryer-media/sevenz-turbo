@@ -126,7 +126,8 @@ pub enum Decoder<R: Read> {
     #[cfg(feature = "ppmd")]
     Ppmd(Box<SevenZReader<std::io::BufReader<R>>>),
     Bcj(BcjReader<R>),
-    Delta(DeltaReader<R>),
+    // Boxed: the filter's history (260 bytes on wasm32) would size every variant.
+    Delta(Box<DeltaReader<R>>),
     #[cfg(feature = "brotli")]
     Brotli(Box<BrotliDecoder<R>>),
     #[cfg(feature = "bzip2")]
@@ -416,7 +417,7 @@ pub fn add_decoder<I: Read>(
             // `wrapping_add` would wrap to a zero distance and mis-decode / divide by zero).
             let d = coder.properties.first().map_or(1, |b| *b as usize + 1);
             let de = DeltaReader::new(input, d);
-            Ok(Decoder::Delta(de))
+            Ok(Decoder::Delta(Box::new(de)))
         }
         #[cfg(feature = "aes256")]
         EncoderMethod::ID_AES256_SHA256 => {

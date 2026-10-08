@@ -422,12 +422,21 @@ fn lzma2_fits_one_block(options: &Lzma2Options) -> bool {
 /// One thread is the solid stream; block threads need a block size, and a
 /// chunk size without threads changes nothing. A folder that fits one block
 /// (see [`lzma2_fits_one_block`]) runs on one thread.
+///
+/// Each block thread's coder runs its match finder on a thread of its own
+/// when `LzmaSettings::match_finder_threads` says two, so the thread count
+/// is divided by that, as `Lzma2EncProps_Normalize` divides
+/// `numTotalThreads` by `numThreads`: block threads times match-finder
+/// threads stays within the caller's count.
 #[cfg(not(feature = "lzma-rust2-encoder"))]
 fn lzma2_block_plan(options: &Lzma2Options) -> (u64, usize) {
     match (options.threads, options.block_size()) {
         (0 | 1, _) | (_, None) => (lzma_turbo::BLOCK_SIZE_SOLID, 1),
         (_, Some(block_size)) if lzma2_fits_one_block(options) => (block_size, 1),
-        (threads, Some(block_size)) => (block_size, threads as usize),
+        (threads, Some(block_size)) => {
+            let per_block = options.settings.match_finder_threads(threads);
+            (block_size, (threads / per_block).max(1) as usize)
+        }
     }
 }
 
@@ -798,14 +807,42 @@ mod tests {
                 other => panic!("not LZMA2 options: {other:?}"),
             }
         };
-        assert_eq!(lzma2_block_plan(&options), (32 << 20, 8));
+        // Level 5's binary-tree finder takes a thread per block: 4 x 2.
+        assert_eq!(lzma2_block_plan(&options), (32 << 20, 4));
         assert_eq!(lzma2_block_plan(&sized(16 << 20)), (32 << 20, 1));
         assert_eq!(lzma2_block_plan(&sized(32 << 20)), (32 << 20, 1));
-        assert_eq!(lzma2_block_plan(&sized((32 << 20) + 1)), (32 << 20, 8));
+        assert_eq!(lzma2_block_plan(&sized((32 << 20) + 1)), (32 << 20, 4));
         // A small folder is one block of its own dictionary's size.
         assert_eq!(lzma2_block_plan(&sized(1000)), (32 << 20, 1));
         let solid = crate::encoder_options::Lzma2Options::from_level(5);
         assert_eq!(lzma2_block_plan(&solid), (lzma_turbo::BLOCK_SIZE_SOLID, 1));
+    }
+
+    /// Block threads times match-finder threads never exceeds the caller's
+    /// count: halved for the binary-tree finder, as 7-Zip does, and whole for
+    /// the fast levels' hash chain, which has no thread of its own.
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    #[test]
+    fn block_threads_leave_room_for_the_match_finder_threads() {
+        use crate::encoder_options::Lzma2Options;
+
+        for (level, threads, blocks) in [
+            (6, 2, 1),
+            (6, 3, 1),
+            (6, 8, 4),
+            (9, 9, 4),
+            (1, 8, 8),
+            (3, 5, 5),
+        ] {
+            let options = Lzma2Options::from_level_mt(level, threads, 1 << 20);
+            let (_, got) = lzma2_block_plan(&options);
+            assert_eq!(got, blocks, "level {level}, {threads} threads");
+            let mf = options.settings.match_finder_threads(threads) as usize;
+            assert!(
+                got * mf <= threads as usize,
+                "level {level}, {threads} threads"
+            );
+        }
     }
 
     /// The `lzma-rust2` encoder makes the same one-block decision: a folder
