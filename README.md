@@ -439,9 +439,7 @@ This crate is licensed under the
 [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0),
 the same as upstream, and upstream's copyright notices are unchanged.
 
-Note that `lzma-turbo`, which this crate depends on for LZMA/LZMA2 decoding
-and encoding, the BCJ/BCJ2/delta filters and CRC-32, is licensed
-GPL-3.0-or-later. This crate's own source stays Apache-2.0, but a
-binary that links it together with `lzma-turbo` is a combined work under the
-GPL. If that is a problem for you, upstream `sevenz-rust2` is the crate you
-want.
+`lzma-turbo`, which this crate depends on for LZMA/LZMA2 decoding and
+encoding, the BCJ/BCJ2/delta filters and CRC-32, is licensed under Apache-2.0
+as well, from its 0.7.0 release, which is the version this crate requires.
+Its releases before 0.7.0 were published under GPL-3.0-or-later.
