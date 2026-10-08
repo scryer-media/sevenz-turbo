@@ -430,6 +430,12 @@ Everything here is new surface; no upstream signature changed meaning.
 - The key derivation hands the hash 64 rounds at a time (`7zAes.cpp`'s
   unrolled buffer) instead of three calls a round; the bytes hashed are the
   same. One 2^19 derivation is about 2 ms faster with AWS-LC on Apple M5 Max.
+- Bench tooling: `decode-bench op version` reports `ppmd_crates`, every
+  `ppmd-*` crate in the `Cargo.lock` the binary embeds with its version, and
+  `ppmd_turbo` (its version, or `absent`), in place of `ppmd_rust`; the
+  harness report's toolchain line prints the PPMd crates and still reads a
+  binary that reports only `ppmd_rust`. Nothing names the PPMd engine by
+  crate any more, so the record survives a change of engine.
 
 ## 0.27.0 - 2026-10-07
 

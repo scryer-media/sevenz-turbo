@@ -60,9 +60,9 @@ func Markdown(report *Report) string {
 	fmt.Fprintln(&b)
 	fmt.Fprintf(&b, "- linked lzma-turbo: %s\n", t.LinkedLzmaTurbo)
 	for _, candidate := range t.Candidates {
-		fmt.Fprintf(&b, "- %s: crypto %s, sevenz-rust2 %s, aws-lc-rs %s, crc-fast %s, ppmd-rust %s (sha256 %s)\n", candidate.Label,
+		fmt.Fprintf(&b, "- %s: crypto %s, sevenz-rust2 %s, aws-lc-rs %s, crc-fast %s, PPMd crates %s (sha256 %s)\n", candidate.Label,
 			candidate.Field("crypto_backend"), candidate.Field("sevenz_rust2"), candidate.Field("aws_lc_rs"),
-			candidate.Field("crc_fast"), candidate.Field("ppmd_rust"), short(candidate.SHA256))
+			candidate.Field("crc_fast"), candidate.PPMdCrates(), short(candidate.SHA256))
 	}
 	fmt.Fprintf(&b, "- 7zz: %s (sha256 %s); provenance: %s; official: %t\n", t.Oracle.Banner, short(t.Oracle.SHA256), t.Oracle.Provenance, t.Oracle.Official)
 	dirty := ""

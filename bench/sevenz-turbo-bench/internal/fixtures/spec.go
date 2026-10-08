@@ -151,7 +151,7 @@ func build(name string, s sizes) Profile {
 			{Name: "delta.7z", Source: "audio", Args: []string{"-mx=5", "-mmt=1", "-mf=Delta:4"}, Note: "delta distance 4 + LZMA2"},
 			{Name: "media_mx1.7z", Source: "media", Args: []string{"-mx=1", lzma2MT, "-mmt=8"}, Note: "near-incompressible LZMA2 -mx1 in parallel blocks: mostly uncompressed chunks, the download-shaped decode"},
 			{Name: "media_mx5.7z", Source: "media", Args: []string{"-mx=5", lzma2MT, "-mmt=8"}, Note: "the same at -mx5: fewer, larger blocks, so the parallel decoder holds fewer runs at once"},
-			{Name: "ppmd.7z", Source: "payload-sub", Args: []string{"-mx=5", "-m0=PPMd", "-mmt=1"}, Note: "PPMd (decoded through the external ppmd-rust crate): secondary row"},
+			{Name: "ppmd.7z", Source: "payload-sub", Args: []string{"-mx=5", "-m0=PPMd", "-mmt=1"}, Note: "PPMd (decoded through an external PPMd crate, named in the toolchain record): secondary row"},
 		},
 	}
 }

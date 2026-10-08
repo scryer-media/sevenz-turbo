@@ -110,3 +110,18 @@ func TestBindRustOnlyAttachesAMatchingCheckout(t *testing.T) {
 		}
 	}
 }
+
+func TestPPMdCratesReadsEitherRecord(t *testing.T) {
+	for name, tc := range map[string]struct {
+		version map[string]any
+		want    string
+	}{
+		"every ppmd crate": {map[string]any{"ppmd_crates": "ppmd-rust 1.5.0, ppmd-turbo 0.1.0", "ppmd_turbo": "0.1.0"}, "ppmd-rust 1.5.0, ppmd-turbo 0.1.0"},
+		"older binary":     {map[string]any{"ppmd_rust": "1.5.0"}, "ppmd-rust 1.5.0"},
+		"no record":        {map[string]any{}, "unknown"},
+	} {
+		if got := (Candidate{Version: tc.version}).PPMdCrates(); got != tc.want {
+			t.Errorf("%s: %q, want %q", name, got, tc.want)
+		}
+	}
+}
