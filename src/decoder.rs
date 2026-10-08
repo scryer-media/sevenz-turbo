@@ -303,6 +303,7 @@ pub fn add_decoder<I: Read>(
                     opts.adaptive_lzma2,
                     opts.limits.memory_limit_bytes,
                     dic_size,
+                    uncompressed_len as u64,
                     control,
                     opts.checksum_splits,
                 ),

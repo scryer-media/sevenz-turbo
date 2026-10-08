@@ -353,13 +353,15 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-/// An archive of `count` small files, solid, so a single LZMA2 run holds many
-/// sub-streams and every file's checksum has to be cut out of it.
+/// An archive of many small files, solid, so a single LZMA2 run holds many
+/// sub-streams and every file's checksum has to be cut out of it. There are
+/// enough of them that the block is over the smallest one the reader decodes
+/// in parallel, so the workers are the ones cutting.
 fn many_small_files_archive(dir: &Path) -> (PathBuf, Vec<Vec<u8>>) {
     let source = dir.join("many");
     std::fs::create_dir_all(&source).expect("mkdir");
     let mut members = Vec::new();
-    for index in 0..64 {
+    for index in 0..256 {
         let bytes = payload(4096 + index * 37);
         std::fs::write(source.join(format!("member{index:03}.txt")), &bytes).expect("write");
         members.push(bytes);

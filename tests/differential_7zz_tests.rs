@@ -63,10 +63,15 @@ fn pseudo_x86(len: usize) -> Vec<u8> {
 }
 
 /// The members every archive in the matrix holds.
+///
+/// The text member alone is larger than the smallest block the reader decodes
+/// in parallel, so the eight-thread and adaptive lanes take the parallel path
+/// for every block that holds it, solid or not, rather than all being decoded
+/// single-threaded as too small to be worth it.
 fn members() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         ("silver_horizon/noise.bin", noise(300 * 1024, 7)),
-        ("silver_horizon/text.txt", text(200 * 1024)),
+        ("silver_horizon/text.txt", text(1280 * 1024)),
         ("silver_horizon/inner/code.bin", pseudo_x86(128 * 1024)),
         ("silver_horizon/tiny.txt", b"one line\n".to_vec()),
     ]

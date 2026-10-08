@@ -522,6 +522,18 @@ Everything here is new surface; no upstream signature changed meaning.
   much. A Copy+BCJ block of 4 MiB went from 1,033 reads to 69. A coder that
   already reads large pieces - LZMA, LZMA2 - goes through the buffer
   without a second copy, and no other row moved.
+- An LZMA2 block that declares less than 1 MiB of output is decoded
+  single-threaded whatever thread count or adaptive mode was asked for.
+  7-Zip's and lzma-turbo's multi-threaded encoders never cut a run finer
+  than `max(4 x dict, 1 MiB)`, so such a block is one run, and the parallel
+  path decoded it on the calling thread anyway after starting workers and
+  reserving its read-ahead. A non-solid archive of 512 blocks of 16 KiB went
+  from 0.24 s, 12.7 MiB peak RSS and 27,000 involuntary context switches at
+  18 threads to 0.14 s, 4.2 MiB and 1,100: the same as one thread. The
+  parallel path reads the remainder of a block in pieces sized to what the
+  block declares rather than 4 MiB each, so it no longer zero-fills and
+  reserves 4 MiB for the last kilobytes of a stream; large decodes are
+  unchanged.
 
 ## 0.26.1 - 2026-09-29
 
