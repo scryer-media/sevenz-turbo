@@ -33,6 +33,7 @@ corpus that has changed since.
 | `audio` | 256 MiB | 8 MiB | synthetic 16-bit stereo PCM: two tones plus noise |
 | `tree` | 8192 x ~32 KiB | 512 x ~16 KiB | many small text members under invented directories |
 | `kdf-tree` | 2048 x ~2 KiB | 128 x ~2 KiB | many tiny members |
+| `media` | 1 GiB | 16 MiB | near-incompressible pages (4016 random bytes, 80 zeros): the already-compressed video and audio of a usenet download |
 
 ## Archives
 
@@ -53,7 +54,9 @@ benchmark passphrase `bench-passphrase`, a public constant):
 | `bcj_arm64.7z` | code-arm64 | `-mx=5 -mmt=1 -mf=ARM64` | BCJ ARM64 filter |
 | `bcj2.7z` | code-x86 | `-mx=5 -mmt=1 -mf=BCJ2` | BCJ2 (four streams, LZMA2 + LZMA) |
 | `delta.7z` | audio | `-mx=5 -mmt=1 -mf=Delta:4` | delta filter, distance 4 |
-| `ppmd.7z` | payload-sub | `-mx=5 -m0=PPMd -mmt=1` | PPMd (decoded by the external `ppmd-rust` crate): a secondary row |
+| `ppmd.7z` | payload-sub | `-mx=5 -m0=PPMd -mmt=1` | PPMd (decoded by the external `ppmd-turbo` crate): a secondary row |
+| `media_mx1.7z` | media | `-mx=1 -m0=lzma2 -mmt=8` | near-incompressible LZMA2 at `-mx1` in parallel blocks: mostly stored chunks, the download-shaped decode |
+| `media_mx5.7z` | media | `-mx=5 -m0=lzma2 -mmt=8` | the same at `-mx5`: fewer, larger blocks, so the parallel decoder holds fewer runs at once |
 
 `-mmt=8` rather than `-mmt=on` keeps the block layout the same on every host
 whatever its core count. The quick corpus sets a 4 MiB LZMA2 block because at

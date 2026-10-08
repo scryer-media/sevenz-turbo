@@ -316,7 +316,7 @@ writer.finish().expect("compress ok");
 | BROTLI (*)  | ✓            | ✓          | `brotli` crate |
 | BZIP2       | ✓            | ✓          | `bzip2` crate |
 | DEFLATE (*) | ✓            | ✓          | `flate2` crate (`zlib-rs`) |
-| PPMD        | ✓            | ✓          | `ppmd-rust` crate |
+| PPMD        | ✓            | ✓          | `ppmd-turbo` crate |
 | LZ4 (*)     | ✓            | ✓          | `lz4_flex` crate |
 | ZSTD (*)    | ✓            | ✓          | `zstd` crate |
 

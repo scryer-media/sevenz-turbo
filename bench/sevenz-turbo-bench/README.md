@@ -9,7 +9,7 @@ and arm64, macOS, Windows. Every row records wall time, CPU time and peak RSS.
 
 Codecs this crate only forwards to an external crate (zstd, brotli, bzip2,
 deflate, lz4) are deliberately not measured. PPMd is measured as a secondary
-row only, because it is the external `ppmd-rust` crate.
+row only, because it is the external `ppmd-turbo` crate.
 
 ## What it runs
 
@@ -44,7 +44,7 @@ the core count, then `all`; `--quick` runs 1 and `all`):
 | solid vs non-solid | `decode/tree_{solid,nonsolid}/T{1,all}`, plus `no-verify`, `stream` | many small members: per-member CRC-32, folder setup and header cost vs one large stream |
 | aes-256 | `decode/aes_store/T1`, `decode/aes_mx1/T{1,all}`, `decode/aes_kdf/T1` (+ `list/aes_kdf`) | AES-256-CBC decrypt in both cryptography builds; SHA-256 key derivation dominated rows |
 | filters | `decode/{bcj_x86,bcj_arm64,bcj2,delta}/T1` | the BCJ x86/ARM64, BCJ2 and delta filters |
-| ppmd (secondary) | `decode/ppmd/T1` | PPMd through `ppmd-rust` |
+| ppmd (secondary) | `decode/ppmd/T1` | PPMd through `ppmd-turbo` |
 | encode | `encode/payload-sub/L{1,3,5,7,9}/T{1,all}`, `encode/payload-sub/L5/T<sweep>`, `encode/tree/L5/Tall/{solid,non-solid}` | the `compress` writer (LZMA2 through lzma-turbo's encoder) vs `7zz a -m0=lzma2:d=…:fb=…:mf=…:a=… -mx<L> -mmt<T>`, with the archive-size ratio; 7zz is given this crate's level settings (xz's table, not 7-Zip's `-mx` defaults), so both sides use the same dictionary, match finder and fast bytes; every archive this crate writes is checked once with an untimed `7zz t` |
 | encode aes-256 | `encode/payload-sub/L5/Tall/aes`, `encode/kdf-tree/L5/T1/non-solid/aes` | AES-256 write (`-mhe=on` on the 7zz side; this crate encrypts the header by default) |
 
@@ -90,7 +90,7 @@ GOOS=windows GOARCH=amd64 go build -o ../../dist/sevenz-turbo-bench.exe .
 
 `decode-bench op version` reports the crypto backend it was built with and the
 locked versions of `lzma-turbo`, `sevenz-rust2`, `aws-lc-rs`, `crc-fast` and
-`ppmd-rust`; the harness refuses a `--candidate-native` whose backend is the
+every `ppmd-*` crate the lock carries; the harness refuses a `--candidate-native` whose backend is the
 same as `--candidate`'s.
 
 ## The oracle

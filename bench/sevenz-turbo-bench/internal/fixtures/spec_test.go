@@ -30,7 +30,7 @@ func TestProfilesShareOneRecipe(t *testing.T) {
 
 // readmePending are archives whose README row awaits the operator's approval
 // of the Markdown edit. Remove a name once bench/fixtures/README.md lists it.
-var readmePending = map[string]bool{"media_mx1.7z": true, "media_mx5.7z": true}
+var readmePending = map[string]bool{}
 
 // The fixtures README lists every archive the recipe writes.
 func TestReadmeListsEveryArchive(t *testing.T) {
