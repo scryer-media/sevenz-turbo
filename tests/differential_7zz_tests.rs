@@ -292,16 +292,19 @@ differential_case!(
 differential_case!(lzma2_delta, ["-m0=delta:4", "-m1=lzma2", "-mx5"]);
 differential_case!(lzma_solid_bcj, ["-m0=BCJ", "-m1=lzma", "-mx9", "-ms=on"]);
 differential_case!(multi_volume, ["-m0=lzma2", "-mx1", "-v256k"]);
+#[cfg(feature = "aes256")]
 differential_case!(
     aes_encrypted,
     ["-m0=lzma2", "-mx5"],
     Some("silver-horizon-passphrase")
 );
+#[cfg(feature = "aes256")]
 differential_case!(
     aes_encrypted_header,
     ["-m0=lzma2", "-mx5", "-mhe=on"],
     Some("silver-horizon-passphrase")
 );
+#[cfg(feature = "aes256")]
 differential_case!(
     aes_encrypted_solid_lzma,
     ["-m0=lzma", "-mx9", "-ms=on"],
