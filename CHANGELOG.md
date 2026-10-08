@@ -495,6 +495,16 @@ Everything here is new surface; no upstream signature changed meaning.
   one-file block read through `for_each_entries` or `read_file` is now
   checked once, against the file's CRC, instead of twice over the same
   bytes; the block check stays wherever it is the only one.
+- Fixed: a PPMd block this crate wrote failed `7zz t` with "Data Error",
+  although `7zz x` and this crate's reader both gave the right bytes back.
+  The writer flushes a block's coder chain before finishing it, and
+  `ppmd-rust`'s `flush` ends the range coder, which `finish` then ended a
+  second time, so every PPMd pack stream carried five bytes after its end
+  that 7-Zip's strict end-of-stream check refuses. A flush now only passes
+  down to the sink, and the stream ends once. Tested: where `7zz` or `7z` is
+  on `PATH`, 7-Zip tests and extracts what every encode method writes -
+  Copy, LZMA, LZMA2, LZMA2 with BCJ and with delta, PPMd, BZip2 and Deflate,
+  solid and not, with and without AES-256.
 
 ## 0.26.1 - 2026-09-29
 

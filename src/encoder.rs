@@ -226,8 +226,12 @@ impl<W: Write> Write for Encoder<W> {
             Encoder::Lzma2Mt(w) => w.as_mut().unwrap().flush(),
             #[cfg(feature = "brotli")]
             Encoder::Brotli(w) => w.flush(),
+            // Not `Ppmd7Encoder::flush`: that one ends the range coder, and
+            // `finish` ends it again, which left the five bytes of a second
+            // end after the stream and made `7zz t` call the block a data
+            // error. A flush here only passes down to the sink.
             #[cfg(feature = "ppmd")]
-            Encoder::Ppmd(w) => w.as_mut().unwrap().flush(),
+            Encoder::Ppmd(w) => w.as_mut().unwrap().get_mut().flush(),
             #[cfg(feature = "bzip2")]
             Encoder::Bzip2(w) => w.as_mut().unwrap().flush(),
             #[cfg(feature = "deflate")]
