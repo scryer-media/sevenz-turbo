@@ -65,6 +65,11 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   only through the non-default `lzma-rust2-encoder` feature; with
   `--no-default-features` the graph is `sevenz-turbo → lzma-turbo → crc-fast`
   and nothing else.
+- The writer sizes each folder's LZMA or LZMA2 coder to the folder, the way
+  7-Zip reduces its dictionary: a folder known to be smaller than the
+  dictionary is coded with one its size (never below 4 KiB), and one that fits
+  a single LZMA2 block is coded on one thread. `ArchiveEntry::from_path`
+  records the file's length so the size is known before the push.
 - The BCJ and delta filters are `lzma-turbo`'s, and BCJ2 is vendored into
   `src/codec/filter/` from `lzma-rust2` 0.20.1 (Apache-2.0, same licence),
   which together are what let `lzma-rust2` leave the decode graph rather than
@@ -385,6 +390,26 @@ Everything here is new surface; no upstream signature changed meaning.
 - The vendored BCJ round-trip tests generate their sample data instead of
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
+
+## 0.27.0 - 2026-10-07
+
+- Each folder's LZMA and LZMA2 coder is sized to the folder. Every folder was
+  set up with the full dictionary and, with more than one thread allowed, a
+  multi-threaded LZMA2 coder that buffers a whole 32 MiB block, so a
+  non-solid archive of small files paid that setup per file. A folder whose
+  size is known and smaller than the dictionary now gets a dictionary its own
+  size (7-Zip's rule, never below 4 KiB), recorded in the coder's properties,
+  and a folder that fits one LZMA2 block is coded on one thread. The encoded
+  header is sized the same way. Archives whose folders are no smaller than
+  the dictionary are written byte for byte as before. On Apple M5 Max, 512
+  non-solid 16 KiB files went from 0.70 s CPU and 101 MB peak RSS to 0.50 s
+  and 8.5 MB, at the same archive size.
+- The writer learns a folder's size from its entries: `ArchiveEntry::size` is
+  read as a size hint before a push (zero means unknown), `from_path` now
+  fills it in from the file's length, and a solid block is sized by the sum.
+  When no entry says, the writer reads up to 1 MiB ahead and sizes a shorter
+  stream by what it read. A wrong hint costs ratio or threads, never
+  correctness; the push records the bytes actually read, as before.
 
 ## 0.26.1 - 2026-09-29
 

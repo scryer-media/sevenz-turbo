@@ -232,6 +232,27 @@ fn lzma2_property_for(dict_size: u32) -> u8 {
         .unwrap_or(40)
 }
 
+/// The block size and block-thread count `lzma-turbo`'s LZMA2 coder runs with.
+///
+/// One thread is the solid stream; block threads need a block size, and a
+/// chunk size without threads changes nothing. A folder known to fit one block
+/// is that block on one thread: the same bytes the block-parallel coder would
+/// produce, without starting its pool and buffering the block per folder.
+#[cfg(not(feature = "lzma-rust2-encoder"))]
+fn lzma2_block_plan(options: &Lzma2Options) -> (u64, usize) {
+    let fits_one_block = |block_size: u64| {
+        options
+            .settings
+            .input_size()
+            .is_some_and(|size| size <= block_size)
+    };
+    match (options.threads, options.block_size()) {
+        (0 | 1, _) | (_, None) => (lzma_turbo::BLOCK_SIZE_SOLID, 1),
+        (_, Some(block_size)) if fits_one_block(block_size) => (block_size, 1),
+        (threads, Some(block_size)) => (block_size, threads as usize),
+    }
+}
+
 pub(crate) fn add_encoder<W: Write>(
     input: CountingWriter<W>,
     method_config: &EncoderConfiguration,
@@ -279,13 +300,7 @@ pub(crate) fn add_encoder<W: Write>(
             validate_lzma_dictionary_size(lzma2_options.settings.dict_size())?;
             #[cfg(not(feature = "lzma-rust2-encoder"))]
             let encoder = {
-                // One thread is the solid stream; block threads need a block
-                // size, and a chunk size without threads changes nothing.
-                let (block_size, threads) =
-                    match (lzma2_options.threads, lzma2_options.block_size()) {
-                        (0 | 1, _) | (_, None) => (lzma_turbo::BLOCK_SIZE_SOLID, 1),
-                        (threads, Some(block_size)) => (block_size, threads as usize),
-                    };
+                let (block_size, threads) = lzma2_block_plan(&lzma2_options);
                 Encoder::Lzma2(Some(LzmaTurboWriter::new(
                     input,
                     &lzma2_options.settings.turbo_props(),
@@ -497,6 +512,8 @@ pub(crate) fn get_options_as_properties<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    use super::lzma2_block_plan;
     use super::lzma2_property_for;
     use crate::codec::lzma_turbo::lzma2_dictionary_size;
 
@@ -524,5 +541,30 @@ mod tests {
         assert_eq!(lzma2_property_for(1 << 20), 16);
         assert_eq!(lzma2_property_for(3 << 20), 19);
         assert_eq!(lzma2_property_for(5 << 20), 21);
+    }
+
+    /// A folder that fits one block skips the block-parallel coder; one that
+    /// does not, or whose size is unknown, keeps the threads it was given.
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    #[test]
+    fn a_folder_that_fits_one_block_is_coded_on_one_thread() {
+        use crate::{EncoderConfiguration, encoder_options::EncoderOptions};
+
+        let options = crate::encoder_options::Lzma2Options::from_level_mt(5, 8, 32 << 20);
+        let sized = |size: u64| {
+            let config: EncoderConfiguration = options.clone().into();
+            match config.sized_for(size).expect("LZMA2").options {
+                Some(EncoderOptions::Lzma2(o)) => o,
+                other => panic!("not LZMA2 options: {other:?}"),
+            }
+        };
+        assert_eq!(lzma2_block_plan(&options), (32 << 20, 8));
+        assert_eq!(lzma2_block_plan(&sized(16 << 20)), (32 << 20, 1));
+        assert_eq!(lzma2_block_plan(&sized(32 << 20)), (32 << 20, 1));
+        assert_eq!(lzma2_block_plan(&sized((32 << 20) + 1)), (32 << 20, 8));
+        // A small folder is one block of its own dictionary's size.
+        assert_eq!(lzma2_block_plan(&sized(1000)), (32 << 20, 1));
+        let solid = crate::encoder_options::Lzma2Options::from_level(5);
+        assert_eq!(lzma2_block_plan(&solid), (lzma_turbo::BLOCK_SIZE_SOLID, 1));
     }
 }

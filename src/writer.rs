@@ -96,6 +96,61 @@ impl ArchiveWriter<File> {
     }
 }
 
+/// `methods` for a folder of `size` bytes: every LZMA and LZMA2 coder is told the size (see
+/// `EncoderConfiguration::sized_for`), so one whose dictionary is larger than the folder gets one
+/// the folder's size, and a folder that fits one LZMA2 block skips the block-parallel coder. `None`
+/// is `methods` itself: an unsized folder is coded exactly as it always was, and so, byte for byte,
+/// is one no smaller than the dictionary.
+fn sized_methods(
+    methods: &Arc<Vec<EncoderConfiguration>>,
+    size: Option<u64>,
+) -> Arc<Vec<EncoderConfiguration>> {
+    let Some(size) = size else {
+        return Arc::clone(methods);
+    };
+    if methods.iter().all(|mc| mc.sized_for(size).is_none()) {
+        return Arc::clone(methods);
+    }
+    Arc::new(
+        methods
+            .iter()
+            .map(|mc| mc.sized_for(size).unwrap_or_else(|| mc.clone()))
+            .collect(),
+    )
+}
+
+/// What the entries of one folder declare they hold, or `None` when they declare nothing.
+///
+/// An entry's `size` before it is pushed is read as how many bytes its reader will yield.
+/// [`ArchiveEntry::from_path`] fills it from the file's metadata; zero is "unknown". A folder
+/// whose entries all say zero is sized by reading ahead instead; see [`folder_size`].
+fn declared_size<'a>(entries: impl IntoIterator<Item = &'a ArchiveEntry>) -> Option<u64> {
+    let total = entries
+        .into_iter()
+        .fold(0u64, |sum, entry| sum.saturating_add(entry.size));
+    (total > 0).then_some(total)
+}
+
+/// How far the writer reads into a folder whose size no entry declared, to learn it. A folder
+/// that ends within it is sized exactly; one that does not is no smaller than this, which is past
+/// where a dictionary-sized setup costs more than coding the bytes.
+const READ_AHEAD: u64 = 1 << 20;
+
+/// The folder's size, as the entries declare it or, failing that, as reading up to
+/// [`READ_AHEAD`] bytes of it finds: the bytes read, which the caller codes first, and the size
+/// when it is known.
+fn folder_size<'a, R: Read>(
+    entries: impl IntoIterator<Item = &'a ArchiveEntry>,
+    reader: &mut R,
+) -> std::io::Result<(Vec<u8>, Option<u64>)> {
+    if let Some(size) = declared_size(entries) {
+        return Ok((Vec::new(), Some(size)));
+    }
+    let mut head = Vec::new();
+    let n = reader.by_ref().take(READ_AHEAD).read_to_end(&mut head)? as u64;
+    Ok((head, (n < READ_AHEAD).then_some(n)))
+}
+
 /// Names of the entries in a block, for an error message. Truncated at ~512 bytes, since a solid
 /// block can hold many thousands.
 fn entries_names(entries: &[ArchiveEntry]) -> String {
@@ -176,12 +231,17 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
             let mut more_sizes: Vec<Rc<Cell<usize>>> =
                 Vec::with_capacity(self.content_methods.len() - 1);
+            let (head, folder) = folder_size([&entry], &mut r)
+                .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+            let methods = sized_methods(&self.content_methods, folder);
 
             let (crc, size) = {
-                let mut w =
-                    Self::create_writer(&self.content_methods, &mut compressed, &mut more_sizes)?;
+                let mut w = Self::create_writer(&methods, &mut compressed, &mut more_sizes)?;
                 let mut write_len = 0;
                 let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
+                w.write_all(&head)
+                    .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+                drop(head);
                 let mut buf = [0u8; 4096];
                 loop {
                     match r.read(&mut buf) {
@@ -219,8 +279,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             sizes.extend(more_sizes.iter().map(|s| s.get() as u64));
             sizes.push(size as u64);
 
-            self.unpack_info
-                .add(self.content_methods.clone(), sizes, crc);
+            self.unpack_info.add(methods, sizes, crc);
 
             self.files.push(entry);
             return Ok(self.files.last().unwrap());
@@ -289,13 +348,19 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         assert_eq!(r.reader_len(), entries.len());
         let mut compressed_len = 0;
         let mut compressed = CompressWrapWriter::new(&mut self.output, &mut compressed_len);
-        let content_methods = &self.content_methods;
+        let (head, folder) = folder_size(&entries, &mut r)
+            .map_err(|e| Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries))))?;
+        let content_methods = &sized_methods(&self.content_methods, folder);
         let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(content_methods.len() - 1);
 
         let (crc, size) = {
             let mut w = Self::create_writer(content_methods, &mut compressed, &mut more_sizes)?;
             let mut write_len = 0;
             let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
+            w.write_all(&head).map_err(|e| {
+                Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries)))
+            })?;
+            drop(head);
             let mut buf = [0u8; 4096];
 
             loop {
@@ -456,7 +521,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
         methods.push(EncoderConfiguration::new(EncoderMethod::LZMA));
 
-        let methods = Arc::new(methods);
+        // The header's length is known: a dictionary larger than it is never used.
+        let methods = sized_methods(&Arc::new(methods), Some(size));
 
         let mut encoded_data = Vec::with_capacity(size as usize / 2);
 
@@ -766,6 +832,13 @@ pub fn prepare_block<R: Read>(
         )));
     }
 
+    let (head, folder) = folder_size(&entries, &mut r).map_err(|e| {
+        Error::io_msg(
+            e,
+            format!("prepare_block: read source:{}", entries_names(&entries)),
+        )
+    })?;
+    let methods = sized_methods(&methods, folder);
     let mut out: Vec<u8> = Vec::new();
     let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(methods.len() - 1);
 
@@ -783,6 +856,13 @@ pub fn prepare_block<R: Read>(
             )?;
             let mut write_len = 0;
             let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
+            w.write_all(&head).map_err(|e| {
+                Error::io_msg(
+                    e,
+                    format!("prepare_block: encode:{}", entries_names(&entries)),
+                )
+            })?;
+            drop(head);
             let mut buf = [0u8; 4096];
             loop {
                 let n = r.read(&mut buf).map_err(|e| {
