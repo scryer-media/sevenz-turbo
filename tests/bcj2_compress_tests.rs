@@ -218,6 +218,33 @@ fn branches_fill_the_call_and_jump_streams() {
     }
 }
 
+/// An entry's compressed size counts all four of its block's pack streams,
+/// both as the writer reports it when the entry is pushed and as the reader
+/// reports it after parsing the finished archive.
+#[test]
+fn the_compressed_size_survives_reopening() {
+    let data = pseudo_x86(256 * 1024, 5);
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    writer.set_content_methods(bcj2_methods());
+    let pushed = writer
+        .push_archive_entry(
+            ArchiveEntry::new_file("cobalt_ridge/bin/tool.exe"),
+            Some(Cursor::new(data)),
+        )
+        .unwrap()
+        .compressed_size;
+    let bytes = writer.finish().unwrap().into_inner();
+
+    let reader = ArchiveReader::new(Cursor::new(bytes.as_slice()), Password::empty()).unwrap();
+    let archive = reader.archive();
+    let packed = archive.block_pack_streams(0);
+    assert_eq!(packed.len(), 4);
+    assert!(packed.iter().skip(1).any(|p| p.size > 0), "{packed:?}");
+    let total: u64 = packed.iter().map(|p| p.size).sum();
+    assert_eq!(pushed, total);
+    assert_eq!(archive.files[0].compressed_size, total);
+}
+
 #[test]
 fn empty_and_tiny_inputs_round_trip() {
     for data in [

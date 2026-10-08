@@ -985,17 +985,22 @@ impl Archive {
                 continue;
             }
 
-            //set `compressed_size` of first file in block
+            // The first file in a block carries the block's compressed size:
+            // every pack stream it reads, which for BCJ2 is all four, as the
+            // writer reports it when the entry is pushed.
             if stream_map.block_first_file_index[next_block_index] == i {
                 let first_pack_stream_index =
                     stream_map.block_first_pack_stream_index[next_block_index];
-                let pack_size =
-                    *archive
-                        .pack_sizes
-                        .get(first_pack_stream_index)
-                        .ok_or_else(|| {
-                            Error::other("block references a pack stream index beyond pack_sizes")
-                        })?;
+                let pack_sizes = first_pack_stream_index
+                    .checked_add(archive.blocks[next_block_index].packed_streams.len())
+                    .and_then(|end| archive.pack_sizes.get(first_pack_stream_index..end))
+                    .ok_or_else(|| {
+                        Error::other("block references a pack stream index beyond pack_sizes")
+                    })?;
+                let pack_size = pack_sizes
+                    .iter()
+                    .try_fold(0u64, |total, &size| total.checked_add(size))
+                    .ok_or_else(|| Error::other("block pack size overflow"))?;
 
                 archive.files[i].compressed_size = pack_size;
             }

@@ -455,6 +455,11 @@ Everything here is new surface; no upstream signature changed meaning.
   the source is read cannot change a byte of the archive; and, where `7zz` or
   `7z` is on `PATH`, that 7-Zip tests and extracts the archives to their
   inputs.
+- Fixed: the reader set a BCJ2 entry's `compressed_size` to its block's first
+  pack stream alone, so the same entry reported a smaller size after the
+  archive was reopened than the writer reported when it was pushed. The
+  first entry of a block now carries the sum of every pack stream the block
+  reads.
 
 ## 0.26.1 - 2026-09-29
 
