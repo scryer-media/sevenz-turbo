@@ -180,14 +180,18 @@ const MT_OUTPUT_SPARE_PIECES: usize = 8;
 
 /// Smallest block, in decoded bytes, that is worth decoding in parallel.
 ///
-/// Below this the block is decoded single-threaded whatever the caller asked
-/// for. A stream this small is almost always a single run: 7-Zip's and
+/// At or below this the block is decoded single-threaded whatever the caller
+/// asked for. A stream this small is almost always a single run: 7-Zip's and
 /// `lzma-turbo`'s multi-threaded encoders cut a run every `max(4 x dict, 1
 /// MiB)` bytes, so nothing they write is split any finer than this, and a
 /// stream of one run is decoded on the calling thread by the parallel path
 /// too, after it has started workers, allocated its read-ahead and checksummed
 /// through its fold. A non-solid archive of small files is thousands of such
 /// blocks, and paid that setup on every one of them for no parallelism at all.
+///
+/// The knee is that minimum run and not a property of the machine: measured
+/// on x86 and on arm64 alike, the parallel path first wins at the second run,
+/// and a block of exactly one run decoded in parallel was 4.5% slower.
 ///
 /// The block's declared size is what is compared, and it is only a hint here:
 /// a stream that is larger than it says is still decoded correctly by the
@@ -589,7 +593,7 @@ impl Lzma2Plan {
     /// ceiling is one right now. `memory_limit_bytes` is
     /// [`ArchiveLimits::memory_limit_bytes`], `dict_size` the dictionary
     /// this coder declares, and `unpacked_len` the bytes it declares it
-    /// decodes to: a block smaller than [`MT_MIN_BLOCK_BYTES`] is decoded
+    /// decodes to: a block no larger than [`MT_MIN_BLOCK_BYTES`] is decoded
     /// single-threaded, adaptive or not, because there is nothing in it to
     /// widen to.
     ///
@@ -623,7 +627,7 @@ impl Lzma2Plan {
         control: &Arc<Lzma2Control>,
         splits: &[u64],
     ) -> Self {
-        if (threads <= 1 && !adaptive) || unpacked_len < MT_MIN_BLOCK_BYTES {
+        if (threads <= 1 && !adaptive) || unpacked_len <= MT_MIN_BLOCK_BYTES {
             return Self::SingleThreaded;
         }
         let budgeted = Self::budgeted_threads(threads, adaptive, memory_limit_bytes);
@@ -2068,7 +2072,9 @@ mod tests {
     fn a_block_smaller_than_a_run_is_single_threaded() {
         let control = Arc::new(Lzma2Control::new(8));
         for (threads, adaptive) in [(8, false), (8, true), (1, true)] {
-            for len in [0, 16 << 10, MT_MIN_BLOCK_BYTES - 1] {
+            // Exactly one run is still one run: the encoder's smallest run is
+            // this size, so a block of it has nothing to hand a second worker.
+            for len in [0, 16 << 10, MT_MIN_BLOCK_BYTES - 1, MT_MIN_BLOCK_BYTES] {
                 assert!(
                     matches!(
                         Lzma2Plan::for_block(
@@ -2091,7 +2097,7 @@ mod tests {
                     adaptive,
                     u64::MAX,
                     1 << 20,
-                    MT_MIN_BLOCK_BYTES,
+                    MT_MIN_BLOCK_BYTES + 1,
                     &control,
                     &[]
                 ),
