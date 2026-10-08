@@ -32,7 +32,8 @@ type Binary struct {
 type Candidate struct {
 	Binary
 	Label string `json:"label"`
-	// Version is the `op version` object: crypto_backend, lzma_turbo,
+	// Version is the `op version` object: crypto_backend, lzma_encoder,
+	// build_profile, git_commit, git_dirty, cargo_lock_sha256, lzma_turbo,
 	// sevenz_rust2, aws_lc_rs, crc_fast, ppmd_rust, available_parallelism.
 	Version map[string]any `json:"version"`
 }
@@ -213,6 +214,18 @@ const LzmaEncoder = "lzma-turbo"
 // script records whether they had uncommitted changes as git_dirty.
 var BuildPaths = []string{"src", "Cargo.toml", "Cargo.lock", "tools/decode-bench"}
 
+// BuildProfile is the Cargo profile every candidate must report: a debug
+// build measures the compiler's unoptimised output, not the crate.
+const BuildProfile = "release"
+
+// CheckProfile fails unless the candidate reports a release build.
+func CheckProfile(candidate Candidate, flag string) error {
+	if got := candidate.Field("build_profile"); got != BuildProfile {
+		return fmt.Errorf("%s %s reports build profile %q, want %q (cargo build --locked --release -p decode-bench; an older decode-bench reports none)", flag, candidate.Path, got, BuildProfile)
+	}
+	return nil
+}
+
 // CheckEncoder fails unless the candidate reports the default LZMA encoder.
 func CheckEncoder(candidate Candidate, flag string) error {
 	if got := candidate.Field("lzma_encoder"); got != LzmaEncoder {
@@ -223,7 +236,7 @@ func CheckEncoder(candidate Candidate, flag string) error {
 
 // buildIdentity are the op version fields that say which source a binary was
 // built from.
-var buildIdentity = []string{"git_commit", "git_dirty", "cargo_lock_sha256", "sevenz_turbo", "lzma_turbo"}
+var buildIdentity = []string{"git_commit", "git_dirty", "cargo_lock_sha256", "build_profile", "sevenz_turbo", "lzma_turbo"}
 
 // SameBuild fails unless native was built from the same committed source as
 // primary, so the two rows differ only by the crypto backend: the same

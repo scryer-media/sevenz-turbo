@@ -223,14 +223,15 @@ fn cargo_lock_sha256() -> String {
 }
 
 /// What the binary is: the crate version, the cryptography backend and LZMA
-/// encoder the build selected, the commit and `Cargo.lock` it was built from
-/// and whether its sources had uncommitted changes then, and the versions
-/// locked when it was built.
+/// encoder the build selected, the Cargo profile it was built under, the
+/// commit and `Cargo.lock` it was built from and whether its sources had
+/// uncommitted changes then, and the versions locked when it was built.
 fn version() -> Fields {
     vec![
         ("decode_bench", str(env!("CARGO_PKG_VERSION"))),
         ("crypto_backend", str(sevenz_turbo::crypto_backend())),
         ("lzma_encoder", str(sevenz_turbo::lzma_encoder())),
+        ("build_profile", str(env!("DECODE_BENCH_PROFILE"))),
         ("git_commit", str(env!("DECODE_BENCH_GIT_COMMIT"))),
         ("git_dirty", str(env!("DECODE_BENCH_GIT_DIRTY"))),
         ("cargo_lock_sha256", Json::Str(cargo_lock_sha256())),
