@@ -1,8 +1,5 @@
 use std::{fmt::Debug, num::NonZeroU64};
 
-#[cfg(feature = "ppmd")]
-use ppmd_rust::{PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER};
-
 #[cfg(feature = "compress")]
 use crate::EncoderConfiguration;
 #[cfg(feature = "aes256")]
@@ -507,21 +504,11 @@ impl PpmdOptions {
     /// * `order` - Model order (clamped to valid PPMD range)
     /// * `memory_size` - Memory size in bytes (clamped to valid PPMD range)
     pub const fn from_order_memory_size(order: u32, memory_size: u32) -> Self {
-        let order = if order > PPMD7_MAX_ORDER {
-            PPMD7_MAX_ORDER
-        } else if order < PPMD7_MIN_ORDER {
-            PPMD7_MIN_ORDER
-        } else {
-            order
-        };
-        let memory_size = if memory_size > PPMD7_MAX_MEM_SIZE {
-            PPMD7_MAX_MEM_SIZE
-        } else if memory_size < PPMD7_MIN_MEM_SIZE {
-            PPMD7_MIN_MEM_SIZE
-        } else {
-            memory_size
-        };
-        Self { order, memory_size }
+        let params = ppmd_turbo::Params::clamped(order, memory_size);
+        Self {
+            order: params.order(),
+            memory_size: params.mem_size(),
+        }
     }
 }
 

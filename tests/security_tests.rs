@@ -1184,3 +1184,218 @@ fn block_coders_over_the_memory_limit_together_are_refused() {
         other => panic!("a block chain over the limit in total must be refused, got {other:?}"),
     }
 }
+
+/// Deterministic text-like bytes: words over a small alphabet, so PPMd and
+/// LZMA both have something to model.
+#[cfg(feature = "ppmd")]
+fn wordy(len: usize) -> Vec<u8> {
+    let words: [&[u8]; 8] = [
+        b"amber ",
+        b"basalt ",
+        b"cobalt ",
+        b"dune ",
+        b"ember ",
+        b"fjord ",
+        b"glacier\n",
+        b"heron ",
+    ];
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        out.extend_from_slice(words[(state >> 61) as usize]);
+    }
+    out.truncate(len);
+    out
+}
+
+/// The packed stream this crate's writer produces for `data` in a one-file
+/// archive coded with `method`: the bytes between the signature header and
+/// the next header.
+#[cfg(feature = "ppmd")]
+fn packed_stream_of(method: sevenz_turbo::EncoderConfiguration, data: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    {
+        let mut writer = ArchiveWriter::new(Cursor::new(&mut bytes)).unwrap();
+        writer.set_content_methods(vec![method]);
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("member.txt"), Some(data))
+            .unwrap();
+        writer.finish().unwrap();
+    }
+    let next_header_offset = u64::from_le_bytes(bytes[12..20].try_into().unwrap()) as usize;
+    bytes[32..32 + next_header_offset].to_vec()
+}
+
+/// A one-file archive of one folder of one coder, with no CRC anywhere: what
+/// the coder produces from `packed` is all that decides the outcome.
+#[cfg(feature = "ppmd")]
+fn single_coder_archive(packed: &[u8], coder_id: [u8; 3], props: &[u8], unpacked: u64) -> Vec<u8> {
+    let mut nh = vec![
+        K_HEADER,
+        K_MAIN_STREAMS_INFO,
+        K_PACK_INFO,
+        0x00,
+        0x01,
+        K_SIZE,
+    ];
+    write_number(&mut nh, packed.len() as u64);
+    nh.extend_from_slice(&[K_END, K_UNPACK_INFO, K_FOLDER, 0x01, 0x00, 0x01, 0x23]);
+    nh.extend_from_slice(&coder_id);
+    nh.push(props.len() as u8);
+    nh.extend_from_slice(props);
+    nh.push(K_CODERS_UNPACK_SIZE);
+    write_number(&mut nh, unpacked);
+    nh.extend_from_slice(&[
+        K_END,
+        K_SUB_STREAMS_INFO,
+        K_END,
+        K_END,
+        K_FILES_INFO,
+        0x01,
+        K_END,
+        K_END,
+    ]);
+    raw_7z_with_packed(packed, &nh)
+}
+
+/// Extracts every entry, returning the bytes or the crate's error.
+#[cfg(feature = "ppmd")]
+fn extract_all(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut reader = ArchiveReader::new(Cursor::new(bytes.to_vec()), Password::empty())?;
+    let mut out = Vec::new();
+    reader.for_each_entries(&mut |_e: &ArchiveEntry, rd: &mut dyn std::io::Read| {
+        rd.read_to_end(&mut out)?;
+        Ok(true)
+    })?;
+    Ok(out)
+}
+
+/// A PPMd stream cut short is refused with the same error the LZMA decoder
+/// gives for a cut stream: an I/O error of kind `UnexpectedEof`, located in
+/// its block. It used to decode, without complaint, to whatever the coder made
+/// of the zeros past the end, so with no CRC to catch it the damage went
+/// unreported.
+#[cfg(feature = "ppmd")]
+#[test]
+fn a_truncated_ppmd_stream_is_refused_like_a_truncated_lzma_stream() {
+    use sevenz_turbo::{BlockErrorKind, EncoderMethod};
+
+    let data = wordy(64 << 10);
+    let ppmd_props = [6u8, 0x00, 0x00, 0x00, 0x01]; // order 6, 16 MiB
+    let lzma_props = [0x5Du8, 0x00, 0x00, 0x10, 0x00]; // lc3 lp0 pb2, 1 MiB
+    let cases = [
+        (
+            "PPMd",
+            [0x03, 0x04, 0x01],
+            &ppmd_props[..],
+            packed_stream_of(
+                sevenz_turbo::encoder_options::PpmdOptions::from_order_memory_size(6, 1 << 24)
+                    .into(),
+                &data,
+            ),
+        ),
+        (
+            "LZMA",
+            [0x03, 0x01, 0x01],
+            &lzma_props[..],
+            packed_stream_of(EncoderMethod::LZMA.into(), &data),
+        ),
+    ];
+
+    let mut kinds = Vec::new();
+    for (name, id, props, packed) in &cases {
+        // The crafted container is right: the whole stream decodes.
+        let whole = single_coder_archive(packed, *id, props, data.len() as u64);
+        assert_eq!(
+            extract_all(&whole).expect(name),
+            data,
+            "{name}: intact stream"
+        );
+
+        let cut = single_coder_archive(&packed[..packed.len() / 2], *id, props, data.len() as u64);
+        let err = extract_all(&cut).expect_err(name);
+        let kind = match &err {
+            Error::BlockDecode { kind, message, .. } => {
+                assert!(message.contains("UnexpectedEof"), "{name}: {message}");
+                *kind
+            }
+            other => panic!("{name}: a cut stream gave {other:?}"),
+        };
+        kinds.push(kind);
+    }
+    assert_eq!(kinds[0], BlockErrorKind::Io);
+    assert_eq!(
+        kinds[0], kinds[1],
+        "PPMd and LZMA report a cut stream alike"
+    );
+}
+
+/// A PPMd stream whose first byte is not the zero 7-Zip's encoder writes is
+/// refused on its first read, as an I/O error of kind `InvalidData` located
+/// in its block, the way the LZMA decoder refuses a corrupt stream.
+#[cfg(feature = "ppmd")]
+#[test]
+fn a_ppmd_stream_with_a_bad_first_byte_is_refused() {
+    let packed = [0x01u8, 0, 0, 0, 0, 0, 0, 0];
+    let bytes = single_coder_archive(&packed, [0x03, 0x04, 0x01], &[6, 0, 0, 0, 1], 16);
+    match extract_all(&bytes).expect_err("a corrupt PPMd stream") {
+        Error::BlockDecode {
+            block_index: 0,
+            kind: sevenz_turbo::BlockErrorKind::Io,
+            message,
+            ..
+        } => {
+            assert!(message.contains("InvalidData"), "{message}")
+        }
+        other => panic!("a corrupt PPMd stream gave {other:?}"),
+    }
+}
+
+/// A PPMd coder that declares a model larger than the memory limit is refused
+/// with the limit's `MaxMemLimited` before its decoder is built, so the model
+/// is never allocated; the same coder decodes under a limit that covers it.
+#[cfg(feature = "ppmd")]
+#[test]
+fn a_ppmd_model_over_the_memory_limit_is_refused() {
+    let data = wordy(4 << 10);
+    let packed = packed_stream_of(
+        sevenz_turbo::encoder_options::PpmdOptions::from_order_memory_size(6, 1 << 30).into(),
+        &data,
+    );
+    let props = [6u8, 0x00, 0x00, 0x00, 0x40]; // order 6, 1 GiB
+    let bytes = single_coder_archive(&packed, [0x03, 0x04, 0x01], &props, data.len() as u64);
+    let archive =
+        sevenz_turbo::Archive::read(&mut Cursor::new(bytes.as_slice()), &Password::empty())
+            .unwrap();
+    let password = Password::empty();
+    let decode = |limit: u64| {
+        let mut source = Cursor::new(bytes.as_slice());
+        let mut out = Vec::new();
+        sevenz_turbo::BlockDecoder::with_limits(
+            1,
+            0,
+            &archive,
+            &password,
+            &mut source,
+            ArchiveLimits::memory(limit),
+        )
+        .for_each_entries(&mut |_e: &ArchiveEntry, rd: &mut dyn std::io::Read| {
+            rd.read_to_end(&mut out)?;
+            Ok(true)
+        })
+        .map(|_| out)
+    };
+
+    match decode(64 * MIB) {
+        Err(Error::BlockDecode {
+            block_index: 0,
+            ref message,
+            ..
+        }) if message.starts_with("MaxMemLimited") => {}
+        other => panic!("a PPMd model over the limit must be refused, got {other:?}"),
+    }
+    assert_eq!(decode(2048 * MIB).unwrap(), data);
+}

@@ -556,6 +556,23 @@ Everything here is new surface; no upstream signature changed meaning.
   harness report's toolchain line prints the PPMd crates and still reads a
   binary that reports only `ppmd_rust`. Nothing names the PPMd engine by
   crate any more, so the record survives a change of engine.
+- PPMd decodes and encodes through `ppmd-turbo` instead of `ppmd-rust`, in
+  both directions: its reader reads straight out of the coder's 64 KiB
+  input buffer, and its writer settles 64 KiB of output at a time and ends
+  the stream once, with no end marker, as 7-Zip does. The decoder is built
+  with the folder's unpacked size, which ends the stream. A stream cut short
+  fails its read as an I/O error of kind `UnexpectedEof` and a corrupt one
+  as `InvalidData`, located in its block, the same errors the LZMA decoders
+  give. A model larger than the memory limit is refused with
+  `MaxMemLimited` before it is allocated. The encoder writes the same bytes
+  as before, which are the bytes `7zz a` writes for the same order and
+  memory size. On Apple M5 Max, 7 interleaved runs each, a 15 MB PPMd
+  block written by 7-Zip decoded in 1.98 s instead of 2.92 s (7zz:
+  2.63 s), and the same data under AES-256 in 2.00 s instead of 2.93 s
+  (7zz: 2.64 s). Encoding runs within 3% of before: 16 MiB of data that
+  barely compresses at order 8 took 2.52 s instead of 2.45 s (7zz:
+  2.44 s), and 4 MiB of x86 code 0.43 s instead of 0.42 s. Text encodes as
+  fast as before.
 
 ## 0.27.0 - 2026-10-07
 
