@@ -653,7 +653,8 @@ Everything here is new surface; no upstream signature changed meaning.
   dictionary, one thread), peak RSS went from 395 to 67 MiB for a 256 MiB
   input and from 1382 to 67 MiB for 1 GiB, with wall and CPU time no worse.
   Building with `--cfg sevenz_turbo_unthreaded` sends every writer down that
-  path, for tests and measurement on a host with threads.
+  path, for tests and measurement on a host with threads, and CI runs clippy
+  and the default-feature tests built that way (the `unthreaded` job).
 - The `wasm32-unknown-unknown` clippy gate (`--no-default-features --features
   default_wasm`, `-D warnings`) passes: `Decoder::Delta` boxes its reader,
   whose filter history would otherwise size every variant, and two closures
