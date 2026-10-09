@@ -94,6 +94,51 @@ func TestPlanCoversTheMatrix(t *testing.T) {
 	}
 }
 
+// The one-thread BCJ2 row has two references: 7zz -mmt=1, and 7zz -mmt=1
+// -mmtf=off, which takes away the thread 7-Zip gives the BCJ2 stage. No other
+// row has the second. Both profiles plan it.
+func TestBCJ2RowHasBothOneThreadReferences(t *testing.T) {
+	for _, quick := range []bool{true, false} {
+		profile := fixtures.Full()
+		if quick {
+			profile = fixtures.Quick()
+		}
+		dir, manifest := fakeCorpus(t, profile)
+		scenarios, err := Plan(manifest, dir, t.TempDir(), Tools{Candidate: "decode-bench", Oracle: "7zz"}, DefaultSettings(quick, 32))
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, scenario := range scenarios {
+			references := map[string]string{}
+			for _, run := range scenario.Variants {
+				if run.Role == RoleReference {
+					references[run.Variant] = strings.Join(run.Args[:len(run.Args)-1], " ")
+				}
+			}
+			if scenario.ID != "decode/bcj2/T1" {
+				if _, ok := references[VariantOracleOneThread]; ok {
+					t.Errorf("quick=%t: %s has the one-thread reference", quick, scenario.ID)
+				}
+				continue
+			}
+			found = true
+			want := map[string]string{VariantOracle: "t -bso0 -bsp0 -mmt=1", VariantOracleOneThread: "t -bso0 -bsp0 -mmt=1 -mmtf=off"}
+			if len(references) != len(want) {
+				t.Errorf("quick=%t: references %v, want %v", quick, references, want)
+			}
+			for variant, args := range want {
+				if references[variant] != args {
+					t.Errorf("quick=%t: %s runs %q, want %q", quick, variant, references[variant], args)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("quick=%t: decode/bcj2/T1 not planned", quick)
+		}
+	}
+}
+
 // The ledger group is every ledger fixture at 2, 4, 8 and all threads with no
 // limit and under each ledger limit, and the controls at 2, 4 and 8.
 func TestLedgerRows(t *testing.T) {

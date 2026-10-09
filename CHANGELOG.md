@@ -937,6 +937,12 @@ Everything here is new surface; no upstream signature changed meaning.
   reads CRLF line endings as LF, in decode-bench and in the harness, so
   `merge` no longer refuses a report from a CRLF checkout over line endings
   alone.
+- Bench harness: the one-thread BCJ2 row, `decode/bcj2/T1`, has two
+  references: `7zz -mmt=1`, which still runs the BCJ2 stage on a second
+  thread, and `7zz -mmt=1 -mmtf=off`, which does not. Every ratio in
+  report.json now names the reference it is against (`reference`), and both
+  reports label the second as `sevenz-turbo vs 7zz -mmtf=off`.
+
 ## 0.26.1 - 2026-09-29
 
 - Fixed: `ArchiveLimits::memory_limit_bytes` bounds a coder chain as a whole,

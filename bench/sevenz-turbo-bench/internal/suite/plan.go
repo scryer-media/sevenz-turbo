@@ -23,7 +23,15 @@ const (
 	VariantTurboPlain = "sevenz-turbo no-ledger"
 	VariantUpstream   = "sevenz-rust2"
 	VariantOracle     = "7zz"
+	// VariantOracleOneThread is 7zz with -mmtf=off beside -mmt=1, a second
+	// reference on a one-thread filter row: at -mmt=1 alone 7-Zip still runs
+	// the BCJ2 stage on a thread of its own.
+	VariantOracleOneThread = "7zz -mmtf=off"
 )
+
+// References lists the reference variants a ratio can be taken against, the
+// primary first.
+var References = []string{VariantOracle, VariantOracleOneThread}
 
 // Roles. A failing candidate or reference run fails the whole run; a failing
 // secondary run is reported and does not.
@@ -290,7 +298,12 @@ func Plan(manifest *fixtures.Manifest, dir, scratch string, tools Tools, setting
 	p.decode("aes-256", "aes_kdf.7z", "1", decodeOpts{upstream: true, native: true,
 		note: "one SHA-256 key derivation per folder unless cached: the key-derivation row"})
 	for _, name := range []string{"bcj_x86.7z", "bcj_arm64.7z", "bcj2.7z", "delta.7z"} {
-		p.decode("filters", name, "1", decodeOpts{upstream: true})
+		o := decodeOpts{upstream: true}
+		if name == "bcj2.7z" {
+			o.oneThreadReference = true
+			o.note = "two references: 7zz -mmt=1, which still runs the BCJ2 stage on a second thread, and 7zz -mmt=1 -mmtf=off, which does not; each ratio names the one it is against"
+		}
+		p.decode("filters", name, "1", o)
 	}
 	p.decode("ppmd (secondary)", "ppmd.7z", "1", decodeOpts{upstream: true, note: "PPMd is an external crate (see the toolchain's PPMd crates), not this crate's code"})
 
@@ -379,9 +392,12 @@ type decodeOpts struct {
 	upstream, native, noVerify, stream, adaptive bool
 	// ledger has the candidate keep the reader's ledger. A ledger row with no
 	// memory limit also runs the candidate without one, as VariantTurboPlain.
-	ledger      bool
-	memoryLimit int64
-	note        string
+	ledger bool
+	// oneThreadReference adds VariantOracleOneThread, 7zz with -mmtf=off as
+	// well as -mmt=n, as a second reference beside VariantOracle.
+	oneThreadReference bool
+	memoryLimit        int64
+	note               string
 }
 
 // ledgerRows plans the ledger group: every ledger fixture at every ledger
@@ -465,6 +481,10 @@ func (p *planner) decode(group, name, threads string, o decodeOpts) {
 		variants = append(variants, Run{Variant: VariantTurboPlain, Role: RoleCandidate, Tool: p.tools.Candidate, Args: plain, JSON: true})
 	}
 	variants = append(variants, Run{Variant: VariantOracle, Role: RoleReference, Tool: p.tools.Oracle, Args: oracle})
+	if o.oneThreadReference {
+		oneThread := append(append([]string(nil), oracle[:len(oracle)-1]...), "-mmtf=off", path)
+		variants = append(variants, Run{Variant: VariantOracleOneThread, Role: RoleReference, Tool: p.tools.Oracle, Args: oneThread})
+	}
 	if o.upstream {
 		upstream := []string{"op", "decode", "--engine", "upstream", "--archive", path, "--threads", n}
 		if record.Encrypted {

@@ -23,6 +23,21 @@ func ratioText(value *float64) string {
 	return fmt.Sprintf("%.3f", *value)
 }
 
+// primaryReference reports whether a ratio is against 7zz as every row runs
+// it; a report written before ratios named their reference has only those.
+func primaryReference(ratio Ratio) bool {
+	return ratio.Reference == "" || ratio.Reference == suite.VariantOracle
+}
+
+// ratioLabel names a ratio's candidate, and its reference when that is not
+// the primary one.
+func ratioLabel(ratio Ratio) string {
+	if primaryReference(ratio) {
+		return ratio.Variant
+	}
+	return ratio.Variant + " vs " + ratio.Reference
+}
+
 // throughputText gives a throughput in MiB/s to three significant figures, so
 // a slow row reads as what it is rather than rounding to 0.
 func throughputText(mibs float64) string {
@@ -106,8 +121,18 @@ func Markdown(report *Report) string {
 		fmt.Fprintln(&b)
 	}
 
+	// ratios holds each candidate's ratio against 7zz; others its ratios
+	// against a second reference, printed on lines of their own that name it.
 	ratios := map[string]map[string]Ratio{}
+	others := map[string]map[string][]Ratio{}
 	for _, ratio := range report.Ratios {
+		if !primaryReference(ratio) {
+			if others[ratio.Scenario] == nil {
+				others[ratio.Scenario] = map[string][]Ratio{}
+			}
+			others[ratio.Scenario][ratio.Variant] = append(others[ratio.Scenario][ratio.Variant], ratio)
+			continue
+		}
 		if ratios[ratio.Scenario] == nil {
 			ratios[ratio.Scenario] = map[string]Ratio{}
 		}
@@ -176,6 +201,14 @@ func Markdown(report *Report) string {
 			}
 			line += fmt.Sprintf(" %s | %s | %s | %s | %s |", wall, cpu, rss, load, dash(extra))
 			fmt.Fprintln(&b, line)
+			for _, other := range others[row.Scenario][row.Variant] {
+				line := fmt.Sprintf("| | %s | - | - | - | - |", ratioLabel(other))
+				if encode {
+					line += fmt.Sprintf(" - | %s |", ratioText(other.Size))
+				}
+				line += fmt.Sprintf(" %s | %s | %s | - | - |", ratioText(other.Wall), ratioText(other.CPU), ratioText(other.RSS))
+				fmt.Fprintln(&b, line)
+			}
 		}
 		fmt.Fprintln(&b)
 		for _, note := range groupNotes {
@@ -272,17 +305,17 @@ func Merge(reports []*Report) (string, error) {
 			walls[row.Scenario+"\x00"+row.Variant] = row.Wall
 		}
 		for _, ratio := range r.Ratios {
-			key := ratio.Scenario + "\x00" + ratio.Variant
+			key := ratio.Scenario + "\x00" + ratioLabel(ratio)
 			if !seen[key] {
 				seen[key] = true
 				order = append(order, key)
 				groupOf[key] = ratio.Group
 			}
-			cell := fmt.Sprintf("%.3f / %s / %s", walls[key].Median, ratioText(ratio.Wall), ratioText(ratio.RSS))
+			cell := fmt.Sprintf("%.3f / %s / %s", walls[ratio.Scenario+"\x00"+ratio.Variant].Median, ratioText(ratio.Wall), ratioText(ratio.RSS))
 			if ratio.Size != nil {
 				cell += " / " + ratioText(ratio.Size)
 			}
-			cells[cellKey{index, ratio.Scenario, ratio.Variant}] = cell
+			cells[cellKey{index, ratio.Scenario, ratioLabel(ratio)}] = cell
 		}
 	}
 	groupIndex := map[string]int{}
