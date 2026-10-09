@@ -233,6 +233,16 @@ impl SeqOutStream for ChannelSink {
         // the encoder then has nowhere to put bytes and stops.
         self.tx.send(buf).map_err(|_| LzmaError::Write)
     }
+
+    /// A block-parallel coder's finished block goes to the writer as the
+    /// buffer it was written into, and the coder gets a written-out buffer
+    /// back for its next block, so a block is never held twice.
+    fn write_vec(&mut self, data: &mut Vec<u8>) -> Result<(), LzmaError> {
+        let mut next = self.spare.try_recv().unwrap_or_default();
+        next.clear();
+        let block = core::mem::replace(data, next);
+        self.tx.send(block).map_err(|_| LzmaError::Write)
+    }
 }
 
 enum State {

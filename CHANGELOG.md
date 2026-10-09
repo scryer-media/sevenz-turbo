@@ -1074,8 +1074,11 @@ Everything here is new surface; no upstream signature changed meaning.
   new one for every 1 MiB of input and for every piece of output, each freed
   on the other thread. That churn left the allocator holding several
   megabytes it could not hand back. The input now travels in 256 KiB pieces,
-  and at most five are allocated for a folder of any length. The archive is
-  the same bytes.
+  and at most five are allocated for a folder of any length. A folder coded
+  in parallel blocks hands each finished block to the writer as the buffer
+  it was coded into, where it copied it, so a block is no longer held twice
+  (about 56 MiB less at level 5 on four threads). The archive is the same
+  bytes.
 
 ## 0.26.1 - 2026-09-29
 
