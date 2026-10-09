@@ -471,9 +471,15 @@ fn lzma2_rust2_uses_mt(options: &Lzma2Options) -> bool {
     options.threads > 1 && !lzma2_fits_one_block(options)
 }
 
-/// The threads coding one folder with `methods` keeps busy: more than one
-/// only for a block-parallel LZMA2 coder, which starts block threads of its
-/// own. `methods` are the folder's, already sized for it.
+/// The threads coding one folder with `methods` keeps busy. `methods` are the
+/// folder's, already sized for it.
+///
+/// A coder that runs on threads of its own counts for those: a block-parallel
+/// LZMA2 coder for its block threads, and with `lzma-turbo`'s encoder every
+/// other LZMA and LZMA2 coder for its one. The coders of a chain run at once,
+/// so their threads add up. Every other coder runs on the thread writing into
+/// the chain, which is the one thread a chain with no such coder keeps busy,
+/// and which only feeds the coders and waits for them where there is one.
 ///
 /// BCJ2's call and jump coders are not counted here: a caller that counts its
 /// folders against a thread budget builds the chain with
@@ -482,30 +488,32 @@ pub(crate) fn folder_threads(methods: &[EncoderConfiguration]) -> u32 {
     methods
         .iter()
         .map(|mc| match (mc.method.id(), &mc.options) {
+            #[cfg(not(feature = "lzma-rust2-encoder"))]
             (EncoderMethod::ID_LZMA2, Some(EncoderOptions::Lzma2(options))) => {
-                #[cfg(not(feature = "lzma-rust2-encoder"))]
-                let threads = lzma2_block_plan(options).1 as u32;
-                #[cfg(feature = "lzma-rust2-encoder")]
-                let threads = if lzma2_rust2_uses_mt(options) {
-                    options.threads
-                } else {
-                    1
-                };
-                threads.max(1)
+                lzma2_block_plan(options).1 as u32
             }
-            _ => 1,
+            #[cfg(not(feature = "lzma-rust2-encoder"))]
+            (EncoderMethod::ID_LZMA | EncoderMethod::ID_LZMA2, _) => 1,
+            // `lzma-rust2`'s single-threaded writers code inside `write`.
+            #[cfg(feature = "lzma-rust2-encoder")]
+            (EncoderMethod::ID_LZMA2, Some(EncoderOptions::Lzma2(options)))
+                if lzma2_rust2_uses_mt(options) =>
+            {
+                options.threads
+            }
+            _ => 0,
         })
-        .max()
-        .unwrap_or(1)
+        .fold(0, u32::saturating_add)
+        .max(1)
 }
 
 /// `methods` for a folder coded on one worker of a parallel non-solid write:
 /// every LZMA2 coder on one thread.
 ///
-/// The workers are the thread budget, and such a folder already keeps one
-/// thread busy (see [`folder_threads`]); left at more than one, its coder would
-/// still start a match-finder thread of its own and double the threads in use.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+/// The workers are the thread budget, and such a folder already keeps busy
+/// the threads [`folder_threads`] counts for it; left at more than one, a
+/// coder would still start a match-finder thread of its own and double the
+/// threads in use.
 pub(crate) fn one_thread_each(methods: &[EncoderConfiguration]) -> Vec<EncoderConfiguration> {
     methods
         .iter()
@@ -870,6 +878,65 @@ mod tests {
                 "level {level}, {threads} threads"
             );
         }
+    }
+
+    /// A chain's LZMA and LZMA2 coders each run on a thread of their own, all
+    /// at once, so a folder costs their sum; a filter beside them costs
+    /// nothing more, and a chain with none of them costs the one thread
+    /// writing into it.
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    #[test]
+    fn a_folder_costs_a_thread_for_each_lzma_coder_in_its_chain() {
+        use super::{folder_threads, one_thread_each};
+        use crate::encoder_options::{Lzma2Options, LzmaOptions};
+        use crate::{EncoderConfiguration, EncoderMethod};
+
+        let lzma2 = || EncoderConfiguration::from(Lzma2Options::from_level(5));
+        let lzma = || EncoderConfiguration::from(LzmaOptions::from_level(5));
+        // Named without options, each still starts its coder's thread.
+        let bare = |method: EncoderMethod| EncoderConfiguration::from(method);
+        assert_eq!(folder_threads(&[bare(EncoderMethod::COPY)]), 1);
+        assert_eq!(folder_threads(&[lzma2()]), 1);
+        assert_eq!(
+            folder_threads(&[lzma2(), bare(EncoderMethod::BCJ_X86_FILTER)]),
+            1
+        );
+        assert_eq!(folder_threads(&[lzma2(), lzma()]), 2);
+        assert_eq!(folder_threads(&[lzma2(), lzma(), lzma2()]), 3);
+        assert_eq!(
+            folder_threads(&[bare(EncoderMethod::LZMA2), bare(EncoderMethod::LZMA)]),
+            2
+        );
+
+        // Four block threads (see the block plan above) and the other coder's
+        // one; on a worker of the folder-parallel writer, one each.
+        let wide = [
+            EncoderConfiguration::from(Lzma2Options::from_level_mt(5, 8, 32 << 20)),
+            lzma(),
+        ];
+        assert_eq!(folder_threads(&wide), 5);
+        assert_eq!(folder_threads(&one_thread_each(&wide)), 2);
+    }
+
+    /// `lzma-rust2`'s single-threaded writers code on the thread writing into
+    /// the chain, so only its multi-threaded LZMA2 writer costs threads.
+    #[cfg(feature = "lzma-rust2-encoder")]
+    #[test]
+    fn only_the_rust2_mt_writer_costs_a_folder_threads() {
+        use super::{folder_threads, one_thread_each};
+        use crate::EncoderConfiguration;
+        use crate::encoder_options::{Lzma2Options, LzmaOptions};
+
+        let lzma2 = || EncoderConfiguration::from(Lzma2Options::from_level(5));
+        let lzma = || EncoderConfiguration::from(LzmaOptions::from_level(5));
+        assert_eq!(folder_threads(&[lzma2()]), 1);
+        assert_eq!(folder_threads(&[lzma2(), lzma()]), 1);
+        let wide = [
+            EncoderConfiguration::from(Lzma2Options::from_level_mt(5, 8, 32 << 20)),
+            lzma(),
+        ];
+        assert_eq!(folder_threads(&wide), 8);
+        assert_eq!(folder_threads(&one_thread_each(&wide)), 1);
     }
 
     /// The `lzma-rust2` encoder makes the same one-block decision: a folder

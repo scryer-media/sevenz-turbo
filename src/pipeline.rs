@@ -130,10 +130,18 @@ fn is_heavy(method: &[u8]) -> bool {
 ///
 /// None of them unless at least two coders that cost real CPU would otherwise
 /// share the caller's thread, and there is more than one thread to run them
-/// on. None either in a chain holding an LZMA2 coder large enough to decode in
-/// parallel: that coder's workers are already the whole of `threads`, and they
-/// follow the reader's live ceiling, which a stage's thread would not. A stage
-/// beside them would be a thread more than the caller asked for.
+/// on. An LZMA2 coder that will decode in parallel is not one of the two: its
+/// work is on its own workers already, and the caller's thread only hands its
+/// output on. That is the AES-over-LZMA2 chain, where the cipher alone was
+/// left on the caller's thread and a thread of its own measured as a wash.
+///
+/// The stages of a chain with such a coder run beside its workers and are not
+/// taken out of them: for the BCJ2 chain 7-Zip writes they are the call and
+/// jump coders, two threads doing what the caller's thread did between its
+/// reads of the main stream. The work is the same and only overlaps, which is
+/// what the chain gains; the reader's live ceiling narrows the main coder's
+/// workers and leaves the stages be.
+///
 /// The top coder is never given a thread: the caller's thread runs it. Of the
 /// rest, those with at least [`MIN_STAGE_BYTES`] of output are given the
 /// threads beyond the caller's, largest first, each once every coder it reads
@@ -149,11 +157,8 @@ pub(crate) fn offload_plan(block: &Block, threads: u32) -> u64 {
         coders[index].encoder_method_id() == EncoderMethod::ID_LZMA2
             && size(index) > MT_MIN_BLOCK_BYTES
     };
-    if (0..count).any(parallel) {
-        return 0;
-    }
     let heavy: Vec<bool> = (0..count)
-        .map(|index| is_heavy(coders[index].encoder_method_id()))
+        .map(|index| is_heavy(coders[index].encoder_method_id()) && !parallel(index))
         .collect();
     if heavy.iter().filter(|&&h| h).count() < 2 {
         return 0;
@@ -883,8 +888,8 @@ mod tests {
             offload_plan(&aes_under(EncoderMethod::ID_LZMA, 64 * MIB, 32 * MIB), 2),
             0b10
         );
-        // AES under an LZMA2 coder that decodes in parallel: its workers are
-        // the whole thread count, and the cipher stays on the caller's.
+        // AES under an LZMA2 coder that decodes in parallel: the cipher is
+        // alone on the caller's thread, and stays there.
         assert_eq!(
             offload_plan(&aes_under(EncoderMethod::ID_LZMA2, 64 * MIB, 32 * MIB), 8),
             0
@@ -901,17 +906,15 @@ mod tests {
             0
         );
 
-        // BCJ2 over an LZMA2 coder that decodes in parallel: no stage gets a
-        // thread, whatever the call and jump streams' sizes. The main coder's
-        // workers are already every thread the caller gave.
+        // BCJ2 over parallel LZMA2: the call and jump coders get threads,
+        // the main stream's coder has its own workers already.
         assert_eq!(
             offload_plan(&bcj2(EncoderMethod::ID_LZMA2, 64 * MIB, 2 * MIB), 8),
-            0
+            0b1100
         );
-        assert_eq!(
-            offload_plan(&bcj2(EncoderMethod::ID_LZMA2, 64 * MIB, 2 * MIB), 2),
-            0
-        );
+        // One of the two at two threads: the caller's is the other.
+        let two = offload_plan(&bcj2(EncoderMethod::ID_LZMA2, 64 * MIB, 2 * MIB), 2);
+        assert_eq!((two & 0b1100, two.count_ones()), (two, 1));
         // BCJ2 over an LZMA2 coder of one run, which decodes on the caller's
         // thread: all three coders, as over LZMA.
         assert_eq!(
@@ -936,6 +939,12 @@ mod tests {
         assert_eq!(
             offload_plan(&bcj2(EncoderMethod::ID_LZMA, 64 * MIB, MIB / 4), 8),
             0b0010
+        );
+        // The same under parallel LZMA2 leaves the main coder alone on the
+        // caller's thread with BCJ2, which is a filter: nothing to do.
+        assert_eq!(
+            offload_plan(&bcj2(EncoderMethod::ID_LZMA2, 64 * MIB, MIB / 4), 8),
+            0
         );
     }
 

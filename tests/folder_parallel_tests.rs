@@ -357,6 +357,27 @@ fn block_parallel_lzma2_settings_keep_large_folders_on_the_calling_thread() {
     assert_decodes_like_sequential(&sequential, &Password::empty(), tree.len());
 }
 
+#[test]
+fn a_chain_of_two_lzma_coders_encodes_the_same_in_parallel() {
+    // Each of the two coders runs on a thread of its own, so the writer has
+    // half as many folders in flight as it was given threads: one at two and
+    // three threads, which is the sequential loop, and more from four.
+    let methods = vec![
+        Lzma2Options::from_level(3).into(),
+        sevenz_turbo::encoder_options::LzmaOptions::from_level(1).into(),
+    ];
+    let tree = members(40, None, false);
+    let sequential = write_sequential(&methods, &tree);
+    for threads in [2, 3, 4, 8] {
+        let parallel = write_parallel(&methods, &tree, threads);
+        assert!(
+            parallel == sequential,
+            "the parallel writer at {threads} threads wrote different bytes"
+        );
+    }
+    assert_decodes_like_sequential(&sequential, &Password::empty(), tree.len());
+}
+
 #[cfg(feature = "aes256")]
 #[test]
 fn aes_members_decode_and_encode_the_same_in_parallel() {

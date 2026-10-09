@@ -347,12 +347,13 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     /// folders in flight. An entry's `size` is read, as by
     /// [`ArchiveEntry::from_path`], as how many bytes its reader will yield.
     ///
-    /// Folders go to the workers when they code on one thread each: always
-    /// for a single-threaded method chain, and for a block-parallel LZMA2 one
-    /// when the folder declares a size that fits one block. Any other folder,
-    /// one whose coder would start block threads of its own, is coded
-    /// alone on the calling thread, after every folder before it has been
-    /// written, so the workers and a multi-threaded coder never run at once.
+    /// Folders go to the workers when no coder of theirs starts block
+    /// threads: always for a single-threaded method chain, and for a
+    /// block-parallel LZMA2 one when the folder declares a size that fits one
+    /// block. Any other folder, one whose coder would start block threads of
+    /// its own, is coded alone on the calling thread, after every folder
+    /// before it has been written, so the workers and a multi-threaded coder
+    /// never run at once.
     ///
     /// **Memory.** Each worker stages at most two folders' compressed bytes,
     /// each at most 8 MiB, before it waits for the writer to take them, so
@@ -366,9 +367,14 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     /// for the writer rather than starting another folder, so no worker has
     /// more than one folder's waiting.
     ///
-    /// **Threads.** A folder is coded by its worker and that worker's one
-    /// coder thread. A BCJ2 folder's call and jump coders run on the worker
-    /// itself here, where a folder coded alone gives each a thread.
+    /// **Threads.** A folder is coded by its worker and that worker's coder
+    /// thread, which `threads` counts as one: the worker feeds the coder and
+    /// waits for it. Every LZMA and LZMA2 coder in the chain has such a
+    /// thread (but not with the `lzma-rust2-encoder` feature, whose coders
+    /// run on the worker), so a chain with two of them has `threads / 2`
+    /// folders in flight, and where that is one its folders are coded one at
+    /// a time. A BCJ2 folder's call and jump coders run on the worker itself
+    /// here, where a folder coded alone gives each a thread.
     ///
     /// With `threads` at one, and on targets without threads, this is the
     /// loop of `push_archive_entry` itself.
@@ -389,12 +395,15 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         F: Fn(usize, &ArchiveEntry) -> std::io::Result<Option<R>> + Sync,
     {
         let threads = threads.clamp(1, 256);
+        // What a folder on a worker keeps busy, and so how many fit `threads`.
+        let per_folder = encoder::folder_threads(&encoder::one_thread_each(&self.content_methods));
+        let workers = threads / per_folder;
         let parallel = |entry: &ArchiveEntry| {
             entry.is_directory
                 || encoder::folder_threads(&sized_methods(
                     &self.content_methods,
                     declared_size([entry]),
-                )) <= 1
+                )) <= per_folder
         };
         let eligible: Vec<bool> = entries.iter().map(parallel).collect();
         let mut index = 0;
@@ -403,8 +412,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             while index < entries.len() && eligible[index] {
                 index += 1;
             }
-            if threads > 1 && index - start > 1 {
-                self.push_non_solid_parallel(&entries, start..index, &open, threads)?;
+            if workers > 1 && index - start > 1 {
+                self.push_non_solid_parallel(&entries, start..index, &open, workers)?;
             } else {
                 for at in start..index {
                     self.push_opened(&entries, at, &open)?;
@@ -443,14 +452,14 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         entries: &[ArchiveEntry],
         run: std::ops::Range<usize>,
         open: &F,
-        threads: u32,
+        workers: u32,
     ) -> Result<()>
     where
         R: Read,
         F: Fn(usize, &ArchiveEntry) -> std::io::Result<Option<R>> + Sync,
     {
         let methods = Arc::new(encoder::one_thread_each(&self.content_methods));
-        let workers = (threads as usize).min(run.len());
+        let workers = (workers as usize).min(run.len());
         let first = run.start;
         let outcome = crate::ordered::run(
             run.len(),
@@ -542,7 +551,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         entries: &[ArchiveEntry],
         run: std::ops::Range<usize>,
         open: &F,
-        _threads: u32,
+        _workers: u32,
     ) -> Result<()>
     where
         R: Read,

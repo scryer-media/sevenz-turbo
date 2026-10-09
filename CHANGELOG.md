@@ -132,9 +132,9 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   a positional source (`ReadAt`) and more than one thread, runs of folders of
   at most 8 MiB decode on workers and reach the callback in archive order,
   inside the thread count and the memory limit. A block whose heavy coders
-  would share one thread, and that has no parallel LZMA2 coder, decodes as a
-  pipeline of stages on threads of their own. Upstream decodes every folder
-  and every coder chain on the calling thread.
+  would share one thread decodes as a pipeline of stages on threads of their
+  own. Upstream decodes every folder and every coder chain on the calling
+  thread.
 - LZMA1 is now subject to the same dictionary memory limit as LZMA2. Upstream
   bounded only LZMA2, so an archive declaring a 4 GiB LZMA1 dictionary would
   try to allocate it.
@@ -521,8 +521,12 @@ Everything here is new surface; no upstream signature changed meaning.
   writer, so memory is bounded by threads x (one coder + 16 MiB), however
   large the inputs. A folder whose coder would start block threads of its
   own is coded alone on the calling thread, after the folders before it. A
-  BCJ2 folder coded on a worker runs its call and jump coders on that worker
-  rather than on two threads of their own, and writes the same bytes. Its
+  worker and its folder's coder thread count as one of `threads`; a chain
+  with more than one LZMA or LZMA2 coder has a coder thread for each, and
+  that many fewer folders in flight (`threads / 2` for two), so the threads
+  at work stay within `threads`. A BCJ2 folder coded on a worker runs its
+  call and jump coders on that worker rather than on two threads of their
+  own, and writes the same bytes. Its
   three other pack streams, held whole until the folder ends as on every
   path, count against the worker's stage like the main stream's bytes: a
   worker whose stage has no room for them waits for the writer instead of
@@ -539,18 +543,24 @@ Everything here is new surface; no upstream signature changed meaning.
   a pipeline when more than one thread is allowed: each coder below the top
   with at least 1 MiB of output gets a thread of its own (at most one fewer
   than the threads allowed, largest first), and the stages are joined by
-  bounded pipes of four 256 KiB pieces. A block with an LZMA2 coder large
-  enough to decode in parallel keeps the sequential chain: that coder's
-  workers are the whole thread count already, and they follow the live
-  ceiling, so a stage beside them would be a thread more than was asked for.
-  A coder's error arrives after the bytes it produced and unchanged, so the
-  block it is reported against is the same as before. A pipe holds up to
-  1.25 MiB, and a block's pipes are charged to the memory limit with its
-  coders before any of them is built; a block whose pipes do not fit keeps
-  the sequential chain. So does the rest of a chain from the first coder
-  whose thread cannot be started: it decodes on the caller's thread, reading
-  the stages already running. One thread, and wasm32, keep the sequential
-  chain.
+  bounded pipes of four 256 KiB pieces. An LZMA2 coder that decodes in
+  parallel already has its own workers and does not count, so AES over
+  parallel LZMA2 stays sequential: a thread for the cipher measured as a
+  wash. Beside such a coder the stages are threads on top of its workers,
+  not out of them: for a BCJ2 chain as 7-Zip writes it, two, decoding the
+  call and jump streams the calling thread decoded before. The work is the
+  same and now overlaps the main stream's; `Lzma2Handle::set_threads`
+  narrows the main coder's workers and not the stages. A coder's error
+  arrives after the bytes it produced and unchanged, so the block it is
+  reported against is the same as before. A pipe holds up to 1.25 MiB, and
+  a block's pipes are charged to the memory limit with its coders before
+  any of them is built; a block whose pipes do not fit keeps the sequential
+  chain. So does the rest of a chain from the first coder whose thread
+  cannot be started: it decodes on the caller's thread, reading the stages
+  already running. One thread, and wasm32, keep the sequential chain. A
+  BCJ2 archive written by 7-Zip (LZMA2 main stream, LZMA call and jump
+  streams) decodes 1.07-1.08x faster at 2-18 threads on Apple M5 Max and
+  1.08-1.11x at 2-8 threads on x86.
 - An adaptive LZMA2 decode reaches the fixed plan's width. It started at one
   thread with the first run decoded on the calling thread, which held the
   stream's cursor; a widening was only heard once a whole run had landed;
