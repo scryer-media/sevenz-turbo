@@ -911,6 +911,22 @@ Everything here is new surface; no upstream signature changed meaning.
   the bytes, behind a feature, not the count), how its held bytes divide
   between input, runs out, runs waiting and parked buffers, and how many runs
   are being decoded at a moment, as opposed to claimed and not yet delivered.
+- Bench harness: a `decode ledger` group in the `full` and `fleet` profiles
+  decodes `media_mx5_3g.7z`, `media_mx5_2g.7z` and `mt.7z` at 2, 4, 8 and all
+  threads, with no memory limit and with limits of 512, 553, 1024, 1065 and
+  2089 MiB, against 7zz at the same thread count, and `media_mx1.7z` and
+  `aes_mx1.7z` at 2, 4 and 8 threads as rows that a change to the run
+  hand-over must not move. The candidate keeps a ledger; each row without a
+  memory limit also runs it without one, as `sevenz-turbo no-ledger`, so the
+  cost of keeping it is measured rather than assumed. The report gains two
+  tables: memory (peak RSS, what the decoder held, the reader's queue, the
+  output behind it, the three together, the dictionary the decode allocated
+  beside dictionary size times the decoders that ran, and the remainder) and
+  dispatch (runs, waves, the runs claimed in each wave and the runs out at
+  its end, the mean runs out while the delivering thread slept, refusals by
+  where in a run the piece was offered, the reader's stops for room, and the
+  time the delivering thread slept and the worker time that stood idle with
+  it). The quick profile plans none of these rows.
 
 ## 0.26.1 - 2026-09-29
 

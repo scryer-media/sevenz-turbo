@@ -111,6 +111,9 @@ type Report struct {
 	Rows     []Row                     `json:"rows"`
 	Ratios   []Ratio                   `json:"ratios"`
 	RSS      []procmeasure.RSSScenario `json:"rss_scenarios"`
+	// Ledgers is the memory and dispatch ledger of every candidate row that
+	// kept one (the decode ledger group).
+	Ledgers []Ledger `json:"ledgers,omitempty"`
 	// Failures lists every failed or unfinished candidate/reference run;
 	// SecondaryFailures the sevenz-rust2 ones, which do not fail the run.
 	Failures          []string `json:"failures"`
@@ -156,9 +159,12 @@ func Build(raw *suite.Raw) *Report {
 			row := summarize(scenario, variant, runs)
 			report.Rows = append(report.Rows, row)
 			byVariant[variant.Variant] = &row
+			if kept := ledger(scenario, variant.Variant, runs); kept != nil {
+				report.Ledgers = append(report.Ledgers, *kept)
+			}
 		}
 		oracle := byVariant[suite.VariantOracle]
-		for _, variant := range []string{suite.VariantTurbo, suite.VariantTurboNative} {
+		for _, variant := range []string{suite.VariantTurbo, suite.VariantTurboNative, suite.VariantTurboPlain} {
 			ours := byVariant[variant]
 			if ours == nil {
 				continue

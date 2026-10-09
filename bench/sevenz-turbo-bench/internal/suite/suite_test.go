@@ -3,6 +3,7 @@ package suite
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -85,6 +86,118 @@ func TestPlanCoversTheMatrix(t *testing.T) {
 				}
 			}
 		}
+		for id := range ids {
+			if quick && strings.HasSuffix(id, "/ledger") {
+				t.Errorf("quick plans the ledger row %s", id)
+			}
+		}
+	}
+}
+
+// The ledger group is every ledger fixture at 2, 4, 8 and all threads with no
+// limit and under each ledger limit, and the controls at 2, 4 and 8.
+func TestLedgerRows(t *testing.T) {
+	dir, manifest := fakeCorpus(t, fixtures.Full())
+	tools := Tools{Candidate: "decode-bench", Native: "decode-bench-native", Oracle: "7zz"}
+	scenarios, err := Plan(manifest, dir, t.TempDir(), tools, DefaultSettings(false, 18))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := map[string]Scenario{}
+	for _, scenario := range scenarios {
+		if scenario.Group == GroupLedger {
+			rows[scenario.ID] = scenario
+		} else if scenario.Ledger {
+			t.Errorf("%s keeps a ledger outside the ledger group", scenario.ID)
+		}
+	}
+	if want := len(LedgerFixtures)*4*(1+len(LedgerLimits)) + len(LedgerControls)*3; len(rows) != want {
+		t.Fatalf("%d ledger rows, want %d", len(rows), want)
+	}
+	for _, name := range []string{"media_mx5_3g", "media_mx5_2g", "mt"} {
+		for _, threads := range []string{"2", "4", "8", "all"} {
+			for _, limit := range []string{"", "/budget-512MiB", "/budget-553MiB", "/budget-1024MiB", "/budget-1065MiB", "/budget-2089MiB"} {
+				id := "decode/" + name + "/T" + threads + limit + "/ledger"
+				if _, ok := rows[id]; !ok {
+					t.Errorf("missing %s", id)
+				}
+			}
+		}
+	}
+	for id, scenario := range rows {
+		if !scenario.Ledger {
+			t.Errorf("%s: not marked as a ledger row", id)
+		}
+		byVariant := map[string]Run{}
+		for _, run := range scenario.Variants {
+			byVariant[run.Variant] = run
+		}
+		ours := strings.Join(byVariant[VariantTurbo].Args, " ")
+		n := DefaultSettings(false, 18).ResolveThreads(scenario.Threads)
+		if !strings.Contains(ours, "--ledger") || !strings.Contains(ours, "--threads "+n) {
+			t.Errorf("%s: candidate runs %q", id, ours)
+		}
+		if oracle := strings.Join(byVariant[VariantOracle].Args, " "); !strings.Contains(oracle, "-mmt="+n+" ") {
+			t.Errorf("%s: 7zz runs %q, want -mmt=%s", id, oracle, n)
+		}
+		// The unobserved twin runs where no limit is set, and is the same
+		// command without the ledger.
+		plain, twin := byVariant[VariantTurboPlain]
+		if twin != (scenario.MemoryLimit == 0) {
+			t.Errorf("%s: limit %d, no-ledger twin planned=%t", id, scenario.MemoryLimit, twin)
+		}
+		if twin {
+			if got := strings.Join(plain.Args, " "); got != strings.Replace(ours, " --ledger", "", 1) || plain.Role != RoleCandidate || !plain.JSON {
+				t.Errorf("%s: twin runs %q beside %q", id, got, ours)
+			}
+		}
+		if scenario.MemoryLimit > 0 && !strings.Contains(ours, "--memory-limit "+strconv.FormatInt(scenario.MemoryLimit, 10)) {
+			t.Errorf("%s: candidate runs %q without its limit", id, ours)
+		}
+		if _, native := byVariant[VariantTurboNative]; native != scenario.Encrypted {
+			t.Errorf("%s: encrypted=%t, native-crypto row planned=%t", id, scenario.Encrypted, native)
+		}
+	}
+	for _, id := range []string{"decode/media_mx1/T2/ledger", "decode/media_mx1/T8/ledger", "decode/aes_mx1/T4/ledger"} {
+		if _, ok := rows[id]; !ok {
+			t.Errorf("missing control %s", id)
+		}
+	}
+	if _, ok := rows["decode/media_mx1/Tall/ledger"]; ok {
+		t.Error("a control is planned at all threads")
+	}
+
+	// A fixed thread count above the usable cores is left out; all threads is
+	// kept and resolves to what there is.
+	narrow, err := Plan(manifest, dir, t.TempDir(), tools, DefaultSettings(false, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scenario := range narrow {
+		if scenario.Group != GroupLedger {
+			continue
+		}
+		if scenario.Threads == "8" {
+			t.Errorf("%s planned on four cores", scenario.ID)
+		}
+		if scenario.Threads == "all" && !strings.Contains(strings.Join(scenario.Variants[0].Args, " "), "--threads 4") {
+			t.Errorf("%s: all threads is not four", scenario.ID)
+		}
+	}
+}
+
+// --only selects ledger rows exactly: a row with no limit does not bring the
+// limited rows of the same fixture and thread count with it.
+func TestOnlySelectsOneLedgerRow(t *testing.T) {
+	dir, manifest := fakeCorpus(t, fixtures.Full())
+	settings := DefaultSettings(false, 18)
+	settings.Only = []string{"decode/media_mx5_3g/T4/ledger"}
+	scenarios, err := Plan(manifest, dir, t.TempDir(), Tools{Candidate: "c", Oracle: "o"}, settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scenarios) != 1 || scenarios[0].ID != "decode/media_mx5_3g/T4/ledger" {
+		t.Fatalf("planned %d scenarios: %+v", len(scenarios), scenarios)
 	}
 }
 

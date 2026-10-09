@@ -170,6 +170,7 @@ func Markdown(report *Report) string {
 			fmt.Fprintln(&b)
 		}
 	}
+	renderLedgers(&b, report.Ledgers)
 	procmeasure.RenderRSSSummary(&b, report.RSS)
 	if len(report.SecondaryFailures) > 0 {
 		fmt.Fprintln(&b, "## Secondary reference failures")
