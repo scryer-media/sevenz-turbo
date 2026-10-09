@@ -972,6 +972,13 @@ Everything here is new surface; no upstream signature changed meaning.
   message per mebibyte. The output is byte-identical (LZMA2 level 5, BCJ2
   and PPMd checked), and `ArchiveWriter::create` still returns
   `ArchiveWriter<File>`.
+- The `SEVENZ_TURBO_MT_TRACE` line of the parallel LZMA2 reader also gives
+  the most the decoder held (`peak_held`, what a memory limit governs), the
+  most the reader had queued for it (`peak_queue`, outside the limit), the
+  most the two came to at one moment (`peak_sum`), and the waves of the
+  decode (`waves`): for each time the delivering thread went to wait, the
+  runs claimed since the last wait and the runs out with workers. Nothing
+  is sampled when the variable is unset.
 
 ## 0.26.1 - 2026-09-29
 

@@ -1041,6 +1041,17 @@ pub(crate) struct MtTrace {
     /// the end of the input was held back rather than announced over the top
     /// of a tail the decoder had not taken. See [`Lzma2MtReader::settle_end`].
     end_deferred: u64,
+    /// The most the decoder held, the most this reader had queued for it, and
+    /// the most the two came to at one moment, sampled after every drain and
+    /// every feed. The first is what the memory limit governs; the second is
+    /// outside it.
+    peak_held: u64,
+    peak_queue: u64,
+    peak_sum: u64,
+    /// Runs the decoder claimed between two waits of this thread, and the
+    /// runs out with a worker as it went to wait, one pair per wait.
+    waves: Vec<(u64, u64)>,
+    claimed_at_wait: u64,
 }
 
 impl<R: Read> Lzma2MtReader<R> {
@@ -1121,6 +1132,27 @@ impl<R: Read> Lzma2MtReader<R> {
             input_left: u64::MAX,
             trace: std::env::var_os("SEVENZ_TURBO_MT_TRACE").map(|_| Box::default()),
         })
+    }
+
+    /// Records what the decoder and this reader hold, for the trace.
+    fn sample_ledger(&mut self) {
+        if let Some(t) = self.trace.as_mut() {
+            let held = self.decoder.held_bytes();
+            let queue = self.held as u64;
+            t.peak_held = t.peak_held.max(held);
+            t.peak_queue = t.peak_queue.max(queue);
+            t.peak_sum = t.peak_sum.max(held + queue);
+        }
+    }
+
+    /// Records a wave for the trace, as this thread goes to wait.
+    fn note_wave(&mut self) {
+        let claimed = self.decoder.runs_claimed();
+        let out = self.busy_workers();
+        if let Some(t) = self.trace.as_mut() {
+            t.waves.push((claimed - t.claimed_at_wait, out));
+            t.claimed_at_wait = claimed;
+        }
     }
 
     /// Moves the checksums the workers computed into the shared folder, where
@@ -2149,6 +2181,7 @@ impl<R: Read> Lzma2MtReader<R> {
             }
             let offered = usize::try_from(end - self.fed_to).unwrap_or(usize::MAX);
             let taken = self.hand_over(offered, whatever_is_held)?;
+            self.sample_ledger();
             self.fed_total += taken as u64;
             fed |= taken > 0;
             if taken < offered {
@@ -2163,8 +2196,9 @@ impl<R: Read> Lzma2MtReader<R> {
 impl<R: Read> Drop for Lzma2MtReader<R> {
     fn drop(&mut self) {
         if let Some(t) = self.trace.as_ref() {
+            let waves: Vec<String> = t.waves.iter().map(|(c, o)| format!("{c}/{o}")).collect();
             eprintln!(
-                "mt-trace: threads={} spawned={} drains={} drain={:.3}s sink={:.3}s/{} small={} MiB pump={:.3}s fed={} MiB fed_partial={} MiB st_decoded={} MiB out={} MiB runs={} moved={} MiB resizes={} refused={} copied_feeds={} declared={} reclaimed={} end_deferred={} dense={}",
+                "mt-trace: threads={} spawned={} drains={} drain={:.3}s sink={:.3}s/{} small={} MiB pump={:.3}s fed={} MiB fed_partial={} MiB st_decoded={} MiB out={} MiB runs={} moved={} MiB resizes={} refused={} copied_feeds={} declared={} reclaimed={} end_deferred={} dense={} peak_held={} peak_queue={} peak_sum={} waves={}",
                 self.applied_threads,
                 self.decoder.spawned_threads(),
                 t.drains,
@@ -2186,6 +2220,10 @@ impl<R: Read> Drop for Lzma2MtReader<R> {
                 t.reclaimed,
                 t.end_deferred,
                 self.dense,
+                t.peak_held,
+                t.peak_queue,
+                t.peak_sum,
+                waves.join(","),
             );
         }
     }
@@ -2316,6 +2354,7 @@ impl<R: Read> Read for Lzma2MtReader<R> {
             };
             self.collect_checks();
             self.publish();
+            self.sample_ledger();
 
             // Whether input went over after the drain, which the decoder has
             // not looked at yet: the next thing is to drain again, not to wait
@@ -2373,6 +2412,8 @@ impl<R: Read> Read for Lzma2MtReader<R> {
                 // lifted and the stream is fed anyway — that is the only thing
                 // that can make another byte, and it is why the state cannot
                 // last.
+                self.sample_ledger();
+                self.note_wave();
                 if self.listening() {
                     // Whichever comes first: the caller widening, or the
                     // slice ending, after which the drain above collects any
