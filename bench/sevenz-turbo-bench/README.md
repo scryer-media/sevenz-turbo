@@ -224,7 +224,7 @@ are three profiles:
 | `fleet` | full | every scenario | 3 + 1 |
 
 A smoke run is `fixtures --profile quick` then `run --quick`, which takes a
-few minutes. `fleet` keeps every scenario of `full`, 140 on an 18-core host
+few minutes. `fleet` keeps every scenario of `full`, 143 on an 18-core host
 (the thread sweep stops below the core count), and only cuts the repeats.
 78 of them are the `decode ledger` group, which `--only /ledger` runs alone.
 From the quick-corpus numbers scaled to the full corpus, the others project
