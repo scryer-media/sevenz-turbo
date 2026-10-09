@@ -44,7 +44,12 @@ type ArchiveSpec struct {
 	Source    string   `json:"source"`
 	Args      []string `json:"args"`
 	Encrypted bool     `json:"encrypted,omitempty"`
-	Note      string   `json:"note"`
+	// MinRuns, when above zero, has generation count the LZMA2 runs of the
+	// archive from its stream (see CountLZMA2Runs), record the count in the
+	// manifest, and refuse an archive with fewer: a fixture written to be
+	// decoded in parallel that the oracle did not cut is not that fixture.
+	MinRuns int    `json:"min_runs,omitempty"`
+	Note    string `json:"note"`
 }
 
 // Profile is a whole corpus recipe.
@@ -79,12 +84,15 @@ const mib = int64(1) << 20
 // sizes is what differs between the full corpus and the quick one.
 type sizes struct {
 	payload, sub, code, audio, media int64
-	treeFiles                        int
-	treeAverage                      int64
-	kdfFiles                         int
+	// media2g and media3g are the larger media sources, whose archives have
+	// more runs than threads; zero leaves them and their archives out.
+	media2g, media3g int64
+	treeFiles        int
+	treeAverage      int64
+	kdfFiles         int
 	// chunk is the explicit LZMA2 block size of the multi-threaded fixtures,
-	// or "" for 7zz's own (four dictionaries, 64 MiB at -mx5). The quick
-	// corpus is too small for 64 MiB blocks to cut it at all.
+	// or "" for 7zz's own (four dictionaries, 128 MiB at -mx5). The quick
+	// corpus is too small for blocks of that size to cut it at all.
 	chunk string
 }
 
@@ -94,6 +102,7 @@ type sizes struct {
 func Full() Profile {
 	return build("full", sizes{
 		payload: 1024 * mib, sub: 256 * mib, code: 64 * mib, audio: 256 * mib, media: 1024 * mib,
+		media2g: 2048 * mib, media3g: 3072 * mib,
 		treeFiles: 8192, treeAverage: 32 << 10, kdfFiles: 2048,
 	})
 }
@@ -124,7 +133,7 @@ func build(name string, s sizes) Profile {
 		lzma2MT = "-m0=lzma2:c=" + s.chunk
 	}
 	password := "-p" + Password
-	return Profile{
+	profile := Profile{
 		Name: name,
 		Sources: []SourceSpec{
 			{Name: "payload", Kind: KindText, Bytes: s.payload, Note: "lzma-turbo's xtask payload (SplitMix64 seed 7): hex words and random runs"},
@@ -138,7 +147,7 @@ func build(name string, s sizes) Profile {
 		},
 		Archives: []ArchiveSpec{
 			{Name: "st.7z", Source: "payload", Args: []string{"-mx=5", "-m0=lzma2", "-mmt=1"}, Note: "one LZMA2 stream with no dictionary resets: cannot be decoded in parallel by anyone"},
-			{Name: "mt.7z", Source: "payload", Args: []string{"-mx=5", lzma2MT, "-mmt=8"}, Note: "LZMA2 written block-parallel (dictionary reset per block): the parallel decode fixture; -mmt=8, not -mmt=on, so the layout is the same on every host"},
+			{Name: "mt.7z", Source: "payload", Args: []string{"-mx=5", lzma2MT, "-mmt=8"}, MinRuns: 2, Note: "LZMA2 written block-parallel (dictionary reset per block): the parallel decode fixture; -mmt=8, not -mmt=on, so the layout is the same on every host"},
 			{Name: "lzma.7z", Source: "payload-sub", Args: []string{"-mx=5", "-m0=lzma", "-mmt=1"}, Note: "LZMA (not LZMA2), one stream"},
 			{Name: "tree_solid.7z", Source: "tree", Args: []string{"-mx=5", lzma2MT, "-mmt=8", "-ms=on"}, Note: "many small members in one solid folder"},
 			{Name: "tree_nonsolid.7z", Source: "tree", Args: []string{"-mx=5", "-m0=lzma2", "-mmt=8", "-ms=off"}, Note: "the same members, one folder each"},
@@ -149,9 +158,43 @@ func build(name string, s sizes) Profile {
 			{Name: "bcj_arm64.7z", Source: "code-arm64", Args: []string{"-mx=5", "-mmt=1", "-mf=ARM64"}, Note: "BCJ ARM64 + LZMA2"},
 			{Name: "bcj2.7z", Source: "code-x86", Args: []string{"-mx=5", "-mmt=1", "-mf=BCJ2"}, Note: "BCJ2 (four streams) + LZMA2/LZMA"},
 			{Name: "delta.7z", Source: "audio", Args: []string{"-mx=5", "-mmt=1", "-mf=Delta:4"}, Note: "delta distance 4 + LZMA2"},
-			{Name: "media_mx1.7z", Source: "media", Args: []string{"-mx=1", lzma2MT, "-mmt=8"}, Note: "near-incompressible LZMA2 -mx1 in parallel blocks: mostly uncompressed chunks, the download-shaped decode"},
-			{Name: "media_mx5.7z", Source: "media", Args: []string{"-mx=5", lzma2MT, "-mmt=8"}, Note: "the same at -mx5: fewer, larger blocks, so the parallel decoder holds fewer runs at once"},
+			{Name: "media_mx1.7z", Source: "media", Args: []string{"-mx=1", lzma2MT, "-mmt=8"}, MinRuns: 2, Note: "near-incompressible LZMA2 -mx1 in parallel blocks: mostly uncompressed chunks, the download-shaped decode"},
+			{Name: "media_mx5.7z", Source: "media", Args: []string{"-mx=5", lzma2MT, "-mmt=8"}, MinRuns: 2, Note: "the same at -mx5: fewer, larger blocks, so the parallel decoder holds fewer runs at once"},
 			{Name: "ppmd.7z", Source: "payload-sub", Args: []string{"-mx=5", "-m0=PPMd", "-mmt=1"}, Note: "PPMd (decoded through an external PPMd crate, named in the toolchain record): secondary row"},
 		},
 	}
+	// The run fixtures: the media recipe at sizes whose -mx5 archive has more
+	// LZMA2 runs than a decode has threads, so a decoder that cannot keep
+	// every thread supplied from a backlog shows it. An archive with no more
+	// runs than threads hands every run out at once and hides that.
+	// WidestHostThreads is the widest thread count the larger one is for.
+	for _, run := range []struct {
+		tag     string
+		bytes   int64
+		minRuns int
+		note    string
+	}{
+		{"2g", s.media2g, 9, "more runs than eight threads take at once"},
+		{"3g", s.media3g, WidestHostThreads + 1, "more runs than the widest host has threads"},
+	} {
+		if run.bytes == 0 {
+			continue
+		}
+		source := "media-" + run.tag
+		profile.Sources = append(profile.Sources, SourceSpec{Name: source, Kind: KindMedia, Bytes: run.bytes,
+			Note: fmt.Sprintf("the media recipe at %d MiB", run.bytes/mib)})
+		profile.Archives = append(profile.Archives, ArchiveSpec{Name: "media_mx5_" + run.tag + ".7z", Source: source,
+			Args: []string{"-mx=5", lzma2MT, "-mmt=8"}, MinRuns: run.minRuns,
+			Note: "near-incompressible LZMA2 at -mx5 with 7zz's own run size: " + run.note + " (the count is taken from the stream and recorded)"})
+	}
+	return profile
 }
+
+// WidestHostThreads is the widest thread count of any host the corpus is
+// measured on. The largest run fixture must have more runs than this.
+const WidestHostThreads = 18
+
+// FullOnlyArchives are the archives of the full profile that the quick one
+// leaves out, with their sources: the run fixtures, which are what they are
+// only at their size.
+var FullOnlyArchives = []string{"media_mx5_2g.7z", "media_mx5_3g.7z"}

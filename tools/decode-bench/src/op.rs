@@ -13,7 +13,7 @@
 //! decode-bench op decode --archive A [--threads N] [--password P]
 //!                        [--memory-limit BYTES] [--no-verify] [--stream]
 //!                        [--adaptive [--poll-ms MS]]
-//!                        [--engine turbo|upstream] [--digest]
+//!                        [--engine turbo|upstream] [--digest] [--ledger]
 //! decode-bench op encode --input DIR --out FILE [--level L] [--threads N]
 //!                        [--non-solid] [--password P]
 //! ```
@@ -22,6 +22,12 @@
 //! `7zz t` does: the timed rows are run without `--digest`. The harness asks
 //! for the order-sensitive digest of the output in a separate, untimed run,
 //! to hold every engine to the same bytes.
+//!
+//! `--ledger` asks the reader to keep a ledger of its parallel LZMA2 decode
+//! (`Lzma2Handle::keep_ledger`) and adds it to the JSON as `ledger_*` fields:
+//! what the decoder and the reader's queue held at most, how the runs went out
+//! to the workers, and how often input was refused for room. Without it the
+//! reader keeps none and the decode is the one a consumer runs.
 //!
 //! Exit status 0 with the JSON line on success; 1 with
 //! `{"ok":false,"error":...}` when the operation itself failed; 2 on a usage
@@ -49,6 +55,7 @@ struct Opts {
     adaptive: bool,
     poll_ms: u64,
     digest: bool,
+    ledger: bool,
     engine: String,
     level: u32,
     non_solid: bool,
@@ -144,6 +151,7 @@ fn parse(args: &[String]) -> Opts {
                     .unwrap_or_else(|_| usage("--poll-ms takes milliseconds"));
             }
             "--digest" => opts.digest = true,
+            "--ledger" => opts.ledger = true,
             "--engine" => opts.engine = value(),
             "--level" => {
                 opts.level = value()
@@ -164,6 +172,7 @@ enum Json {
     Int(u64),
     Float(f64),
     Str(String),
+    Ints(Vec<u64>),
 }
 
 fn render(fields: &Fields) -> String {
@@ -179,6 +188,12 @@ fn render(fields: &Fields) -> String {
             Json::Int(value) => out.push_str(&value.to_string()),
             Json::Float(value) => out.push_str(&format!("{value:.6}")),
             Json::Str(value) => out.push_str(&quote(value)),
+            Json::Ints(values) => {
+                let items: Vec<String> = values.iter().map(u64::to_string).collect();
+                out.push('[');
+                out.push_str(&items.join(","));
+                out.push(']');
+            }
         }
     }
     out.push('}');
@@ -212,11 +227,19 @@ const CARGO_LOCK: &[u8] = include_bytes!("../../../Cargo.lock");
 
 /// The SHA-256 of [`CARGO_LOCK`], lower-case hex: the same digest the harness
 /// takes of a checkout's `Cargo.lock`, to tell whether that checkout built
-/// this binary. Taken by the crate's own backend, so the `native-crypto`
-/// build does not carry AWS-LC's SHA-256 beside RustCrypto's for this one
-/// digest.
+/// this binary. CRLF line endings are read as LF, as the harness reads them,
+/// so a binary built from a CRLF checkout carries the digest of the same lock
+/// checked out with LF. Taken by the crate's own backend, so the
+/// `native-crypto` build does not carry AWS-LC's SHA-256 beside RustCrypto's
+/// for this one digest.
 fn cargo_lock_sha256() -> String {
-    sevenz_turbo::sha256(CARGO_LOCK)
+    let lf: Vec<u8> = CARGO_LOCK
+        .iter()
+        .enumerate()
+        .filter(|&(at, &byte)| !(byte == b'\r' && CARGO_LOCK.get(at + 1) == Some(&b'\n')))
+        .map(|(_, &byte)| byte)
+        .collect();
+    sevenz_turbo::sha256(&lf)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -493,6 +516,9 @@ fn decode_turbo(opts: &Opts) -> Result<Fields, String> {
     }
     reader.set_verify_checksums(!opts.no_verify);
     let handle = reader.lzma2_handle();
+    if opts.ledger {
+        handle.keep_ledger();
+    }
     let governor = opts.adaptive.then(|| {
         Governor::start(
             handle.clone(),
@@ -597,7 +623,84 @@ fn decode_turbo(opts: &Opts) -> Result<Fields, String> {
         fields.push(("sub_streams", Json::Int(sub_streams)));
         fields.push(("crcs_reported", Json::Int(crcs_reported)));
     }
+    if let Some(ledger) = handle.ledger() {
+        ledger_fields(&ledger, &mut fields);
+    }
     Ok(fields)
+}
+
+/// The reader's ledger of its parallel LZMA2 decode, as `ledger_*` fields.
+/// Bytes are bytes and times are nanoseconds, as the library reports them.
+fn ledger_fields(ledger: &sevenz_turbo::Lzma2Ledger, fields: &mut Fields) {
+    fields.extend([
+        ("ledger_blocks", Json::Int(ledger.blocks)),
+        (
+            "ledger_dictionary_bytes",
+            Json::Int(ledger.dictionary_bytes),
+        ),
+        ("ledger_budget_bytes", Json::Int(ledger.budget_bytes)),
+        ("ledger_threads", Json::Int(ledger.threads)),
+        ("ledger_worker_threads", Json::Int(ledger.worker_threads)),
+        ("ledger_peak_held_bytes", Json::Int(ledger.peak_held_bytes)),
+        (
+            "ledger_peak_queue_bytes",
+            Json::Int(ledger.peak_queue_bytes),
+        ),
+        (
+            "ledger_peak_queue_capacity_bytes",
+            Json::Int(ledger.peak_queue_capacity_bytes),
+        ),
+        (
+            "ledger_peak_spill_bytes",
+            Json::Int(ledger.peak_spill_bytes),
+        ),
+        (
+            "ledger_peak_total_bytes",
+            Json::Int(ledger.peak_total_bytes),
+        ),
+        ("ledger_peak_runs_out", Json::Int(ledger.peak_runs_out)),
+        (
+            "ledger_peak_runs_pending",
+            Json::Int(ledger.peak_runs_pending),
+        ),
+        ("ledger_runs", Json::Int(ledger.runs)),
+        ("ledger_chase_bytes", Json::Int(ledger.chase_bytes)),
+        ("ledger_wave_count", Json::Int(ledger.wave_count)),
+        ("ledger_wave_runs", Json::Ints(ledger.wave_runs.clone())),
+        (
+            "ledger_wave_runs_out",
+            Json::Ints(ledger.wave_runs_out.clone()),
+        ),
+        ("ledger_refused_feeds", Json::Int(ledger.refused_feeds)),
+        (
+            "ledger_refused_at_boundary",
+            Json::Int(ledger.refused_at_boundary),
+        ),
+        (
+            "ledger_refused_at_boundary_busy",
+            Json::Int(ledger.refused_at_boundary_busy),
+        ),
+        (
+            "ledger_refused_at_boundary_small",
+            Json::Int(ledger.refused_at_boundary_small),
+        ),
+        (
+            "ledger_refused_at_boundary_bytes",
+            Json::Int(ledger.refused_at_boundary_bytes),
+        ),
+        ("ledger_refused_mid_run", Json::Int(ledger.refused_mid_run)),
+        (
+            "ledger_refused_run_pending",
+            Json::Int(ledger.refused_run_pending),
+        ),
+        ("ledger_gate_refusals", Json::Int(ledger.gate_refusals)),
+        ("ledger_backlog_stops", Json::Int(ledger.backlog_stops)),
+        ("ledger_waits", Json::Int(ledger.waits)),
+        (
+            "ledger_wait_nanos_by_runs_out",
+            Json::Ints(ledger.wait_nanos_by_runs_out.clone()),
+        ),
+    ]);
 }
 
 /// The streaming lane's check of the sub-stream hook: with verification on,

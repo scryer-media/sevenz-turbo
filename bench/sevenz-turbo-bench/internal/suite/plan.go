@@ -17,9 +17,21 @@ import (
 const (
 	VariantTurbo       = "sevenz-turbo"
 	VariantTurboNative = "sevenz-turbo native-crypto"
-	VariantUpstream    = "sevenz-rust2"
-	VariantOracle      = "7zz"
+	// VariantTurboPlain is the candidate decoding with no ledger kept, in a
+	// scenario whose candidate keeps one: the same decode as a consumer runs
+	// it, in the same passes, so the report shows what observing it costs.
+	VariantTurboPlain = "sevenz-turbo no-ledger"
+	VariantUpstream   = "sevenz-rust2"
+	VariantOracle     = "7zz"
+	// VariantOracleOneThread is 7zz with -mmtf=off beside -mmt=1, a second
+	// reference on a one-thread filter row: at -mmt=1 alone 7-Zip still runs
+	// the BCJ2 stage on a thread of its own.
+	VariantOracleOneThread = "7zz -mmtf=off"
 )
+
+// References lists the reference variants a ratio can be taken against, the
+// primary first.
+var References = []string{VariantOracle, VariantOracleOneThread}
 
 // Roles. A failing candidate or reference run fails the whole run; a failing
 // secondary run is reported and does not.
@@ -38,7 +50,27 @@ const (
 
 // FullOnlyGroups have no scenario in the quick matrix: their fixtures are
 // only worth timing at the full corpus's size.
-var FullOnlyGroups = map[string]bool{"lzma2 near-incompressible": true}
+var FullOnlyGroups = map[string]bool{"lzma2 near-incompressible": true, GroupLedger: true}
+
+// GroupLedger is the decodes measured with the reader's ledger kept: runs
+// against threads against memory limits.
+const GroupLedger = "decode ledger"
+
+// LedgerFixtures are the archives of the ledger rows that are swept over
+// every thread count and limit, the one with the most runs first.
+// LedgerControls are decoded at each thread count with no limit: their runs
+// are small, so a change made for the large-run fixtures must not move them.
+var (
+	LedgerFixtures = []string{"media_mx5_3g.7z", "media_mx5_2g.7z", "mt.7z"}
+	LedgerControls = []string{"media_mx1.7z", "aes_mx1.7z"}
+	// LedgerThreads is the sweep of the ledger rows; a count above the usable
+	// cores is left out.
+	LedgerThreads = []string{"2", "4", "8", "all"}
+	// LedgerLimits are the decode limits of the ledger rows, in MiB, after
+	// the row with none: 512 and 1024, and 553, 1065 and 2089, which are what
+	// weaver passes for 2, 4 and 8 threads.
+	LedgerLimits = []int64{512, 553, 1024, 1065, 2089}
+)
 
 // Groups, in report order.
 var Groups = []string{
@@ -48,6 +80,7 @@ var Groups = []string{
 	"lzma2 near-incompressible",
 	"lzma",
 	"memory budget",
+	GroupLedger,
 	"solid vs non-solid",
 	"aes-256",
 	"filters",
@@ -73,8 +106,11 @@ type Scenario struct {
 	NoVerify    bool  `json:"no_verify,omitempty"`
 	// Adaptive is weaver's chase decode: the parallel LZMA2 decoder started
 	// at one thread and widened as runs queue up.
-	Adaptive bool   `json:"adaptive,omitempty"`
-	Stream   bool   `json:"stream,omitempty"`
+	Adaptive bool `json:"adaptive,omitempty"`
+	Stream   bool `json:"stream,omitempty"`
+	// Ledger marks a decode whose candidate keeps the reader's ledger
+	// (decode-bench --ledger) and reports it in its result.
+	Ledger   bool   `json:"ledger,omitempty"`
 	Note     string `json:"note,omitempty"`
 	Variants []Run  `json:"variants"`
 }
@@ -239,6 +275,9 @@ func Plan(manifest *fixtures.Manifest, dir, scratch string, tools Tools, setting
 		p.decode("lzma2 near-incompressible", "media_mx5.7z", "all", decodeOpts{adaptive: true, memoryLimit: 4 << 30,
 			note: adaptiveNote + "; under an explicit 4 GiB limit, as weaver passes its granted decode budget"})
 	}
+	if !settings.Quick {
+		p.ledgerRows()
+	}
 	p.decode("lzma", "lzma.7z", "1", decodeOpts{upstream: true})
 	for _, budget := range settings.Budgets {
 		p.decode("memory budget", "mt.7z", settings.BudgetThreads, decodeOpts{memoryLimit: budget,
@@ -259,7 +298,12 @@ func Plan(manifest *fixtures.Manifest, dir, scratch string, tools Tools, setting
 	p.decode("aes-256", "aes_kdf.7z", "1", decodeOpts{upstream: true, native: true,
 		note: "one SHA-256 key derivation per folder unless cached: the key-derivation row"})
 	for _, name := range []string{"bcj_x86.7z", "bcj_arm64.7z", "bcj2.7z", "delta.7z"} {
-		p.decode("filters", name, "1", decodeOpts{upstream: true})
+		o := decodeOpts{upstream: true}
+		if name == "bcj2.7z" {
+			o.oneThreadReference = true
+			o.note = "two references: 7zz -mmt=1, which still runs the BCJ2 stage on a second thread, and 7zz -mmt=1 -mmtf=off, which does not; each ratio names the one it is against"
+		}
+		p.decode("filters", name, "1", o)
 	}
 	p.decode("ppmd (secondary)", "ppmd.7z", "1", decodeOpts{upstream: true, note: "PPMd is an external crate (see the toolchain's PPMd crates), not this crate's code"})
 
@@ -346,8 +390,46 @@ const adaptiveNote = "weaver's chase decode: set_adaptive_lzma2 + set_threads(1)
 
 type decodeOpts struct {
 	upstream, native, noVerify, stream, adaptive bool
-	memoryLimit                                  int64
-	note                                         string
+	// ledger has the candidate keep the reader's ledger. A ledger row with no
+	// memory limit also runs the candidate without one, as VariantTurboPlain.
+	ledger bool
+	// oneThreadReference adds VariantOracleOneThread, 7zz with -mmtf=off as
+	// well as -mmt=n, as a second reference beside VariantOracle.
+	oneThreadReference bool
+	memoryLimit        int64
+	note               string
+}
+
+// ledgerRows plans the ledger group: every ledger fixture at every ledger
+// thread count with no limit and under each ledger limit, and the controls at
+// the fixed thread counts with no limit.
+func (p *planner) ledgerRows() {
+	for _, name := range LedgerFixtures {
+		for _, threads := range LedgerThreads {
+			if !p.affords(threads) {
+				continue
+			}
+			p.decode(GroupLedger, name, threads, decodeOpts{ledger: true})
+			for _, limit := range LedgerLimits {
+				p.decode(GroupLedger, name, threads, decodeOpts{ledger: true, memoryLimit: limit << 20})
+			}
+		}
+	}
+	for _, name := range LedgerControls {
+		for _, threads := range LedgerThreads {
+			if threads == "all" || !p.affords(threads) {
+				continue
+			}
+			p.decode(GroupLedger, name, threads, decodeOpts{ledger: true, native: true})
+		}
+	}
+}
+
+// affords reports whether the usable cores cover a thread count; "all" always
+// does.
+func (p *planner) affords(threads string) bool {
+	n, err := strconv.Atoi(threads)
+	return err != nil || n <= p.settings.CPUs
 }
 
 func (p *planner) decode(group, name, threads string, o decodeOpts) {
@@ -371,6 +453,12 @@ func (p *planner) decode(group, name, threads string, o decodeOpts) {
 		id += fmt.Sprintf("/budget-%dMiB", o.memoryLimit>>20)
 		ours = append(ours, "--memory-limit", strconv.FormatInt(o.memoryLimit, 10))
 	}
+	// The twin of a ledger row is the same command without the ledger.
+	plain := append([]string(nil), ours...)
+	if o.ledger {
+		id += "/ledger"
+		ours = append(ours, "--ledger")
+	}
 	if !p.settings.Keeps(id) {
 		return
 	}
@@ -381,14 +469,22 @@ func (p *planner) decode(group, name, threads string, o decodeOpts) {
 	oracle := []string{"t", "-bso0", "-bsp0", "-mmt=" + n}
 	if record.Encrypted {
 		ours = append(ours, "--password", fixtures.Password)
+		plain = append(plain, "--password", fixtures.Password)
 		oracle = append(oracle, "-p"+fixtures.Password)
 	}
 	oracle = append(oracle, path)
 	variants := []Run{{Variant: VariantTurbo, Role: RoleCandidate, Tool: p.tools.Candidate, Args: ours, JSON: true}}
-	if o.native && p.tools.Native != "" {
+	if o.native && record.Encrypted && p.tools.Native != "" {
 		variants = append(variants, Run{Variant: VariantTurboNative, Role: RoleCandidate, Tool: p.tools.Native, Args: ours, JSON: true})
 	}
+	if o.ledger && o.memoryLimit == 0 {
+		variants = append(variants, Run{Variant: VariantTurboPlain, Role: RoleCandidate, Tool: p.tools.Candidate, Args: plain, JSON: true})
+	}
 	variants = append(variants, Run{Variant: VariantOracle, Role: RoleReference, Tool: p.tools.Oracle, Args: oracle})
+	if o.oneThreadReference {
+		oneThread := append(append([]string(nil), oracle[:len(oracle)-1]...), "-mmtf=off", path)
+		variants = append(variants, Run{Variant: VariantOracleOneThread, Role: RoleReference, Tool: p.tools.Oracle, Args: oneThread})
+	}
 	if o.upstream {
 		upstream := []string{"op", "decode", "--engine", "upstream", "--archive", path, "--threads", n}
 		if record.Encrypted {
@@ -399,7 +495,7 @@ func (p *planner) decode(group, name, threads string, o decodeOpts) {
 	p.add(Scenario{
 		ID: id, Group: group, Op: OpDecode, Fixture: name, Threads: threads,
 		MemoryLimit: o.memoryLimit, Encrypted: record.Encrypted, NoVerify: o.noVerify, Stream: o.stream,
-		Adaptive: o.adaptive, Note: o.note, Variants: variants,
+		Adaptive: o.adaptive, Ledger: o.ledger, Note: o.note, Variants: variants,
 	})
 }
 

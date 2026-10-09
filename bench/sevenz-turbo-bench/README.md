@@ -28,6 +28,7 @@ Variants:
 |---|---|---|
 | `sevenz-turbo` | candidate | `decode-bench` built with default features (AWS-LC cryptography) |
 | `sevenz-turbo native-crypto` | candidate (AES rows only) | `decode-bench --features native-crypto` (RustCrypto) |
+| `sevenz-turbo no-ledger` | candidate (decode ledger rows with no limit) | the same `decode-bench`, run without `--ledger`: the decode as a consumer runs it, in the same passes as the observed one |
 | `7zz` | reference (oracle) | the official 7-Zip console binary: `7zz t` (decode), `7zz l -slt` (list), `7zz a` (encode) |
 | `sevenz-rust2` | secondary | upstream `sevenz-rust2 =0.22.2`, already linked by `decode-bench`; decode rows only, informational |
 
@@ -41,9 +42,10 @@ the core count, then `all`; `--quick` runs 1 and `all`):
 | lzma2 parallel | `decode/mt/T<sweep>`, plus `Tall/no-verify` and `Tall/stream` | the parallel LZMA2 decoder; the CRC-32 cost; the single-parse streaming consumer (`block_decoder` per block, sub-stream CRC hook) |
 | lzma | `decode/lzma/T1` | LZMA (not LZMA2) |
 | memory budget | `decode/mt/T8/budget-<N>MiB` (full 64 and 512 MiB, quick 20 and 96 MiB) | `ArchiveLimits::memory`: `parallel_path=false` in the notes means the budget forced the single-threaded fallback; compare its peak RSS with the unbudgeted row |
+| decode ledger | `decode/{media_mx5_3g,media_mx5_2g,mt}/T{2,4,8,all}/ledger` and the same under a limit, `…/budget-<N>MiB/ledger` for 512, 553, 1024, 1065 and 2089 MiB; `decode/{media_mx1,aes_mx1}/T{2,4,8}/ledger`. Full and fleet only | the parallel LZMA2 decoder given more runs than it has threads, at each thread count and under the limits a consumer passes (553, 1065 and 2089 MiB are what weaver passes at 2, 4 and 8 threads), with each decode's memory and dispatch ledger (below). The `-mx1` rows are controls: their runs are small, so a change made for the large-run fixtures must not move them |
 | solid vs non-solid | `decode/tree_{solid,nonsolid}/T{1,all}`, plus `no-verify`, `stream` | many small members: per-member CRC-32, folder setup and header cost vs one large stream |
 | aes-256 | `decode/aes_store/T1`, `decode/aes_mx1/T{1,all}`, `decode/aes_kdf/T1` (+ `list/aes_kdf`) | AES-256-CBC decrypt in both cryptography builds; SHA-256 key derivation dominated rows |
-| filters | `decode/{bcj_x86,bcj_arm64,bcj2,delta}/T1` | the BCJ x86/ARM64, BCJ2 and delta filters |
+| filters | `decode/{bcj_x86,bcj_arm64,bcj2,delta}/T1` | the BCJ x86/ARM64, BCJ2 and delta filters; the BCJ2 row has two references, `7zz -mmt=1`, which still runs the BCJ2 stage on a second thread, and `7zz -mmt=1 -mmtf=off` (variant `7zz -mmtf=off`), which does not; its ratio against the second is printed as `sevenz-turbo vs 7zz -mmtf=off` |
 | ppmd (secondary) | `decode/ppmd/T1` | PPMd through `ppmd-turbo` |
 | encode | `encode/payload-sub/L{1,3,5,7,9}/T{1,all}`, `encode/payload-sub/L5/T<sweep>`, `encode/tree/L5/Tall/{solid,non-solid}` | the `compress` writer (LZMA2 through lzma-turbo's encoder) vs `7zz a -m0=lzma2:d=…:fb=…:mf=…:a=… -mx<L> -mmt<T>`, with the archive-size ratio; 7zz is given this crate's level settings (xz's table, not 7-Zip's `-mx` defaults), so both sides use the same dictionary, match finder and fast bytes; every archive this crate writes is checked once with an untimed `7zz t` |
 | encode aes-256 | `encode/payload-sub/L5/Tall/aes`, `encode/kdf-tree/L5/T1/non-solid/aes` | AES-256 write (`-mhe=on` on the 7zz side; this crate encrypts the header by default) |
@@ -68,6 +70,59 @@ direction rarpar-bench and the weaver bench reports use, so merged reports
 read the same way): ratio = 7zz / sevenz-turbo, >1 = sevenz-turbo better.
 Above 1.000 sevenz-turbo is faster, smaller or lower; below 1.000 it is
 slower, larger or higher. The peak RSS section lists the lowest ratio first.
+
+### The decode ledger
+
+A `decode ledger` row runs `decode-bench op decode --ledger`: the reader keeps
+an `Lzma2Ledger` (`Lzma2Handle::keep_ledger`) of its parallel LZMA2 decode and
+decode-bench prints it in its JSON line as `ledger_*` fields. Keeping it reads
+gauges the decode already has, where the decode already stops to look at them;
+the `sevenz-turbo no-ledger` variant of the rows with no limit is the same
+command without it, so the report shows both against 7zz. A fixed thread count
+above the usable cores is left out, and `all` is the usable cores.
+
+The report gains two tables. Each cell is the median over the measured runs,
+with the range where the runs differed.
+
+`decode ledger: memory`, in MiB:
+
+| column | what it is |
+|---|---|
+| limit, budget | the limit the row passed, and what it left the decoder to hold (the default for the thread count where no limit was passed) |
+| peak RSS | the process's, as in every other table |
+| held | the peak of lzma-turbo's `held_bytes()`: input pieces, the buffer of every run out with a worker, decoded runs waiting their turn and buffers parked for reuse, by capacity |
+| queue | the peak of the reader's queue of packed input read and not yet handed to the decoder, by length (what its 192 MiB read-ahead allowance is measured against) and by the capacity of its pieces |
+| spill | the peak of decoded output held between the decoder and the caller |
+| together | the most `held`, the queue's capacity and `spill` came to at one moment; they peak at different moments, so it is below their sum. This is what a memory limit governs |
+| dictionaries | allocated / touched / nominal. A worker has no dictionary of its own: it decodes into the run's output buffer, which `held` counts. The decode allocates one dictionary, and only when the calling thread decodes a run itself; no more of it is written than that thread decoded. Nominal is the dictionary size times the decoders that ran |
+| remainder | peak RSS less `together` and the allocated dictionaries: everything the ledger does not name. Negative where buffers counted by capacity were never written, since RSS counts touched pages only |
+
+The byte figures are sampled where the reader looks (after every read of
+packed input, every hand-over to the decoder and every drain of output), so
+none is above its true peak.
+
+`decode ledger: dispatch`:
+
+| column | what it is |
+|---|---|
+| runs | LZMA2 runs handed to a decoder; for a ledger fixture this is the count in `fixtures.json` |
+| waves, runs per wave | a wave is the runs a decoder claimed between two sleeps of the delivering thread: it is closed each time that thread goes to sleep for a worker with runs claimed since the wave before. The sequence is the first measured run's, repeats folded (`1x3` is three waves of one run), and cut after 24 terms; `report.json` has it whole |
+| runs out per wave | the runs out as the delivering thread went to sleep at the end of each wave. A decode that keeps its threads supplied claims a run for each that comes back and shows the thread count here wave after wave; one that lets them run dry claims nothing while they finish and shows only what it claimed in the wave |
+| peak runs out | the most runs out with a decoder at once |
+| out asleep | the mean runs out over the time the delivering thread slept: `report.json` has the time by runs out (`wait_seconds_by_runs_out`) |
+| refused at boundary (busy) | input pieces the decoder handed back for want of room with the hand-over standing at the end of a run and no complete run waiting: it holds a whole run it cannot start, because the header that closes that run is at the front of the piece it refused. In brackets, those with a run out |
+| refused mid-run; refused, run waiting | the other pieces handed back: part way through a run, and at a run's end with a complete run already waiting |
+| gate, backlog | times the reader stopped reading ahead because what the decoder held left no room for another run under the budget, and times it stopped with room |
+| waits, wait s, idle thread s | times the delivering thread slept for a worker and for how long; and that time weighted by the threads with no run out |
+
+A run is out from the moment a decoder claims it until its last byte is
+delivered, so a run that is decoded and waiting its turn behind an earlier one
+still counts: runs out is at least the threads at work, not exactly them.
+
+Three things the ledger cannot say, because lzma-turbo does not report them:
+how often the decoder itself declined to start a run for want of room, how
+`held` divides between input, runs out, finished runs and parked buffers, and
+how many runs are being decoded at a given moment as opposed to out.
 
 ## Build
 
@@ -152,10 +207,11 @@ are three profiles:
 | `fleet` | full | every scenario | 3 + 1 |
 
 A smoke run is `fixtures --profile quick` then `run --quick`, which takes a
-few minutes. `fleet` keeps every scenario of `full`, 52 on an 18-core host
+few minutes. `fleet` keeps every scenario of `full`, 137 on an 18-core host
 (the thread sweep stops below the core count), and only cuts the repeats.
-From the quick-corpus numbers scaled to the full corpus, it projects to about
-4.5 hours on a 12- or 16-thread x86 host. Most of that is a handful of rows:
+78 of them are the `decode ledger` group, which `--only /ledger` runs alone.
+From the quick-corpus numbers scaled to the full corpus, the others project
+to about 4.5 hours on a 12- or 16-thread x86 host. Most of that is a handful of rows:
 the non-solid tree encode, the PPMd decode (mostly its secondary
 sevenz-rust2 variant), the AES and single-thread level 3, 7 and 9 encodes,
 and the solid tree encode, each projected at 10 minutes or more there.
@@ -199,7 +255,7 @@ change the exit code.
 | file | contents |
 |---|---|
 | `raw.json` | `schema` `sevenz-turbo-bench/raw/1`: host, toolchain, corpus manifest, the planned scenarios with every command line, and one record per run (`wall_seconds`, `user_seconds`, `sys_seconds`, `max_rss_bytes`, `rss_source`, `bytes_in`, `bytes_out`, `load_average`, `status`, `failure`, decode-bench's own JSON `result`) |
-| `report.json` | `schema_version` 1, `schema` `sevenz-turbo-bench/report/1`: per-variant rows (`wall_seconds`, `cpu_seconds`, `max_rss_bytes`, `load_average` as `{median,min,max,n}`), the `ratios` against 7zz, `rss_scenarios` sorted worst first, and the failure lists |
+| `report.json` | `schema_version` 1, `schema` `sevenz-turbo-bench/report/1`: per-variant rows (`wall_seconds`, `cpu_seconds`, `max_rss_bytes`, `load_average` as `{median,min,max,n}`), the `ratios` against 7zz, `rss_scenarios` sorted worst first, `ledgers` (one per decode ledger row, every figure as `{median,min,max,n}` in bytes or counts, with the first measured run's `wave_runs`), and the failure lists |
 | `report.md` | the same, readable: the orientation, the host (OS, arch, CPU model, cores, memory, ISA flags such as avx2/avx512*/vbmi2/gfni/vaes/sha_ni or neon/aes/pmull/sha2/sve/sve2), the toolchain (linked lzma-turbo, crypto backends, 7zz banner and provenance, rustc, crate commit), one table per group and a worst-first "Peak RSS per scenario" section |
 
 The host descriptor reads ISA flags from Go's `x/sys/cpu` plus

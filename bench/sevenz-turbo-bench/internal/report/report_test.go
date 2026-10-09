@@ -153,3 +153,53 @@ func TestMergeRefusesDifferentWorkloads(t *testing.T) {
 		t.Errorf("a report without a fixture manifest was merged: %v", err)
 	}
 }
+
+func TestSlowThroughputIsNotRoundedToZero(t *testing.T) {
+	for _, c := range []struct {
+		mibs float64
+		want string
+	}{
+		{1234.5, "1234"},
+		{123.4, "123"},
+		{12.34, "12.3"},
+		{1.234, "1.23"},
+		{0.4567, "0.457"},
+		{0.25, "0.25"},
+		{0.0123, "0.0123"},
+	} {
+		if got := throughputText(c.mibs); got != c.want {
+			t.Errorf("throughputText(%v) = %q, want %q", c.mibs, got, c.want)
+		}
+	}
+}
+
+// A row with a second reference gets a ratio against each, and each ratio
+// names the reference it is against, in report.json and in both reports.
+func TestEveryRatioNamesItsReference(t *testing.T) {
+	raw := sampleRaw()
+	raw.Scenarios[0].Variants = append(raw.Scenarios[0].Variants, suite.Run{Variant: suite.VariantOracleOneThread, Role: suite.RoleReference})
+	for _, wall := range []float64{1.0, 1.2, 1.1} {
+		raw.Runs = append(raw.Runs, run(raw.Scenarios[0].ID, suite.VariantOracleOneThread, suite.RoleReference, wall*3, 40<<20, suite.StatusOK))
+	}
+	built := Build(raw)
+	against := map[string]float64{}
+	for _, ratio := range built.Ratios {
+		against[ratio.Reference] = *ratio.Wall
+	}
+	if len(built.Ratios) != 2 || against[suite.VariantOracle] != 2 || against[suite.VariantOracleOneThread] != 3 {
+		t.Fatalf("ratios %+v, want 2 against 7zz and 3 against 7zz -mmtf=off", built.Ratios)
+	}
+	md := Markdown(built)
+	if !strings.Contains(md, "| | sevenz-turbo vs 7zz -mmtf=off | - | - | - | - | 3.000 |") {
+		t.Errorf("report.md does not label the second reference's ratio:\n%s", md)
+	}
+	merged, err := Merge([]*Report{built})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"| decode/mt/T4 | sevenz-turbo | 1.100 / 2.000 /", "| decode/mt/T4 | sevenz-turbo vs 7zz -mmtf=off | 1.100 / 3.000 /"} {
+		if !strings.Contains(merged, want) {
+			t.Errorf("merged report lacks %q:\n%s", want, merged)
+		}
+	}
+}

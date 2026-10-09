@@ -72,14 +72,17 @@ type Row struct {
 	Extra string `json:"extra,omitempty"`
 }
 
-// Ratio compares one candidate variant against 7zz in one scenario.
+// Ratio compares one candidate variant against one reference in one
+// scenario: 7zz, or on a row that has a second reference, that one too.
 type Ratio struct {
-	Scenario string   `json:"scenario"`
-	Group    string   `json:"group"`
-	Variant  string   `json:"variant"`
-	Wall     *float64 `json:"wall,omitempty"`
-	CPU      *float64 `json:"cpu,omitempty"`
-	RSS      *float64 `json:"rss,omitempty"`
+	Scenario string `json:"scenario"`
+	Group    string `json:"group"`
+	Variant  string `json:"variant"`
+	// Reference is the reference variant the ratio is against.
+	Reference string   `json:"reference"`
+	Wall      *float64 `json:"wall,omitempty"`
+	CPU       *float64 `json:"cpu,omitempty"`
+	RSS       *float64 `json:"rss,omitempty"`
 	// Size is the archive-size ratio of an encode.
 	Size *float64 `json:"size,omitempty"`
 }
@@ -111,6 +114,9 @@ type Report struct {
 	Rows     []Row                     `json:"rows"`
 	Ratios   []Ratio                   `json:"ratios"`
 	RSS      []procmeasure.RSSScenario `json:"rss_scenarios"`
+	// Ledgers is the memory and dispatch ledger of every candidate row that
+	// kept one (the decode ledger group).
+	Ledgers []Ledger `json:"ledgers,omitempty"`
 	// Failures lists every failed or unfinished candidate/reference run;
 	// SecondaryFailures the sevenz-rust2 ones, which do not fail the run.
 	Failures          []string `json:"failures"`
@@ -156,19 +162,26 @@ func Build(raw *suite.Raw) *Report {
 			row := summarize(scenario, variant, runs)
 			report.Rows = append(report.Rows, row)
 			byVariant[variant.Variant] = &row
+			if kept := ledger(scenario, variant.Variant, runs); kept != nil {
+				report.Ledgers = append(report.Ledgers, *kept)
+			}
 		}
 		oracle := byVariant[suite.VariantOracle]
-		for _, variant := range []string{suite.VariantTurbo, suite.VariantTurboNative} {
+		for _, variant := range []string{suite.VariantTurbo, suite.VariantTurboNative, suite.VariantTurboPlain} {
 			ours := byVariant[variant]
 			if ours == nil {
 				continue
 			}
-			if oracle != nil && ours.OK > 0 && oracle.OK > 0 {
-				ratio := Ratio{Scenario: scenario.ID, Group: scenario.Group, Variant: variant,
-					Wall: divide(oracle.Wall.Median, ours.Wall.Median), CPU: divide(oracle.CPU.Median, ours.CPU.Median),
-					RSS: divide(oracle.RSS.Median, ours.RSS.Median)}
+			for _, reference := range suite.References {
+				against := byVariant[reference]
+				if against == nil || ours.OK == 0 || against.OK == 0 {
+					continue
+				}
+				ratio := Ratio{Scenario: scenario.ID, Group: scenario.Group, Variant: variant, Reference: reference,
+					Wall: divide(against.Wall.Median, ours.Wall.Median), CPU: divide(against.CPU.Median, ours.CPU.Median),
+					RSS: divide(against.RSS.Median, ours.RSS.Median)}
 				if scenario.Op == suite.OpEncode {
-					ratio.Size = divide(float64(oracle.BytesOut), float64(ours.BytesOut))
+					ratio.Size = divide(float64(against.BytesOut), float64(ours.BytesOut))
 				}
 				report.Ratios = append(report.Ratios, ratio)
 			}

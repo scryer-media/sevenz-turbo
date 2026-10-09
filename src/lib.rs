@@ -138,7 +138,7 @@ use std::{
 
 pub use archive::*;
 pub use block::*;
-pub use codec::lzma_turbo::{Lzma2Handle, Lzma2Progress};
+pub use codec::lzma_turbo::{Lzma2Handle, Lzma2Ledger, Lzma2Progress};
 pub use container::{
     ArchiveLimits, BlockCompletion, CrcFolder, PackStreamRange, SubStream, SubStreamCompletion,
     UnsizedCoder, coder_memory_estimate, crc32_combine,

@@ -972,6 +972,68 @@ Everything here is new surface; no upstream signature changed meaning.
   message per mebibyte. The output is byte-identical (LZMA2 level 5, BCJ2
   and PPMd checked), and `ArchiveWriter::create` still returns
   `ArchiveWriter<File>`.
+- Bench harness: the full corpus gains `media_mx5_2g.7z` and
+  `media_mx5_3g.7z`, the near-incompressible recipe at 2 and 3 GiB written at
+  `-mx=5 -mmt=8` with 7-Zip's own run size: 16 and 24 LZMA2 runs of 128 MiB.
+  The larger has more runs than the widest host measured has threads (18), so
+  a parallel decoder that cannot keep every thread supplied from a backlog
+  shows it at any thread count; the 1 GiB archives have eight runs and hide
+  it from eight threads up. `fixtures` counts the runs of these, of `mt.7z`
+  and of the other media archives from each archive's own stream, by walking
+  its LZMA2 chunk headers, records the count and the run sizes in
+  `fixtures.json`, and refuses an archive with fewer runs than its recipe
+  needs. The quick corpus is unchanged.
+- `Lzma2Handle::keep_ledger` asks a reader to account for its parallel LZMA2
+  decodes, and `Lzma2Handle::ledger` returns the account as an `Lzma2Ledger`:
+  the most the decoder held, the most packed input queued for it and decoded
+  output held behind it, and the most the three came to at one moment; the
+  runs handed out, in waves, where a wave is the runs the decoder claimed
+  between two sleeps of the delivering thread, each with the runs out as that
+  thread went to sleep; how often the decoder handed a
+  piece of input back for want of room, split by where in a run the piece was
+  offered; how often the reader stopped reading ahead for room and how often
+  because the decoder had its backlog; and how long the delivering thread
+  slept, by the runs out as it went to sleep. A ledger steers nothing: it
+  reads the gauges a decode already keeps at the points where it already
+  looks at them. A reader not asked for one carries an empty `Option` and
+  every hook returns at its first branch. `decode-bench op decode --ledger`
+  keeps one and reports it as `ledger_*` fields. Three figures are not in it,
+  because lzma-turbo 0.7.0 does not expose them: how many times the decoder
+  declined to give a complete run to a worker for want of room (it reports
+  the bytes, behind a feature, not the count), how its held bytes divide
+  between input, runs out, runs waiting and parked buffers, and how many runs
+  are being decoded at a moment, as opposed to claimed and not yet delivered.
+- Bench harness: a `decode ledger` group in the `full` and `fleet` profiles
+  decodes `media_mx5_3g.7z`, `media_mx5_2g.7z` and `mt.7z` at 2, 4, 8 and all
+  threads, with no memory limit and with limits of 512, 553, 1024, 1065 and
+  2089 MiB, against 7zz at the same thread count, and `media_mx1.7z` and
+  `aes_mx1.7z` at 2, 4 and 8 threads as rows that a change to the run
+  hand-over must not move. The candidate keeps a ledger; each row without a
+  memory limit also runs it without one, as `sevenz-turbo no-ledger`, so the
+  cost of keeping it is measured rather than assumed. The report gains two
+  tables: memory (peak RSS, what the decoder held, the reader's queue, the
+  output behind it, the three together, the dictionary the decode allocated
+  beside dictionary size times the decoders that ran, and the remainder) and
+  dispatch (runs, waves, the runs claimed in each wave and the runs out at
+  its end, the mean runs out while the delivering thread slept, refusals by
+  where in a run the piece was offered, the reader's stops for room, and the
+  time the delivering thread slept and the worker time that stood idle with
+  it). The quick profile plans none of these rows.
+- Bench harness: report.md gives throughput to three significant figures, so
+  a row under 0.5 MiB/s no longer reads as 0.
+- Bench harness: raw.json and the reports built from it name the corpus, the
+  run's scratch and output directories, the checkout and the home directory
+  as `<fixtures>`, `<scratch>`, `<out>`, `<repo>` and `~`, not by their
+  absolute paths.
+- Bench harness: the Cargo.lock digest that ties a candidate to its checkout
+  reads CRLF line endings as LF, in decode-bench and in the harness, so
+  `merge` no longer refuses a report from a CRLF checkout over line endings
+  alone.
+- Bench harness: the one-thread BCJ2 row, `decode/bcj2/T1`, has two
+  references: `7zz -mmt=1`, which still runs the BCJ2 stage on a second
+  thread, and `7zz -mmt=1 -mmtf=off`, which does not. Every ratio in
+  report.json now names the reference it is against (`reference`), and both
+  reports label the second as `sevenz-turbo vs 7zz -mmtf=off`.
 
 ## 0.26.1 - 2026-09-29
 

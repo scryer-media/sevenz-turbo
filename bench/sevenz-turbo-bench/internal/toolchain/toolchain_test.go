@@ -183,3 +183,15 @@ func TestSameBuild(t *testing.T) {
 		t.Error("a pair built from uncommitted changes was accepted")
 	}
 }
+
+func TestLockDigestReadsCRLFAsLF(t *testing.T) {
+	const lf = "911169ddaaf146aff539f58c26c489af3b892dff0fe283c1c264c65ae5aa59a2"
+	for _, lock := range []string{"a\nb\n", "a\r\nb\r\n", "a\r\nb\n"} {
+		if got := LockDigest([]byte(lock)); got != lf {
+			t.Errorf("LockDigest(%q) = %s, want the LF digest %s", lock, got, lf)
+		}
+	}
+	if got := LockDigest([]byte("a\rb\n")); got != "367d1c77eadc1495a7db4200f46a8b90ea1fa926282722d308c05a65098a4112" {
+		t.Errorf("a carriage return not before a line feed was dropped: %s", got)
+	}
+}

@@ -417,12 +417,20 @@ func ProbeRust(ctx context.Context, repo string) Rust {
 		rust.BuildDirty = run(repo, "git", append([]string{"status", "--porcelain", "--untracked-files=no", "--"}, BuildPaths...)...) != ""
 	}
 	if lock, err := os.ReadFile(filepath.Join(repo, "Cargo.lock")); err == nil {
-		sum := sha256.Sum256(lock)
-		rust.CargoLock = hex.EncodeToString(sum[:])
+		rust.CargoLock = LockDigest(lock)
 		rust.LockedTurbo = LockedVersion(string(lock), "lzma-turbo")
 		rust.LockedVersion = LockedVersion(string(lock), "sevenz-turbo")
 	}
 	return rust
+}
+
+// LockDigest is the SHA-256 of a Cargo.lock with CRLF line endings read as
+// LF, lower-case hex, so a checkout made with CRLF endings carries the digest
+// of the same lock checked out with LF. decode-bench takes its own digest the
+// same way.
+func LockDigest(lock []byte) string {
+	sum := sha256.Sum256(bytes.ReplaceAll(lock, []byte("\r\n"), []byte("\n")))
+	return hex.EncodeToString(sum[:])
 }
 
 // DefaultCandidate is where `cargo build --release -p decode-bench` puts the

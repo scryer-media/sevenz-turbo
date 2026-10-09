@@ -27,6 +27,11 @@ use crate::error::Error;
 #[cfg(all(feature = "compress", not(feature = "lzma-rust2-encoder")))]
 pub(crate) mod writer;
 
+/// What a parallel LZMA2 decode held and how its runs went out, for a caller
+/// that asked. See [`Lzma2Handle::keep_ledger`].
+mod ledger;
+pub use ledger::Lzma2Ledger;
+
 /// Bytes an LZMA or LZMA2 decoder holds beyond its dictionary: the range
 /// decoder's input buffer, the probability tables and the chunk buffer. The
 /// reference decoder's own accounting is tens of kilobytes; a megabyte covers
@@ -475,6 +480,8 @@ pub(crate) struct Lzma2Control {
     /// listening for its caller waits on. See [`Lzma2MtReader::listening`].
     changes: Mutex<u64>,
     changed: Condvar,
+    /// Off unless a caller asked. See [`Lzma2Handle::keep_ledger`].
+    ledger: ledger::LedgerSlot,
 }
 
 impl Lzma2Control {
@@ -490,6 +497,7 @@ impl Lzma2Control {
             folder: Mutex::new(CrcFolder::new()),
             changes: Mutex::new(0),
             changed: Condvar::new(),
+            ledger: ledger::LedgerSlot::default(),
         }
     }
 
@@ -998,6 +1006,8 @@ pub(crate) struct Lzma2MtReader<R: Read> {
     /// [`lzma2_packed_bound`].
     input_left: u64,
     trace: Option<Box<MtTrace>>,
+    /// `None` unless the caller asked for one. See [`Lzma2Handle::keep_ledger`].
+    ledger: Option<Box<ledger::Probe>>,
 }
 
 /// Phase timing for the parallel path, off unless `SEVENZ_TURBO_MT_TRACE` is
@@ -1078,6 +1088,10 @@ impl<R: Read> Lzma2MtReader<R> {
         }
         control.engage();
         control.set_threads(threads);
+        let ledger = control.ledger.start(
+            lzma2_dictionary_size(&[dict_prop]).map_or(0, u64::from),
+            memory_limit,
+        );
         Ok(Self {
             decoder,
             input,
@@ -1120,6 +1134,7 @@ impl<R: Read> Lzma2MtReader<R> {
             fed_total: 0,
             input_left: u64::MAX,
             trace: std::env::var_os("SEVENZ_TURBO_MT_TRACE").map(|_| Box::default()),
+            ledger,
         })
     }
 
@@ -1750,6 +1765,7 @@ impl<R: Read> Lzma2MtReader<R> {
         }
         self.held += seg.len();
         self.segs.push_back(seg);
+        self.ledger_look();
     }
 
     /// Stream offset one past the last byte read, counting what is queued but
@@ -1810,6 +1826,7 @@ impl<R: Read> Lzma2MtReader<R> {
                     given += take;
                 }
                 Some(rest) => {
+                    self.ledger_refused(rest.len());
                     self.held += rest.len();
                     self.segs.push_front(rest);
                     if let Some(t) = self.trace.as_mut() {
@@ -1827,6 +1844,7 @@ impl<R: Read> Lzma2MtReader<R> {
         }
         // Whatever went over may have been the last of it.
         self.settle_end();
+        self.ledger_look();
         Ok(given)
     }
 
@@ -2077,6 +2095,7 @@ impl<R: Read> Lzma2MtReader<R> {
                 self.hold_bytes
             };
             if !whatever_is_held && far_enough && self.fed_at_boundary() {
+                self.ledger_stopped();
                 break;
             }
             let mut end = self.read_to().min(self.safe_limit());
@@ -2316,6 +2335,7 @@ impl<R: Read> Read for Lzma2MtReader<R> {
             };
             self.collect_checks();
             self.publish();
+            self.ledger_look();
 
             // Whether input went over after the drain, which the decoder has
             // not looked at yet: the next thing is to drain again, not to wait
@@ -2379,7 +2399,7 @@ impl<R: Read> Read for Lzma2MtReader<R> {
                     // run that landed.
                     self.control
                         .wait_for_change(self.applied_threads, MT_LISTEN_SLICE);
-                } else if !self.decoder.wait_for_worker() {
+                } else if !self.wait_for_worker() {
                     let t1 = std::time::Instant::now();
                     let fed = self.pump_input(1, true)?;
                     if let Some(t) = self.trace.as_mut() {
