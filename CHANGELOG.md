@@ -980,7 +980,11 @@ Everything here is new surface; no upstream signature changed meaning.
   runs claimed since the last wait and the runs out with workers. Nothing
   is sampled when the variable is unset. `peak_held` and the decoder's
   reasons for holding a run back (`dispatch_held_back`, `input_refused`,
-  `sheds`) come from `lzma-turbo`'s `AdaptiveLedger`.
+  `sheds`) come from `lzma-turbo`'s `AdaptiveLedger`. `wait` splits the
+  delivering thread's waits on a worker by why fewer runs were being
+  decoded than there are threads: none (`full`), finished blocks queued
+  behind the one waited on (`ordered`), no complete run at the cursor
+  (`input`), or a complete run held back (`held`).
 - A parallel LZMA2 decode under a memory limit keeps the decoder and the
   reader's queue inside it together. The memory contract: the limit governs
   the decoder's held bytes (`AdaptiveLedger`'s `input_bytes`,

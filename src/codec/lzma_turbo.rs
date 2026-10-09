@@ -1050,6 +1050,15 @@ pub(crate) struct MtTrace {
     /// drain and every feed and before every wait. The decoder's own peak is
     /// its ledger's, which sees every change rather than these samples.
     peak_queue: u64,
+    /// Time this thread spent waiting on a worker, split by why fewer runs
+    /// were being decoded than there are threads as it went to wait: all of
+    /// them were busy; finished blocks were waiting their turn behind the
+    /// one being waited on; no complete run was at the cursor; or a complete
+    /// run was there and not dispatched.
+    wait_full: std::time::Duration,
+    wait_ordered: std::time::Duration,
+    wait_input: std::time::Duration,
+    wait_held: std::time::Duration,
     peak_sum: u64,
     /// Runs the decoder claimed between two waits of this thread, and the
     /// runs out with a worker as it went to wait, one pair per wait.
@@ -1156,6 +1165,31 @@ impl<R: Read> Lzma2MtReader<R> {
     }
 
     /// Records a wave for the trace, as this thread goes to wait.
+    fn timed_wait_for_worker(&mut self) -> bool {
+        if self.trace.is_none() {
+            return self.decoder.wait_for_worker();
+        }
+        let ledger = self.decoder.ledger();
+        let threads = self.applied_threads.max(1) as usize;
+        let pending = self.decoder.pending_runs();
+        let t0 = std::time::Instant::now();
+        let waited = self.decoder.wait_for_worker();
+        let spent = t0.elapsed();
+        if let Some(t) = self.trace.as_mut() {
+            let bucket = if ledger.runs_decoding >= threads {
+                &mut t.wait_full
+            } else if ledger.runs_waiting > 0 {
+                &mut t.wait_ordered
+            } else if pending == 0 {
+                &mut t.wait_input
+            } else {
+                &mut t.wait_held
+            };
+            *bucket += spent;
+        }
+        waited
+    }
+
     fn note_wave(&mut self) {
         let claimed = self.decoder.runs_claimed();
         let out = self.busy_workers();
@@ -2333,7 +2367,7 @@ impl<R: Read> Drop for Lzma2MtReader<R> {
             let waves: Vec<String> = t.waves.iter().map(|(c, o)| format!("{c}/{o}")).collect();
             let ledger = self.decoder.ledger();
             eprintln!(
-                "mt-trace: threads={} spawned={} drains={} drain={:.3}s sink={:.3}s/{} small={} MiB pump={:.3}s fed={} MiB fed_partial={} MiB st_decoded={} MiB out={} MiB runs={} moved={} MiB resizes={} refused={} copied_feeds={} declared={} reclaimed={} end_deferred={} dense={} peak_held={} peak_queue={} peak_sum={} room_stops={} dispatch_held_back=busy:{}/room:{}/room_chase:{}/too_large:{}/incomplete:{} input_refused={} sheds={} waves={}",
+                "mt-trace: threads={} spawned={} drains={} drain={:.3}s sink={:.3}s/{} small={} MiB pump={:.3}s fed={} MiB fed_partial={} MiB st_decoded={} MiB out={} MiB runs={} moved={} MiB resizes={} refused={} copied_feeds={} declared={} reclaimed={} end_deferred={} dense={} peak_held={} peak_queue={} peak_sum={} room_stops={} dispatch_held_back=busy:{}/room:{}/room_chase:{}/too_large:{}/incomplete:{} input_refused={} sheds={} wait=full:{:.3}s/ordered:{:.3}s/input:{:.3}s/held:{:.3}s waves={}",
                 self.applied_threads,
                 self.decoder.spawned_threads(),
                 t.drains,
@@ -2366,6 +2400,10 @@ impl<R: Read> Drop for Lzma2MtReader<R> {
                 ledger.refused_incomplete,
                 ledger.input_refusals,
                 ledger.sheds,
+                t.wait_full.as_secs_f64(),
+                t.wait_ordered.as_secs_f64(),
+                t.wait_input.as_secs_f64(),
+                t.wait_held.as_secs_f64(),
                 waves.join(","),
             );
         }
@@ -2565,7 +2603,7 @@ impl<R: Read> Read for Lzma2MtReader<R> {
                     // run that landed.
                     self.control
                         .wait_for_change(self.applied_threads, MT_LISTEN_SLICE);
-                } else if !self.decoder.wait_for_worker() {
+                } else if !self.timed_wait_for_worker() {
                     let t1 = std::time::Instant::now();
                     let fed = self.pump_input(1, true)?;
                     if let Some(t) = self.trace.as_mut() {
