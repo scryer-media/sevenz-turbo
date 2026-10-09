@@ -1021,6 +1021,19 @@ Everything here is new surface; no upstream signature changed meaning.
   as it is read, and lets the decoder's refusal stop the feed. While the
   decoder refuses, the reader reads no more than two pieces ahead. The queue
   now peaks at one 4 MiB read.
+- A parallel LZMA2 decode of small runs stops reading ahead where it means
+  to. Past the first wave each read goes over whole, and the feed stopped
+  only if it happened to end at a run boundary, which it seldom did; and it
+  counted only the runs the decoder had scanned, which it does in a drain,
+  so the runs just fed were invisible to it. So it fed on until the decoder
+  refused input at its pair bound: on the 1 MiB runs `7zz -mx1` writes, at
+  eight threads, about seventy runs held where the read-ahead asks for
+  sixteen. The feed now counts every run fed that no worker has taken, and
+  once the read-ahead is full it hands over the run in hand to its end and
+  stops there, declaring it with the next header. Linux x86-64, 1 GiB,
+  median of 3, peak RSS: `aes_mx1` 33 to 28 MiB at two threads and 81 to 63
+  MiB at eight; `media_mx1` 33 to 29 MiB and 81 to 69 MiB. Wall time is
+  unchanged within 1.5%.
 
 ## 0.26.1 - 2026-09-29
 

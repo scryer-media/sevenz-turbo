@@ -1541,8 +1541,23 @@ impl<R: Read> Lzma2MtReader<R> {
 
     /// How many more complete runs the decoder should be holding than it is.
     fn backlog_wanted(&self) -> u64 {
-        self.backlog_target()
-            .saturating_sub(self.decoder.pending_runs() as u64)
+        self.backlog_target().saturating_sub(self.waiting_runs())
+    }
+
+    /// Complete runs fed to the decoder that no worker has taken yet.
+    ///
+    /// The decoder counts a run as pending only once it has scanned it, and
+    /// it scans in a drain, so between drains every run fed since the last
+    /// one is waiting for a worker and invisible to its count. Read-ahead
+    /// measured by that count alone kept feeding until the decoder's own
+    /// bound refused input: on a stream of runs of about a mebibyte at eight
+    /// threads the decoder held sixty runs of input with four of them
+    /// counted, and the decode was resident at three times what `7zz` was.
+    /// So the runs this reader has seen end and fed over are counted as
+    /// well, less those the decoder has handed to a decoder by either path.
+    fn waiting_runs(&self) -> u64 {
+        let fed = self.runs_fed().saturating_sub(self.decoder.runs_claimed());
+        fed.max(self.decoder.pending_runs() as u64)
     }
 
     /// Whether the decoder has as much work in hand as reading further ahead
@@ -1579,11 +1594,11 @@ impl<R: Read> Lzma2MtReader<R> {
         if !self.room_for_a_run() {
             return true;
         }
-        let pending = self.decoder.pending_runs() as u64;
-        if pending < self.demand_floor() {
+        let waiting = self.waiting_runs();
+        if waiting < self.demand_floor() {
             return false;
         }
-        pending >= self.backlog_target() || self.backlog_packed() >= self.byte_cap()
+        waiting >= self.backlog_target() || self.backlog_packed() >= self.byte_cap()
     }
 
     /// Whether the decode has nothing to get on with but the run at the
@@ -2363,16 +2378,18 @@ impl<R: Read> Lzma2MtReader<R> {
                 // a run is handed back: one worker would start a run's decode
                 // late. The header is a page away, and goes over only where
                 // the page fits beside the decoder and the queue. Past the
-                // first wave a stop at a boundary is the decoder's own bound
-                // and its refusal declares the run (see [`Self::hand_over`]).
+                // first wave a stop at the decoder's own bound is declared by
+                // its refusal (see [`Self::hand_over`]), but a stop at the
+                // read-ahead's end of a run is not, and the run would wait
+                // for the next feed to be claimed, so the page goes over
+                // there too.
                 let page_fits = self
                     .decoder
                     .held_bytes()
                     .saturating_add(self.queue_bytes())
                     .saturating_add(MT_DECLARE_BYTES as u64)
                     <= self.limit;
-                let scanned = self.decoder_has_scanned();
-                if page_fits && !scanned && self.run_undeclared() {
+                if page_fits && self.run_undeclared() {
                     let took = self.declare_run()?;
                     self.fed_total += took as u64;
                     fed |= took > 0;
@@ -2444,6 +2461,24 @@ impl<R: Read> Lzma2MtReader<R> {
                         if let Some(&next) = self.run_ends.get(reached) {
                             end = end.min(next);
                         }
+                    }
+                }
+                // Read-ahead that is far enough stops at the next boundary,
+                // and past the first wave a read goes over whole, so a feed
+                // that waited to find itself at a boundary seldom did: it
+                // went on until the decoder refused input at its pair bound.
+                // On runs of about a mebibyte at eight threads that was
+                // seventy of them held for sixteen wanted. So once far enough
+                // the run in hand goes over to its end and no further.
+                //
+                // Not where the budget is what said far enough: there the
+                // decoder's refusal stops the feed and declares the run, and
+                // a stop here could leave the run undeclared with no room for
+                // the page that would declare it.
+                if far_enough && !whatever_is_held && self.room_for_a_run() {
+                    let reached = self.run_ends.partition_point(|&e| e <= self.fed_to);
+                    if let Some(&next) = self.run_ends.get(reached) {
+                        end = end.min(next);
                     }
                 }
             }
@@ -3840,10 +3875,10 @@ mod stall_tests {
             // still able to pay for a run, it is holding at least what a
             // worker coming free would need.
             if rd.backlog_full() && rd.room_for_a_run() {
-                let pending = rd.decoder.pending_runs() as u64;
+                let waiting = rd.waiting_runs();
                 assert!(
-                    pending >= rd.demand_floor(),
-                    "stopped at {pending} runs with a floor of {}",
+                    waiting >= rd.demand_floor(),
+                    "stopped at {waiting} runs with a floor of {}",
                     rd.demand_floor()
                 );
             }
@@ -3853,6 +3888,44 @@ mod stall_tests {
             }
         }
         assert_eq!(got, plain);
+    }
+
+    /// A read-ahead that is far enough stops at the end of the run in hand.
+    ///
+    /// Past the first wave a read goes over whole, so a feed that stopped only
+    /// on finding itself at a boundary seldom found one and went on until the
+    /// decoder refused input at its pair bound. Without a limit that bound is
+    /// eight mebibytes a thread, and on runs of about a mebibyte at eight
+    /// threads the decoder held seventy runs of input where the read-ahead
+    /// asks for sixteen.
+    ///
+    /// The feed is driven here with no drain inside it, which is the stretch
+    /// in which it went too far: nothing is scanned or dispatched, so what
+    /// the workers are doing cannot move the counts. It is asked for every
+    /// run there is, so that only the read-ahead can stop it. What may be
+    /// waiting at the end is the read-ahead and the run the feed was in when
+    /// it got there.
+    #[test]
+    fn a_full_read_ahead_stops_at_the_end_of_the_run_in_hand() {
+        const RUNS: usize = 96;
+        let threads = 8u32;
+        let (packed, plain) = stream(RUNS, 16);
+        let (mut rd, _control) = reader_limited(Cursor::new(packed), threads, u64::MAX);
+        // Past the first wave, so that the decoder has scanned a run and a
+        // read goes over whole.
+        let mut got = vec![0u8; 64 << 10];
+        let n = rd.read(&mut got).expect("decode");
+        got.truncate(n);
+        assert!(rd.decoder_has_scanned(), "the first wave should be out");
+        rd.pump_input(RUNS as u64, false).expect("feed");
+        let waiting = rd.runs_fed().saturating_sub(rd.decoder.runs_claimed());
+        let bound = rd.backlog_target() + 1;
+        assert!(
+            waiting <= bound,
+            "{waiting} runs fed and waiting, past a read-ahead of {bound}"
+        );
+        rd.read_to_end(&mut got).expect("decode the rest");
+        assert_eq!(got, plain, "the bytes out must be the bytes in");
     }
 
     /// An allowance smaller than one run still gets every run to a worker.
