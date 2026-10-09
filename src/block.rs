@@ -68,6 +68,19 @@ impl Block {
     pub fn ordered_coder_iter(&self) -> OrderedCoderIter<'_> {
         OrderedCoderIter::new(self)
     }
+
+    /// Whether any coder of this block decrypts.
+    ///
+    /// The one case in which a decode failure may be the wrong password
+    /// rather than damage. It is read from the block's own coders and not
+    /// from whether the caller supplied a password: a consumer that hands
+    /// every archive of a job the job's password must still be told that an
+    /// unencrypted block is damaged.
+    pub(crate) fn is_encrypted(&self) -> bool {
+        self.coders.iter().any(|coder| {
+            coder.encoder_method_id() == crate::archive::EncoderMethod::ID_AES256_SHA256
+        })
+    }
 }
 
 /// Represents a single coder within a compression block.

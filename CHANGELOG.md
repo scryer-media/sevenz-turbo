@@ -805,6 +805,36 @@ Everything here is new surface; no upstream signature changed meaning.
   way. One thread compares on the read that hands the last byte over, as
   0.26.1 did at every count; this was never in a published version. The
   comparison now comes first, and the stop is honoured after it.
+- Fixed: damage in a block that does not decrypt is reported as damage
+  whatever password the caller holds. Whether a failure might be a wrong
+  password was decided by whether a password had been supplied, not by
+  whether the block has an AES coder. A consumer that hands every archive of
+  a job the job's password was therefore told `BlockErrorKind::Password`, or
+  `Error::MaybeBadPassword`, for a checksum mismatch or a broken stream in a
+  plain block, and was asked for a password where it could have repaired.
+  0.26.1 answers `Password` for a flipped byte of a store-mode block read
+  under such a password. The answer is now read from the block's own coders
+  on every path: `for_each_entries` on one thread and on folder workers,
+  `read_file`, the construction of a coder from its properties, and the
+  compressed header, which is damage under any password unless it is itself
+  encrypted. A block that does decrypt is unchanged: a wrong key and damaged
+  ciphertext cannot be told apart, and both stay `Password`.
+- Fixed: a store-mode block whose source ends before the bytes its header
+  declares is an error. Copy keeps no count of its own, and neither does a
+  filter over it, so an archive cut short, or a header declaring more than
+  was packed, ended the stream with a clean end of input: each file came out
+  short and the decode returned `Ok`. A CRC did not catch it, because a
+  file's CRC is compared once every byte it declares has been read. 0.26.1
+  does the same: of a two-file store archive cut inside the first file it
+  delivers 60,000 of 100,000 bytes, none of the second file, and `Ok`, with
+  verification on or off. A block's packed stream, each packed stream of a
+  BCJ2 block and the block's decoded output now fail the read that finds the
+  stream ended with bytes still owed, with `io::ErrorKind::UnexpectedEof`,
+  the kind a truncated LZMA stream gives. `for_each_entries` reports it as
+  `Error::BlockDecode` of kind `Io` located in the block, on one thread and
+  on folder workers, and `read_file` as `Error::Io` of that kind. A read of
+  no bytes is still answered with none, and a read past a block's declared
+  length is passed on, so an LZMA2 coder is still brought to its end marker.
 - Fixed: a PPMd block this crate wrote failed `7zz t` with "Data Error",
   although `7zz x` and this crate's reader both gave the right bytes back.
   The writer flushes a block's coder chain before finishing it, and

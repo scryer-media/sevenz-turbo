@@ -77,6 +77,10 @@ pub(crate) struct DecodeOptions<'a> {
     /// limit as a whole rather than each coder within it alone.
     #[cfg_attr(not(feature = "zstd"), allow(dead_code))]
     pub(crate) reserved_kb: usize,
+    /// Whether the chain being built decrypts (`Block::is_encrypted`): a
+    /// coder that cannot make sense of its input then reports a possible
+    /// wrong password, and otherwise damage, whatever password was supplied.
+    pub(crate) encrypted: bool,
 }
 
 impl<'a> DecodeOptions<'a> {
@@ -92,6 +96,8 @@ impl<'a> DecodeOptions<'a> {
             checksum_splits: &[],
             files_verified: false,
             reserved_kb: 0,
+            // Set from the header's own block once it has been read.
+            encrypted: false,
         }
     }
 
@@ -102,6 +108,11 @@ impl<'a> DecodeOptions<'a> {
             reserved_kb,
             ..self
         }
+    }
+
+    /// The same options, for a chain that does or does not decrypt.
+    pub(crate) fn decrypting(self, encrypted: bool) -> Self {
+        Self { encrypted, ..self }
     }
 
     /// Whether the checksums of this block are being computed by the LZMA2
@@ -300,7 +311,7 @@ pub fn add_decoder<I: Read>(
                 &coder.properties,
                 dict_size,
             )
-            .map_err(|e| Error::bad_password(e, !password.is_empty()))?;
+            .map_err(|e| Error::bad_password(e, opts.encrypted))?;
             Ok(Decoder::Lzma(Box::new(lz)))
         }
         EncoderMethod::ID_LZMA2 => {
@@ -334,7 +345,7 @@ pub fn add_decoder<I: Read>(
                 None => Lzma2Plan::SingleThreaded,
             };
             let lz = lzma2_decoder(input, dict_prop, plan)
-                .map_err(|e| Error::bad_password(e, !password.is_empty()))?;
+                .map_err(|e| Error::bad_password(e, opts.encrypted))?;
             Ok(Decoder::Lzma2(Box::new(lz)))
         }
         #[cfg(feature = "ppmd")]

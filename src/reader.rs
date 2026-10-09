@@ -45,12 +45,53 @@ impl<R: Read> BoundedReader<R> {
 
 impl<R: Read> Read for BoundedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.remain == 0 {
+        if self.remain == 0 || buf.is_empty() {
             return Ok(0);
         }
         let bound = buf.len().min(self.remain);
         let size = self.inner.read(&mut buf[..bound])?;
+        if size == 0 {
+            return Err(ended_early());
+        }
         self.remain -= size;
+        Ok(size)
+    }
+}
+
+/// The error of a stream that ended while bytes its header declared were
+/// still owed.
+///
+/// A coder that keeps its own count, LZMA or LZMA2, reports a short stream
+/// itself. Copy cannot, and neither can a filter over it: they hand on what
+/// their input gives them. So a source cut short, or a header that declares
+/// more than was packed, used to end such a stream with `Ok(0)`, and its
+/// files came out short with nothing said: a file's CRC is compared once
+/// every byte it declares has been read, and that read never came. It is the
+/// same error a truncated LZMA stream gives.
+fn ended_early() -> io::Error {
+    io::ErrorKind::UnexpectedEof.into()
+}
+
+/// Fails the read that finds a block's decoded stream ended before the bytes
+/// its header declares have come out of it.
+///
+/// Reads beyond the declared size are passed on as they are: the read that
+/// lets an LZMA2 coder reach its end marker is one of them.
+struct DeclaredLength<R> {
+    inner: R,
+    owed: u64,
+}
+
+impl<R: Read> Read for DeclaredLength<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let size = self.inner.read(buf)?;
+        if size == 0 && self.owed > 0 {
+            return Err(ended_early());
+        }
+        self.owed = self.owed.saturating_sub(size as u64);
         Ok(size)
     }
 }
@@ -91,7 +132,7 @@ impl<'a, R: Read + Seek> Seek for SharedBoundedReader<'a, R> {
 
 impl<'a, R: Read + Seek> Read for SharedBoundedReader<'a, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.cur >= self.bounds.1 {
+        if self.cur >= self.bounds.1 || buf.is_empty() {
             return Ok(0);
         }
 
@@ -101,6 +142,9 @@ impl<'a, R: Read + Seek> Read for SharedBoundedReader<'a, R> {
 
         let bound = buf.len().min((self.bounds.1 - self.cur) as usize);
         let size = inner.read(&mut buf[..bound])?;
+        if size == 0 {
+            return Err(ended_early());
+        }
         self.cur += size as u64;
         Ok(size)
     }
@@ -494,7 +538,10 @@ impl Archive {
                 HeaderBounds::new(next_header_size_int, opts.limits),
                 opts,
             )?;
-            buf = read_decoded_header(&mut out_reader, buf_size, password)?;
+            // The header's own chain says whether it decrypts, as a block's
+            // does: a damaged plain header is damage under any password.
+            let encrypted = archive.blocks.first().is_some_and(Block::is_encrypted);
+            buf = read_decoded_header(&mut out_reader, buf_size, encrypted)?;
             archive = Archive::default();
             buf_reader = buf.as_slice();
             nid = buf_reader.read_u8()?;
@@ -651,7 +698,7 @@ impl Archive {
             opts.limits,
             0,
         )?;
-        let opts = &opts.reserving(reserved_kb);
+        let opts = &opts.reserving(reserved_kb).decrypting(block.is_encrypted());
         let pack_size = archive.pack_sizes[first_pack_stream_index] as usize;
         let input_reader = BoundedReader::new(reader, pack_size);
         let mut decoder: Box<dyn Read> = Box::new(input_reader);
@@ -2185,7 +2232,10 @@ impl<R: Read + Seek> ArchiveReader<R> {
             }
             stage = chain.add(block, stage, index, password, opts)?;
         }
-        let mut decoder = chain.pipeline.here(stage);
+        let mut decoder: Box<dyn Read + 'r> = Box::new(DeclaredLength {
+            inner: chain.pipeline.here(stage),
+            owed: block.get_unpack_size(),
+        });
         // Read after the coders are built: the LZMA2 coder decides there
         // whether its workers fold the checksums, and when they do, the
         // block's is folded with them rather than taken again here, on the
@@ -2296,7 +2346,10 @@ impl<R: Read + Seek> ArchiveReader<R> {
             opts,
             &mut chain,
         )?;
-        let mut decoder = chain.pipeline.here(stage);
+        let mut decoder: Box<dyn Read + 'r> = Box::new(DeclaredLength {
+            inner: chain.pipeline.here(stage),
+            owed: block.get_unpack_size(),
+        });
         // On this thread, where the graph's last coder makes the bytes: see
         // `build_decode_stack`.
         if block.has_crc && opts.verify_checksums {
@@ -2612,7 +2665,6 @@ impl<R: Read + Seek> ArchiveReader<R> {
             source: &source,
         };
         let archive = &self.archive;
-        let encrypted = !self.password.is_empty();
         let verify_checksums = self.verify_checksums;
         let on_block = &mut self.on_block_complete;
         let on_sub = &mut self.on_sub_stream_complete;
@@ -2627,7 +2679,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 let block_index = first + job;
                 let finished = replay_folder(
                     archive,
-                    encrypted,
+                    archive.blocks[block_index].is_encrypted(),
                     verify_checksums,
                     block_index,
                     rx,
@@ -2732,6 +2784,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     // Below, against the file's own CRC.
                     files_verified: true,
                     reserved_kb: 0,
+                    encrypted: self.archive.blocks[block_index].is_encrypted(),
                 };
                 self.lzma2.set_block_index(block_index);
                 let (mut block_reader, _size) = Self::build_decode_stack(
@@ -2756,12 +2809,14 @@ impl<R: Read + Seek> ArchiveReader<R> {
 
                 decoder.read_to_end(&mut data).map_err(|e| {
                     // A checksum that did not match is reported located and
-                    // typed, as `for_each_entries` reports it: under a
-                    // password it may be the wrong key decrypting to garbage,
-                    // so it stays `Password` there, never repairable damage.
+                    // typed, as `for_each_entries` reports it: in a block
+                    // that decrypts it may be the wrong key decrypting to
+                    // garbage, so it stays `Password` there, never repairable
+                    // damage. A block that does not decrypt is damaged
+                    // whatever password the caller holds.
                     let e = Error::from(e);
                     let checksum = e.is_checksum_failure();
-                    let e = e.maybe_bad_password(!self.password.is_empty());
+                    let e = e.maybe_bad_password(opts.encrypted);
                     if checksum {
                         let packed_offset = self
                             .archive
@@ -3097,6 +3152,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
             // this thread or folded from the workers'.
             files_verified: verify_checksums,
             reserved_kb: 0,
+            encrypted: archive.blocks[block_index].is_encrypted(),
         };
         lzma2.set_block_index(block_index);
         // Where this block's packed bytes start, so a failure below can say
@@ -3163,14 +3219,20 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                     };
                     each(file, &mut verifying)
                 } else {
-                    each(file, &mut bounded)
+                    // The bounded reader fails a file the block's stream ends
+                    // inside of, and that is the block's fault as well.
+                    let mut recording = FaultRecordingReader {
+                        inner: &mut bounded,
+                        faulted: Rc::clone(&faulted),
+                    };
+                    each(file, &mut recording)
                 };
                 // What the callback took of the file, and whether that was all
                 // of it.
                 let taken = (bound - bounded.remain) as u64;
                 let read_to_end = taken == file.size;
                 let outcome = outcome
-                    .map_err(|e| e.maybe_bad_password(!self.password.is_empty()))
+                    .map_err(|e| e.maybe_bad_password(opts.encrypted))
                     .map_err(|e| {
                         // Only a failure that came out of the decode chain is
                         // this block's fault; the caller's own errors pass
@@ -3916,7 +3978,7 @@ impl Read for ReplayEntry<'_, '_> {
 fn read_decoded_header(
     decoded: &mut dyn Read,
     declared: usize,
-    password: &Password,
+    encrypted: bool,
 ) -> Result<Vec<u8>, Error> {
     let mut buf = Vec::new();
     buf.try_reserve_exact(declared)
@@ -3927,11 +3989,11 @@ fn read_decoded_header(
     decoded
         .take(declared as u64)
         .read_to_end(&mut buf)
-        .map_err(|e| Error::bad_password(e, !password.is_empty()))?;
+        .map_err(|e| Error::bad_password(e, encrypted))?;
     if buf.len() != declared {
         return Err(Error::bad_password(
             io::Error::from(io::ErrorKind::UnexpectedEof),
-            !password.is_empty(),
+            encrypted,
         ));
     }
     Ok(buf)
@@ -3964,8 +4026,7 @@ mod decoded_header_buffer_tests {
             let mut longer = data.clone();
             longer.extend_from_slice(&[0xAA; 64]);
             for source in [&data, &longer] {
-                let buf = read_decoded_header(&mut Trickle(source), declared, &Password::empty())
-                    .unwrap();
+                let buf = read_decoded_header(&mut Trickle(source), declared, false).unwrap();
                 assert_eq!(buf, data);
                 assert_eq!(
                     buf.capacity(),
@@ -3978,7 +4039,7 @@ mod decoded_header_buffer_tests {
 
     #[test]
     fn a_short_decode_is_refused() {
-        let err = read_decoded_header(&mut Trickle(&[1, 2, 3]), 4, &Password::empty()).unwrap_err();
+        let err = read_decoded_header(&mut Trickle(&[1, 2, 3]), 4, false).unwrap_err();
         assert!(matches!(err, Error::Io(ref e, _) if e.kind() == io::ErrorKind::UnexpectedEof));
     }
 }
@@ -4071,6 +4132,114 @@ mod block_checksum_tests {
         .expect("stack");
         let err = io::copy(&mut rd, &mut io::sink()).expect_err("the borrowed CRC is checked");
         assert!(Error::from(err).is_checksum_failure());
+    }
+}
+
+/// What a header that cannot be true costs a block that does not decrypt:
+/// damage, said once, in that block.
+#[cfg(all(test, feature = "compress"))]
+mod header_damage_tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::{ArchiveWriter, BlockErrorKind, EncoderConfiguration, EncoderMethod};
+
+    fn one_file(method: EncoderMethod) -> (Cursor<Vec<u8>>, Archive) {
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+        writer.set_content_methods(vec![EncoderConfiguration::new(method)]);
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("one"), Some(data.as_slice()))
+            .expect("push");
+        let mut source = writer.finish().expect("finish");
+        let archive = Archive::read(&mut source, &Password::empty()).expect("parse");
+        (source, archive)
+    }
+
+    fn read_all(
+        archive: &Archive,
+        password: &Password,
+        source: &mut Cursor<Vec<u8>>,
+        verify: bool,
+    ) -> Result<bool, Error> {
+        BlockDecoder::new(1, 0, archive, password, source)
+            .with_verify_checksums(verify)
+            .for_each_entries(&mut |_, rd| {
+                io::copy(rd, &mut io::sink())?;
+                Ok(true)
+            })
+    }
+
+    /// Copy has no count of its own: a block that declares more bytes than
+    /// were packed used to end 64 bytes short with `Ok`.
+    #[test]
+    fn a_store_block_that_declares_more_than_was_packed_ends_early() {
+        let (mut source, mut archive) = one_file(EncoderMethod::COPY);
+        archive.blocks[0].unpack_sizes[0] += 64;
+        archive.files[0].size += 64;
+        archive.files[0].has_crc = false;
+        for verify in [true, false] {
+            match read_all(&archive, &Password::empty(), &mut source, verify) {
+                Err(Error::BlockDecode {
+                    block_index: 0,
+                    kind: BlockErrorKind::Io,
+                    message,
+                    ..
+                }) => assert!(message.contains("UnexpectedEof"), "{message}"),
+                other => panic!("verify {verify}: expected an early end, got {other:?}"),
+            }
+        }
+    }
+
+    /// A coder that cannot be built from its properties is damage in a block
+    /// that does not decrypt, whatever password the caller holds.
+    #[test]
+    fn coder_properties_that_cannot_be_read_are_not_a_password_error() {
+        let (mut source, mut archive) = one_file(EncoderMethod::LZMA);
+        // No `lc`, `lp` and `pb` encode to this.
+        archive.blocks[0].coders[0].properties[0] = 0xFF;
+        for password in [Password::empty(), Password::from("the password of the job")] {
+            match read_all(&archive, &password, &mut source, true) {
+                Err(Error::BlockDecode {
+                    block_index: 0,
+                    kind,
+                    ..
+                }) => assert_ne!(kind, BlockErrorKind::Password),
+                other => panic!("expected damage located in block 0, got {other:?}"),
+            }
+        }
+    }
+
+    /// A read of no bytes is answered with none and is never an early end; a
+    /// read past the declared length is passed on, which is how an LZMA2
+    /// coder is brought to its end marker.
+    #[test]
+    fn only_a_read_that_is_owed_bytes_can_end_early() {
+        let source = [1u8, 2, 3];
+        let mut buf = [0u8; 8];
+
+        let mut bounded = BoundedReader::new(&source[..], 5);
+        assert_eq!(bounded.read(&mut []).expect("no bytes asked for"), 0);
+        assert_eq!(bounded.read(&mut buf).expect("three bytes"), 3);
+        assert_eq!(bounded.read(&mut []).expect("no bytes asked for"), 0);
+        let error = bounded.read(&mut buf).expect_err("two bytes are owed");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+
+        let mut declared = DeclaredLength {
+            inner: &source[..],
+            owed: 2,
+        };
+        assert_eq!(declared.read(&mut buf).expect("not capped"), 3);
+        assert_eq!(declared.read(&mut buf).expect("nothing is owed"), 0);
+
+        let mut declared = DeclaredLength {
+            inner: &source[..],
+            owed: 4,
+        };
+        assert_eq!(declared.read(&mut []).expect("no bytes asked for"), 0);
+        assert_eq!(declared.read(&mut buf).expect("three bytes"), 3);
+        let error = declared.read(&mut buf).expect_err("one byte is owed");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 }
 
