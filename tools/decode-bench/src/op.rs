@@ -227,11 +227,19 @@ const CARGO_LOCK: &[u8] = include_bytes!("../../../Cargo.lock");
 
 /// The SHA-256 of [`CARGO_LOCK`], lower-case hex: the same digest the harness
 /// takes of a checkout's `Cargo.lock`, to tell whether that checkout built
-/// this binary. Taken by the crate's own backend, so the `native-crypto`
-/// build does not carry AWS-LC's SHA-256 beside RustCrypto's for this one
-/// digest.
+/// this binary. CRLF line endings are read as LF, as the harness reads them,
+/// so a binary built from a CRLF checkout carries the digest of the same lock
+/// checked out with LF. Taken by the crate's own backend, so the
+/// `native-crypto` build does not carry AWS-LC's SHA-256 beside RustCrypto's
+/// for this one digest.
 fn cargo_lock_sha256() -> String {
-    sevenz_turbo::sha256(CARGO_LOCK)
+    let lf: Vec<u8> = CARGO_LOCK
+        .iter()
+        .enumerate()
+        .filter(|&(at, &byte)| !(byte == b'\r' && CARGO_LOCK.get(at + 1) == Some(&b'\n')))
+        .map(|(_, &byte)| byte)
+        .collect();
+    sevenz_turbo::sha256(&lf)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()

@@ -933,6 +933,10 @@ Everything here is new surface; no upstream signature changed meaning.
   run's scratch and output directories, the checkout and the home directory
   as `<fixtures>`, `<scratch>`, `<out>`, `<repo>` and `~`, not by their
   absolute paths.
+- Bench harness: the Cargo.lock digest that ties a candidate to its checkout
+  reads CRLF line endings as LF, in decode-bench and in the harness, so
+  `merge` no longer refuses a report from a CRLF checkout over line endings
+  alone.
 ## 0.26.1 - 2026-09-29
 
 - Fixed: `ArchiveLimits::memory_limit_bytes` bounds a coder chain as a whole,
