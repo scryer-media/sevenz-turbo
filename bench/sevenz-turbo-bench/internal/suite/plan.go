@@ -276,6 +276,14 @@ func Plan(manifest *fixtures.Manifest, dir, scratch string, tools Tools, setting
 	}
 	p.encode("encode", "tree", 5, "all", encodeOpts{})
 	p.encode("encode", "tree", 5, "all", encodeOpts{nonSolid: true})
+	if !settings.Quick {
+		p.encode("encode", "tree", 5, "1", encodeOpts{nonSolid: true,
+			note: "one folder per member on one thread: per-folder set-up cost"})
+		for _, threads := range encodeThreads {
+			p.encode("encode", "kdf-tree", 5, threads, encodeOpts{nonSolid: true,
+				note: "tiny members, one folder each, no cipher: per-folder cost alone"})
+		}
+	}
 	p.encode("encode aes-256", "payload-sub", 5, "all", encodeOpts{encrypted: true})
 	p.encode("encode aes-256", "kdf-tree", 5, "1", encodeOpts{encrypted: true, nonSolid: true,
 		note: "tiny members, one encrypted folder each: write-side key-derivation and per-folder cost"})
