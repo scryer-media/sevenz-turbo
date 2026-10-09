@@ -276,8 +276,19 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     /// ```
     pub fn push_archive_entry<R: Read>(
         &mut self,
+        entry: ArchiveEntry,
+        reader: Option<R>,
+    ) -> Result<&ArchiveEntry> {
+        self.push_entry(entry, reader, &mut encoder::FolderCoder::default())
+    }
+
+    /// [`ArchiveWriter::push_archive_entry`], with `coder` kept by the caller
+    /// from one folder to the next.
+    fn push_entry<R: Read>(
+        &mut self,
         mut entry: ArchiveEntry,
         reader: Option<R>,
+        coder: &mut encoder::FolderCoder,
     ) -> Result<&ArchiveEntry> {
         if !entry.is_directory
             && let Some(mut r) = reader
@@ -288,6 +299,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 &mut r,
                 &mut self.output,
                 encoder::Bcj2Sides::Threads,
+                coder,
             )?;
             return self.record_folder(folder);
         }
@@ -410,6 +422,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 )) <= per_folder
         };
         let eligible: Vec<bool> = entries.iter().map(parallel).collect();
+        // The folders coded here, one after another, share one coder.
+        let mut coder = encoder::FolderCoder::default();
         let mut index = 0;
         while index < entries.len() {
             let start = index;
@@ -417,14 +431,14 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 index += 1;
             }
             if workers > 1 && index - start > 1 {
-                self.push_non_solid_parallel(&entries, start..index, &open, workers)?;
+                self.push_non_solid_parallel(&entries, start..index, &open, workers, &mut coder)?;
             } else {
                 for at in start..index {
-                    self.push_opened(&entries, at, &open)?;
+                    self.push_opened(&entries, at, &open, &mut coder)?;
                 }
             }
             if index < entries.len() {
-                self.push_opened(&entries, index, &open)?;
+                self.push_opened(&entries, index, &open, &mut coder)?;
                 index += 1;
             }
         }
@@ -432,7 +446,13 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     }
 
     /// One entry of [`ArchiveWriter::push_archive_entries_non_solid`], here.
-    fn push_opened<R, F>(&mut self, entries: &[ArchiveEntry], index: usize, open: &F) -> Result<()>
+    fn push_opened<R, F>(
+        &mut self,
+        entries: &[ArchiveEntry],
+        index: usize,
+        open: &F,
+        coder: &mut encoder::FolderCoder,
+    ) -> Result<()>
     where
         R: Read,
         F: Fn(usize, &ArchiveEntry) -> std::io::Result<Option<R>>,
@@ -444,7 +464,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             open(index, &entry)
                 .map_err(|e| Error::io_msg(e, format!("Open entry:{}", entry.name())))?
         };
-        self.push_archive_entry(entry, reader)?;
+        self.push_entry(entry, reader, coder)?;
         Ok(())
     }
 
@@ -457,6 +477,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         run: std::ops::Range<usize>,
         open: &F,
         workers: u32,
+        coder: &mut encoder::FolderCoder,
     ) -> Result<()>
     where
         R: Read,
@@ -464,6 +485,10 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     {
         let methods = Arc::new(encoder::one_thread_each(&self.content_methods));
         let workers = (workers as usize).min(run.len());
+        // A coder per worker, kept from one of its folders to the next: a
+        // worker takes one at the start of a folder and puts it back at the
+        // end, so there are never more than there are workers.
+        let coders = std::sync::Mutex::new(Vec::<encoder::FolderCoder>::new());
         let first = run.start;
         let outcome = crate::ordered::run(
             run.len(),
@@ -484,6 +509,11 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                                 tx: &mut *tx,
                                 cancelled: false,
                             };
+                            let mut coder = coders
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .pop()
+                                .unwrap_or_default();
                             // The worker is the folder's thread: a BCJ2 chain's
                             // call and jump coders run on it, not beside it.
                             let encoded = encode_entry(
@@ -492,7 +522,12 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                                 &mut reader,
                                 &mut sink,
                                 encoder::Bcj2Sides::Inline,
+                                &mut coder,
                             );
+                            coders
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(coder);
                             if sink.cancelled {
                                 return;
                             }
@@ -542,7 +577,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             // Not one worker could be started: code the run here instead.
             None => {
                 for at in run {
-                    self.push_opened(entries, at, open)?;
+                    self.push_opened(entries, at, open, coder)?;
                 }
                 Ok(())
             }
@@ -556,13 +591,14 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         run: std::ops::Range<usize>,
         open: &F,
         _workers: u32,
+        coder: &mut encoder::FolderCoder,
     ) -> Result<()>
     where
         R: Read,
         F: Fn(usize, &ArchiveEntry) -> std::io::Result<Option<R>> + Sync,
     {
         for at in run {
-            self.push_opened(entries, at, open)?;
+            self.push_opened(entries, at, open, coder)?;
         }
         Ok(())
     }
@@ -1116,6 +1152,11 @@ struct EncodedFolder {
 /// for the folder, writing the main pack stream to `output`. `sides` is where
 /// a BCJ2 chain's call and jump coders run.
 ///
+/// When the coder the data meets first is LZMA or LZMA2 on one thread,
+/// `coder` runs it here, reading `r` itself, and keeps it for the next folder
+/// this thread codes (see [`encoder::FolderCoder`]); the bytes are the ones the
+/// chain [`ArchiveWriter::create_writer`] builds would write.
+///
 /// The checksums of the data and of the compressed bytes are taken here, on
 /// the thread doing the coding, which is what lets a worker do all of it.
 fn encode_entry<R: Read, O: Write>(
@@ -1124,6 +1165,7 @@ fn encode_entry<R: Read, O: Write>(
     r: &mut R,
     output: O,
     sides: encoder::Bcj2Sides,
+    coder: &mut encoder::FolderCoder,
 ) -> Result<EncodedFolder> {
     let mut compressed_len = 0;
     let mut compressed = CompressWrapWriter::new(output, &mut compressed_len);
@@ -1134,8 +1176,47 @@ fn encode_entry<R: Read, O: Write>(
         .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
     let methods = folder_methods(content_methods, folder)?;
     let mut bcj2 = None;
+    let pulled = match methods.split_last() {
+        Some((first, _)) => encoder::FolderCoder::plan(first)?,
+        None => None,
+    };
 
-    let (crc, size) = {
+    let (crc, size) = if let Some(pulled) = pulled {
+        // The data meets the last method first. The chain after it is built
+        // as `create_writer` builds it, and the counter `create_writer` would
+        // put under the pulled coder - the size of what it codes into the next
+        // coder - is put there here.
+        let rest = &methods[..methods.len() - 1];
+        let mut chain: Box<dyn Write + '_> = if rest.is_empty() {
+            Box::new(&mut out)
+        } else {
+            let rest = ArchiveWriter::<std::io::Cursor<Vec<u8>>>::create_writer(
+                rest,
+                &mut out,
+                &mut more_sizes,
+                &mut bcj2,
+                sides,
+            )?;
+            let counting = CountingWriter::new(rest);
+            more_sizes.push(counting.counting());
+            Box::new(counting)
+        };
+        let mut read_len = 0;
+        let mut input = CrcReader {
+            inner: head.as_slice().chain(&mut *r),
+            crc: Crc32::new(),
+            read: &mut read_len,
+        };
+        let encode_error = |e| Error::io_msg(e, format!("Encode entry:{}", entry.name()));
+        coder
+            .encode(&pulled, &mut input, &mut chain)
+            .map_err(encode_error)?;
+        chain.flush().map_err(encode_error)?;
+        // The empty write ends every coder after this one.
+        chain.write(&[]).map_err(encode_error)?;
+        drop(chain);
+        (input.crc.finalize(), read_len)
+    } else {
         let mut w = ArchiveWriter::<std::io::Cursor<Vec<u8>>>::create_writer(
             &methods,
             &mut out,
@@ -1239,6 +1320,24 @@ impl Write for StageSink<'_, '_> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// A folder's input on its way to a coder that reads it: the checksum and
+/// length of what was read, as [`CompressWrapWriter`] takes them of what is
+/// written into a coder.
+struct CrcReader<'a, R> {
+    inner: R,
+    crc: Crc32,
+    read: &'a mut usize,
+}
+
+impl<R: Read> Read for CrcReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.crc.update(&buf[..n]);
+        *self.read += n;
+        Ok(n)
     }
 }
 

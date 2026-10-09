@@ -976,6 +976,16 @@ Everything here is new surface; no upstream signature changed meaning.
   it three times (`is_file`, `is_dir`, then the metadata itself). What it
   returns is unchanged: a link is what it points to, and a path whose
   metadata cannot be read is neither a file nor a directory.
+- A non-solid folder whose LZMA or LZMA2 coder runs on one thread is now
+  encoded on the thread that adds it, by an encoder that is kept and reused
+  for the next such folder, where each folder started an encoder thread and
+  built a new encoder (window, tables and a 1 MiB read buffer) of its own.
+  `push_archive_entries_non_solid` keeps one encoder per worker for the
+  length of the call; `push_archive_entry` also codes on the calling thread
+  but still builds an encoder per entry. Folders under 4 KiB now share one set of encoder settings: the
+  size hint given to the encoder is at least 4 KiB, below which the
+  encoder's dictionary does not shrink further anyway. The archive is the
+  same bytes.
 
 ## 0.26.1 - 2026-09-29
 
