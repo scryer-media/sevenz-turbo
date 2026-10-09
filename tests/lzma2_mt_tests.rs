@@ -166,6 +166,83 @@ fn the_parallel_path_is_engaged_and_reports_its_backlog() {
     assert!(spawned > 0, "no worker thread was ever created");
 }
 
+/// Runs in the LZMA2 stream of a one-folder archive `7zz` wrote, counted from
+/// the stream itself: a run begins at every chunk that resets the dictionary.
+/// The packed stream starts straight after the 32-byte signature header and
+/// ends at the chunk header that is a single zero.
+fn runs_in_stream(archive: &Path) -> u64 {
+    let bytes = std::fs::read(archive).expect("read archive");
+    let mut at = 32;
+    let mut runs = 0;
+    loop {
+        let control = bytes[at];
+        let size =
+            |offset: usize| usize::from(u16::from_be_bytes([bytes[offset], bytes[offset + 1]])) + 1;
+        match control {
+            0x00 => return runs,
+            0x01 | 0x02 => {
+                runs += u64::from(control == 0x01);
+                at += 3 + size(at + 1);
+            }
+            0x80.. => {
+                runs += u64::from(control >= 0xE0);
+                at += 5 + usize::from(control >= 0xC0) + size(at + 3);
+            }
+            _ => panic!("not an LZMA2 chunk header at {at}: {control:#04x}"),
+        }
+    }
+}
+
+/// A ledger is kept only for a handle that asked, and what it says of the runs
+/// is what the stream says: every run is handed to a decoder exactly once, and
+/// the waves it records are those runs and no others.
+#[test]
+fn a_kept_ledger_accounts_for_every_run_in_the_stream() {
+    if !have_7zz() {
+        eprintln!("skipping: 7zz is not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let archive = multi_run_archive(tmp.path());
+    let expected = oracle(&archive);
+    let in_stream = runs_in_stream(&archive);
+    assert!(in_stream > 1, "the archive is one run: {in_stream}");
+
+    let mut unasked = open(&archive, 8);
+    let handle = unasked.lzma2_handle();
+    assert!(extract(&mut unasked) == expected);
+    assert_eq!(handle.ledger(), None, "a ledger nobody asked for was kept");
+
+    for threads in [2, 8] {
+        let mut reader = open(&archive, threads);
+        let handle = reader.lzma2_handle();
+        handle.keep_ledger();
+        assert!(
+            extract(&mut reader) == expected,
+            "bytes differ at {threads}"
+        );
+
+        let ledger = handle.ledger().expect("a ledger was asked for");
+        assert_eq!(ledger.blocks, 1);
+        assert_eq!(ledger.dictionary_bytes, 256 * 1024);
+        assert_eq!(ledger.threads, u64::from(threads));
+        assert_eq!(ledger.runs, in_stream, "runs at {threads} threads");
+        assert!(ledger.wave_count >= 1);
+        if ledger.wave_count as usize == ledger.wave_runs.len() {
+            assert_eq!(ledger.wave_runs.iter().sum::<u64>(), in_stream);
+        }
+        assert_eq!(ledger.wave_runs.len(), ledger.wave_runs_out.len());
+        assert!(ledger.peak_runs_out >= 1);
+        assert!(ledger.peak_held_bytes > 0);
+        assert!(ledger.peak_total_bytes >= ledger.peak_held_bytes);
+        assert!(ledger.peak_queue_capacity_bytes >= ledger.peak_queue_bytes);
+        assert_eq!(
+            ledger.refused_feeds,
+            ledger.refused_at_boundary + ledger.refused_mid_run + ledger.refused_run_pending,
+        );
+    }
+}
+
 /// Moving the thread count while the archive is decoding changes nothing about
 /// the bytes. The switch lands at the next run boundary, which is a dictionary
 /// reset, so a run decoded inline and the same run decoded on a worker are the

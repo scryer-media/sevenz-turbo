@@ -891,6 +891,26 @@ Everything here is new surface; no upstream signature changed meaning.
   its LZMA2 chunk headers, records the count and the run sizes in
   `fixtures.json`, and refuses an archive with fewer runs than its recipe
   needs. The quick corpus is unchanged.
+- `Lzma2Handle::keep_ledger` asks a reader to account for its parallel LZMA2
+  decodes, and `Lzma2Handle::ledger` returns the account as an `Lzma2Ledger`:
+  the most the decoder held, the most packed input queued for it and decoded
+  output held behind it, and the most the three came to at one moment; the
+  runs handed out, in waves, where a wave is the runs the decoder claimed
+  between two sleeps of the delivering thread, each with the runs out as that
+  thread went to sleep; how often the decoder handed a
+  piece of input back for want of room, split by where in a run the piece was
+  offered; how often the reader stopped reading ahead for room and how often
+  because the decoder had its backlog; and how long the delivering thread
+  slept, by the runs out as it went to sleep. A ledger steers nothing: it
+  reads the gauges a decode already keeps at the points where it already
+  looks at them. A reader not asked for one carries an empty `Option` and
+  every hook returns at its first branch. `decode-bench op decode --ledger`
+  keeps one and reports it as `ledger_*` fields. Three figures are not in it,
+  because lzma-turbo 0.7.0 does not expose them: how many times the decoder
+  declined to give a complete run to a worker for want of room (it reports
+  the bytes, behind a feature, not the count), how its held bytes divide
+  between input, runs out, runs waiting and parked buffers, and how many runs
+  are being decoded at a moment, as opposed to claimed and not yet delivered.
 
 ## 0.26.1 - 2026-09-29
 
