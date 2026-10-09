@@ -671,8 +671,26 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let content_methods = &folder_methods(&self.content_methods, folder)?;
         let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(content_methods.len() - 1);
         let mut bcj2 = None;
+        let pulled = match content_methods.split_last() {
+            Some((first, _)) => encoder::FolderCoder::plan(first)?,
+            None => None,
+        };
 
-        let (crc, size) = {
+        let (crc, size) = if let Some(pulled) = pulled {
+            // A one-thread coder pulls the members itself: no read buffer,
+            // no hand-off chunks and no encoder thread.
+            encode_pulled(
+                content_methods,
+                &pulled,
+                &mut encoder::FolderCoder::default(),
+                &mut head.as_slice().chain(&mut r),
+                &mut out,
+                &mut more_sizes,
+                &mut bcj2,
+                encoder::Bcj2Sides::Threads,
+                |e| Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries))),
+            )?
+        } else {
             let mut w = Self::create_writer(
                 content_methods,
                 &mut out,
@@ -1159,6 +1177,53 @@ struct EncodedFolder {
 ///
 /// The checksums of the data and of the compressed bytes are taken here, on
 /// the thread doing the coding, which is what lets a worker do all of it.
+/// Codes one folder whose data-facing coder is `pulled`: that coder runs on
+/// this thread and pulls `input` itself, and the rest of `methods` is built
+/// after it as `create_writer` builds a chain. Returns the CRC-32 and length
+/// of what was read.
+#[allow(clippy::too_many_arguments)]
+fn encode_pulled<W: Write>(
+    methods: &[EncoderConfiguration],
+    pulled: &encoder::PulledCoder,
+    coder: &mut encoder::FolderCoder,
+    input: &mut dyn Read,
+    out: &mut W,
+    more_sizes: &mut Vec<Rc<Cell<usize>>>,
+    bcj2: &mut Option<encoder::Bcj2Slot>,
+    sides: encoder::Bcj2Sides,
+    error: impl Fn(std::io::Error) -> Error,
+) -> Result<(u32, usize)> {
+    // The data meets the last method first. The chain after it is built as
+    // `create_writer` builds it, and the counter `create_writer` would put
+    // under the pulled coder - the size of what it codes into the next
+    // coder - is put there here.
+    let rest = &methods[..methods.len() - 1];
+    let mut chain: Box<dyn Write + '_> = if rest.is_empty() {
+        Box::new(out)
+    } else {
+        let rest = ArchiveWriter::<std::io::Cursor<Vec<u8>>>::create_writer(
+            rest, out, more_sizes, bcj2, sides,
+        )?;
+        let counting = CountingWriter::new(rest);
+        more_sizes.push(counting.counting());
+        Box::new(counting)
+    };
+    let mut read_len = 0;
+    let mut input = CrcReader {
+        inner: input,
+        crc: Crc32::new(),
+        read: &mut read_len,
+    };
+    coder
+        .encode(pulled, &mut input, &mut chain)
+        .map_err(&error)?;
+    chain.flush().map_err(&error)?;
+    // The empty write ends every coder after this one.
+    chain.write(&[]).map_err(&error)?;
+    drop(chain);
+    Ok((input.crc.finalize(), read_len))
+}
+
 fn encode_entry<R: Read, O: Write>(
     content_methods: &Arc<Vec<EncoderConfiguration>>,
     entry: ArchiveEntry,
@@ -1182,40 +1247,17 @@ fn encode_entry<R: Read, O: Write>(
     };
 
     let (crc, size) = if let Some(pulled) = pulled {
-        // The data meets the last method first. The chain after it is built
-        // as `create_writer` builds it, and the counter `create_writer` would
-        // put under the pulled coder - the size of what it codes into the next
-        // coder - is put there here.
-        let rest = &methods[..methods.len() - 1];
-        let mut chain: Box<dyn Write + '_> = if rest.is_empty() {
-            Box::new(&mut out)
-        } else {
-            let rest = ArchiveWriter::<std::io::Cursor<Vec<u8>>>::create_writer(
-                rest,
-                &mut out,
-                &mut more_sizes,
-                &mut bcj2,
-                sides,
-            )?;
-            let counting = CountingWriter::new(rest);
-            more_sizes.push(counting.counting());
-            Box::new(counting)
-        };
-        let mut read_len = 0;
-        let mut input = CrcReader {
-            inner: head.as_slice().chain(&mut *r),
-            crc: Crc32::new(),
-            read: &mut read_len,
-        };
-        let encode_error = |e| Error::io_msg(e, format!("Encode entry:{}", entry.name()));
-        coder
-            .encode(&pulled, &mut input, &mut chain)
-            .map_err(encode_error)?;
-        chain.flush().map_err(encode_error)?;
-        // The empty write ends every coder after this one.
-        chain.write(&[]).map_err(encode_error)?;
-        drop(chain);
-        (input.crc.finalize(), read_len)
+        encode_pulled(
+            &methods,
+            &pulled,
+            coder,
+            &mut head.as_slice().chain(&mut *r),
+            &mut out,
+            &mut more_sizes,
+            &mut bcj2,
+            sides,
+            |e| Error::io_msg(e, format!("Encode entry:{}", entry.name())),
+        )?
     } else {
         let mut w = ArchiveWriter::<std::io::Cursor<Vec<u8>>>::create_writer(
             &methods,

@@ -991,6 +991,11 @@ Everything here is new surface; no upstream signature changed meaning.
   `from_path` looks the path up again. On Windows that lookup opens the
   file, so a tree walked and added with `from_path` opened every file twice.
   `from_path` is now `from_metadata` over the path's metadata.
+- `push_archive_entries` (a solid folder) also codes a one-thread LZMA or
+  LZMA2 coder on the calling thread, pulling the members itself, where it
+  read them through a 1 MiB buffer and handed them to an encoder thread in
+  1 MiB chunks, up to four in flight. At level 1 on one thread that was
+  half the writer's peak memory. The archive is the same bytes.
 
 ## 0.26.1 - 2026-09-29
 
