@@ -5,7 +5,7 @@ use std::{
     io,
     io::{Read, Seek, SeekFrom},
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use lzma_turbo::crc::{Crc32, crc32};
@@ -1698,7 +1698,10 @@ pub struct ArchiveReader<R: Read + Seek> {
     adaptive_lzma2: bool,
     verify_checksums: bool,
     lzma2: Arc<Lzma2Control>,
-    index: HashMap<String, IndexEntry>,
+    /// Where each name's entry is, built by the first call that looks a name
+    /// up. A consumer that walks the entries never asks, and building it at
+    /// open cost every reader a second copy of every name.
+    index: OnceLock<HashMap<String, IndexEntry>>,
     limits: ArchiveLimits,
     #[allow(clippy::type_complexity)]
     on_block_complete: Option<Box<dyn FnMut(BlockCompletion) + Send>>,
@@ -1810,7 +1813,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             }
         }
 
-        let mut reader = Self {
+        Ok(Self {
             source,
             archive,
             password,
@@ -1823,16 +1826,12 @@ impl<R: Read + Seek> ArchiveReader<R> {
             adaptive_lzma2: false,
             verify_checksums: true,
             lzma2: Arc::new(Lzma2Control::new(1)),
-            index: HashMap::default(),
+            index: OnceLock::new(),
             limits,
             on_block_complete: None,
             on_sub_stream_complete: None,
             positional: None,
-        };
-
-        reader.fill_index();
-
-        Ok(reader)
+        })
     }
 
     /// Gives the reader a positional view of its source, so that the folders
@@ -1997,7 +1996,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
     /// * `password` - Password for encrypted archives
     #[inline]
     pub fn from_archive(archive: Archive, source: R, password: Password) -> Self {
-        let mut reader = Self {
+        Self {
             source,
             archive,
             password,
@@ -2005,16 +2004,12 @@ impl<R: Read + Seek> ArchiveReader<R> {
             adaptive_lzma2: false,
             verify_checksums: true,
             lzma2: Arc::new(Lzma2Control::new(1)),
-            index: HashMap::default(),
+            index: OnceLock::new(),
             limits: ArchiveLimits::default(),
             on_block_complete: None,
             on_sub_stream_complete: None,
             positional: None,
-        };
-
-        reader.fill_index();
-
-        reader
+        }
     }
 
     /// Sets how many threads one block's LZMA2 coder may decode on, clamped
@@ -2118,18 +2113,26 @@ impl<R: Read + Seek> ArchiveReader<R> {
         self.lzma2.progress()
     }
 
-    fn fill_index(&mut self) {
-        for (file_index, file) in self.archive.files.iter().enumerate() {
-            let block_index = self.archive.stream_map.file_block_index[file_index];
-
-            self.index.insert(
-                file.name.clone(),
-                IndexEntry {
-                    block_index,
-                    file_index,
-                },
-            );
-        }
+    /// The name index, built by the first call.
+    ///
+    /// Of two entries with one name the later is the one found, as it was
+    /// when the index was built at open.
+    fn index(&self) -> &HashMap<String, IndexEntry> {
+        self.index.get_or_init(|| {
+            let files = &self.archive.files;
+            let mut index = HashMap::with_capacity(files.len());
+            for (file_index, file) in files.iter().enumerate() {
+                let block_index = self.archive.stream_map.file_block_index[file_index];
+                index.insert(
+                    file.name.clone(),
+                    IndexEntry {
+                        block_index,
+                        file_index,
+                    },
+                );
+            }
+            index
+        })
     }
 
     /// Returns a reference to the underlying [`Archive`] structure.
@@ -2717,7 +2720,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
     /// This function is very inefficient when used with solid archives, since
     /// it needs to decode all data before the actual file.
     pub fn read_file(&mut self, name: &str) -> Result<Vec<u8>, Error> {
-        let index_entry = *self.index.get(name).ok_or(Error::FileNotFound)?;
+        let index_entry = *self.index().get(name).ok_or(Error::FileNotFound)?;
         let file = &self.archive.files[index_entry.file_index];
 
         if !file.has_stream {
@@ -2840,7 +2843,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         file_name: &str,
         methods: &mut Vec<EncoderMethod>,
     ) -> Result<(), Error> {
-        let index_entry = self.index.get(file_name).ok_or(Error::FileNotFound)?;
+        let index_entry = self.index().get(file_name).ok_or(Error::FileNotFound)?;
         let file = &self.archive.files[index_entry.file_index];
 
         if !file.has_stream {
@@ -4132,6 +4135,57 @@ mod block_checksum_tests {
         .expect("stack");
         let err = io::copy(&mut rd, &mut io::sink()).expect_err("the borrowed CRC is checked");
         assert!(Error::from(err).is_checksum_failure());
+    }
+}
+
+/// The name index is built by the call that first needs it.
+#[cfg(all(test, feature = "compress"))]
+mod name_index_tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::ArchiveWriter;
+
+    fn reader(entries: &[(&str, &[u8])]) -> ArchiveReader<Cursor<Vec<u8>>> {
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+        for (name, data) in entries {
+            writer
+                .push_archive_entry(ArchiveEntry::new_file(name), Some(*data))
+                .expect("push");
+        }
+        let source = writer.finish().expect("finish");
+        ArchiveReader::new(source, Password::empty()).expect("open")
+    }
+
+    /// A consumer that walks the entries never pays for the index.
+    #[test]
+    fn opening_and_walking_build_no_index() {
+        let mut reader = reader(&[("a", b"first"), ("b", b"second")]);
+        assert!(reader.index.get().is_none(), "opening built the name index");
+        reader
+            .for_each_entries(|_, data| {
+                io::copy(data, &mut io::sink())?;
+                Ok(true)
+            })
+            .expect("walk");
+        assert!(reader.index.get().is_none(), "walking built the name index");
+
+        assert_eq!(reader.read_file("b").expect("read"), b"second");
+        assert_eq!(reader.index.get().map(HashMap::len), Some(2));
+        assert!(matches!(reader.read_file("c"), Err(Error::FileNotFound)));
+    }
+
+    /// Two entries of one name: a lookup finds the later, as it did when the
+    /// index was built at open.
+    #[test]
+    fn a_name_held_twice_finds_the_later_entry() {
+        let mut reader = reader(&[("a", b"first"), ("a", b"second")]);
+        assert_eq!(reader.read_file("a").expect("read"), b"second");
+        let mut methods = Vec::new();
+        reader
+            .file_compression_methods("a", &mut methods)
+            .expect("methods");
+        assert!(!methods.is_empty());
     }
 }
 

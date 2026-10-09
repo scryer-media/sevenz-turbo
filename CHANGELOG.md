@@ -586,6 +586,14 @@ Everything here is new surface; no upstream signature changed meaning.
   the memory limit leaves. The coder with the most to decode keeps the plan,
   the first of several that tie; every other LZMA2 coder of the chain decodes
   on one thread, and counts for the pipeline as any other CPU-heavy coder.
+- A reader no longer builds its name index when it is opened.
+  `ArchiveReader::read_file` and `file_compression_methods` build it on the
+  first lookup by name; a consumer that walks the entries never does, and no
+  longer holds a second copy of every name. Over a parsed archive of 100,000
+  entries, making the reader took 3.7 ms on Apple M5 Max and now takes under
+  a microsecond; the first lookup by name then takes 2.2 ms, the index being
+  sized for the entry count where it used to grow as it filled. Of two
+  entries with one name a lookup finds the later, as before.
 - An adaptive LZMA2 decode reaches the fixed plan's width. It started at one
   thread with the first run decoded on the calling thread, which held the
   stream's cursor; a widening was only heard once a whole run had landed;
