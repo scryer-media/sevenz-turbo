@@ -999,6 +999,28 @@ Everything here is new surface; no upstream signature changed meaning.
   output buffer is not charged twice. And it cuts a small head off a read
   as an exact-size copy, so a few kilobytes are not charged, or kept, as
   the whole 4 MiB read. Requires `lzma-turbo` 0.8.0.
+- A parallel LZMA2 decode gives every thread a run in the first wave. The
+  decoder holds one run pair (input and output) per thread under any larger
+  limit, but it learns the pair's size only when it scans, which it does in
+  a drain. The reader used to feed its whole read-ahead before the first
+  drain, so that drain found no room for some of the outputs. On 128 MiB
+  runs at four threads, two workers started a run late, and every later
+  wave waited on that offset. Until the decoder has scanned a run, the
+  read-ahead now reserves an output for every run fed, and works to the
+  pair bound itself.
+  It also declares the last run of that first wave, by handing over the
+  next run's header, so that run's worker is not left idle until a run is
+  handed back. After the first scan the decoder's own bound governs, as
+  before: reserving there as well held back the run a finishing worker
+  would have taken next and lost a thread for the rest of the decode.
+- A parallel LZMA2 decode no longer holds a run's input queued in the
+  reader while the decoder refuses it. The reader used to hand a run over
+  only once it had read the run's end, so on 128 MiB runs a whole run sat in
+  its queue (130 MiB at peak) while the decoder, holding one run pair per
+  thread, refused it. Past the first wave the reader now hands each read over
+  as it is read, and lets the decoder's refusal stop the feed. While the
+  decoder refuses, the reader reads no more than two pieces ahead. The queue
+  now peaks at one 4 MiB read.
 
 ## 0.26.1 - 2026-09-29
 
