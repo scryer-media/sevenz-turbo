@@ -48,6 +48,7 @@ the core count, then `all`; `--quick` runs 1 and `all`):
 | filters | `decode/{bcj_x86,bcj_arm64,bcj2,delta}/T1` | the BCJ x86/ARM64, BCJ2 and delta filters; the BCJ2 row judges parity against `7zz -mmt=1 -mmtf=off` (variant `7zz -mmtf=off`) and reports plain `7zz -mmt=1` beside it; see [Parity at one thread](#parity-at-one-thread) |
 | ppmd (secondary) | `decode/ppmd/T1` | PPMd through `ppmd-turbo` |
 | encode | `encode/payload-sub/L{1,3,5,7,9}/T{1,all}`, `encode/payload-sub/L5/T<sweep>`, `encode/tree/L5/Tall/{solid,non-solid}` | the `compress` writer (LZMA2 through lzma-turbo's encoder) vs `7zz a -m0=lzma2:d=…:fb=…:mf=…:a=… -mx<L> -mmt<T>`, with the archive-size ratio; 7zz is given this crate's level settings (xz's table, not 7-Zip's `-mx` defaults), so both sides use the same dictionary, match finder and fast bytes; every archive this crate writes is checked once with an untimed `7zz t` |
+| encode bcj2 | `encode/bcj2/L5/{T1,T4,Tall}` (full only) | the BCJ2 writer over the x86-shaped `code-x86` source (`decode-bench op encode --filter bcj2`: BCJ2 first, its main stream into LZMA2 at level 5, its call and jump streams into LZMA) vs `7zz a -mf=BCJ2 -mx5 -mmt<T>` with the same LZMA2 settings, with the archive-size ratio. T4 is planned only on a host with more than four cores. The one-thread row has one reference, plain `7zz -mmt=1`: 7zz refuses `-mmtf=off` alongside a filter when it writes an archive, so the decode row's second reference cannot be run here |
 | encode aes-256 | `encode/payload-sub/L5/Tall/aes`, `encode/kdf-tree/L5/T1/non-solid/aes` | AES-256 write (`-mhe=on` on the 7zz side; this crate encrypts the header by default) |
 
 A multi-threaded encode uses the block size `7zz` would (four dictionaries,
@@ -223,7 +224,7 @@ are three profiles:
 | `fleet` | full | every scenario | 3 + 1 |
 
 A smoke run is `fixtures --profile quick` then `run --quick`, which takes a
-few minutes. `fleet` keeps every scenario of `full`, 137 on an 18-core host
+few minutes. `fleet` keeps every scenario of `full`, 140 on an 18-core host
 (the thread sweep stops below the core count), and only cuts the repeats.
 78 of them are the `decode ledger` group, which `--only /ledger` runs alone.
 From the quick-corpus numbers scaled to the full corpus, the others project

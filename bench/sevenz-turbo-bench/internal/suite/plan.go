@@ -6,6 +6,7 @@ package suite
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -50,7 +51,11 @@ const (
 
 // FullOnlyGroups have no scenario in the quick matrix: their fixtures are
 // only worth timing at the full corpus's size.
-var FullOnlyGroups = map[string]bool{"lzma2 near-incompressible": true, GroupLedger: true}
+var FullOnlyGroups = map[string]bool{"lzma2 near-incompressible": true, GroupLedger: true, GroupEncodeBCJ2: true}
+
+// GroupEncodeBCJ2 is the BCJ2 encodes of the x86-shaped code source: BCJ2
+// over LZMA2 at level 5, against 7zz -mf=BCJ2 at the same thread count.
+const GroupEncodeBCJ2 = "encode bcj2"
 
 // GroupLedger is the decodes measured with the reader's ledger kept: runs
 // against threads against memory limits.
@@ -86,6 +91,7 @@ var Groups = []string{
 	"filters",
 	"ppmd (secondary)",
 	"encode",
+	GroupEncodeBCJ2,
 	"encode aes-256",
 }
 
@@ -331,6 +337,16 @@ func Plan(manifest *fixtures.Manifest, dir, scratch string, tools Tools, setting
 			p.encode("encode", "kdf-tree", 5, threads, encodeOpts{nonSolid: true,
 				note: "tiny members, one folder each, no cipher: per-folder cost alone"})
 		}
+		for _, threads := range []string{"1", "4", "all"} {
+			if threads == "4" && !slices.Contains(settings.Threads, threads) {
+				continue
+			}
+			o := encodeOpts{bcj2: true}
+			if threads == "1" {
+				o.note = "one reference only: 7zz -mmt=1 -mf=BCJ2, which may run the BCJ2 stage on a second thread. 7zz refuses -mmtf=off with a filter when it writes an archive, so the one-thread reference the decode row has cannot be run here"
+			}
+			p.encode(GroupEncodeBCJ2, "code-x86", 5, threads, o)
+		}
 	}
 	p.encode("encode aes-256", "payload-sub", 5, "all", encodeOpts{encrypted: true})
 	p.encode("encode aes-256", "kdf-tree", 5, "1", encodeOpts{encrypted: true, nonSolid: true,
@@ -516,7 +532,10 @@ func (p *planner) decode(group, name, threads string, o decodeOpts) {
 
 type encodeOpts struct {
 	nonSolid, encrypted bool
-	note                string
+	// bcj2 writes the BCJ2 chain, as 7zz -mf=BCJ2 does: BCJ2 first, its
+	// main stream into LZMA2 at the level, its call and jump streams into LZMA.
+	bcj2 bool
+	note string
 }
 
 // The crate's encoder levels (src/encoder_options.rs, LzmaSettings): xz's
@@ -551,6 +570,9 @@ func (p *planner) encode(group, source string, level int, threads string, o enco
 	spec, _ := fixtures.Full().Source(source)
 	n := p.settings.ResolveThreads(threads)
 	id := fmt.Sprintf("encode/%s/L%d/T%s", source, level, threads)
+	if o.bcj2 {
+		id = fmt.Sprintf("encode/bcj2/L%d/T%s", level, threads)
+	}
 	solid := "solid"
 	if o.nonSolid {
 		solid = "non-solid"
@@ -585,6 +607,10 @@ func (p *planner) encode(group, source string, level int, threads string, o enco
 	if o.encrypted {
 		ours = append(ours, "--password", fixtures.Password)
 		oracle = append(oracle, "-p"+fixtures.Password, "-mhe=on")
+	}
+	if o.bcj2 {
+		ours = append(ours, "--filter", "bcj2")
+		oracle = append(oracle, "-mf=BCJ2")
 	}
 	entries, err := fixtures.Entries(p.dir, source)
 	if err != nil && p.err == nil {
