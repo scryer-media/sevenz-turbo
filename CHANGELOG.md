@@ -986,6 +986,11 @@ Everything here is new surface; no upstream signature changed meaning.
   size hint given to the encoder is at least 4 KiB, below which the
   encoder's dictionary does not shrink further anyway. The archive is the
   same bytes.
+- New `ArchiveEntry::from_metadata` builds an entry from metadata the caller
+  already holds, such as a directory walk's `DirEntry::metadata`, where
+  `from_path` looks the path up again. On Windows that lookup opens the
+  file, so a tree walked and added with `from_path` opened every file twice.
+  `from_path` is now `from_metadata` over the path's metadata.
 
 ## 0.26.1 - 2026-09-29
 

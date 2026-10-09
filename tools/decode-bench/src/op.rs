@@ -685,6 +685,9 @@ struct Member {
     /// The archive name: the path relative to `--input`.
     name: String,
     size: u64,
+    /// What the walk found, so the entry is built without looking the path
+    /// up again (on Windows that lookup is an open of its own).
+    meta: std::fs::Metadata,
 }
 
 /// The files `7zz a` is given for the same source: every regular file under
@@ -695,7 +698,8 @@ struct Member {
 fn source_members(input: &Path) -> Result<Vec<Member>, String> {
     let mut members = Vec::new();
     if input.is_file() {
-        let size = std::fs::metadata(input).map_err(|e| e.to_string())?.len();
+        let meta = std::fs::metadata(input).map_err(|e| e.to_string())?;
+        let size = meta.len();
         let name = input
             .file_name()
             .ok_or_else(|| format!("{} has no file name", input.display()))?
@@ -705,6 +709,7 @@ fn source_members(input: &Path) -> Result<Vec<Member>, String> {
             path: input.to_path_buf(),
             name,
             size,
+            meta,
         });
         return Ok(members);
     }
@@ -720,13 +725,19 @@ fn source_members(input: &Path) -> Result<Vec<Member>, String> {
                 stack.push(entry.path());
             } else if kind.is_file() {
                 let path = entry.path();
-                let size = entry.metadata().map_err(|e| e.to_string())?.len();
+                let meta = entry.metadata().map_err(|e| e.to_string())?;
+                let size = meta.len();
                 let name = path
                     .strip_prefix(input)
                     .map_err(|e| e.to_string())?
                     .to_string_lossy()
                     .to_string();
-                members.push(Member { path, name, size });
+                members.push(Member {
+                    path,
+                    name,
+                    size,
+                    meta,
+                });
             }
         }
     }
@@ -804,7 +815,7 @@ fn encode(opts: &Opts) -> Result<Fields, String> {
 
     let mut writer = sevenz_turbo::ArchiveWriter::create(out).map_err(|e| e.to_string())?;
     writer.set_content_methods(methods);
-    let entry = |m: &Member| sevenz_turbo::ArchiveEntry::from_path(&m.path, m.name.clone());
+    let entry = |m: &Member| sevenz_turbo::ArchiveEntry::from_metadata(&m.meta, m.name.clone());
     if opts.non_solid {
         // Independent folders are coded on parallel workers and written in
         // member order; each member is opened on the thread that codes it.
