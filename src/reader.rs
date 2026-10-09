@@ -1,6 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::File,
     io,
     io::{Read, Seek, SeekFrom},
@@ -2613,6 +2613,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         };
         let archive = &self.archive;
         let encrypted = !self.password.is_empty();
+        let verify_checksums = self.verify_checksums;
         let on_block = &mut self.on_block_complete;
         let on_sub = &mut self.on_sub_stream_complete;
         let outcome = crate::ordered::run_paced(
@@ -2627,6 +2628,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 let finished = replay_folder(
                     archive,
                     encrypted,
+                    verify_checksums,
                     block_index,
                     rx,
                     each,
@@ -2809,6 +2811,115 @@ impl<R: Read + Seek> ArchiveReader<R> {
             });
 
         Ok(())
+    }
+}
+
+/// A file whose bytes were handed over before the parallel LZMA2 coder had
+/// reported their checksum.
+///
+/// The coder reports a run's checksums when the run is finished. A run it
+/// decodes on the calling thread, as its bytes arrive, stays one open piece
+/// until the coder reaches the end of the stream, so a file inside such a run
+/// is delivered before its checksum is. Its comparison and its completion
+/// wait here until the checksum arrives.
+struct OwedCompletion {
+    file_index: usize,
+    sub_stream_index: usize,
+    unpacked_offset: u64,
+    len: u64,
+}
+
+/// The files of one block that [`BlockDecoder::for_each_entries`] has handed
+/// over and not yet compared with their CRCs, in file order.
+struct OwedCompletions<'b> {
+    archive: &'b Archive,
+    lzma2: &'b Lzma2Control,
+    block_index: usize,
+    packed_offset: u64,
+    queue: VecDeque<OwedCompletion>,
+}
+
+impl OwedCompletions<'_> {
+    /// Compares the files at the front of the queue whose checksums have
+    /// arrived and reports their completions, stopping at the first one that
+    /// is still missing.
+    ///
+    /// `at_end` says the stream has been read to its end, after which a
+    /// checksum that is missing will never arrive. A file with a CRC to
+    /// compare is then an error, never a file passed unchecked.
+    fn settle<H>(&mut self, at_end: bool, mut hook: Option<&mut H>) -> Result<(), Error>
+    where
+        H: FnMut(SubStreamCompletion) + ?Sized,
+    {
+        while let Some(next) = self.queue.front() {
+            let file = &self.archive.files[next.file_index];
+            match self.lzma2.folded(next.unpacked_offset, next.len) {
+                Some(crc32) => {
+                    if file.has_crc && u64::from(crc32) != file.crc {
+                        return Err(Error::ChecksumVerificationFailed
+                            .in_block(self.block_index, self.packed_offset));
+                    }
+                    if let Some(hook) = hook.as_deref_mut() {
+                        hook(SubStreamCompletion {
+                            block_index: self.block_index,
+                            sub_stream_index: next.sub_stream_index,
+                            file_index: next.file_index,
+                            unpacked_offset: next.unpacked_offset,
+                            len: next.len,
+                            crc32,
+                        });
+                    }
+                }
+                None if !at_end => break,
+                None if file.has_crc => return Err(self.unverified()),
+                None => {}
+            }
+            self.queue.pop_front();
+        }
+        Ok(())
+    }
+
+    /// The failure of a block whose bytes were all read and whose coder
+    /// reported no checksum for them: they cannot be vouched for.
+    fn unverified(&self) -> Error {
+        Error::other("the decoder reported no checksum for bytes that were read to their end")
+            .in_block(self.block_index, self.packed_offset)
+    }
+}
+
+/// How much of a block's stream is read at once to reach its end.
+const STREAM_END_CHUNK: usize = 64 << 10;
+
+/// Reads and discards `left` more bytes of a block's decoded stream, then
+/// makes the read that sees the stream's end.
+///
+/// A parallel LZMA2 coder is asked for no more than its caller has room for,
+/// so it does not look past the last byte it hands over for the end of its
+/// own input, and it is on reaching that end that it reports the checksums of
+/// a run it decoded on the calling thread. This is the read that takes it
+/// there. One byte past `left` is asked for and no more, however long the
+/// stream turns out to be.
+fn read_to_stream_end<R: Read>(reader: &mut R, mut left: u64) -> io::Result<()> {
+    if left > 0 {
+        let mut scratch = vec![0u8; STREAM_END_CHUNK];
+        while left > 0 {
+            let want = left.min(scratch.len() as u64) as usize;
+            match reader.read(&mut scratch[..want]) {
+                // Shorter than its sizes say: the stream has ended all the
+                // same, and what is missing is reported by whoever is owed it.
+                Ok(0) => return Ok(()),
+                Ok(n) => left -= n as u64,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    let mut probe = [0u8; 1];
+    loop {
+        match reader.read(&mut probe) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            end => return end.map(|_| ()),
+        }
     }
 }
 
@@ -3016,29 +3127,49 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         let mut unpacked_offset = 0u64;
         let mut sub_stream = 0usize;
         let crc_report = Rc::new(Cell::new(None));
+        let unpack_size = archive.blocks[block_index].get_unpack_size();
+        // How much of the block's decoded stream the callbacks have read, and
+        // whether the read that sees its end has been made.
+        let mut consumed = 0u64;
+        let mut stream_ended = false;
+        let mut owed = OwedCompletions {
+            archive,
+            lzma2: &lzma2,
+            block_index,
+            packed_offset,
+            queue: VecDeque::new(),
+        };
+        let mut finished = true;
 
         for file_index in start..(file_count + start) {
             let file = &archive.files[file_index];
             if file.has_stream && file.size > 0 {
-                let mut decoder: Box<dyn Read> =
-                    Box::new(BoundedReader::new(&mut block_reader, file.size as usize));
-                if file.has_crc && verify_checksums && !folding {
+                let bound = file.size as usize;
+                let mut bounded = BoundedReader::new(&mut block_reader, bound);
+                let outcome = if file.has_crc && verify_checksums && !folding {
                     crc_report.set(None);
                     // A file that does not match its CRC is the block's
                     // fault, although the check sits above the recording
                     // reader: it is recorded too, so the failure leaves this
                     // block located and typed as the folded check's does.
-                    decoder = Box::new(FaultRecordingReader {
+                    let mut verifying = FaultRecordingReader {
                         inner: Crc32VerifyingReader::reporting(
-                            decoder,
-                            file.size as usize,
+                            &mut bounded,
+                            bound,
                             file.crc,
                             Rc::clone(&crc_report),
                         ),
                         faulted: Rc::clone(&faulted),
-                    });
-                }
-                let outcome = each(file, &mut decoder)
+                    };
+                    each(file, &mut verifying)
+                } else {
+                    each(file, &mut bounded)
+                };
+                // What the callback took of the file, and whether that was all
+                // of it.
+                let taken = (bound - bounded.remain) as u64;
+                let read_to_end = taken == file.size;
+                let outcome = outcome
                     .map_err(|e| e.maybe_bad_password(!self.password.is_empty()))
                     .map_err(|e| {
                         // Only a failure that came out of the decode chain is
@@ -3050,19 +3181,38 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                             e
                         }
                     })?;
+                consumed += taken;
                 if folding {
+                    // The files before this one first, so completions are
+                    // heard in file order.
+                    owed.settle(false, on_sub_stream_complete.as_deref_mut())?;
                     // The workers checksummed this file's bytes as they
                     // produced them; folding the pieces is a few multiplies
-                    // over GF(2), and reads none of them back. A range that is
-                    // not covered means the callback left bytes unread, which
-                    // is not a checksum failure and is not reported as one.
-                    if let Some(crc32) = lzma2.folded(unpacked_offset, file.size) {
+                    // over GF(2), and reads none of them back.
+                    let check = lzma2.folded(unpacked_offset, file.size);
+                    if let (Some(crc32), true) = (check, owed.queue.is_empty()) {
                         if file.has_crc && u64::from(crc32) != file.crc {
                             return Err(Error::ChecksumVerificationFailed
                                 .in_block(block_index, packed_offset));
                         }
                         crc_report.set(Some(crc32));
+                    } else if check.is_some() || (read_to_end && file.has_crc) {
+                        // Every byte was handed over and the coder has not
+                        // reported their checksum yet, or a file before this
+                        // one is still waiting for its own. It is compared
+                        // when the checksum arrives, at the end of the stream
+                        // at the latest, and never passed as checked before.
+                        owed.queue.push_back(OwedCompletion {
+                            file_index,
+                            sub_stream_index: first_sub_stream + sub_stream,
+                            unpacked_offset,
+                            len: file.size,
+                        });
                     }
+                    // Otherwise there is nothing to compare: the file has no
+                    // CRC, or the callback left bytes unread and nothing
+                    // covers the range, which is not a checksum failure and is
+                    // not reported as one.
                 }
                 if let (Some(hook), Some(crc32)) =
                     (on_sub_stream_complete.as_deref_mut(), crc_report.take())
@@ -3078,8 +3228,20 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                 }
                 unpacked_offset += file.size;
                 sub_stream += 1;
+                if !owed.queue.is_empty() && consumed == unpack_size {
+                    // The last byte of the stream is out. The coder publishes
+                    // what it still holds when it reaches the end of its
+                    // input, which is one read away: made here, so a folder of
+                    // one file hears its verdict where the sequential path
+                    // gives it, before any file after it is announced.
+                    read_to_stream_end(&mut block_reader, 0)
+                        .map_err(|e| Error::from(e).in_block(block_index, packed_offset))?;
+                    stream_ended = true;
+                    owed.settle(true, on_sub_stream_complete.as_deref_mut())?;
+                }
                 if !outcome {
-                    return Ok(false);
+                    finished = false;
+                    break;
                 }
             } else {
                 if file.has_stream {
@@ -3087,21 +3249,53 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                 }
                 let empty_reader: &mut dyn Read = &mut ([0u8; 0].as_slice());
                 if !each(file, empty_reader)? {
-                    return Ok(false);
+                    finished = false;
+                    break;
                 }
             }
         }
-        if folding
-            && archive.blocks[block_index].has_crc
-            && let Some(crc32) = lzma2.folded(0, archive.blocks[block_index].get_unpack_size())
-            && u64::from(crc32) != archive.blocks[block_index].crc
-        {
+        if !owed.queue.is_empty() {
+            // A file was read to its end and the callbacks stopped short of
+            // the stream's: the rest is decoded here, because its checksum is
+            // not known until the coder gets there, and a file handed over in
+            // full is compared with its CRC before this returns.
+            read_to_stream_end(&mut block_reader, unpack_size.saturating_sub(consumed))
+                .map_err(|e| Error::from(e).in_block(block_index, packed_offset))?;
+            stream_ended = true;
+            owed.settle(true, on_sub_stream_complete)?;
+        }
+        // Every byte of the block went to the callbacks, so its own checksum is
+        // owed whether or not the last of them then asked to stop: the
+        // sequential path compares it on the read that hands the last byte
+        // over, before the callback can answer.
+        let read_in_full = unpack_size != 0 && consumed == unpack_size;
+        if !finished && !read_in_full {
+            return Ok(false);
+        }
+        if folding && archive.blocks[block_index].has_crc {
             // The block's own checksum, folded from the same segments: the
             // stream was not wrapped in a verifying reader, because that
             // reader runs on the thread delivering the bytes.
-            return Err(Error::ChecksumVerificationFailed.in_block(block_index, packed_offset));
+            let mut check = lzma2.folded(0, unpack_size);
+            if check.is_none() && read_in_full && !stream_ended {
+                read_to_stream_end(&mut block_reader, 0)
+                    .map_err(|e| Error::from(e).in_block(block_index, packed_offset))?;
+                check = lzma2.folded(0, unpack_size);
+            }
+            match check {
+                Some(crc32) if u64::from(crc32) != archive.blocks[block_index].crc => {
+                    return Err(
+                        Error::ChecksumVerificationFailed.in_block(block_index, packed_offset)
+                    );
+                }
+                Some(_) => {}
+                // Every byte was read and nothing answers for them.
+                None if read_in_full => return Err(owed.unverified()),
+                // The callbacks left bytes unread, as above.
+                None => {}
+            }
         }
-        Ok(true)
+        Ok(finished)
     }
 
     /// The offsets this block's files start at in its decoded stream, without
@@ -3438,6 +3632,7 @@ impl FolderWorker<'_> {
 fn replay_folder<F>(
     archive: &Archive,
     encrypted: bool,
+    verify_checksums: bool,
     block_index: usize,
     rx: &mut crate::ordered::Receiver<'_, FolderMessage>,
     each: &mut F,
@@ -3457,11 +3652,23 @@ where
     // A file's failure the callback was handed and did not return, kept so
     // that it is still the folder's error.
     let mut swallowed: Option<(io::ErrorKind, String)> = None;
+    // How much of the folder the callbacks have been handed. Once that is all
+    // of it the folder's own CRC is owed too, whether or not the callback
+    // handed the last byte then asked to stop.
+    let block = &archive.blocks[block_index];
+    let unpack_size = block.get_unpack_size();
+    let mut delivered = 0u64;
+    let folder_owed = |delivered: u64| {
+        verify_checksums && block.has_crc && unpack_size != 0 && delivered == unpack_size
+    };
     loop {
         match rx.recv() {
             None => return Err(lost()),
             Some(FolderMessage::Begin(file_index)) => {
                 let file = &archive.files[file_index];
+                // Set once a callback has asked to stop: whether the file it
+                // stopped at is owed a verdict of its own.
+                let owed_file;
                 if !(file.has_stream && file.size > 0) {
                     // An empty file has no bytes to fail on: its errors are the
                     // caller's own, passed through.
@@ -3470,54 +3677,97 @@ where
                         _ => return Err(lost()),
                     }
                     let empty_reader: &mut dyn Read = &mut ([0u8; 0].as_slice());
-                    if !each(file, empty_reader)? {
+                    if each(file, empty_reader)? {
+                        continue;
+                    }
+                    if !folder_owed(delivered) {
                         return Ok(false);
                     }
-                    continue;
-                }
-                let mut entry = ReplayEntry {
-                    rx: &mut *rx,
-                    chunk: Vec::new(),
-                    pos: 0,
-                    state: ReplayState::Open,
-                    fault: None,
-                };
-                let outcome = each(file, &mut entry)
-                    .map_err(|e| e.maybe_bad_password(encrypted))
-                    .map_err(|e| {
-                        // As on the sequential path: only a failure that came
-                        // out of the decode is this folder's fault.
-                        if entry.state.faulted() {
-                            e.in_block(block_index, packed_offset)
-                        } else {
-                            e
+                    owed_file = false;
+                } else {
+                    let mut entry = ReplayEntry {
+                        rx: &mut *rx,
+                        chunk: Vec::new(),
+                        pos: 0,
+                        delivered: 0,
+                        state: ReplayState::Open,
+                        fault: None,
+                    };
+                    let outcome = each(file, &mut entry)
+                        .map_err(|e| e.maybe_bad_password(encrypted))
+                        .map_err(|e| {
+                            // As on the sequential path: only a failure that
+                            // came out of the decode is this folder's fault.
+                            if entry.state.faulted() {
+                                e.in_block(block_index, packed_offset)
+                            } else {
+                                e
+                            }
+                        })?;
+                    let unseen = entry.finish();
+                    delivered += entry.delivered;
+                    if outcome {
+                        if let Some(error) = unseen {
+                            // The worker read the whole file; the callback
+                            // stopped short of where it failed. The member is
+                            // damaged all the same.
+                            return Err(Error::from(error)
+                                .maybe_bad_password(encrypted)
+                                .in_block(block_index, packed_offset));
                         }
-                    })?;
-                let unseen = entry.finish();
-                if !outcome {
-                    // The worker read the file to its end whatever the
-                    // callback did, so its checksum is final and its
-                    // completion, when it has one, is the worker's next
-                    // message. The hook hears it before the callback's
-                    // `false` is honoured, as on the sequential path.
-                    if entry.state == ReplayState::Ended
-                        && let Some(FolderMessage::Completion(completion)) = rx.recv()
-                        && let Some(hook) = on_sub_stream_complete.as_deref_mut()
-                    {
-                        hook(completion);
+                        if let Some(fault) = entry.fault.take() {
+                            swallowed = Some(fault);
+                        }
+                        continue;
                     }
-                    return Ok(false);
+                    if entry.state != ReplayState::Ended {
+                        return Ok(false);
+                    }
+                    owed_file = verify_checksums && file.has_crc && entry.delivered == file.size;
                 }
-                if let Some(error) = unseen {
-                    // The worker read the whole file; the callback stopped
-                    // short of where it failed. The member is damaged all
-                    // the same.
-                    return Err(Error::from(error)
-                        .maybe_bad_password(encrypted)
-                        .in_block(block_index, packed_offset));
-                }
-                if let Some(fault) = entry.fault.take() {
-                    swallowed = Some(fault);
+                // The worker read the file to its end whatever the callback
+                // did, and its completion, when it has one, is the worker's
+                // next message unless the folder's coder could not report the
+                // checksum before the end of its stream. The hook hears it
+                // before the callback's `false` is honoured, as on the
+                // sequential path.
+                //
+                // A file with a CRC that the callback read to its end is not
+                // left unchecked because the callback then stopped: its
+                // verdict is waited for, past whatever the worker sends about
+                // the files after it. So is the folder's, which the worker
+                // gives last, when the callbacks were handed every byte of it.
+                let owed_folder = folder_owed(delivered);
+                let owed = owed_file || owed_folder;
+                loop {
+                    match rx.recv() {
+                        Some(FolderMessage::Completion(completion)) => {
+                            let verdict = completion.file_index == file_index;
+                            if let Some(hook) = on_sub_stream_complete.as_deref_mut() {
+                                hook(completion);
+                            }
+                            if !owed_folder && (verdict || !owed_file) {
+                                return Ok(false);
+                            }
+                        }
+                        Some(
+                            FolderMessage::Begin(_) | FolderMessage::Data(_) | FolderMessage::End,
+                        ) if owed => {}
+                        Some(FolderMessage::Done(FolderEnd::Failed(error))) if owed => {
+                            return Err(error);
+                        }
+                        // A file after this one failed, and the folder's
+                        // decode stopped there with this one unchecked.
+                        Some(FolderMessage::Fault(error)) if owed => {
+                            return Err(Error::from(error)
+                                .maybe_bad_password(encrypted)
+                                .in_block(block_index, packed_offset));
+                        }
+                        Some(FolderMessage::Done(FolderEnd::Stopped)) | None if owed => {
+                            return Err(lost());
+                        }
+                        _ => return Ok(false),
+                    }
                 }
             }
             Some(FolderMessage::Completion(completion)) => {
@@ -3562,6 +3812,8 @@ struct ReplayEntry<'r, 'a> {
     rx: &'r mut crate::ordered::Receiver<'a, FolderMessage>,
     chunk: Vec<u8>,
     pos: usize,
+    /// How much of the file the callback has been handed.
+    delivered: u64,
     state: ReplayState,
     /// The failure the callback was handed, described, for a later read and
     /// for a callback that does not return it.
@@ -3606,6 +3858,7 @@ impl Read for ReplayEntry<'_, '_> {
                 let n = buf.len().min(self.chunk.len() - self.pos);
                 buf[..n].copy_from_slice(&self.chunk[self.pos..self.pos + n]);
                 self.pos += n;
+                self.delivered += n as u64;
                 return Ok(n);
             }
             match self.state {

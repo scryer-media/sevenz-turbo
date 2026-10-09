@@ -770,6 +770,41 @@ Everything here is new surface; no upstream signature changed meaning.
   one-file block read through `for_each_entries` or `read_file` is now
   checked once, against the file's CRC, instead of twice over the same
   bytes; the block check stays wherever it is the only one.
+- Fixed: the files of an LZMA2 folder decoded as one long run are compared
+  with their CRCs at every thread count. Above one thread the parallel
+  reader's workers take the checksums and the reader asks for each file's.
+  A stream the reader cannot split - one run longer than the reader holds
+  for a split, which is what 7-Zip writes when it has no block threading
+  (`-mmt=1`, `-mmt=2`), at any size past a few megabytes packed - is
+  checksummed as one open piece, and the decoder gives that piece up only
+  when it reaches the stream's end marker. A reader that stopped at a file's
+  last byte never got there: it found no checksum for the file, took that as
+  bytes the callback had left unread, and compared nothing. Such a file was
+  delivered with a wrong CRC unnoticed, its sub-stream hook was never
+  called, and the block's own CRC was passed over the same way, while the
+  block hook still reported it verified. One thread compared them, as
+  0.26.1 did at every count; this was never in a published version.
+  The reader now keeps such a file owed. Once the stream has been read to
+  its end it makes the one read that reaches the end marker, then compares
+  every owed file in archive order and calls its hook; a folder worker does
+  the same, and so does the block's own check. A file with a CRC for which
+  the decoder still has no checksum after the end of the stream is an
+  error, never a pass. Known limit: files that share one such run and are
+  not the last of their block are compared, and their hooks called, when
+  the block ends and not as each file ends, and a callback that stops after
+  one of them has the rest of the block decoded and thrown away to get its
+  checksum. Comparing at each file's end needs the decoder to give up the
+  open piece at a file boundary, which is a later lzma-turbo version.
+- Fixed: a block whose only checksum is its own is compared once every byte
+  of it has been handed over, whether or not the callback handed the last
+  byte then stops. Above one thread that checksum is folded from the
+  workers' after the last callback returns, and a callback that answered
+  `false` was taken at its word first: a damaged block whose files carry no
+  CRCs of their own passed unnoticed, whether its stream was one run or
+  many. A folder decoded on a worker had its verdict left unread the same
+  way. One thread compares on the read that hands the last byte over, as
+  0.26.1 did at every count; this was never in a published version. The
+  comparison now comes first, and the stop is honoured after it.
 - Fixed: a PPMd block this crate wrote failed `7zz t` with "Data Error",
   although `7zz x` and this crate's reader both gave the right bytes back.
   The writer flushes a block's coder chain before finishing it, and
