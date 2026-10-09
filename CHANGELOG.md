@@ -880,6 +880,17 @@ Everything here is new surface; no upstream signature changed meaning.
   message per mebibyte. The output is byte-identical (LZMA2 level 5, BCJ2
   and PPMd checked), and `ArchiveWriter::create` still returns
   `ArchiveWriter<File>`.
+- Bench harness: the full corpus gains `media_mx5_2g.7z` and
+  `media_mx5_3g.7z`, the near-incompressible recipe at 2 and 3 GiB written at
+  `-mx=5 -mmt=8` with 7-Zip's own run size: 16 and 24 LZMA2 runs of 128 MiB.
+  The larger has more runs than the widest host measured has threads (18), so
+  a parallel decoder that cannot keep every thread supplied from a backlog
+  shows it at any thread count; the 1 GiB archives have eight runs and hide
+  it from eight threads up. `fixtures` counts the runs of these, of `mt.7z`
+  and of the other media archives from each archive's own stream, by walking
+  its LZMA2 chunk headers, records the count and the run sizes in
+  `fixtures.json`, and refuses an archive with fewer runs than its recipe
+  needs. The quick corpus is unchanged.
 
 ## 0.26.1 - 2026-09-29
 

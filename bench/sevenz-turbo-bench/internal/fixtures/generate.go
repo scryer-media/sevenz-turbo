@@ -58,6 +58,9 @@ type ArchiveRecord struct {
 	SHA256        string `json:"sha256"`
 	UnpackedBytes int64  `json:"unpacked_bytes"`
 	Entries       int    `json:"entries"`
+	// LZMA2 is the archive's run layout as counted from its stream, for an
+	// archive whose recipe sets MinRuns.
+	LZMA2 *LZMA2Runs `json:"lzma2,omitempty"`
 }
 
 // Manifest is fixtures.json.
@@ -571,6 +574,16 @@ func ensureArchive(ctx context.Context, options Options, archive ArchiveSpec, so
 		return record, err
 	}
 	record.Bytes, record.SHA256 = size, digest
+	if archive.MinRuns > 0 {
+		runs, err := countRuns(path, source.TotalBytes)
+		if err != nil {
+			return record, err
+		}
+		if runs.Runs < archive.MinRuns {
+			return record, fmt.Errorf("7zz wrote %d LZMA2 run(s), the largest %d bytes; the recipe needs at least %d", runs.Runs, runs.LargestRunBytes, archive.MinRuns)
+		}
+		record.LZMA2 = &runs
+	}
 	if problem != "" {
 		want.SHA256 = digest
 		data, err := json.MarshalIndent(want, "", "  ")
