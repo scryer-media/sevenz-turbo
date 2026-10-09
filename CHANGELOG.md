@@ -1024,6 +1024,13 @@ Everything here is new surface; no upstream signature changed meaning.
   reads CRLF line endings as LF, in decode-bench and in the harness, so
   `merge` no longer refuses a report from a CRLF checkout over line endings
   alone.
+- Bench harness: BCJ2 encode rows, `encode/bcj2/L5/{T1,T4,Tall}`, in the full
+  and fleet profiles. They write the x86-shaped `code-x86` source with
+  `decode-bench op encode --filter bcj2`, a new flag that writes the BCJ2 chain
+  7zz writes for `-mf=BCJ2`: BCJ2 first, LZMA2 for its main stream, LZMA for
+  its call and jump streams. The reference is `7zz a -mf=BCJ2 -mx5 -mmt<T>`.
+  7zz refuses `-mmtf=off` with a filter when it writes, so the one-thread
+  encode row has only the plain `7zz -mmt=1` reference.
 - Bench harness: the one-thread BCJ2 row, `decode/bcj2/T1`, judges parity
   against `7zz -mmt=1 -mmtf=off`, the 7zz that also decodes on one thread;
   plain `7zz -mmt=1` still runs the BCJ2 stage on a second thread, and its

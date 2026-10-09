@@ -15,7 +15,7 @@
 //!                        [--adaptive [--poll-ms MS]]
 //!                        [--engine turbo|upstream] [--digest] [--ledger]
 //! decode-bench op encode --input DIR --out FILE [--level L] [--threads N]
-//!                        [--non-solid] [--password P]
+//!                        [--non-solid] [--password P] [--filter bcj2]
 //! ```
 //!
 //! A decode counts the bytes it drains and does nothing else with them, as
@@ -59,6 +59,8 @@ struct Opts {
     engine: String,
     level: u32,
     non_solid: bool,
+    /// The filter an encode puts before LZMA2: "" for none, or "bcj2".
+    filter: String,
 }
 
 /// Runs one operation and exits.
@@ -159,6 +161,12 @@ fn parse(args: &[String]) -> Opts {
                     .unwrap_or_else(|_| usage("--level takes 0-9"));
             }
             "--non-solid" => opts.non_solid = true,
+            "--filter" => {
+                opts.filter = value();
+                if opts.filter != "bcj2" {
+                    usage("--filter takes bcj2");
+                }
+            }
             other => usage(&format!("unknown option {other}")),
         }
     }
@@ -873,6 +881,11 @@ const MAX_SOLID_BLOCK: u64 = 4 << 30;
 /// Writes an archive of `--input` (a directory) with LZMA2 at `--level`,
 /// solid unless `--non-solid`, AES-256 when `--password` is given.
 ///
+/// `--filter bcj2` writes the BCJ2 chain 7zz writes for `-mf=BCJ2`: BCJ2
+/// first, its main stream into LZMA2 at `--level`, and its call and jump
+/// streams into the crate's own LZMA side coders. The crate does not combine
+/// BCJ2 with AES, so the two are refused together.
+///
 /// The members are walked once, before encoding, and that walk is where the
 /// reported file and byte counts come from: there is no second pass over the
 /// source after the archive is finished.
@@ -900,6 +913,13 @@ fn encode(opts: &Opts) -> Result<Fields, String> {
         methods.push(AesEncoderOptions::new(sevenz_turbo::Password::from(password)).into());
     }
     methods.push(lzma2.into());
+    let bcj2 = opts.filter == "bcj2";
+    if bcj2 {
+        if opts.password.is_some() {
+            return Err("--filter bcj2 cannot be combined with --password".into());
+        }
+        methods.push(sevenz_turbo::EncoderMethod::BCJ2_FILTER.into());
+    }
 
     let members = source_members(input)?;
     let files = members.len() as u64;
@@ -967,6 +987,7 @@ fn encode(opts: &Opts) -> Result<Fields, String> {
         ("dictionary", Json::Int(u64::from(dict))),
         ("block_size", Json::Int(if threads > 1 { block } else { 0 })),
         ("solid", Json::Bool(!opts.non_solid)),
+        ("filter", str(if bcj2 { "bcj2" } else { "none" })),
         ("encrypted", Json::Bool(opts.password.is_some())),
         ("files", Json::Int(files)),
         ("bytes_in", Json::Int(bytes_in)),
@@ -1075,6 +1096,70 @@ mod tests {
                 "non_solid {non_solid}"
             );
         }
+    }
+
+    #[test]
+    fn a_bcj2_encode_writes_the_bcj2_chain_and_round_trips() {
+        use sevenz_turbo::EncoderMethod;
+
+        let scratch = Scratch::new("encode-bcj2");
+        let input = scratch.0.join("src");
+        tree(&input);
+        // An x86-shaped member: calls and jumps with near targets.
+        let mut code = Vec::new();
+        for i in 0u32..4096 {
+            code.extend_from_slice(&[0x55, 0x48, 0x89, 0xE5, 0xE8]);
+            code.extend_from_slice(&(i % 97 * 16).to_le_bytes());
+            code.extend_from_slice(&[0xE9]);
+            code.extend_from_slice(&(i % 13 * 32).to_le_bytes());
+        }
+        std::fs::write(input.join("code.bin"), &code).unwrap();
+        for threads in [1, 4] {
+            let out = scratch.0.join(format!("out-bcj2-{threads}.7z"));
+            let opts = Opts {
+                input: Some(input.clone()),
+                out: Some(out.clone()),
+                threads,
+                level: 5,
+                filter: "bcj2".into(),
+                ..Opts::default()
+            };
+            encode(&opts).unwrap();
+            let mut reader =
+                sevenz_turbo::ArchiveReader::open(&out, sevenz_turbo::Password::empty()).unwrap();
+            let archive = reader.archive().clone();
+            assert!(!archive.blocks.is_empty());
+            for index in 0..archive.blocks.len() {
+                let coders = archive.block_coders(index);
+                assert_eq!(coders.len(), 4, "threads {threads}, block {index}");
+                assert_eq!(coders[3].encoder_method_id(), EncoderMethod::ID_BCJ2);
+                assert_eq!(coders[2].encoder_method_id(), EncoderMethod::ID_LZMA2);
+            }
+            let mut seen = None;
+            reader
+                .for_each_entries(|entry, data| {
+                    if entry.name() == "code.bin" {
+                        let mut bytes = Vec::new();
+                        data.read_to_end(&mut bytes)?;
+                        seen = Some(bytes);
+                    } else {
+                        std::io::copy(data, &mut std::io::sink())?;
+                    }
+                    Ok(true)
+                })
+                .unwrap();
+            assert_eq!(seen.as_deref(), Some(&code[..]), "threads {threads}");
+        }
+        let refused = Opts {
+            input: Some(input.clone()),
+            out: Some(scratch.0.join("refused.7z")),
+            threads: 1,
+            level: 5,
+            filter: "bcj2".into(),
+            password: Some("p".into()),
+            ..Opts::default()
+        };
+        assert!(encode(&refused).is_err());
     }
 
     #[test]

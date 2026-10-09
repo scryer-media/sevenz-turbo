@@ -3,6 +3,7 @@ package suite
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -97,6 +98,64 @@ func TestPlanCoversTheMatrix(t *testing.T) {
 // The one-thread BCJ2 row has two references: 7zz -mmt=1, and 7zz -mmt=1
 // -mmtf=off, which takes away the thread 7-Zip gives the BCJ2 stage. No other
 // row has the second. Both profiles plan it.
+func TestBCJ2EncodeRowsMatch7zzFilter(t *testing.T) {
+	for _, quick := range []bool{true, false} {
+		profile := fixtures.Full()
+		if quick {
+			profile = fixtures.Quick()
+		}
+		dir, manifest := fakeCorpus(t, profile)
+		scenarios, err := Plan(manifest, dir, t.TempDir(), Tools{Candidate: "decode-bench", Oracle: "7zz"}, DefaultSettings(quick, 32))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ids []string
+		for _, scenario := range scenarios {
+			if !strings.HasPrefix(scenario.ID, "encode/bcj2/") {
+				for _, run := range scenario.Variants {
+					if slices.Contains(run.Args, "--filter") || slices.Contains(run.Args, "-mf=BCJ2") {
+						t.Errorf("quick=%t: %s %s runs a filter: %v", quick, scenario.ID, run.Variant, run.Args)
+					}
+				}
+				continue
+			}
+			ids = append(ids, scenario.ID)
+			if scenario.Group != GroupEncodeBCJ2 || scenario.Fixture != "code-x86" || scenario.Level != 5 || scenario.ParityReference != "" {
+				t.Errorf("quick=%t: %s is %+v", quick, scenario.ID, scenario)
+			}
+			n := strings.TrimPrefix(scenario.ID, "encode/bcj2/L5/T")
+			if n == "all" {
+				n = "32"
+			}
+			references := 0
+			for _, run := range scenario.Variants {
+				args := strings.Join(run.Args, " ")
+				switch run.Variant {
+				case VariantTurbo:
+					if !strings.Contains(args, "--filter bcj2") || !strings.Contains(args, "--threads "+n) {
+						t.Errorf("%s: candidate runs %q", scenario.ID, args)
+					}
+				case VariantOracle:
+					references++
+					if !strings.Contains(args, "-mf=BCJ2") || !strings.Contains(args, "-mmt="+n+" ") || !strings.Contains(args, "-mx=5") {
+						t.Errorf("%s: 7zz runs %q", scenario.ID, args)
+					}
+				}
+			}
+			if references != 1 {
+				t.Errorf("%s: %d 7zz references, want 1", scenario.ID, references)
+			}
+		}
+		want := []string{"encode/bcj2/L5/T1", "encode/bcj2/L5/T4", "encode/bcj2/L5/Tall"}
+		if quick {
+			want = nil
+		}
+		if !slices.Equal(ids, want) {
+			t.Errorf("quick=%t: BCJ2 encode rows %v, want %v", quick, ids, want)
+		}
+	}
+}
+
 func TestBCJ2RowHasBothOneThreadReferences(t *testing.T) {
 	for _, quick := range []bool{true, false} {
 		profile := fixtures.Full()
