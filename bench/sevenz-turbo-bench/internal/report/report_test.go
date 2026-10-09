@@ -153,3 +153,22 @@ func TestMergeRefusesDifferentWorkloads(t *testing.T) {
 		t.Errorf("a report without a fixture manifest was merged: %v", err)
 	}
 }
+
+func TestSlowThroughputIsNotRoundedToZero(t *testing.T) {
+	for _, c := range []struct {
+		mibs float64
+		want string
+	}{
+		{1234.5, "1234"},
+		{123.4, "123"},
+		{12.34, "12.3"},
+		{1.234, "1.23"},
+		{0.4567, "0.457"},
+		{0.25, "0.25"},
+		{0.0123, "0.0123"},
+	} {
+		if got := throughputText(c.mibs); got != c.want {
+			t.Errorf("throughputText(%v) = %q, want %q", c.mibs, got, c.want)
+		}
+	}
+}

@@ -927,7 +927,8 @@ Everything here is new surface; no upstream signature changed meaning.
   where in a run the piece was offered, the reader's stops for room, and the
   time the delivering thread slept and the worker time that stood idle with
   it). The quick profile plans none of these rows.
-
+- Bench harness: report.md gives throughput to three significant figures, so
+  a row under 0.5 MiB/s no longer reads as 0.
 ## 0.26.1 - 2026-09-29
 
 - Fixed: `ArchiveLimits::memory_limit_bytes` bounds a coder chain as a whole,

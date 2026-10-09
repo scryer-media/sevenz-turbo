@@ -23,6 +23,21 @@ func ratioText(value *float64) string {
 	return fmt.Sprintf("%.3f", *value)
 }
 
+// throughputText gives a throughput in MiB/s to three significant figures, so
+// a slow row reads as what it is rather than rounding to 0.
+func throughputText(mibs float64) string {
+	switch {
+	case mibs >= 100:
+		return fmt.Sprintf("%.0f", mibs)
+	case mibs >= 10:
+		return fmt.Sprintf("%.1f", mibs)
+	case mibs >= 1:
+		return fmt.Sprintf("%.2f", mibs)
+	default:
+		return fmt.Sprintf("%.3g", mibs)
+	}
+}
+
 func mib(bytes int64) string {
 	if bytes <= 0 {
 		return "-"
@@ -136,7 +151,7 @@ func Markdown(report *Report) string {
 			}
 			throughput := "-"
 			if row.ThroughputMiBs > 0 {
-				throughput = fmt.Sprintf("%.0f", row.ThroughputMiBs)
+				throughput = throughputText(row.ThroughputMiBs)
 			}
 			line := fmt.Sprintf("| %s | %s | %s | %s | %s | %s |", name, variantLabel(row), seconds(row.Wall), seconds(row.CPU),
 				procmeasure.MiBRange(int64(row.RSS.Median), int64(row.RSS.Min), int64(row.RSS.Max)), throughput)
