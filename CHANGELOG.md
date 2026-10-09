@@ -45,8 +45,10 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   hooks, renovate, issue templates, `AGENTS.md`, `SECURITY.md`,
   `CONTRIBUTORS.md`. Upstream's `.github/workflows/rust.yml` and
   `.github/dependabot.yml` were removed as duplicates of these.
-- The `lzma-turbo` dependency is a path dependency for now. It becomes a
-  crates.io version pin before this crate is published.
+- The `lzma-turbo` dependency is a crates.io version pin. While the two
+  crates are developed together a `path` to the sibling checkout is added and
+  dropped again before release; `cargo xtask release` refuses to tag while it
+  is there.
 
 ### Decoding
 
@@ -65,16 +67,18 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   only through the non-default `lzma-rust2-encoder` feature; with
   `--no-default-features` the graph is `sevenz-turbo → lzma-turbo → crc-fast`
   and nothing else.
-- The writer sizes each folder's LZMA or LZMA2 coder to the folder, the way
-  7-Zip reduces its dictionary: a folder known to be smaller than the
-  dictionary is coded with one its size (never below 4 KiB), and one that fits
-  a single LZMA2 block is coded on one thread. `ArchiveEntry::from_path`
-  records the file's length so the size is known before the push.
-- The BCJ and delta filters are `lzma-turbo`'s, and BCJ2 is vendored into
-  `src/codec/filter/` from `lzma-rust2` 0.20.1 (Apache-2.0, same licence),
-  which together are what let `lzma-rust2` leave the decode graph rather than
-  be carried for three filters. `src/codec/filter/mod.rs` documents what is
-  still vendored and the mechanical changes made to it.
+- The branch converters, the delta filter and BCJ2 are all `lzma-turbo`'s
+  (`lzma_turbo::filters`). The `Read` and `Write` wrappers around the BCJ and
+  delta converters are vendored from `lzma-rust2` 0.20.1 (Apache-2.0, same
+  licence) in `src/codec/filter/`; the BCJ2 reader and writer are this crate's
+  own. Together that is what let `lzma-rust2` leave the decode graph rather
+  than be carried for three filters. `src/codec/filter/mod.rs` documents what
+  is still vendored and the mechanical changes made to it.
+- PPMd decodes and encodes through
+  [`ppmd-turbo`](https://github.com/scryer-media/ppmd-turbo) instead of
+  `ppmd-rust` (0.27.0). The decoder is given the folder's unpacked size, a
+  stream cut short is `UnexpectedEof`, a corrupt one `InvalidData`, and a
+  model larger than the memory limit is refused before it is allocated.
 - LZMA2 decodes on several threads through `lzma-turbo`'s `Lzma2AdaptiveDecoder`
   — a stream is cut at the dictionary resets that make a *run* independently
   decodable, and runs are decoded on workers while output stays in order.
@@ -280,8 +284,10 @@ Everything here is new surface; no upstream signature changed meaning.
   `lzma-turbo`, with the exact signatures and the local work-around for each.
   The parallel-decoder request landed and is recorded as such; the AES and
   key-derivation requests were withdrawn when that crate removed both on
-  purpose; what is outstanding is worker-side checksums on the adaptive
-  decoder and a run index over a stream not yet being decoded.
+  purpose; worker-side checksums landed and this fork folds them; what is
+  outstanding is a memory limit the parallel decoder holds to, or an account
+  of what it does not hold to, and a run index over a stream not yet being
+  decoded.
 - `AGENTS.md` gained the rule this fork is now held to: no CRC-32 is computed
   in a serialised section of the multi-threaded path, and thread counts
   default to one.
@@ -293,6 +299,15 @@ Everything here is new surface; no upstream signature changed meaning.
 - `ArchiveWriter::push_archive_entries_non_solid` codes a non-solid archive's
   folders on several workers and writes them in order (0.27.0), the bytes a
   loop of `push_archive_entry` writes.
+- An LZMA2 thread count is divided between block threads and each block
+  coder's match-finder thread, as 7-Zip's `Lzma2EncProps_Normalize` divides it
+  (0.27.0): where a level runs the match finder on a thread of its own,
+  `threads` buys `threads / 2` block coders.
+- The writer sizes each folder's LZMA or LZMA2 coder to the folder, the way
+  7-Zip reduces its dictionary: a folder known to be smaller than the
+  dictionary is coded with one its size (never below 4 KiB), and one that fits
+  a single LZMA2 block is coded on one thread. `ArchiveEntry::from_path`
+  records the file's length so the size is known before the push.
 
 ### Cryptography
 
@@ -362,14 +377,13 @@ Everything here is new surface; no upstream signature changed meaning.
   `compress` carries no in-guest block cipher — and the seam mirrors
   `rarpar`'s `unrar-rs` hooks module deliberately, so an embedder wires both
   crates the same way.
-  FOLLOW-UP, deliberately not wired here: `lzma-turbo` is growing `crc-host` /
-  `crypto-host` hooks of its own on an unpublished branch. Once 0.3.6 is
-  released this crate gains `crc-host = ["lzma-turbo/crc-host"]` and
-  `crypto-host` forwards `lzma-turbo/crypto-host`, so the member CRC-32 and the
-  KDF's SHA-256 are delegated too. Until then `crypto-host` forwards
-  `lzma-turbo/native-crypto`, which is what gives a delegating wasm guest a
-  SHA-256 without a C toolchain and without dragging in `native-crypto`'s
-  `aes`/`cbc`.
+  FOLLOW-UP, not wired yet: `lzma-turbo` ships `crc-host` / `crypto-host`
+  hooks of its own (since its 0.4.0). When this crate forwards them
+  (`crc-host = ["lzma-turbo/crc-host"]`, and `crypto-host` forwarding
+  `lzma-turbo/crypto-host`), the member CRC-32 and the KDF's SHA-256 are
+  delegated too. Until then `crypto-host` forwards `lzma-turbo/native-crypto`,
+  which is what gives a delegating wasm guest a SHA-256 without a C toolchain
+  and without dragging in `native-crypto`'s `aes`/`cbc`.
 - New `sevenz_turbo::crypto_backend() -> &'static str`, reporting which backend
   a build selected (`"aws-lc"`, `"rustcrypto"`, or `"host"` on a delegating
   wasm build), for consumers who want to assert on it.

@@ -2,8 +2,9 @@
 //!
 //! # Provenance
 //!
-//! These files are copied from [`lzma-rust2`] 0.20.1 (`src/filter/`) by Nils
-//! Hasenbanck, Apache-2.0, the same licence as this crate. Upstream
+//! `bcj.rs` and `delta.rs` are copied from [`lzma-rust2`] 0.20.1
+//! (`src/filter/`) by Nils Hasenbanck, Apache-2.0, the same licence as this
+//! crate. Upstream
 //! `sevenz-rust2` reaches them through the `lzma-rust2` dependency; this fork
 //! decodes LZMA and LZMA2 with `lzma-turbo` instead, and vendoring the filters
 //! is what lets `lzma-rust2` leave the runtime dependency graph entirely

@@ -225,10 +225,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Verify the crates.io archive lists cleanly
-        # `cargo package` cannot build while `lzma-turbo` is a path dependency
-        # without a version; listing still proves the manifest and includes are
-        # sane. The build check comes back when the dependency is a published
-        # version pin (see docs/lzma-turbo-requests.md).
+        # Listing proves the manifest and the includes are sane. The packaged
+        # crate is not built here.
         run: cargo package --locked --no-verify --list
 
   ci-complete:

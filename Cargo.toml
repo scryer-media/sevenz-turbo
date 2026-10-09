@@ -50,13 +50,13 @@ native-crypto = ["dep:aes", "dep:cbc", "lzma-turbo/native-crypto"]
 # is still computed in the guest and needs a backend that builds without a C
 # toolchain.
 #
-# FOLLOW-UP (wire once `lzma-turbo` 0.3.6 lands, not before): `lzma-turbo` is
-# growing its own `crc-host` / `crypto-host` hooks on branch
-# `feature/wasm-host-hooks`. When that is published, this crate gains a
-# `crc-host = ["lzma-turbo/crc-host"]` feature and `crypto-host` forwards
-# `lzma-turbo/crypto-host`, so a wasm guest delegates the member CRC-32 and the
-# KDF's SHA-256 as well. Deliberately NOT wired here: nothing may depend on an
-# unpublished branch of `lzma-turbo`.
+# FOLLOW-UP: `lzma-turbo` has shipped `crc-host` / `crypto-host` hooks of its
+# own since 0.4.0. This crate does not forward them yet: `crypto-host` below
+# still selects `lzma-turbo/native-crypto`, so a delegating wasm guest computes
+# the member CRC-32 and the KDF's SHA-256 in the guest. Wiring it means a
+# `crc-host = ["lzma-turbo/crc-host"]` feature here, `crypto-host` forwarding
+# `lzma-turbo/crypto-host`, and a `wasm-conformance` case that proves both
+# reach the host.
 crypto-host = ["lzma-turbo/native-crypto"]
 brotli = ["dep:brotli"]
 bzip2 = ["dep:bzip2"]

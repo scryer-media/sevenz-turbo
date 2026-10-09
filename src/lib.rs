@@ -12,6 +12,11 @@
 //!    ranges, a borrowing reader, typed corruption errors carrying a block
 //!    index and packed offset, and a per-block completion hook.
 //!
+//! PPMd also goes through a different engine,
+//! [`ppmd-turbo`](https://github.com/scryer-media/ppmd-turbo), and the default
+//! thread count, the cryptography backends and the limits on hostile archives
+//! differ; the README lists them.
+//!
 //! The `CHANGELOG.md` section "Fork" is the exhaustive divergence list.
 //!
 //! ## Supported Codecs & filters

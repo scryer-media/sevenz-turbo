@@ -251,9 +251,9 @@ fn locked_version(name: &str) -> Option<&'static str> {
         .map(|(_, v)| v)
 }
 
-/// `name version` for every `ppmd-*` package locked, sorted: whichever PPMd
-/// engine the crate links (`ppmd-rust` today, `ppmd-turbo` next), and the
-/// one upstream `sevenz-rust2` brings with it, without naming either here.
+/// `name version` for every `ppmd-*` package locked, sorted: the PPMd engine
+/// the crate links (`ppmd-turbo`) and the one upstream `sevenz-rust2` brings
+/// with it (`ppmd-rust`), read from the lock so that neither is hard-coded.
 fn locked_ppmd_crates() -> Vec<String> {
     let mut crates: Vec<String> = locked_packages()
         .filter(|(name, _)| name.starts_with("ppmd-"))

@@ -23,8 +23,8 @@ want; an API the container work needs to change will change, with a version
 bump and a changelog entry.
 
 Two things are the reason the fork exists; the default thread count, the
-cryptography backends and the limits on hostile archives below also differ
-from upstream.
+cryptography backends, the PPMd engine (`ppmd-turbo`) and the limits on
+hostile archives below also differ from upstream.
 
 ### 1. LZMA and LZMA2 decode and encode with `lzma-turbo`
 
@@ -165,8 +165,8 @@ cannot build C can use `default-features = false` with `aes256, native-crypto`;
 that lane compiles to AES-NI on x86-64 and to the ARMv8 cryptography extensions
 on aarch64. Decrypting a 7z stream in pieces needs no streaming API on either
 lane: each chunk is decrypted with the current IV and its last ciphertext block
-becomes the next chunk's. Writing archives (`compress`) keeps RustCrypto's
-`cbc::Encryptor`. CRC-32 is `crc-fast`.
+becomes the next chunk's. Writing archives (`compress`) encrypts through the
+same backend switch. CRC-32 is `crc-fast`.
 
 Because Cargo features are additive, `native-crypto` cannot mean "turn AWS-LC
 off"; it means "win when both are compiled". So `aes256` does not pull a
