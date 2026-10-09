@@ -90,7 +90,7 @@ getrandom = { version = "0.4", optional = true }
 # From crates.io. While the two crates are developed together a `path` to the
 # sibling checkout is added here and dropped again before release
 # (`cargo xtask release` refuses to tag while it is here).
-lzma-turbo = { version = "0.7.0", path = "../../../lzma-turbo/.worktrees/alloc-nofill", default-features = false, features = ["std", "asm", "crc", "filters"] }
+lzma-turbo = { version = "0.7.0", default-features = false, features = ["std", "asm", "crc", "filters"] }
 # Encoders only, behind `lzma-rust2-encoder`, as the alternative to
 # `lzma-turbo`'s. The decode path never reaches lzma-rust2; see AGENTS.md.
 lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "encoder", "optimization"], optional = true }
