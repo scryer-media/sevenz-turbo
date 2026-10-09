@@ -166,7 +166,9 @@ that lane compiles to AES-NI on x86-64 and to the ARMv8 cryptography extensions
 on aarch64. Decrypting a 7z stream in pieces needs no streaming API on either
 lane: each chunk is decrypted with the current IV and its last ciphertext block
 becomes the next chunk's. Writing archives (`compress`) encrypts through the
-same backend switch. CRC-32 is `crc-fast`.
+same backend switch. CRC-32 is `crc-fast`. On wasm, `crypto-host` and
+`crc-host` hand both to the embedding host instead (see
+[WASM support](#wasm-support)).
 
 Because Cargo features are additive, `native-crypto` cannot mean "turn AWS-LC
 off"; it means "win when both are compiled". So `aes256` does not pull a
@@ -339,7 +341,7 @@ Every branch converter, BCJ2 and the delta filter are `lzma-turbo`'s
 (`lzma_turbo::filters`). The `Read`/`Write` wrappers around the BCJ and delta
 converters were vendored from `lzma-rust2` 0.20.1 (`src/codec/filter/`); the
 BCJ2 reader is this crate's own. CRC-32 everywhere is `crc-fast`, through
-`lzma-turbo`'s `crc` module.
+`lzma-turbo`'s `crc` module (the host's, on a wasm build with `crc-host`).
 
 ### WASM support
 
@@ -354,27 +356,40 @@ The `util` feature's `wasm-bindgen` exports follow the feature set: `decompress`
 is there whenever `util` is, and `compress` only when the `compress` feature is
 on as well, so a decode-only guest builds without the writer half of the crate.
 
-#### Letting the host do the AES (`crypto-host`)
+#### Letting the host do the cryptography and checksums (`crypto-host`, `crc-host`)
 
-A wasm guest has neither AES-NI nor the ARMv8 cryptography extensions, so the
-block cipher is the one part of decoding an encrypted 7z archive that the
-embedding program can do several times faster than the guest. The `crypto-host`
-feature moves it there: on a `wasm32` target the bulk AES-256-CBC **decrypt**
-leaves the guest through a plain `fn` pointer the embedder installs.
+A wasm guest has neither AES-NI, the SHA extensions, carry-less multiply nor
+their ARMv8 counterparts, so the block cipher, the key derivation's SHA-256 and
+the CRC-32 are the parts of decoding a 7z archive that the embedding program
+can do several times faster than the guest. Two features move them there, on a
+`wasm32` target only:
+
+- `crypto-host`: the bulk AES-256-CBC **decrypt** leaves the guest through this
+  crate's own hook, and the 7z key derivation's SHA-256 through `lzma-turbo`'s
+  (the feature forwards `lzma-turbo/crypto-host`).
+- `crc-host`: every CRC-32 the archive carries — start header, header, members
+  — leaves the guest through `lzma-turbo`'s hooks (the feature forwards
+  `lzma-turbo/crc-host`).
 
 ```bash
-RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --target wasm32-unknown-unknown --no-default-features --features=aes256_wasm,crypto-host,bzip2,ppmd
+RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --target wasm32-unknown-unknown --no-default-features --features=aes256_wasm,crc-host,crypto-host,bzip2,ppmd
 ```
 
-Nothing else changes: the SHA-256 key derivation, the LZMA/LZMA2 decode and the
-CRCs stay in the guest, the public API is untouched, and the encoder keeps its
-own in-guest AES. The feature adds no AES dependency at all — a delegating build
-that does not also ask for `compress` carries no block cipher of its own.
+Nothing else changes: the LZMA/LZMA2 decode stays in the guest, the public API
+is untouched, and the encoder keeps its own in-guest AES. Checksums inside a
+bzip2 or zstd stream are those codecs' own and stay in the guest too.
+`crypto-host` adds no AES dependency at all — a delegating build that does not
+also ask for `compress` carries no block cipher of its own.
 
-The embedder installs one hook before opening an encrypted archive:
+The embedder installs the hooks before opening an archive. Both seams are
+reachable from `sevenz_turbo::hooks`, so no direct dependency on `lzma-turbo`
+is needed:
 
 ```rust,ignore
-use sevenz_turbo::hooks::{HostAesError, HostCryptoHooks, install_host_crypto_hooks};
+use sevenz_turbo::hooks::{
+    HostAesError, HostCryptoHooks, HostHashHooks, install_host_crypto_hooks,
+    install_host_hash_hooks,
+};
 
 fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, HostAesError> {
     // forward to the embedder's AES-256-CBC (a raw wasm import, a component
@@ -382,9 +397,12 @@ fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, HostAe
 }
 
 install_host_crypto_hooks(HostCryptoHooks { aes_cbc_decrypt });
+install_host_hash_hooks(HostHashHooks::new(
+    crc32, crc64_xz, sha256_init, sha256_clone, sha256_update, sha256_finalize, sha256_drop,
+));
 ```
 
-The contract the hook must satisfy:
+The contract the AES hook must satisfy:
 
 - It returns the AES-256-CBC decryption of `data` under `key`/`iv`, **no
   padding**, as a fresh buffer of exactly `data.len()` bytes.
@@ -392,21 +410,31 @@ The contract the hook must satisfy:
   may be empty.
 - It is **stateless per call**: this crate threads the CBC IV across chunks
   itself, so a host never carries cipher state between calls.
-- A hook that errors, answers with the wrong length, or was never installed is
-  an embedder contract violation and panics. There is no silent in-guest
-  fallback, because a fallback would quietly undo the delegation.
+
+The hash hooks are `lzma-turbo`'s, and so is their contract (see
+`lzma_turbo::hooks`): the CRCs resume from a seed in the finalized domain,
+SHA-256 is a streaming state behind an opaque handle, and every handle is
+finalized or dropped exactly once. `HostHashHooks` takes every hook whichever
+feature is on, and only the ones a feature consumes are called; 7z has no
+CRC-64, so `crc64_xz` is never called by this crate.
+
+A hook that errors, answers with the wrong length, or was never installed is an
+embedder contract violation and panics. There is no silent in-guest fallback,
+because a fallback would quietly undo the delegation.
 
 `examples/wasm_host_extract_conformance.rs` is a complete reference embedding —
-a `wasm32-wasip1` guest that declares one raw import in a `host` namespace and
-forwards the hook to it — and `tools/wasm-conformance` is the native `wasmtime`
-harness that runs it: it writes an encrypted fixture archive,
-extracts it inside the guest through a reference host AES, and asserts the
-guest's bytes equal the native decoder's. `wasmtime` is a dev-dependency of that
-harness only and never enters the crate's dependency graph.
+a `wasm32-wasip1` guest that declares its raw imports in a `host` namespace and
+forwards the hooks to them — and `tools/wasm-conformance` is the native
+`wasmtime` harness that runs it: it writes an encrypted fixture archive,
+extracts it inside the guest through a reference host AES, SHA-256 and CRC-32,
+asserts the guest's bytes equal the native decoder's and that each import was
+actually called, and checks that a guest missing either set of hooks panics
+with that set's message. `wasmtime` is a dev-dependency of that harness only and
+never enters the crate's dependency graph.
 
-On native targets `crypto-host` is accepted but inert: AWS-LC or RustCrypto
-stays selected and no hook is ever called, so feature unification in a mixed
-workspace cannot turn a native build into a delegating one.
+On native targets both features are accepted but inert: AWS-LC or RustCrypto
+and `crc-fast` stay selected and no hook is ever called, so feature unification
+in a mixed workspace cannot turn a native build into a delegating one.
 
 ## Acknowledgements
 

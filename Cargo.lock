@@ -2197,7 +2197,9 @@ version = "0.0.0"
 dependencies = [
  "aes",
  "cbc",
+ "crc-fast",
  "sevenz-turbo",
+ "sha2 0.11.0",
  "tempfile",
  "wasmtime",
  "wasmtime-wasi",

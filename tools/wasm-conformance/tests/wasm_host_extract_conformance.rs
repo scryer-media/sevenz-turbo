@@ -1,14 +1,15 @@
 //! Native `wasmtime` driver for the encrypted-extraction CONFORMANCE test.
 //!
 //! This is the executable proof that a full AES-256 encrypted 7z extraction
-//! runs correctly inside a wasm guest whose block cipher lives on the host:
-//! the crate's `crypto-host` backend, the embedder hook it calls
-//! (`sevenz_turbo::hooks`), and the example's own raw import
-//! (`host::host_aes_cbc_decrypt`) that the hook forwards to. It DOUBLES as the
-//! reference an embedding host must satisfy for that ABI — it implements
-//! `host_aes_cbc_decrypt` exactly to contract (raw offsets into the guest's
-//! linear memory, in-place AES-256-CBC, no padding, stateless per call) with a
-//! RustCrypto reference.
+//! runs correctly inside a wasm guest whose block cipher, key-derivation hash
+//! and CRC-32 live on the host: the crate's `crypto-host` and `crc-host`
+//! backends, the embedder hooks they call (`sevenz_turbo::hooks`), and the
+//! example's own raw imports in the `host` namespace that the hooks forward
+//! to. It DOUBLES as the reference an embedding host must satisfy for that
+//! ABI — it implements every import exactly to contract (raw offsets into the
+//! guest's linear memory; in-place AES-256-CBC, no padding, stateless per
+//! call; CRCs resumed from a finalized seed; SHA-256 behind opaque handles)
+//! with RustCrypto and `crc-fast` references.
 //!
 //! What is asserted:
 //!
@@ -16,30 +17,37 @@
 //!    byte-identical, entry for entry, to the same archive decoded by the
 //!    native decoder in this process. Nothing weaker: the guest prints the hex
 //!    of every recovered byte.
-//! 2. A guest that never installs a hook panics with the documented message
-//!    rather than decoding wrongly or silently falling back in-guest.
+//! 2. The AES, CRC-32 and SHA-256 imports were each actually called, and every
+//!    SHA-256 handle the guest opened was closed — so the extraction went
+//!    through the host rather than through an in-guest backend.
+//! 3. A guest that never installs one set of hooks panics with that set's
+//!    documented message rather than decoding wrongly or silently falling back
+//!    in-guest.
 //!
 //! Flow:
 //!   1. Write a fixture archive (AES-256 + LZMA2, invented file names) into
 //!      `CARGO_TARGET_TMPDIR` with this crate's own encoder.
 //!   2. Build `examples/wasm_host_extract_conformance.rs` for `wasm32-wasip1`
-//!      with `--no-default-features --features aes256,crypto-host`, into a
+//!      with `--no-default-features --features aes256,crc-host,crypto-host`, into a
 //!      private target dir so the nested cargo does not fight the outer test's
 //!      target lock.
 //!   3. Instantiate with `wasmtime`, providing WASI preview1 (argv, stdio, and
-//!      the fixture directory preopened read-only as `/fixture`) plus the one
-//!      custom host import.
-//!   4. Run `_start` and compare its stdout with the native extraction.
+//!      the fixture directory preopened read-only as `/fixture`) plus the
+//!      custom host imports.
+//!   4. Run `_start`, compare its stdout with the native extraction, and check
+//!      the host's call counts.
 //!
 //! Skipped automatically if the `wasm32-wasip1` target is not installed.
 
 #![cfg(not(target_family = "wasm"))]
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
 
-use wasmtime::{Caller, Engine, Extern, Linker, Module, Store};
+use sha2::Digest as _;
+use wasmtime::{Caller, Engine, Extern, Linker, Memory, Module, Store};
 use wasmtime_wasi::p1::WasiP1Ctx;
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{FsPerms, WasiCtxBuilder};
@@ -55,6 +63,128 @@ const RC_OOB: i64 = -3;
 /// The password the fixture is written and read with. It is a test fixture,
 /// not a secret.
 const FIXTURE_PASSWORD: &str = "cormorant-bracket-9";
+
+/// What the guest's store carries: its WASI context, the reference host's
+/// SHA-256 states, and a count of every delegated call.
+struct Host {
+    wasi: WasiP1Ctx,
+    /// Live SHA-256 states, by the handle the guest holds.
+    sha: HashMap<i64, sha2::Sha256>,
+    /// The next handle to hand out. Never reused, so a stale handle is caught.
+    next_handle: i64,
+    calls: Calls,
+}
+
+/// How many times the guest crossed each import.
+#[derive(Debug, Default, Clone, Copy)]
+struct Calls {
+    aes: usize,
+    crc32: usize,
+    sha256_init: usize,
+    sha256_update: usize,
+    sha256_finalize: usize,
+    sha256_close: usize,
+}
+
+/// The guest's exported linear memory. A module without one cannot have made
+/// a call that passes pointers, so its absence is a harness bug.
+fn guest_memory(caller: &mut Caller<'_, Host>) -> Memory {
+    match caller.get_export("memory") {
+        Some(Extern::Memory(memory)) => memory,
+        _ => panic!("the guest exports no linear memory"),
+    }
+}
+
+/// Read `len` bytes at `ptr` from the guest, trapping (by panicking the host
+/// call) on an out-of-bounds range: that is a contract violation, not an
+/// outcome to report.
+fn read_guest(caller: &mut Caller<'_, Host>, ptr: i32, len: i32) -> Vec<u8> {
+    let memory = guest_memory(caller);
+    let mut buf = vec![0u8; len as u32 as usize];
+    memory
+        .read(&*caller, ptr as u32 as usize, &mut buf)
+        .expect("guest range out of bounds (contract violation)");
+    buf
+}
+
+/// The reference `host_crc32`: CRC-32/ISO-HDLC resumed from a finalized seed.
+/// `crc-fast`'s running register is the complement of the finalized value, so
+/// seeding it with `!seed` resumes the stream exactly.
+fn reference_host_crc32(mut caller: Caller<'_, Host>, seed: i32, ptr: i32, len: i32) -> i32 {
+    caller.data_mut().calls.crc32 += 1;
+    let data = read_guest(&mut caller, ptr, len);
+    let mut digest = crc_fast::Digest::new_with_init_state(
+        crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+        u64::from(!(seed as u32)),
+    );
+    digest.update(&data);
+    digest.finalize() as u32 as i32
+}
+
+/// The reference `host_crc64_xz`. 7z carries no CRC-64, so the guest never
+/// calls it; it is here because the hook set requires one.
+fn reference_host_crc64_xz(mut caller: Caller<'_, Host>, seed: i64, ptr: i32, len: i32) -> i64 {
+    let data = read_guest(&mut caller, ptr, len);
+    let mut digest =
+        crc_fast::Digest::new_with_init_state(crc_fast::CrcAlgorithm::Crc64Xz, !(seed as u64));
+    digest.update(&data);
+    digest.finalize() as i64
+}
+
+fn reference_host_sha256_init(mut caller: Caller<'_, Host>) -> i64 {
+    let host = caller.data_mut();
+    host.calls.sha256_init += 1;
+    let handle = host.next_handle;
+    host.next_handle += 1;
+    host.sha.insert(handle, sha2::Sha256::new());
+    handle
+}
+
+fn reference_host_sha256_clone(mut caller: Caller<'_, Host>, handle: i64) -> i64 {
+    let host = caller.data_mut();
+    let copy = host
+        .sha
+        .get(&handle)
+        .expect("sha256_clone of a handle that is not live (contract violation)")
+        .clone();
+    let new = host.next_handle;
+    host.next_handle += 1;
+    host.sha.insert(new, copy);
+    new
+}
+
+fn reference_host_sha256_update(mut caller: Caller<'_, Host>, handle: i64, ptr: i32, len: i32) {
+    let data = read_guest(&mut caller, ptr, len);
+    let host = caller.data_mut();
+    host.calls.sha256_update += 1;
+    host.sha
+        .get_mut(&handle)
+        .expect("sha256_update of a handle that is not live (contract violation)")
+        .update(&data);
+}
+
+fn reference_host_sha256_finalize(mut caller: Caller<'_, Host>, handle: i64, out_ptr: i32) {
+    let host = caller.data_mut();
+    host.calls.sha256_finalize += 1;
+    host.calls.sha256_close += 1;
+    let digest = host
+        .sha
+        .remove(&handle)
+        .expect("sha256_finalize of a handle that is not live (contract violation)")
+        .finalize();
+    let memory = guest_memory(&mut caller);
+    memory
+        .write(&mut caller, out_ptr as u32 as usize, &digest)
+        .expect("digest destination out of bounds (contract violation)");
+}
+
+fn reference_host_sha256_drop(mut caller: Caller<'_, Host>, handle: i64) {
+    let host = caller.data_mut();
+    host.calls.sha256_close += 1;
+    host.sha
+        .remove(&handle)
+        .expect("sha256_drop of a handle that is not live (contract violation)");
+}
 
 /// Reference AES-256-CBC decrypt in place with a FRESH context seeded by `iv`
 /// (stateless per call, matching the host contract).
@@ -73,13 +203,14 @@ fn reference_cbc_decrypt(key: &[u8; 32], iv: &[u8; AES_BLOCK], data: &mut [u8]) 
 /// the passed offsets, decrypts in place, and writes the plaintext back.
 /// Stateless per call. Returns the contract's status codes.
 fn reference_host_aes_cbc_decrypt(
-    mut caller: Caller<'_, WasiP1Ctx>,
+    mut caller: Caller<'_, Host>,
     key_ptr: i64,
     key_len: i64,
     iv_ptr: i64,
     buf_ptr: i64,
     buf_len: i64,
 ) -> i64 {
+    caller.data_mut().calls.aes += 1;
     // Validate per the contract before touching memory. 7z is AES-256 only.
     if key_len != 32 {
         return RC_BAD_KEY_LEN;
@@ -188,7 +319,8 @@ fn wasm_toolchain() -> Option<(PathBuf, PathBuf)> {
     Some((cargo, rustc))
 }
 
-/// Build the conformance example for `wasm32-wasip1` with `crypto-host` and
+/// Build the conformance example for `wasm32-wasip1` with the delegating
+/// features and
 /// return the path to the produced `.wasm`.
 ///
 /// Built once per test binary: the tests below run in parallel and would
@@ -220,7 +352,7 @@ fn build_conformance_wasm() -> PathBuf {
             "wasm_host_extract_conformance",
             "--no-default-features",
             "--features",
-            "aes256,crypto-host",
+            "aes256,crc-host,crypto-host",
             "--target",
             "wasm32-wasip1",
         ])
@@ -321,19 +453,22 @@ struct GuestRun {
     stdout: String,
     stderr: String,
     outcome: Result<(), String>,
+    calls: Calls,
+    /// SHA-256 handles the guest opened and never closed.
+    live_sha_handles: usize,
 }
 
 /// Run the wasm guest over the preopened `fixture_dir`, with the reference host
-/// AES import, capturing stdout and stderr.
+/// imports, capturing stdout and stderr.
 fn run_guest(wasm: &Path, fixture_dir: &Path, extra_arg: Option<&str>) -> GuestRun {
     let engine = Engine::default();
     let module = Module::from_file(&engine, wasm).expect("load wasm module");
 
-    let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
-    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |ctx: &mut WasiP1Ctx| ctx)
+    let mut linker: Linker<Host> = Linker::new(&engine);
+    wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |host: &mut Host| &mut host.wasi)
         .expect("add wasi preview1 to linker");
-    // The one custom import, in the fixed namespace, satisfying the example's
-    // raw `#[link(wasm_import_module = "host")]` extern.
+    // The custom imports, in the fixed namespace, satisfying the example's raw
+    // `#[link(wasm_import_module = "host")]` externs.
     linker
         .func_wrap(
             "host",
@@ -341,6 +476,31 @@ fn run_guest(wasm: &Path, fixture_dir: &Path, extra_arg: Option<&str>) -> GuestR
             reference_host_aes_cbc_decrypt,
         )
         .expect("define host host_aes_cbc_decrypt");
+    linker
+        .func_wrap("host", "host_crc32", reference_host_crc32)
+        .expect("define host host_crc32");
+    linker
+        .func_wrap("host", "host_crc64_xz", reference_host_crc64_xz)
+        .expect("define host host_crc64_xz");
+    linker
+        .func_wrap("host", "host_sha256_init", reference_host_sha256_init)
+        .expect("define host host_sha256_init");
+    linker
+        .func_wrap("host", "host_sha256_clone", reference_host_sha256_clone)
+        .expect("define host host_sha256_clone");
+    linker
+        .func_wrap("host", "host_sha256_update", reference_host_sha256_update)
+        .expect("define host host_sha256_update");
+    linker
+        .func_wrap(
+            "host",
+            "host_sha256_finalize",
+            reference_host_sha256_finalize,
+        )
+        .expect("define host host_sha256_finalize");
+    linker
+        .func_wrap("host", "host_sha256_drop", reference_host_sha256_drop)
+        .expect("define host host_sha256_drop");
 
     let stdout = MemoryOutputPipe::new(16 * 1024 * 1024);
     let stderr = MemoryOutputPipe::new(1024 * 1024);
@@ -356,7 +516,15 @@ fn run_guest(wasm: &Path, fixture_dir: &Path, extra_arg: Option<&str>) -> GuestR
     if let Some(arg) = extra_arg {
         builder.arg(arg);
     }
-    let mut store = Store::new(&engine, builder.build_p1());
+    let mut store = Store::new(
+        &engine,
+        Host {
+            wasi: builder.build_p1(),
+            sha: HashMap::new(),
+            next_handle: 1,
+            calls: Calls::default(),
+        },
+    );
 
     let instance = linker
         .instantiate(&mut store, &module)
@@ -376,16 +544,21 @@ fn run_guest(wasm: &Path, fixture_dir: &Path, extra_arg: Option<&str>) -> GuestR
         },
     };
 
+    let calls = store.data().calls;
+    let live_sha_handles = store.data().sha.len();
     drop(store);
     GuestRun {
         stdout: String::from_utf8_lossy(&stdout.contents()).into_owned(),
         stderr: String::from_utf8_lossy(&stderr.contents()).into_owned(),
         outcome,
+        calls,
+        live_sha_handles,
     }
 }
 
 /// The conformance assertion: everything the guest recovered through the host
-/// AES equals, byte for byte, what the native decoder recovers.
+/// AES, SHA-256 and CRC-32 equals, byte for byte, what the native decoder
+/// recovers, and each of those really was the host's.
 #[test]
 fn wasm_guest_extraction_matches_the_native_decoder() {
     if wasm_toolchain().is_none() {
@@ -423,29 +596,40 @@ fn wasm_guest_extraction_matches_the_native_decoder() {
             "guest extraction of {name} differs from the native decoder's"
         );
     }
+
+    let calls = run.calls;
+    assert!(calls.aes > 0, "no AES call reached the host: {calls:?}");
+    assert!(
+        calls.crc32 > 0,
+        "no CRC-32 call reached the host: {calls:?}"
+    );
+    assert!(
+        calls.sha256_init > 0 && calls.sha256_update > 0 && calls.sha256_finalize > 0,
+        "the key derivation's SHA-256 did not run on the host: {calls:?}"
+    );
+    assert_eq!(
+        run.live_sha_handles, 0,
+        "the guest left SHA-256 handles open: {calls:?}"
+    );
 }
 
-/// A guest that never installs a hook must stop with the documented message.
-/// Silently decoding wrongly, or falling back to an in-guest cipher, would
-/// defeat the whole point of delegation — so the absence of wiring is a panic
-/// an embedder cannot miss.
+/// A guest that never installs this crate's AES hook must stop with the
+/// documented message. Silently decoding wrongly, or falling back to an
+/// in-guest cipher, would defeat the whole point of delegation — so the
+/// absence of wiring is a panic an embedder cannot miss.
 #[test]
-fn a_guest_without_hooks_panics_with_the_documented_message() {
+fn a_guest_without_the_aes_hook_panics_with_the_documented_message() {
     if wasm_toolchain().is_none() {
         eprintln!("skipping: wasm32-wasip1 target not installed");
         return;
     }
 
     let fixture = write_fixture();
-    let run = run_guest(
-        &CONFORMANCE_WASM,
-        fixture.path(),
-        Some("--skip-hook-install"),
-    );
+    let run = run_guest(&CONFORMANCE_WASM, fixture.path(), Some("--skip-aes-hook"));
 
     assert!(
         run.outcome.is_err(),
-        "a guest with no hooks installed must not complete an extraction\n\
+        "a guest with no AES hook installed must not complete an extraction\n\
          --- guest stdout ---\n{}",
         run.stdout
     );
@@ -456,6 +640,36 @@ fn a_guest_without_hooks_panics_with_the_documented_message() {
     );
     assert!(
         run.stderr.contains("install_host_crypto_hooks"),
+        "the panic must name the call that fixes it; stderr was:\n{}",
+        run.stderr
+    );
+}
+
+/// The same for `lzma-turbo`'s hash hooks, which this crate re-exports: the
+/// first CRC-32 the reader verifies has nowhere to go, and says so.
+#[test]
+fn a_guest_without_the_hash_hooks_panics_with_the_documented_message() {
+    if wasm_toolchain().is_none() {
+        eprintln!("skipping: wasm32-wasip1 target not installed");
+        return;
+    }
+
+    let fixture = write_fixture();
+    let run = run_guest(&CONFORMANCE_WASM, fixture.path(), Some("--skip-hash-hooks"));
+
+    assert!(
+        run.outcome.is_err(),
+        "a guest with no hash hooks installed must not complete an extraction\n\
+         --- guest stdout ---\n{}",
+        run.stdout
+    );
+    assert!(
+        run.stderr.contains("no host hash hooks installed"),
+        "the panic must name the missing wiring; stderr was:\n{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("install_host_hash_hooks"),
         "the panic must name the call that fixes it; stderr was:\n{}",
         run.stderr
     );

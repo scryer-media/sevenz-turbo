@@ -174,10 +174,11 @@ jobs:
         env:
           RUSTFLAGS: --cfg getrandom_backend="wasm_js"
       # Decode-only and delegating: the configuration a wasm embedder actually
-      # ships, which carries no in-guest block cipher at all. Without `util`,
-      # so the crate is proven to build with no `wasm-bindgen` export surface.
+      # ships, which carries no in-guest block cipher at all and hands the
+      # CRC-32 to the host as well. Without `util`, so the crate is proven to
+      # build with no `wasm-bindgen` export surface.
       - name: Check the delegating wasm guest without an in-guest AES
-        run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features aes256_wasm,crypto-host,bzip2,ppmd
+        run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features aes256_wasm,crc-host,crypto-host,bzip2,ppmd
         env:
           RUSTFLAGS: --cfg getrandom_backend="wasm_js"
       # The same set with `util`: the `wasm-bindgen` surface compiles without
@@ -188,9 +189,9 @@ jobs:
         env:
           RUSTFLAGS: --cfg getrandom_backend="wasm_js"
       # The conformance harness builds the wasm32-wasip1 guest example itself
-      # and runs it under `wasmtime` with a reference host AES, comparing the
-      # guest's extraction with the native decoder's.
-      - name: Run the wasm host-AES conformance harness
+      # and runs it under `wasmtime` with a reference host AES, SHA-256 and
+      # CRC-32, comparing the guest's extraction with the native decoder's.
+      - name: Run the wasm host-delegation conformance harness
         run: |
           cargo clippy --locked -p wasm-conformance --all-targets -- -D warnings
           cargo test --locked -p wasm-conformance

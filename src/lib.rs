@@ -105,10 +105,11 @@ pub fn lzma_encoder() -> &'static str {
     }
 }
 
-/// Embedder-supplied delegation hooks for the bulk AES-256-CBC decrypt
-/// (the `crypto-host` feature). See the module documentation for the contract
-/// a host must satisfy.
-#[cfg(all(feature = "aes256", feature = "crypto-host"))]
+/// Embedder-supplied delegation hooks for the bulk AES-256-CBC decrypt, the
+/// key derivation's SHA-256 and the 7z CRC-32 (the `crypto-host` and
+/// `crc-host` features). See the module documentation for the contract a host
+/// must satisfy.
+#[cfg(any(feature = "crc-host", feature = "crypto-host"))]
 pub mod hooks;
 
 mod error;
