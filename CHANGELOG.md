@@ -1034,6 +1034,19 @@ Everything here is new surface; no upstream signature changed meaning.
   median of 3, peak RSS: `aes_mx1` 33 to 28 MiB at two threads and 81 to 63
   MiB at eight; `media_mx1` 33 to 29 MiB and 81 to 69 MiB. Wall time is
   unchanged within 1.5%.
+- A parallel LZMA2 decode of runs of at most 4 MiB, which is what `7zz` writes
+  at `-mx1` and for dictionaries up to 1 MiB, reads its input in 1 MiB pieces
+  and keeps one run per thread waiting instead of two. A piece is let go
+  only once every run in it is done, so a 4 MiB read held four small runs for
+  each one being decoded. The run size comes from the runs already scanned,
+  and before the first has closed from the dictionary, so the first reads
+  are already the right size. Larger runs are read as before: on 128 MiB
+  runs either change alone cost a sixth of the wall time at four threads.
+  Linux x86-64, 1 GiB, median of 3, peak RSS: `aes_mx1` 28 to 19 MiB at two
+  threads and 63 to 48 MiB at eight; `media_mx1` 28 to 18 MiB and 66 to 52
+  MiB; 4 MiB runs at two threads 50 to 33 MiB. Wall time is unchanged within
+  the run-to-run spread, and the 2 GiB, 128 MiB-run decode at four threads is
+  unchanged.
 
 ## 0.26.1 - 2026-09-29
 
