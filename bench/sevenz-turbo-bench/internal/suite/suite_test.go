@@ -120,9 +120,15 @@ func TestBCJ2RowHasBothOneThreadReferences(t *testing.T) {
 				if _, ok := references[VariantOracleOneThread]; ok {
 					t.Errorf("quick=%t: %s has the one-thread reference", quick, scenario.ID)
 				}
+				if scenario.ParityReference != "" {
+					t.Errorf("quick=%t: %s judges parity against %q, want 7zz", quick, scenario.ID, scenario.ParityReference)
+				}
 				continue
 			}
 			found = true
+			if scenario.ParityReference != VariantOracleOneThread {
+				t.Errorf("quick=%t: decode/bcj2/T1 judges parity against %q, want %q", quick, scenario.ParityReference, VariantOracleOneThread)
+			}
 			want := map[string]string{VariantOracle: "t -bso0 -bsp0 -mmt=1", VariantOracleOneThread: "t -bso0 -bsp0 -mmt=1 -mmtf=off"}
 			if len(references) != len(want) {
 				t.Errorf("quick=%t: references %v, want %v", quick, references, want)
