@@ -1561,13 +1561,21 @@ impl<R: Read> Lzma2MtReader<R> {
     /// Complete runs the decoder should have waiting once this reader has read
     /// far enough ahead: [`MT_BACKLOG_RUNS_PER_THREAD`] for every thread that
     /// can be decoding at once.
+    ///
+    /// Small runs wait no deeper than one past [`Self::demand_floor`] either:
+    /// a run for every idle worker and two spare. With every thread busy that
+    /// is two runs, where a run per thread was eight at eight threads, each
+    /// held in its piece while it waited. One spare is too few: the feed then
+    /// stops with the next run's header unread, so the run behind cannot be
+    /// declared, its piece is cut and grown again, and two threads lost 4 MiB
+    /// that way. With two spare, 1 MiB runs at eight threads peaked 5 to 9 MiB
+    /// lower at the same wall time and two threads held within 1 MiB.
     fn backlog_target(&self) -> u64 {
-        let per_thread = if self.small_runs() {
-            MT_SMALL_RUN_BACKLOG_PER_THREAD
-        } else {
-            MT_BACKLOG_RUNS_PER_THREAD
-        };
-        self.affordable_threads() * per_thread
+        if self.small_runs() {
+            let per_thread = self.affordable_threads() * MT_SMALL_RUN_BACKLOG_PER_THREAD;
+            return per_thread.min(self.demand_floor() + 1);
+        }
+        self.affordable_threads() * MT_BACKLOG_RUNS_PER_THREAD
     }
 
     /// Whether this stream's runs are small runs; see [`MT_SMALL_RUN_BYTES`].

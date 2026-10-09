@@ -1047,6 +1047,12 @@ Everything here is new surface; no upstream signature changed meaning.
   MiB; 4 MiB runs at two threads 50 to 33 MiB. Wall time is unchanged within
   the run-to-run spread, and the 2 GiB, 128 MiB-run decode at four threads is
   unchanged.
+- A parallel LZMA2 decode of those small runs keeps no more of them waiting
+  than its idle workers can take plus two, so with every thread busy two
+  runs wait instead of one per thread. Linux x86-64, 1 GiB, median of 3,
+  peak RSS at eight threads: `aes_mx1` 46 to 39-41 MiB and `media_mx1` 50
+  to 40-43 MiB; at two threads within 1 MiB of before. Wall time is
+  unchanged within the run-to-run spread.
 
 ## 0.26.1 - 2026-09-29
 
