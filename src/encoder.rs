@@ -522,40 +522,74 @@ fn lzma2_rust2_uses_mt(options: &Lzma2Options) -> bool {
     options.threads > 1 && !lzma2_fits_one_block(options)
 }
 
+/// The threads of its own the coder of `mc` runs on: a block-parallel LZMA2
+/// coder's block threads, and with `lzma-turbo`'s encoder every other LZMA
+/// and LZMA2 coder's one. Any other coder has none: it runs on the thread
+/// writing into the chain.
+fn coder_threads(mc: &EncoderConfiguration) -> u32 {
+    match (mc.method.id(), &mc.options) {
+        #[cfg(not(feature = "lzma-rust2-encoder"))]
+        (EncoderMethod::ID_LZMA2, Some(EncoderOptions::Lzma2(options))) => {
+            lzma2_block_plan(options).1 as u32
+        }
+        #[cfg(not(feature = "lzma-rust2-encoder"))]
+        (EncoderMethod::ID_LZMA | EncoderMethod::ID_LZMA2, _) => 1,
+        // `lzma-rust2`'s single-threaded writers code inside `write`.
+        #[cfg(feature = "lzma-rust2-encoder")]
+        (EncoderMethod::ID_LZMA2, Some(EncoderOptions::Lzma2(options)))
+            if lzma2_rust2_uses_mt(options) =>
+        {
+            options.threads
+        }
+        _ => 0,
+    }
+}
+
+/// Whether `method` compresses, where a filter or the cipher only transforms
+/// what passes through it.
+fn compresses(method: EncoderMethod) -> bool {
+    matches!(
+        method.id(),
+        EncoderMethod::ID_LZMA
+            | EncoderMethod::ID_LZMA2
+            | EncoderMethod::ID_PPMD
+            | EncoderMethod::ID_BZIP2
+            | EncoderMethod::ID_DEFLATE
+            | EncoderMethod::ID_BROTLI
+            | EncoderMethod::ID_ZSTD
+            | EncoderMethod::ID_LZ4
+    )
+}
+
 /// The threads coding one folder with `methods` keeps busy. `methods` are the
 /// folder's, already sized for it.
 ///
-/// A coder that runs on threads of its own counts for those: a block-parallel
-/// LZMA2 coder for its block threads, and with `lzma-turbo`'s encoder every
-/// other LZMA and LZMA2 coder for its one. The coders of a chain run at once,
-/// so their threads add up. Every other coder runs on the thread writing into
-/// the chain, which is the one thread a chain with no such coder keeps busy,
-/// and which only feeds the coders and waits for them where there is one.
+/// The coders of a chain run at once, so the threads they run on add up (see
+/// [`coder_threads`]). Every other coder runs on the thread writing into the
+/// chain, which is the one thread a chain with no such coder keeps busy.
+///
+/// Beside such a coder that thread is counted only where a compressor codes
+/// on it. A second compressor is at work while the coders' threads are: eight
+/// folders of PPMd or BZip2 with LZMA2 measured at up to 12.7 cores. A filter
+/// or the cipher is not counted: the thread passes the coders' bytes through
+/// it and waits for them, and eight folders of LZMA2 measured at 7.7 to 7.9
+/// cores with AES-256 over it and 7.7 to 8.0 without.
 ///
 /// BCJ2's call and jump coders are not counted here: a caller that counts its
 /// folders against a thread budget builds the chain with
 /// [`Bcj2Sides::Inline`], which starts no thread for them.
 pub(crate) fn folder_threads(methods: &[EncoderConfiguration]) -> u32 {
-    methods
+    let own = methods
         .iter()
-        .map(|mc| match (mc.method.id(), &mc.options) {
-            #[cfg(not(feature = "lzma-rust2-encoder"))]
-            (EncoderMethod::ID_LZMA2, Some(EncoderOptions::Lzma2(options))) => {
-                lzma2_block_plan(options).1 as u32
-            }
-            #[cfg(not(feature = "lzma-rust2-encoder"))]
-            (EncoderMethod::ID_LZMA | EncoderMethod::ID_LZMA2, _) => 1,
-            // `lzma-rust2`'s single-threaded writers code inside `write`.
-            #[cfg(feature = "lzma-rust2-encoder")]
-            (EncoderMethod::ID_LZMA2, Some(EncoderOptions::Lzma2(options)))
-                if lzma2_rust2_uses_mt(options) =>
-            {
-                options.threads
-            }
-            _ => 0,
-        })
-        .fold(0, u32::saturating_add)
-        .max(1)
+        .map(coder_threads)
+        .fold(0, u32::saturating_add);
+    if own == 0 {
+        return 1;
+    }
+    let writing_thread_compresses = methods
+        .iter()
+        .any(|mc| coder_threads(mc) == 0 && compresses(mc.method));
+    own.saturating_add(u32::from(writing_thread_compresses))
 }
 
 /// `methods` for a folder coded on one worker of a parallel non-solid write:
@@ -1025,24 +1059,110 @@ mod tests {
         assert_eq!(folder_threads(&one_thread_each(&wide)), 2);
     }
 
+    /// A compressor with no thread of its own codes on the thread writing
+    /// into the chain, and beside an LZMA or LZMA2 coder that thread is at
+    /// work while the coder's is: it counts. A filter or the cipher there
+    /// does not, and neither does a chain that runs on the one thread anyway.
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    #[test]
+    fn a_second_compressor_costs_the_thread_writing_into_the_chain() {
+        use super::{folder_threads, one_thread_each};
+        use crate::encoder_options::{Lzma2Options, LzmaOptions};
+        use crate::{EncoderConfiguration, EncoderMethod};
+
+        let lzma2 = || EncoderConfiguration::from(Lzma2Options::from_level(5));
+        let lzma = || EncoderConfiguration::from(LzmaOptions::from_level(5));
+        let bare = |method: EncoderMethod| EncoderConfiguration::from(method);
+
+        // Either side of the coder: the one that takes the data, or the one
+        // that takes the coder's output.
+        for other in [
+            EncoderMethod::PPMD,
+            EncoderMethod::BZIP2,
+            EncoderMethod::DEFLATE,
+            EncoderMethod::BROTLI,
+            EncoderMethod::ZSTD,
+            EncoderMethod::LZ4,
+        ] {
+            assert_eq!(folder_threads(&[lzma2(), bare(other)]), 2, "{other:?}");
+            assert_eq!(folder_threads(&[bare(other), lzma2()]), 2, "{other:?}");
+            assert_eq!(folder_threads(&[bare(other), lzma()]), 2, "{other:?}");
+            // Alone, or under the cipher, it is the one thread.
+            assert_eq!(folder_threads(&[bare(other)]), 1, "{other:?}");
+            assert_eq!(
+                folder_threads(&[bare(EncoderMethod::AES256_SHA256), bare(other)]),
+                1,
+                "{other:?}"
+            );
+        }
+        // The writing thread is one thread, whatever codes on it.
+        assert_eq!(
+            folder_threads(&[
+                lzma2(),
+                bare(EncoderMethod::PPMD),
+                bare(EncoderMethod::BZIP2)
+            ]),
+            2
+        );
+        assert_eq!(
+            folder_threads(&[lzma2(), lzma(), bare(EncoderMethod::PPMD)]),
+            3
+        );
+
+        // The cipher and the filters pass the coder's bytes on: no thread.
+        for passing in [
+            EncoderMethod::AES256_SHA256,
+            EncoderMethod::COPY,
+            EncoderMethod::DELTA_FILTER,
+            EncoderMethod::BCJ_X86_FILTER,
+            EncoderMethod::BCJ_ARM64_FILTER,
+            EncoderMethod::BCJ2_FILTER,
+        ] {
+            assert_eq!(folder_threads(&[bare(passing), lzma2()]), 1, "{passing:?}");
+            assert_eq!(folder_threads(&[lzma2(), bare(passing)]), 1, "{passing:?}");
+            assert_eq!(
+                folder_threads(&[bare(passing), lzma2(), lzma()]),
+                2,
+                "{passing:?}"
+            );
+        }
+
+        // On a worker of the folder-parallel writer: its coder's one thread
+        // and the worker's own.
+        let wide = [
+            EncoderConfiguration::from(Lzma2Options::from_level_mt(5, 8, 32 << 20)),
+            bare(EncoderMethod::PPMD),
+        ];
+        assert_eq!(folder_threads(&wide), 5);
+        assert_eq!(folder_threads(&one_thread_each(&wide)), 2);
+    }
+
     /// `lzma-rust2`'s single-threaded writers code on the thread writing into
-    /// the chain, so only its multi-threaded LZMA2 writer costs threads.
+    /// the chain, so only its multi-threaded LZMA2 writer costs threads of
+    /// its own; a single-threaded writer beside it is a compressor on the
+    /// writing thread, and costs that one.
     #[cfg(feature = "lzma-rust2-encoder")]
     #[test]
     fn only_the_rust2_mt_writer_costs_a_folder_threads() {
         use super::{folder_threads, one_thread_each};
-        use crate::EncoderConfiguration;
         use crate::encoder_options::{Lzma2Options, LzmaOptions};
+        use crate::{EncoderConfiguration, EncoderMethod};
 
         let lzma2 = || EncoderConfiguration::from(Lzma2Options::from_level(5));
         let lzma = || EncoderConfiguration::from(LzmaOptions::from_level(5));
+        let mt = || EncoderConfiguration::from(Lzma2Options::from_level_mt(5, 8, 32 << 20));
         assert_eq!(folder_threads(&[lzma2()]), 1);
         assert_eq!(folder_threads(&[lzma2(), lzma()]), 1);
-        let wide = [
-            EncoderConfiguration::from(Lzma2Options::from_level_mt(5, 8, 32 << 20)),
-            lzma(),
-        ];
-        assert_eq!(folder_threads(&wide), 8);
+        assert_eq!(folder_threads(&[mt()]), 8);
+        assert_eq!(
+            folder_threads(&[
+                EncoderConfiguration::from(EncoderMethod::AES256_SHA256),
+                mt()
+            ]),
+            8
+        );
+        let wide = [mt(), lzma()];
+        assert_eq!(folder_threads(&wide), 9);
         assert_eq!(folder_threads(&one_thread_each(&wide)), 1);
     }
 

@@ -373,8 +373,12 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     /// thread (but not with the `lzma-rust2-encoder` feature, whose coders
     /// run on the worker), so a chain with two of them has `threads / 2`
     /// folders in flight, and where that is one its folders are coded one at
-    /// a time. A BCJ2 folder's call and jump coders run on the worker itself
-    /// here, where a folder coded alone gives each a thread.
+    /// a time. A filter or AES-256 in such a chain runs on the worker between
+    /// its waits and costs no thread. Any other compressor (PPMd, BZip2 and
+    /// the rest) codes on the worker while the coder's thread runs, so beside
+    /// an LZMA or LZMA2 coder it counts as a thread too. A BCJ2 folder's call
+    /// and jump coders run on the worker itself here, where a folder coded
+    /// alone gives each a thread.
     ///
     /// With `threads` at one, and on targets without threads, this is the
     /// loop of `push_archive_entry` itself.

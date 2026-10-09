@@ -541,7 +541,14 @@ Everything here is new surface; no upstream signature changed meaning.
   worker and its folder's coder thread count as one of `threads`; a chain
   with more than one LZMA or LZMA2 coder has a coder thread for each, and
   that many fewer folders in flight (`threads / 2` for two), so the threads
-  at work stay within `threads`. A BCJ2 folder coded on a worker runs its
+  at work stay within `threads`. A compressor that is not LZMA or LZMA2
+  (PPMd, BZip2 and the rest) codes on the worker itself, so beside an LZMA
+  or LZMA2 coder it counts as a thread too: eight folders of PPMd or BZip2
+  with LZMA2 kept up to 12.7 cores busy at `threads = 8` on Apple M5 Max
+  when it did not. A filter or AES-256 in the chain is not counted, since
+  the worker runs it between its waits for the coder: eight folders of
+  LZMA2 kept 7.7 to 7.9 cores busy with AES-256 over it and 7.7 to 8.0
+  without. A BCJ2 folder coded on a worker runs its
   call and jump coders on that worker rather than on two threads of their
   own, and writes the same bytes. Its
   three other pack streams, held whole until the folder ends as on every
