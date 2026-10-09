@@ -244,6 +244,20 @@ fn ppmd_memory_kb(memory_size: u32) -> usize {
 /// is [`unsized_coders_memory_kb`]'s figure for the chain, which is live
 /// beside the plan's buffers as much as a sized coder is. A limit of
 /// `u64::MAX` is no limit and stays so.
+///
+/// # The memory contract
+///
+/// What the parallel decode keeps under this budget is two ledgers summed.
+/// One is the decoder's held bytes: its input pieces, the output buffers of
+/// the runs out with workers, the decoded runs waiting to be handed over, and
+/// the buffers parked for reuse (`lzma-turbo`'s `AdaptiveLedger`:
+/// `input_bytes`, `runs_out_bytes`, `runs_waiting_bytes`, `parked_bytes`).
+/// The other is the reader's queue: the pieces read and not yet handed over,
+/// at their capacity. Their sum stays at or under the budget. Dictionaries,
+/// coder state and allocator slack are documented additions, not bounded by
+/// it: the first two are reserved out of the caller's limit by the sizes the
+/// headers declare before this budget is what is left, and the third is the
+/// allocator's.
 fn lzma2_plan_budget(
     memory_limit_bytes: u64,
     reserved_kb: usize,

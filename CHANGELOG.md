@@ -978,7 +978,23 @@ Everything here is new surface; no upstream signature changed meaning.
   most the two came to at one moment (`peak_sum`), and the waves of the
   decode (`waves`): for each time the delivering thread went to wait, the
   runs claimed since the last wait and the runs out with workers. Nothing
-  is sampled when the variable is unset.
+  is sampled when the variable is unset. `peak_held` and the decoder's
+  reasons for holding a run back (`dispatch_held_back`, `input_refused`,
+  `sheds`) come from `lzma-turbo`'s `AdaptiveLedger`.
+- A parallel LZMA2 decode under a memory limit keeps the decoder and the
+  reader's queue inside it together. The memory contract: the limit governs
+  the decoder's held bytes (`AdaptiveLedger`'s `input_bytes`,
+  `runs_out_bytes`, `runs_waiting_bytes` and `parked_bytes`) plus the
+  reader's queue (pieces read and not yet handed over, at their capacity).
+  Dictionaries, coder state and allocator slack are documented additions,
+  not bounded by it. The queue used to sit outside the limit, and a decode
+  could hold a read more than it allowed. The reader now does four things.
+  It sets the decoder's limit to what is left after its queue before every
+  feed and drain. It reads again only when a read fits beside both. It asks
+  the decoder's own `dispatch_cost` whether another run fits, so a parked
+  output buffer is not charged twice. And it cuts a small head off a read
+  as an exact-size copy, so a few kilobytes are not charged, or kept, as
+  the whole 4 MiB read. Requires `lzma-turbo` 0.8.0.
 
 ## 0.26.1 - 2026-09-29
 
