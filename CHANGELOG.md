@@ -546,10 +546,14 @@ Everything here is new surface; no upstream signature changed meaning.
   without. A BCJ2 folder coded on a worker runs its
   call and jump coders on that worker rather than on two threads of their
   own, and writes the same bytes. Its
-  three other pack streams, held whole until the folder ends as on every
-  path, count against the worker's stage like the main stream's bytes: a
-  worker whose stage has no room for them waits for the writer instead of
-  starting another folder.
+  three other pack streams, held whole by the worker until the folder ends as
+  on every path, then go through the worker's stage after the main stream, in
+  pieces of at most 256 KiB, each counted against the stage like the main
+  stream's bytes: a worker whose stage has no room for them waits for the
+  writer instead of starting another folder. They used to follow as one
+  message holding all three, which a stage the writer had already emptied took
+  at once whatever its size, so each folder in the window could leave its
+  whole tail parked beside the next.
 - On Apple M5 Max (18 threads), the 8192-member non-solid tree (256 MiB
   unpacked, 32 KiB average, written by `7zz -mx=5 -ms=off`) decodes in
   0.30 s at all threads, from 3.35 s (11.2x; `7zz t` takes 3.43 s, as it
@@ -1051,6 +1055,20 @@ Everything here is new surface; no upstream signature changed meaning.
 - CI's package job builds the crate from its own archive (`cargo package
   --locked`) as well as listing it, so a file the build needs that the
   archive leaves out fails on the pull request rather than at publish.
+- `ArchiveEntry::from_path` reads the path's metadata once, where it read
+  it three times (`is_file`, `is_dir`, then the metadata itself). What it
+  returns is unchanged: a link is what it points to, and a path whose
+  metadata cannot be read is neither a file nor a directory.
+- A non-solid folder whose LZMA or LZMA2 coder runs on one thread is now
+  encoded on the thread that adds it, by an encoder that is kept and reused
+  for the next such folder, where each folder started an encoder thread and
+  built a new encoder (window, tables and a 1 MiB read buffer) of its own.
+  `push_archive_entries_non_solid` keeps one encoder per worker for the
+  length of the call; `push_archive_entry` also codes on the calling thread
+  but still builds an encoder per entry. Folders under 4 KiB now share one set of encoder settings: the
+  size hint given to the encoder is at least 4 KiB, below which the
+  encoder's dictionary does not shrink further anyway. The archive is the
+  same bytes.
 
 ## 0.26.1 - 2026-09-29
 

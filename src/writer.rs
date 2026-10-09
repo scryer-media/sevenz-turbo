@@ -276,8 +276,19 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     /// ```
     pub fn push_archive_entry<R: Read>(
         &mut self,
+        entry: ArchiveEntry,
+        reader: Option<R>,
+    ) -> Result<&ArchiveEntry> {
+        self.push_entry(entry, reader, &mut encoder::FolderCoder::default())
+    }
+
+    /// [`ArchiveWriter::push_archive_entry`], with `coder` kept by the caller
+    /// from one folder to the next.
+    fn push_entry<R: Read>(
+        &mut self,
         mut entry: ArchiveEntry,
         reader: Option<R>,
+        coder: &mut encoder::FolderCoder,
     ) -> Result<&ArchiveEntry> {
         if !entry.is_directory
             && let Some(mut r) = reader
@@ -288,6 +299,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 &mut r,
                 &mut self.output,
                 encoder::Bcj2Sides::Threads,
+                coder,
             )?;
             return self.record_folder(folder);
         }
@@ -302,7 +314,28 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     /// Records a folder [`encode_entry`] has written the main pack stream of:
     /// writes a BCJ2 folder's other three pack streams after it, and takes the
     /// pack, block and entry metadata.
-    fn record_folder(&mut self, folder: EncodedFolder) -> Result<&ArchiveEntry> {
+    fn record_folder(&mut self, mut folder: EncodedFolder) -> Result<&ArchiveEntry> {
+        let tail = match folder.bcj2.take() {
+            Some(bcj2) => {
+                for (bytes, _) in &bcj2.streams {
+                    self.output
+                        .write_all(bytes)
+                        .map_err(|e| Error::io_msg(e, "write BCJ2 stream".to_string()))?;
+                }
+                Some(bcj2.written())
+            }
+            None => None,
+        };
+        self.record_written_folder(folder, tail)
+    }
+
+    /// [`ArchiveWriter::record_folder`] once every pack stream of the folder
+    /// is in the output: `tail` is what its BCJ2 streams took, if it has them.
+    fn record_written_folder(
+        &mut self,
+        folder: EncodedFolder,
+        tail: Option<Bcj2Written>,
+    ) -> Result<&ArchiveEntry> {
         let EncodedFolder {
             mut entry,
             methods,
@@ -313,11 +346,15 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             compressed_crc,
             bcj2,
         } = folder;
+        debug_assert!(bcj2.is_none(), "the BCJ2 streams are written before this");
         self.pack_info.add_stream(compressed_len, compressed_crc);
-        let tail_len = match &bcj2 {
-            Some(bcj2) => self.write_bcj2_tail(bcj2)?,
-            None => 0,
-        };
+        let mut tail_len = 0;
+        if let Some(tail) = &tail {
+            for &(len, crc) in &tail.streams {
+                self.pack_info.add_stream(len, crc);
+                tail_len += len;
+            }
+        }
         entry.has_stream = true;
         entry.size = size;
         entry.crc = u64::from(crc);
@@ -328,7 +365,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let mut sizes = more_sizes;
         sizes.push(size);
 
-        self.unpack_info.add(methods, sizes, crc).bcj2 = bcj2.map(|b| b.sizes);
+        self.unpack_info.add(methods, sizes, crc).bcj2 = tail.map(|t| t.sizes);
 
         self.files.push(entry);
         Ok(self.files.last().unwrap())
@@ -410,6 +447,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 )) <= per_folder
         };
         let eligible: Vec<bool> = entries.iter().map(parallel).collect();
+        // The folders coded here, one after another, share one coder.
+        let mut coder = encoder::FolderCoder::default();
         let mut index = 0;
         while index < entries.len() {
             let start = index;
@@ -417,14 +456,14 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 index += 1;
             }
             if workers > 1 && index - start > 1 {
-                self.push_non_solid_parallel(&entries, start..index, &open, workers)?;
+                self.push_non_solid_parallel(&entries, start..index, &open, workers, &mut coder)?;
             } else {
                 for at in start..index {
-                    self.push_opened(&entries, at, &open)?;
+                    self.push_opened(&entries, at, &open, &mut coder)?;
                 }
             }
             if index < entries.len() {
-                self.push_opened(&entries, index, &open)?;
+                self.push_opened(&entries, index, &open, &mut coder)?;
                 index += 1;
             }
         }
@@ -432,7 +471,13 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     }
 
     /// One entry of [`ArchiveWriter::push_archive_entries_non_solid`], here.
-    fn push_opened<R, F>(&mut self, entries: &[ArchiveEntry], index: usize, open: &F) -> Result<()>
+    fn push_opened<R, F>(
+        &mut self,
+        entries: &[ArchiveEntry],
+        index: usize,
+        open: &F,
+        coder: &mut encoder::FolderCoder,
+    ) -> Result<()>
     where
         R: Read,
         F: Fn(usize, &ArchiveEntry) -> std::io::Result<Option<R>>,
@@ -444,7 +489,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             open(index, &entry)
                 .map_err(|e| Error::io_msg(e, format!("Open entry:{}", entry.name())))?
         };
-        self.push_archive_entry(entry, reader)?;
+        self.push_entry(entry, reader, coder)?;
         Ok(())
     }
 
@@ -457,6 +502,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         run: std::ops::Range<usize>,
         open: &F,
         workers: u32,
+        coder: &mut encoder::FolderCoder,
     ) -> Result<()>
     where
         R: Read,
@@ -464,6 +510,10 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     {
         let methods = Arc::new(encoder::one_thread_each(&self.content_methods));
         let workers = (workers as usize).min(run.len());
+        // A coder per worker, kept from one of its folders to the next: a
+        // worker takes one at the start of a folder and puts it back at the
+        // end, so there are never more than there are workers.
+        let coders = std::sync::Mutex::new(Vec::<encoder::FolderCoder>::new());
         let first = run.start;
         let outcome = crate::ordered::run(
             run.len(),
@@ -484,6 +534,11 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                                 tx: &mut *tx,
                                 cancelled: false,
                             };
+                            let mut coder = coders
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .pop()
+                                .unwrap_or_default();
                             // The worker is the folder's thread: a BCJ2 chain's
                             // call and jump coders run on it, not beside it.
                             let encoded = encode_entry(
@@ -492,47 +547,83 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                                 &mut reader,
                                 &mut sink,
                                 encoder::Bcj2Sides::Inline,
+                                &mut coder,
                             );
+                            coders
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(coder);
                             if sink.cancelled {
                                 return;
                             }
-                            encoded.map(FolderOut::Encoded)
+                            encoded.map(|folder| FolderOut::Encoded(folder, None))
                         }
                     }
                 };
-                // A BCJ2 folder's other three pack streams ride on this
-                // message, whole, and count against the stage like the main
-                // stream's bytes did: the worker waits here for the writer
-                // rather than leave them queued and start its next folder.
-                let weight = match &result {
-                    Ok(FolderOut::Encoded(folder)) => {
-                        folder.bcj2.as_ref().map_or(0, Bcj2Packed::len)
+                // A BCJ2 folder's other three pack streams follow the main
+                // one through the stage, in pieces no longer than the main
+                // stream's and each charged its length, so the worker waits
+                // on the stage for them exactly as it did for the main
+                // stream's bytes. Only their checksums and sizes ride on
+                // `Done`.
+                let result = match result {
+                    Ok(FolderOut::Encoded(mut folder, _)) => {
+                        let shipped = match folder.bcj2.take() {
+                            Some(bcj2) => {
+                                match send_bcj2_tail(bcj2, OUTPUT_BUF_LEN, |m, w| tx.send(m, w)) {
+                                    Ok(shipped) => Some(Box::new(shipped)),
+                                    Err(crate::ordered::Cancelled) => return,
+                                }
+                            }
+                            None => None,
+                        };
+                        Ok(FolderOut::Encoded(folder, shipped))
                     }
-                    _ => 0,
+                    other => other,
                 };
-                let _ = tx.send(EncodeMessage::Done(Box::new(result)), weight);
+                let _ = tx.send(EncodeMessage::Done(Box::new(result)), 0);
             },
-            |_, rx| loop {
-                match rx.recv() {
-                    Some(EncodeMessage::Data(bytes)) => self
-                        .output
-                        .write_all(&bytes)
-                        .map_err(|e| Error::io_msg(e, "write folder".to_string()))?,
-                    Some(EncodeMessage::Done(result)) => {
-                        match (*result)? {
-                            FolderOut::Encoded(folder) => {
-                                self.record_folder(folder)?;
-                            }
-                            FolderOut::Unstreamed(entry) => {
-                                self.push_archive_entry::<&[u8]>(entry, None)?;
-                            }
+            |_, rx| {
+                // What the folder's BCJ2 tail took, stream by stream, as it
+                // was written.
+                let mut tail_lens = [0u64; 3];
+                loop {
+                    match rx.recv() {
+                        Some(EncodeMessage::Data(bytes)) => self
+                            .output
+                            .write_all(&bytes)
+                            .map_err(|e| Error::io_msg(e, "write folder".to_string()))?,
+                        Some(EncodeMessage::Tail { stream, bytes }) => {
+                            self.output
+                                .write_all(&bytes)
+                                .map_err(|e| Error::io_msg(e, "write BCJ2 stream".to_string()))?;
+                            tail_lens[stream] += bytes.len() as u64;
                         }
-                        return Ok(());
-                    }
-                    None => {
-                        return Err(Error::other(
-                            "the worker coding this folder stopped before finishing it",
-                        ));
+                        Some(EncodeMessage::Done(result)) => {
+                            match (*result)? {
+                                FolderOut::Encoded(folder, shipped) => {
+                                    let tail = match shipped {
+                                        Some(shipped) => Some(shipped.written(tail_lens)),
+                                        None if tail_lens == [0; 3] => None,
+                                        None => {
+                                            return Err(Error::other(
+                                                "a folder sent BCJ2 streams it did not declare",
+                                            ));
+                                        }
+                                    };
+                                    self.record_written_folder(folder, tail)?;
+                                }
+                                FolderOut::Unstreamed(entry) => {
+                                    self.push_archive_entry::<&[u8]>(entry, None)?;
+                                }
+                            }
+                            return Ok(());
+                        }
+                        None => {
+                            return Err(Error::other(
+                                "the worker coding this folder stopped before finishing it",
+                            ));
+                        }
                     }
                 }
             },
@@ -542,7 +633,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             // Not one worker could be started: code the run here instead.
             None => {
                 for at in run {
-                    self.push_opened(entries, at, open)?;
+                    self.push_opened(entries, at, open, coder)?;
                 }
                 Ok(())
             }
@@ -556,13 +647,14 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         run: std::ops::Range<usize>,
         open: &F,
         _workers: u32,
+        coder: &mut encoder::FolderCoder,
     ) -> Result<()>
     where
         R: Read,
         F: Fn(usize, &ArchiveEntry) -> std::io::Result<Option<R>> + Sync,
     {
         for at in run {
-            self.push_opened(entries, at, open)?;
+            self.push_opened(entries, at, open, coder)?;
         }
         Ok(())
     }
@@ -1116,6 +1208,11 @@ struct EncodedFolder {
 /// for the folder, writing the main pack stream to `output`. `sides` is where
 /// a BCJ2 chain's call and jump coders run.
 ///
+/// When the coder the data meets first is LZMA or LZMA2 on one thread,
+/// `coder` runs it here, reading `r` itself, and keeps it for the next folder
+/// this thread codes (see [`encoder::FolderCoder`]); the bytes are the ones the
+/// chain [`ArchiveWriter::create_writer`] builds would write.
+///
 /// The checksums of the data and of the compressed bytes are taken here, on
 /// the thread doing the coding, which is what lets a worker do all of it.
 fn encode_entry<R: Read, O: Write>(
@@ -1124,6 +1221,7 @@ fn encode_entry<R: Read, O: Write>(
     r: &mut R,
     output: O,
     sides: encoder::Bcj2Sides,
+    coder: &mut encoder::FolderCoder,
 ) -> Result<EncodedFolder> {
     let mut compressed_len = 0;
     let mut compressed = CompressWrapWriter::new(output, &mut compressed_len);
@@ -1134,8 +1232,47 @@ fn encode_entry<R: Read, O: Write>(
         .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
     let methods = folder_methods(content_methods, folder)?;
     let mut bcj2 = None;
+    let pulled = match methods.split_last() {
+        Some((first, _)) => encoder::FolderCoder::plan(first)?,
+        None => None,
+    };
 
-    let (crc, size) = {
+    let (crc, size) = if let Some(pulled) = pulled {
+        // The data meets the last method first. The chain after it is built
+        // as `create_writer` builds it, and the counter `create_writer` would
+        // put under the pulled coder - the size of what it codes into the next
+        // coder - is put there here.
+        let rest = &methods[..methods.len() - 1];
+        let mut chain: Box<dyn Write + '_> = if rest.is_empty() {
+            Box::new(&mut out)
+        } else {
+            let rest = ArchiveWriter::<std::io::Cursor<Vec<u8>>>::create_writer(
+                rest,
+                &mut out,
+                &mut more_sizes,
+                &mut bcj2,
+                sides,
+            )?;
+            let counting = CountingWriter::new(rest);
+            more_sizes.push(counting.counting());
+            Box::new(counting)
+        };
+        let mut read_len = 0;
+        let mut input = CrcReader {
+            inner: head.as_slice().chain(&mut *r),
+            crc: Crc32::new(),
+            read: &mut read_len,
+        };
+        let encode_error = |e| Error::io_msg(e, format!("Encode entry:{}", entry.name()));
+        coder
+            .encode(&pulled, &mut input, &mut chain)
+            .map_err(encode_error)?;
+        chain.flush().map_err(encode_error)?;
+        // The empty write ends every coder after this one.
+        chain.write(&[]).map_err(encode_error)?;
+        drop(chain);
+        (input.crc.finalize(), read_len)
+    } else {
         let mut w = ArchiveWriter::<std::io::Cursor<Vec<u8>>>::create_writer(
             &methods,
             &mut out,
@@ -1201,7 +1338,8 @@ const ENCODE_WINDOW_PER_WORKER: usize = 2;
 /// A folder a worker coded, or an entry with no data to code.
 #[cfg(not(target_arch = "wasm32"))]
 enum FolderOut {
-    Encoded(EncodedFolder),
+    /// The folder, with what its BCJ2 streams declared once they were sent.
+    Encoded(EncodedFolder, Option<Box<Bcj2Shipped>>),
     Unstreamed(ArchiveEntry),
 }
 
@@ -1209,8 +1347,57 @@ enum FolderOut {
 enum EncodeMessage {
     /// The next compressed bytes of the folder's main pack stream.
     Data(Vec<u8>),
+    /// The next bytes of one of a BCJ2 folder's other pack streams: `stream`
+    /// is 0 for rc, 1 for call, 2 for jump, and they come in that order,
+    /// after the main stream.
+    Tail { stream: usize, bytes: Vec<u8> },
     /// The folder is coded.
     Done(Box<Result<FolderOut>>),
+}
+
+/// What a BCJ2 folder's other three pack streams declared once a worker had
+/// sent their bytes through the stage: their checksums, in pack order, and
+/// the call and jump streams' sizes before their coders.
+#[cfg(not(target_arch = "wasm32"))]
+struct Bcj2Shipped {
+    crcs: [u32; 3],
+    sizes: Bcj2SideSizes,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Bcj2Shipped {
+    /// The streams as the writer wrote them, `lens` long.
+    fn written(self, lens: [u64; 3]) -> Bcj2Written {
+        Bcj2Written {
+            streams: [0, 1, 2].map(|i| (lens[i], self.crcs[i])),
+            sizes: self.sizes,
+        }
+    }
+}
+
+/// Sends a BCJ2 folder's rc, call and jump streams through the stage, in
+/// that order, in pieces of at most `chunk` bytes, each charged its length.
+#[cfg(not(target_arch = "wasm32"))]
+fn send_bcj2_tail(
+    bcj2: Bcj2Packed,
+    chunk: usize,
+    mut send: impl FnMut(EncodeMessage, usize) -> std::result::Result<(), crate::ordered::Cancelled>,
+) -> std::result::Result<Bcj2Shipped, crate::ordered::Cancelled> {
+    let Bcj2Packed { streams, sizes } = bcj2;
+    let mut crcs = [0u32; 3];
+    for (stream, (bytes, crc)) in streams.into_iter().enumerate() {
+        crcs[stream] = crc;
+        for piece in bytes.chunks(chunk.max(1)) {
+            send(
+                EncodeMessage::Tail {
+                    stream,
+                    bytes: piece.to_vec(),
+                },
+                piece.len(),
+            )?;
+        }
+    }
+    Ok(Bcj2Shipped { crcs, sizes })
 }
 
 /// The output an encode worker codes into: the folder's stage.
@@ -1239,6 +1426,24 @@ impl Write for StageSink<'_, '_> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// A folder's input on its way to a coder that reads it: the checksum and
+/// length of what was read, as [`CompressWrapWriter`] takes them of what is
+/// written into a coder.
+struct CrcReader<'a, R> {
+    inner: R,
+    crc: Crc32,
+    read: &'a mut usize,
+}
+
+impl<R: Read> Read for CrcReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.crc.update(&buf[..n]);
+        *self.read += n;
+        Ok(n)
     }
 }
 
@@ -1324,6 +1529,25 @@ impl Bcj2Packed {
     fn len(&self) -> usize {
         self.streams.iter().map(|(bytes, _)| bytes.len()).sum()
     }
+
+    /// What the streams take once written.
+    fn written(&self) -> Bcj2Written {
+        Bcj2Written {
+            streams: self
+                .streams
+                .each_ref()
+                .map(|(bytes, crc)| (bytes.len() as u64, *crc)),
+            sizes: self.sizes,
+        }
+    }
+}
+
+/// A BCJ2 block's rc, call and jump pack streams once written: each one's
+/// length and CRC, in pack order, and the call and jump streams' sizes before
+/// their coders.
+struct Bcj2Written {
+    streams: [(u64, u32); 3],
+    sizes: Bcj2SideSizes,
 }
 
 impl PreparedBlock {
@@ -1609,5 +1833,88 @@ mod folder_size_tests {
         assert_eq!(declared_size(&[file(10), file(0)]), None);
         assert_eq!(declared_size(&[file(0)]), None);
         assert_eq!(declared_size(&[ArchiveEntry::new_directory("d")]), None);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod bcj2_tail_stage_tests {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::{Bcj2Packed, EncodeMessage, send_bcj2_tail};
+    use crate::{ordered::run, writer::unpack_info::Bcj2SideSizes};
+
+    fn tail(job: usize) -> Bcj2Packed {
+        let stream = |len: usize, salt: u8| -> (Vec<u8>, u32) {
+            (
+                (0..len).map(|i| (i as u8) ^ salt ^ job as u8).collect(),
+                salt.into(),
+            )
+        };
+        Bcj2Packed {
+            streams: [
+                stream(40_000 + job, 1),
+                stream(3_000, 2),
+                stream(25_000 + 7 * job, 3),
+            ],
+            sizes: Bcj2SideSizes::default(),
+        }
+    }
+
+    /// A BCJ2 folder's three side streams go through the stage like its main
+    /// stream: whatever the writer's pace, what the workers have parked never
+    /// passes the window times the cap, plus the one piece each worker and
+    /// the writer may be holding between the queue and the count. Before,
+    /// the streams rode whole on the folder's last message, which an empty
+    /// queue takes at once, so each folder could park all of them.
+    #[test]
+    fn a_bcj2_tail_never_parks_more_than_the_window_times_the_cap() {
+        let staged = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let (window, cap, chunk, workers, jobs) = (4, 8_192, 2_048, 2, 10);
+        let got = Mutex::new(vec![Vec::new(); jobs]);
+        let outcome = run::<EncodeMessage, (), _, _>(
+            jobs,
+            workers,
+            window,
+            cap,
+            |job, tx| {
+                let shipped = send_bcj2_tail(tail(job), chunk, |message, weight| {
+                    assert!(weight <= chunk);
+                    let now = staged.fetch_add(weight, Ordering::SeqCst) + weight;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tx.send(message, weight)
+                });
+                assert!(shipped.is_ok());
+            },
+            |job, rx| {
+                let mut streams = [Vec::new(), Vec::new(), Vec::new()];
+                while let Some(message) = rx.recv() {
+                    let EncodeMessage::Tail { stream, bytes } = message else {
+                        unreachable!("only tails are sent here");
+                    };
+                    staged.fetch_sub(bytes.len(), Ordering::SeqCst);
+                    streams[stream].extend_from_slice(&bytes);
+                }
+                got.lock().unwrap()[job] = streams.to_vec();
+                Ok(())
+            },
+        );
+        assert!(matches!(outcome, Some(Ok(()))));
+        assert!(
+            peak.load(Ordering::SeqCst) <= window * cap + (workers + 1) * chunk,
+            "parked {} bytes",
+            peak.load(Ordering::SeqCst)
+        );
+        // The writer gets every stream back whole and in pack order.
+        let got = got.into_inner().unwrap();
+        for (job, streams) in got.iter().enumerate() {
+            let want = tail(job);
+            for (i, (bytes, _)) in want.streams.iter().enumerate() {
+                assert!(streams[i] == *bytes, "job {job} stream {i}");
+            }
+        }
     }
 }

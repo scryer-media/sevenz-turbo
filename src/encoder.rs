@@ -4,7 +4,7 @@ use std::{cell::RefCell, io::Write, rc::Rc};
 use lzma_rust2::{Lzma2Writer, Lzma2WriterMt, LzmaWriter};
 
 #[cfg(not(feature = "lzma-rust2-encoder"))]
-use crate::codec::lzma_turbo::writer::{Coder, LzmaTurboWriter, SideCoder};
+use crate::codec::lzma_turbo::writer::{Coder, LzmaTurboWriter, PullCoder, SideCoder};
 
 use crate::codec::filter::{
     bcj::BcjWriter,
@@ -458,12 +458,121 @@ fn turbo_props(settings: &LzmaSettings, threads: u32) -> lzma_turbo::LzmaEncProp
     }
     // C: `props.reduceSize`. Only where it shrinks the dictionary, so an
     // input at least the dictionary's size is coded exactly as before.
+    //
+    // Raised to `LzmaEncProps_Normalize`'s floor, below which it shrinks
+    // nothing further: the coder is the same, and so are the settings, which
+    // is what lets one kept coder serve every folder under the floor (see
+    // `FolderCoder`). The size is read nowhere else on this path.
     if let Some(size) = settings.input_size()
         && size < u64::from(settings.requested_dict_size())
     {
-        props = props.with_reduce_size(size);
+        props = props.with_reduce_size(size.max(REDUCE_SIZE_FLOOR));
     }
     props
+}
+
+/// C: `kReduceMin` in `LzmaEncProps_Normalize`: a dictionary is never shrunk
+/// below 4 KiB to fit the input.
+#[cfg(not(feature = "lzma-rust2-encoder"))]
+const REDUCE_SIZE_FLOOR: u64 = 1 << 12;
+
+/// What one thread coding folder after folder keeps between them: the LZMA
+/// or LZMA2 coder the data meets first, when that coder runs on one thread,
+/// with its window, tables and state.
+///
+/// [`FolderCoder::plan`] says whether a folder's first coder is one; if it
+/// is, the caller hands that coder the folder's reader and the rest of the
+/// chain, built as [`add_encoder`] builds it, as its output. Nothing is
+/// started on another thread and nothing is copied on the way in: the
+/// encoder reads the input into its own window. Folders whose settings are
+/// the same - every folder under 4 KiB, and every folder at least the
+/// dictionary's size - share one encoder; any other folder builds its own,
+/// in place of the one kept.
+///
+/// With the `lzma-rust2-encoder` feature nothing is planned here: that
+/// encoder already codes on the thread that writes into it.
+#[derive(Default)]
+pub(crate) struct FolderCoder {
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    pull: PullCoder,
+}
+
+/// A coder [`FolderCoder::plan`] accepted, ready for [`FolderCoder::encode`].
+pub(crate) struct PulledCoder {
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    props: lzma_turbo::LzmaEncProps,
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    coder: Coder,
+}
+
+impl FolderCoder {
+    /// The coder [`FolderCoder::encode`] would run for `mc`, if `mc` is LZMA
+    /// or LZMA2 on one thread: one block thread and no match-finder thread.
+    ///
+    /// # Errors
+    ///
+    /// A dictionary size the encoder refuses, as [`add_encoder`] refuses it.
+    pub(crate) fn plan(mc: &EncoderConfiguration) -> Result<Option<PulledCoder>, Error> {
+        #[cfg(not(feature = "lzma-rust2-encoder"))]
+        {
+            let (props, coder) = match (mc.method.id(), &mc.options) {
+                (EncoderMethod::ID_LZMA, options) => {
+                    let options = match options {
+                        Some(EncoderOptions::Lzma(options)) => options.clone(),
+                        _ => LzmaOptions::default(),
+                    };
+                    validate_lzma_dictionary_size(options.0.dict_size())?;
+                    (turbo_props(&options.0, 1), Coder::Lzma)
+                }
+                (EncoderMethod::ID_LZMA2, options) => {
+                    let options = match options {
+                        Some(EncoderOptions::Lzma2(options)) => options.clone(),
+                        _ => Lzma2Options::default(),
+                    };
+                    validate_lzma_dictionary_size(options.settings.dict_size())?;
+                    let (block_size, threads) = lzma2_block_plan(&options);
+                    (
+                        turbo_props(&options.settings, options.threads),
+                        Coder::Lzma2 {
+                            block_size,
+                            threads,
+                        },
+                    )
+                }
+                _ => return Ok(None),
+            };
+            Ok(PullCoder::drives(&props, coder).then_some(PulledCoder { props, coder }))
+        }
+        #[cfg(feature = "lzma-rust2-encoder")]
+        {
+            let _ = mc;
+            Ok(None)
+        }
+    }
+
+    /// Codes everything `input` yields with `coder` into `out`, on this
+    /// thread.
+    ///
+    /// # Errors
+    ///
+    /// What `input` or `out` returned, or the encoder's own failure.
+    pub(crate) fn encode(
+        &mut self,
+        coder: &PulledCoder,
+        input: &mut dyn std::io::Read,
+        out: &mut dyn Write,
+    ) -> std::io::Result<()> {
+        #[cfg(not(feature = "lzma-rust2-encoder"))]
+        {
+            self.pull.encode(&coder.props, coder.coder, input, out)
+        }
+        #[cfg(feature = "lzma-rust2-encoder")]
+        {
+            // `plan` never hands one out with this feature.
+            let _ = (coder, input, out);
+            unreachable!("no coder is pulled with the lzma-rust2 encoder")
+        }
+    }
 }
 
 /// The `lzma-rust2` setting for `settings`: its preset for the level, which

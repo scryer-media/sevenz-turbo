@@ -184,12 +184,16 @@ impl ArchiveEntry {
         };
         let mut entry = ArchiveEntry {
             name: entry_name,
-            has_stream: path.is_file(),
-            is_directory: path.is_dir(),
             ..Default::default()
         };
 
+        // One lookup for everything: `Path::is_file` and `Path::is_dir` are
+        // each a `metadata` call of their own, and a tree of tiny files pays
+        // for every lookup (on Windows an open, a query and a close each). A
+        // path whose metadata cannot be read is neither, as those two say.
         if let Ok(meta) = path.metadata() {
+            entry.has_stream = meta.is_file();
+            entry.is_directory = meta.is_dir();
             // How much the file holds now. Pushing the entry replaces it with
             // what was actually read; until then the writer takes it as the
             // folder's size, to size the dictionary.

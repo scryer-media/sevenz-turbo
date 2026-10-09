@@ -38,7 +38,7 @@ const CHUNK: usize = 1 << 20;
 const INPUT_DEPTH: usize = 2;
 
 /// Which coder the writer fronts.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Coder {
     /// A raw LZMA stream: no header, no end marker. The five property bytes
     /// live in the folder's coder record.
@@ -113,6 +113,21 @@ impl Encoder {
                 enc.set_threads(threads);
                 Ok(Encoder::Lzma2(Box::new(enc)))
             }
+        }
+    }
+
+    /// Runs the whole stream on the calling thread, from an input that may
+    /// not be sent anywhere. The same bytes as [`Encoder::run`] for a coder
+    /// [`PullCoder::drives`]: with one block thread and the one-thread match
+    /// finder, `encode_mt` and `encode_send` are both this loop.
+    fn run_here(
+        &mut self,
+        input: &mut dyn SeqInStream,
+        out: &mut dyn SeqOutStream,
+    ) -> Result<(), LzmaError> {
+        match self {
+            Encoder::Lzma(enc) => enc.encode(input, out),
+            Encoder::Lzma2(enc) => enc.encode(input, out),
         }
     }
 
@@ -396,13 +411,141 @@ impl<W: Write> Write for LzmaTurboWriter<W> {
     }
 }
 
+/// The encoder's view of a reader: what it reads is the stream's input, and
+/// an I/O error is kept here, for [`PullCoder::encode`] to return as it was.
+struct ReadSource<'a> {
+    inner: &'a mut dyn io::Read,
+    error: Option<io::Error>,
+}
+
+impl SeqInStream for ReadSource<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, LzmaError> {
+        loop {
+            match self.inner.read(buf) {
+                Ok(n) => return Ok(n),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) => {
+                    self.error = Some(err);
+                    return Err(LzmaError::Read);
+                }
+            }
+        }
+    }
+}
+
+/// The encoder's view of a writer, keeping an I/O error as [`ReadSource`]
+/// does.
+struct WriteSink<'a> {
+    inner: &'a mut dyn Write,
+    error: Option<io::Error>,
+}
+
+impl SeqOutStream for WriteSink<'_> {
+    fn write(&mut self, data: &[u8]) -> Result<(), LzmaError> {
+        self.inner.write_all(data).map_err(|err| {
+            self.error = Some(err);
+            LzmaError::Write
+        })
+    }
+}
+
+/// An encoder kept between streams, with what it was built for.
+struct Kept {
+    props: LzmaEncProps,
+    coder: Coder,
+    encoder: Encoder,
+}
+
+/// An LZMA or LZMA2 coder that runs on the thread that calls it, pulling each
+/// stream's input from a reader, and keeps its encoder from one stream to the
+/// next.
+///
+/// [`LzmaTurboWriter`] is pushed bytes, so it puts the encoder on a thread of
+/// its own (or behind a queue where there are none) and builds it for one
+/// stream. A caller that has the whole input as a reader needs neither: the
+/// encoder reads it straight into its window here. And a caller that codes
+/// many streams with the same settings - one folder after another - builds
+/// the encoder, its window and its tables once. Each stream re-initialises
+/// the encoder as `LzmaEnc_Prepare` does (lzma-turbo documents its encoders
+/// as reusable on that footing), so a stream's bytes are the ones a fresh
+/// encoder writes; the tests below hold this to it.
+///
+/// Only a coder on one thread is driven here: one block thread and the
+/// one-thread match finder (see [`PullCoder::drives`]).
+#[derive(Default)]
+pub(crate) struct PullCoder {
+    kept: Option<Kept>,
+}
+
+impl PullCoder {
+    /// Whether a coder of `props` and `coder` runs on one thread, and so can
+    /// be driven here, byte for byte as [`LzmaTurboWriter`] would code it.
+    pub(crate) fn drives(props: &LzmaEncProps, coder: Coder) -> bool {
+        let one_block_thread = match coder {
+            Coder::Lzma => true,
+            Coder::Lzma2 { threads, .. } => threads <= 1,
+        };
+        one_block_thread && props.normalized().num_threads <= 1
+    }
+
+    /// Codes everything `input` yields as one stream into `out`, with the
+    /// encoder kept from the last stream when it was built for the same
+    /// `props` and `coder`, and a new one otherwise.
+    ///
+    /// # Errors
+    ///
+    /// What `input` or `out` returned, as they returned it; otherwise
+    /// `InvalidInput` for a setting `lzma-turbo` refuses and `OutOfMemory`
+    /// for an encoder it could not allocate. After an error the encoder is
+    /// dropped rather than kept.
+    pub(crate) fn encode(
+        &mut self,
+        props: &LzmaEncProps,
+        coder: Coder,
+        input: &mut dyn io::Read,
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        debug_assert!(Self::drives(props, coder));
+        let reuse = self
+            .kept
+            .as_ref()
+            .is_some_and(|kept| kept.props == *props && kept.coder == coder);
+        if !reuse {
+            // Free the last encoder before building the next, so the two are
+            // never held at once.
+            self.kept = None;
+            self.kept = Some(Kept {
+                props: *props,
+                coder,
+                encoder: Encoder::new(props, coder).map_err(io_error)?,
+            });
+        }
+        let kept = self.kept.as_mut().expect("built above");
+        let mut source = ReadSource {
+            inner: input,
+            error: None,
+        };
+        let mut sink = WriteSink {
+            inner: out,
+            error: None,
+        };
+        match kept.encoder.run_here(&mut source, &mut sink) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.kept = None;
+                Err(source.error.or(sink.error).unwrap_or_else(|| io_error(err)))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read, Write};
 
     use lzma_turbo::{BLOCK_SIZE_SOLID, Lzma2Reader, LzmaEncProps, LzmaProps, LzmaReader};
 
-    use super::{CHUNK, Coder, LzmaTurboWriter, SideCoder, State};
+    use super::{CHUNK, Coder, LzmaTurboWriter, PullCoder, SideCoder, State};
 
     fn sample(len: usize) -> Vec<u8> {
         // Compressible but not trivial: a short period with a slow drift.
@@ -626,6 +769,100 @@ mod tests {
                 "{coder:?}"
             );
         }
+    }
+
+    fn pulled(pull: &mut PullCoder, props: &LzmaEncProps, coder: Coder, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        pull.encode(props, coder, &mut &data[..], &mut out)
+            .expect("pull");
+        out
+    }
+
+    /// One coder kept across streams of every length, both coders and a
+    /// change of settings in between, writes each stream exactly as the
+    /// writer with a fresh encoder on its own thread does.
+    #[test]
+    fn a_kept_pull_coder_writes_each_stream_as_a_fresh_writer() {
+        let solid = Coder::Lzma2 {
+            block_size: BLOCK_SIZE_SOLID,
+            threads: 1,
+        };
+        let one_block = Coder::Lzma2 {
+            block_size: CHUNK as u64,
+            threads: 1,
+        };
+        let level5 = LzmaEncProps::new().with_level(5).with_dict_size(1 << 16);
+        let mut pull = PullCoder::default();
+        let streams: [(LzmaEncProps, Coder, usize); 10] = [
+            (props(), solid, 2000),
+            (props(), solid, 0),
+            (props(), solid, 3 * CHUNK + 77),
+            (props(), solid, 1),
+            (level5, solid, 70_000),
+            (level5, solid, 5000),
+            (props(), Coder::Lzma, CHUNK + 999),
+            (props(), Coder::Lzma, 300),
+            (level5, one_block, CHUNK - 3),
+            (props(), solid, 2000),
+        ];
+        for (i, (p, coder, len)) in streams.into_iter().enumerate() {
+            assert!(PullCoder::drives(&p, coder));
+            let data = sample(len + i);
+            let mut fresh = LzmaTurboWriter::new(Vec::new(), &p, coder).expect("writer");
+            fresh.write_all(&data).expect("write");
+            let want = fresh.finish().expect("finish");
+            assert_eq!(pulled(&mut pull, &p, coder, &data), want, "stream {i}");
+        }
+        let decoded = sample(5);
+        let packed = pulled(&mut pull, &props(), solid, &decoded);
+        assert_eq!(decode_lzma2(&packed, decoded.len()), decoded);
+    }
+
+    /// Block threads and the threaded match finder need threads of their own,
+    /// so such a coder is not driven here.
+    #[test]
+    fn a_coder_on_more_than_one_thread_is_not_pulled() {
+        assert!(!PullCoder::drives(
+            &props(),
+            Coder::Lzma2 {
+                block_size: CHUNK as u64,
+                threads: 2,
+            }
+        ));
+        assert!(!PullCoder::drives(
+            &LzmaEncProps::new().with_level(5).with_num_threads(2),
+            Coder::Lzma
+        ));
+    }
+
+    /// A reader's error comes back as it was, and the coder that saw it is
+    /// not kept for the next stream.
+    #[test]
+    fn a_pull_coders_read_error_is_returned_and_the_coder_dropped() {
+        struct Failing;
+        impl Read for Failing {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "no",
+                ))
+            }
+        }
+        let coder = Coder::Lzma2 {
+            block_size: BLOCK_SIZE_SOLID,
+            threads: 1,
+        };
+        let mut pull = PullCoder::default();
+        let err = pull
+            .encode(&props(), coder, &mut Failing, &mut Vec::new())
+            .expect_err("the read fails");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(pull.kept.is_none());
+        let data = sample(4000);
+        assert_eq!(
+            pulled(&mut pull, &props(), coder, &data),
+            streamed(coder, &data)
+        );
     }
 
     #[test]
