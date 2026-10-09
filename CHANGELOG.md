@@ -465,6 +465,9 @@ Everything here is new surface; no upstream signature changed meaning.
 - The key derivation hands the hash 64 rounds at a time (`7zAes.cpp`'s
   unrolled buffer) instead of three calls a round; the bytes hashed are the
   same. One 2^19 derivation is about 2 ms faster with AWS-LC on Apple M5 Max.
+  The buffer is at most 64 KiB whatever the password's length: a password
+  past about a kilobyte gets fewer rounds to a call, and one past 64 KiB is
+  hashed where it lies, three calls a round as before, with no copy made.
 - The folders of a non-solid archive decode in parallel. A new `ReadAt` trait
   reads archive bytes at an offset with no shared cursor; it is implemented
   for `std::fs::File` (`pread` on Unix, `seek_read` on Windows), for bytes in
@@ -554,8 +557,10 @@ Everything here is new surface; no upstream signature changed meaning.
   arrives after the bytes it produced and unchanged, so the block it is
   reported against is the same as before. A pipe holds up to 1.25 MiB, and
   a block's pipes are charged to the memory limit with its coders before
-  any of them is built; a block whose pipes do not fit keeps the sequential
-  chain. So does the rest of a chain from the first coder whose thread
+  any of them is built: every coder, the filters and the fixed-size codecs
+  at the figures `Archive::decoder_memory_estimate` gives them. A block
+  whose pipes do not fit beside them keeps the sequential chain; nothing is
+  refused for it. So does the rest of a chain from the first coder whose thread
   cannot be started: it decodes on the caller's thread, reading the stages
   already running. One thread, and wasm32, keep the sequential chain. A
   BCJ2 archive written by 7-Zip (LZMA2 main stream, LZMA call and jump

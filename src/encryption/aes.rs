@@ -280,6 +280,27 @@ fn derive_key(num_cycles_power: u8, salt: &[u8], password: &[u8]) -> [u8; 32] {
 /// of two: `7zAes.cpp`'s `kUnrPow`.
 const KDF_UNROLL_POWER: u8 = 6;
 
+/// The most bytes of rounds laid out for one call to the hash. A round is as
+/// long as the password, which is the caller's and of any length, so the
+/// layout is bounded here and not by it. A password of up to about a
+/// kilobyte keeps the whole `2^KDF_UNROLL_POWER` rounds a call.
+const KDF_BATCH_BYTES: usize = 64 << 10;
+
+/// How many rounds of `round_len` bytes are laid out for one call, as a power
+/// of two: [`KDF_UNROLL_POWER`], or as many fewer as keeps the layout within
+/// [`KDF_BATCH_BYTES`]. `None` for a round longer than that by itself, which
+/// is not laid out at all.
+fn kdf_unroll_power(num_cycles_power: u8, round_len: usize) -> Option<u8> {
+    if round_len > KDF_BATCH_BYTES {
+        return None;
+    }
+    let mut power = num_cycles_power.min(KDF_UNROLL_POWER);
+    while round_len > KDF_BATCH_BYTES >> power {
+        power -= 1;
+    }
+    Some(power)
+}
+
 /// `7zAes.c`'s derivation, over whichever SHA-256 the caller names. Generic so
 /// that a build with both cryptography backends can check they agree; the
 /// crate itself only ever instantiates it at [`Sha256`].
@@ -291,22 +312,35 @@ const KDF_UNROLL_POWER: u8 = 6;
 /// the hash sees the same bytes, in the same order, as three calls a round,
 /// and the per-call cost (a foreign call, with AWS-LC) is paid 192 times less
 /// often.
+///
+/// The buffer is at most [`KDF_BATCH_BYTES`] whatever the password's length:
+/// longer rounds are laid out fewer at a time, and a round longer than the
+/// bound by itself goes to the hash as its three pieces, with no copy made.
+/// The per-call cost that the layout saves is nothing beside a round that
+/// long.
 pub(crate) fn derive_key_with<S: Sha256Like>(
     num_cycles_power: u8,
     salt: &[u8],
     password: &[u8],
 ) -> [u8; 32] {
-    let unroll_power = num_cycles_power.min(KDF_UNROLL_POWER);
+    let mut sha = S::new();
+    let round_len = salt.len().saturating_add(password.len()).saturating_add(8);
+    let Some(unroll_power) = kdf_unroll_power(num_cycles_power, round_len) else {
+        for counter in 0..(1u64 << num_cycles_power) {
+            sha.update(salt);
+            sha.update(password);
+            sha.update(&counter.to_le_bytes());
+        }
+        return sha.finalize();
+    };
     let unroll = 1u64 << unroll_power;
-    let round_len = salt.len() + password.len() + 8;
     // It holds the password, so it is cleared when dropped.
-    let mut rounds = Zeroizing::new(Vec::with_capacity(round_len * unroll as usize));
+    let mut rounds = Zeroizing::new(Vec::with_capacity(round_len << unroll_power));
     for counter in 0..unroll {
         rounds.extend_from_slice(salt);
         rounds.extend_from_slice(password);
         rounds.extend_from_slice(&counter.to_le_bytes());
     }
-    let mut sha = S::new();
     for _ in 0..(1u64 << (num_cycles_power - unroll_power)) {
         sha.update(&rounds);
         for round in rounds.chunks_exact_mut(round_len) {
@@ -597,6 +631,124 @@ mod key_derivation_tests {
                 }
             }
         }
+    }
+
+    /// The rounds laid out for a call stay within the bound whatever a round's
+    /// length, and a round longer than the bound is not laid out.
+    #[test]
+    fn the_rounds_laid_out_for_a_call_are_bounded() {
+        // An ordinary password: every round the unroll width allows.
+        assert_eq!(kdf_unroll_power(19, 64), Some(KDF_UNROLL_POWER));
+        assert_eq!(kdf_unroll_power(3, 64), Some(3));
+        assert_eq!(kdf_unroll_power(0, 64), Some(0));
+        // The longest round that keeps them all, and the first that does not.
+        let full = KDF_BATCH_BYTES >> KDF_UNROLL_POWER;
+        assert_eq!(kdf_unroll_power(19, full), Some(KDF_UNROLL_POWER));
+        assert_eq!(kdf_unroll_power(19, full + 1), Some(KDF_UNROLL_POWER - 1));
+        assert_eq!(kdf_unroll_power(19, KDF_BATCH_BYTES), Some(0));
+        assert_eq!(kdf_unroll_power(19, KDF_BATCH_BYTES + 1), None);
+        assert_eq!(kdf_unroll_power(19, usize::MAX), None);
+        for round_len in [
+            8,
+            9,
+            100,
+            full - 1,
+            full,
+            full + 1,
+            3 * full,
+            KDF_BATCH_BYTES,
+        ] {
+            for power in [0, 1, 5, 6, 7, 24] {
+                let unroll = kdf_unroll_power(power, round_len).expect("laid out");
+                assert!(unroll <= power.min(KDF_UNROLL_POWER));
+                assert!(
+                    round_len << unroll <= KDF_BATCH_BYTES,
+                    "{round_len} << {unroll}"
+                );
+            }
+        }
+    }
+
+    /// A hash that only measures what it is handed.
+    #[derive(Default)]
+    struct Measured {
+        bytes: u64,
+        calls: u64,
+        widest: usize,
+    }
+
+    thread_local! {
+        /// What the last [`Measured`] of this thread was handed.
+        static MEASURED: std::cell::Cell<(u64, u64, usize)> =
+            const { std::cell::Cell::new((0, 0, 0)) };
+    }
+
+    impl Sha256Like for Measured {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn update(&mut self, data: &[u8]) {
+            self.bytes += data.len() as u64;
+            self.calls += 1;
+            self.widest = self.widest.max(data.len());
+        }
+
+        fn finalize(self) -> [u8; 32] {
+            MEASURED.with(|cell| cell.set((self.bytes, self.calls, self.widest)));
+            [0; 32]
+        }
+    }
+
+    /// The bytes, the calls and the widest call of one derivation.
+    fn measured(power: u8, salt: &[u8], password: &[u8]) -> (u64, u64, usize) {
+        derive_key_with::<Measured>(power, salt, password);
+        MEASURED.with(std::cell::Cell::get)
+    }
+
+    /// The password is the caller's and of any length; what is laid out for
+    /// the hash is not sized by it.
+    #[test]
+    fn a_long_password_is_not_laid_out_sixty_four_times() {
+        let salt = b"0123456789abcdef";
+        // Rounds of a kilobyte: all 64 to a call, 128 rounds in two calls.
+        let password = vec![0x5Au8; (KDF_BATCH_BYTES >> KDF_UNROLL_POWER) - 24];
+        assert_eq!(
+            measured(7, salt, &password),
+            (128 * 1024, 2, KDF_BATCH_BYTES)
+        );
+        // A byte longer: 32 to a call, and no call wider than the bound.
+        let password = vec![0x5Au8; (KDF_BATCH_BYTES >> KDF_UNROLL_POWER) - 23];
+        assert_eq!(measured(7, salt, &password), (128 * 1025, 4, 32 * 1025));
+        // A round longer than the bound by itself: its three pieces, as they
+        // are, and the widest of them is the password where it lies.
+        let password = vec![0x5Au8; KDF_BATCH_BYTES];
+        let round = (salt.len() + password.len() + 8) as u64;
+        assert_eq!(
+            measured(7, salt, &password),
+            (128 * round, 3 * 128, password.len())
+        );
+    }
+
+    /// The same key at every width of layout, down to none.
+    #[test]
+    fn bounded_rounds_hash_the_same_bytes() {
+        let full = KDF_BATCH_BYTES >> KDF_UNROLL_POWER;
+        for len in [full - 8, full - 7, KDF_BATCH_BYTES - 8, KDF_BATCH_BYTES - 7] {
+            let password = vec![0xC3u8; len];
+            for power in [0, 6, 7] {
+                assert_eq!(
+                    derive_key(power, b"", &password),
+                    derive_key_round_by_round(power, b"", &password),
+                    "power {power}, password {len} bytes"
+                );
+            }
+        }
+        let password = vec![0xC3u8; 3 * full];
+        assert_eq!(
+            derive_key(9, b"0123456789abcdef", &password),
+            derive_key_round_by_round(9, b"0123456789abcdef", &password)
+        );
     }
 
     /// A clone is the same password: the key one copy derived, every copy

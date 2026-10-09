@@ -472,7 +472,8 @@ impl Archive {
     /// of a block decoded as a pipeline on more than one thread, 1.25 MiB
     /// each and one or two for every coder given a thread of its own: those
     /// are charged to [`ArchiveLimits::memory_limit_bytes`] when the block
-    /// is decoded, and a block they do not fit decodes without them.
+    /// is decoded, beside every coder of its chain at this table's figures,
+    /// and a block they do not fit decodes without them.
     ///
     /// [`ArchiveLimits::memory_limit_bytes`]: crate::ArchiveLimits::memory_limit_bytes
     ///

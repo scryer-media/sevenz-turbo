@@ -33,7 +33,7 @@ use std::thread::JoinHandle;
 use crate::archive::EncoderMethod;
 use crate::block::Block;
 use crate::codec::lzma_turbo::MT_MIN_BLOCK_BYTES;
-use crate::decoder::{DecodeOptions, INPUT_BUF_SIZE, add_decoder};
+use crate::decoder::{DecodeOptions, INPUT_BUF_SIZE, add_decoder, unsized_coders_memory_kb};
 use crate::{Error, Password};
 
 /// Bytes a stage hands on at a time.
@@ -684,10 +684,17 @@ impl<'r> Chain<'r> {
     /// Plans `block`'s chain for `opts.threads`.
     ///
     /// The pipes of a plan are memory the chain holds beyond its coders'.
-    /// They are added to `opts.reserved_kb`, where the coders' own share
-    /// already is, and a plan whose pipes do not fit under
+    /// They are added to `opts.reserved_kb`, where the sized coders' own
+    /// share already is, and a plan whose pipes do not fit under
     /// `memory_limit_bytes` beside the coders is given up: the block then
     /// decodes on the caller's thread, as it would with one thread.
+    ///
+    /// Beside every coder, that is, and not the sized ones alone: the
+    /// filters and the fixed-size codecs are counted at the memory model's
+    /// figures (see `unsized_coders_memory_kb`), so the pipes are opened only
+    /// where the limit holds the whole chain and them. Those figures stay
+    /// out of `opts.reserved_kb`, which a coder fitting itself to what is
+    /// left subtracts: its own would be in it.
     pub(crate) fn new(block: &Block, opts: &mut DecodeOptions<'_>) -> Self {
         let mut offload = offload_plan(block, opts.threads);
         if offload != 0 {
@@ -695,7 +702,14 @@ impl<'r> Chain<'r> {
                 .saturating_mul(PIPE_BYTES)
                 .div_ceil(1024);
             let chain_kb = opts.reserved_kb.saturating_add(pipes_kb);
-            if chain_kb > opts.limits.memory_limit_kb() {
+            let others_kb = unsized_coders_memory_kb(
+                block
+                    .coders
+                    .iter()
+                    .enumerate()
+                    .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index))),
+            );
+            if chain_kb.saturating_add(others_kb) > opts.limits.memory_limit_kb() {
                 offload = 0;
             } else {
                 opts.reserved_kb = chain_kb;
@@ -949,13 +963,17 @@ mod tests {
     }
 
     /// The pipes of a plan are charged to the memory limit with the coders,
-    /// and a plan they do not fit beside is given up for the caller's thread.
+    /// every one of them, and a plan they do not fit beside is given up for
+    /// the caller's thread.
     #[test]
     fn a_plan_whose_pipes_do_not_fit_the_memory_limit_is_given_up() {
         const MIB: u64 = 1 << 20;
         let pipe_kb = PIPE_BYTES / 1024;
-        // What the chain's coders were already granted.
+        // What the chain's sized coders were already granted.
         let coders_kb = 4096;
+        // What the memory model holds for the cipher, and for BCJ2.
+        let aes_kb = 1024;
+        let bcj2_kb = 16 * 1024;
         let plan = |block: &Block, threads: u32, limit_kb: Option<usize>| {
             let limits = crate::ArchiveLimits {
                 memory_limit_bytes: limit_kb.map_or(u64::MAX, |kb| kb as u64 * 1024),
@@ -973,13 +991,15 @@ mod tests {
         let aes = aes_under(EncoderMethod::ID_LZMA, 64 * MIB, 32 * MIB);
         assert_eq!(plan_pipes(&aes, 0b10), 2);
         assert_eq!(
-            plan(&aes, 2, Some(coders_kb + 2 * pipe_kb)),
+            plan(&aes, 2, Some(coders_kb + aes_kb + 2 * pipe_kb)),
             (0b10, coders_kb + 2 * pipe_kb)
         );
         assert_eq!(
-            plan(&aes, 2, Some(coders_kb + 2 * pipe_kb - 1)),
+            plan(&aes, 2, Some(coders_kb + aes_kb + 2 * pipe_kb - 1)),
             (0, coders_kb)
         );
+        // Room for the sized coder and the pipes, and none for the cipher.
+        assert_eq!(plan(&aes, 2, Some(coders_kb + 2 * pipe_kb)), (0, coders_kb));
         // Without a limit the plan stands, and what it holds is still said.
         assert_eq!(plan(&aes, 2, None), (0b10, coders_kb + 2 * pipe_kb));
         // One thread plans nothing and reserves nothing.
@@ -990,13 +1010,54 @@ mod tests {
         let graph = bcj2(EncoderMethod::ID_LZMA, 64 * MIB, 2 * MIB);
         assert_eq!(plan_pipes(&graph, 0b1110), 6);
         assert_eq!(
-            plan(&graph, 8, Some(coders_kb + 6 * pipe_kb)),
+            plan(&graph, 8, Some(coders_kb + bcj2_kb + 6 * pipe_kb)),
             (0b1110, coders_kb + 6 * pipe_kb)
         );
         assert_eq!(
-            plan(&graph, 8, Some(coders_kb + 6 * pipe_kb - 1)),
+            plan(&graph, 8, Some(coders_kb + bcj2_kb + 6 * pipe_kb - 1)),
             (0, coders_kb)
         );
+        assert_eq!(
+            plan(&graph, 8, Some(coders_kb + 6 * pipe_kb)),
+            (0, coders_kb)
+        );
+    }
+
+    /// What the plan counts beside the sized coders: the model's figure for
+    /// each coder the chain check leaves out, and nothing twice.
+    #[test]
+    fn every_coder_the_chain_check_leaves_out_is_counted_for_the_pipes() {
+        const MIB: u64 = 1 << 20;
+        let kb = |coders: &[crate::block::Coder]| {
+            unsized_coders_memory_kb(coders.iter().map(|coder| (coder, 64 * MIB)))
+        };
+        let with_properties = |method: &[u8], properties: &[u8]| {
+            let mut coder = coder(method, 1);
+            coder.properties = properties.to_vec();
+            coder
+        };
+        // Sized coders are the chain check's: an LZMA coder of a 1 MiB
+        // dictionary, an LZMA2 coder of the same, a PPMd coder of 16 MiB.
+        let lzma = with_properties(EncoderMethod::ID_LZMA, &[0x5D, 0, 0, 0x10, 0]);
+        let lzma2 = with_properties(EncoderMethod::ID_LZMA2, &[16]);
+        assert_eq!(kb(&[lzma.clone(), lzma2.clone()]), 0);
+        #[cfg(feature = "ppmd")]
+        assert_eq!(
+            kb(&[with_properties(EncoderMethod::ID_PPMD, &[6, 0, 0, 0, 1])]),
+            0
+        );
+        // The rest at the model's figures, which add up along the chain.
+        let aes = coder(EncoderMethod::ID_AES256_SHA256, 1);
+        let bcj = coder(EncoderMethod::ID_BCJ_X86, 1);
+        let bcj2 = coder(EncoderMethod::ID_BCJ2, 4);
+        assert_eq!(kb(std::slice::from_ref(&aes)), 1024);
+        assert_eq!(kb(std::slice::from_ref(&bcj2)), 16 * 1024);
+        assert_eq!(kb(&[lzma2, bcj, aes]), 2 * 1024);
+        assert_eq!(kb(&[bcj2, lzma.clone(), lzma.clone(), lzma]), 16 * 1024);
+        assert_eq!(kb(&[coder(EncoderMethod::ID_COPY, 1)]), 0);
+        assert_eq!(kb(&[coder(EncoderMethod::ID_ZSTD, 1)]), 160 * 1024);
+        // No model, no figure: building the coder is what refuses it.
+        assert_eq!(kb(&[coder(&[0x7F, 0x7F], 1)]), 0);
     }
 
     /// Every entry of an archive, in order, read at `threads`.

@@ -20,7 +20,7 @@ use crate::codec::{
         lzma2_dictionary_size, lzma2_memory_usage_kb,
     },
 };
-use crate::container::ArchiveLimits;
+use crate::container::{ArchiveLimits, coder_memory_estimate};
 #[cfg(feature = "aes256")]
 use crate::encryption::Aes256Sha256Decoder;
 use crate::{Password, archive::EncoderMethod, block::Coder, error::Error};
@@ -265,6 +265,30 @@ pub(crate) fn check_chain_memory<'c>(
         });
     }
     Ok(total_kb)
+}
+
+/// Kilobytes the memory model holds for the coders of a chain that
+/// [`check_chain_memory`] does not count: the filters and the fixed-size
+/// codecs, each at [`coder_memory_estimate`]'s figure, which is what
+/// `Archive::decoder_memory_estimate` charges it when an archive is opened
+/// under a limit. A coder with no figure there counts for nothing here, and
+/// is refused when [`add_decoder`] reaches it.
+///
+/// No chain is refused on these: they are margins over what such a coder
+/// allocates, and a decode-time refusal on a margin would turn away blocks
+/// that fit. They decide only whether a chain has room for more than its
+/// coders, which `pipeline::Chain::new` asks before it opens its pipes.
+///
+/// `coders` is as [`check_chain_memory`] takes it.
+pub(crate) fn unsized_coders_memory_kb<'c>(
+    coders: impl IntoIterator<Item = (&'c Coder, u64)>,
+) -> usize {
+    coders
+        .into_iter()
+        .filter(|&(coder, len)| sized_coder_memory_kb(coder, len as usize).is_none())
+        .filter_map(|(coder, _)| coder_memory_estimate(coder).ok())
+        .map(|bytes| usize::try_from(bytes.div_ceil(1024)).unwrap_or(usize::MAX))
+        .fold(0, usize::saturating_add)
 }
 
 pub fn add_decoder<I: Read>(

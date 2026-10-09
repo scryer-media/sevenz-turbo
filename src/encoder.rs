@@ -425,6 +425,57 @@ fn lzma2_property_for(dict_size: u32) -> u8 {
         .unwrap_or(40)
 }
 
+/// The `lzma-turbo` setting for a coder of `settings` that the caller allowed
+/// `threads` threads.
+///
+/// More than one engages the threaded match finder, as 7-Zip does
+/// (C++: `numThreads = (algo == 0 || btMode == 0) ? 1 : 2`): the
+/// binary-tree finder of the normal mode gets a thread of its own, the
+/// fast mode's hash chain does not. The output is the same bytes either
+/// way.
+///
+/// Here and not with the settings: the option types name no encoder, so that
+/// which one codes them is decided in this file alone.
+#[cfg(not(feature = "lzma-rust2-encoder"))]
+fn turbo_props(settings: &LzmaSettings, threads: u32) -> lzma_turbo::LzmaEncProps {
+    use lzma_turbo::MatchFinderKind;
+
+    let fast = settings.fast();
+    let mut props = lzma_turbo::LzmaEncProps::new()
+        .with_level(settings.level())
+        .with_dict_size(settings.requested_dict_size())
+        .with_fast_bytes(settings.nice_len())
+        .with_fast_mode(fast)
+        .with_match_finder(if fast {
+            MatchFinderKind::Hc4
+        } else {
+            MatchFinderKind::Bt4
+        });
+    if let Some(depth) = settings.hash_chain_depth() {
+        props = props.with_match_cycles(depth);
+    } else if settings.match_finder_threads(threads) > 1 {
+        props = props.with_num_threads(2);
+    }
+    // C: `props.reduceSize`. Only where it shrinks the dictionary, so an
+    // input at least the dictionary's size is coded exactly as before.
+    if let Some(size) = settings.input_size()
+        && size < u64::from(settings.requested_dict_size())
+    {
+        props = props.with_reduce_size(size);
+    }
+    props
+}
+
+/// The `lzma-rust2` setting for `settings`: its preset for the level, which
+/// is the settings' own table, with the caller's overrides applied.
+#[cfg(feature = "lzma-rust2-encoder")]
+fn rust2_options(settings: &LzmaSettings) -> lzma_rust2::LzmaOptions {
+    let mut options = lzma_rust2::LzmaOptions::with_preset(settings.level());
+    options.dict_size = settings.dict_size();
+    options.nice_len = settings.nice_len();
+    options
+}
+
 /// Whether the folder these options were sized for is known to fit one LZMA2
 /// block.
 ///
@@ -563,9 +614,9 @@ pub(crate) fn add_encoder<W: Write>(
             };
             validate_lzma_dictionary_size(options.0.dict_size())?;
             #[cfg(not(feature = "lzma-rust2-encoder"))]
-            let lz = LzmaTurboWriter::new(input, &options.0.turbo_props(1), Coder::Lzma)?;
+            let lz = LzmaTurboWriter::new(input, &turbo_props(&options.0, 1), Coder::Lzma)?;
             #[cfg(feature = "lzma-rust2-encoder")]
-            let lz = LzmaWriter::new_no_header(input, &options.0.rust2_options(), false)?;
+            let lz = LzmaWriter::new_no_header(input, &rust2_options(&options.0), false)?;
             Ok(Encoder::Lzma(Some(lz)))
         }
         EncoderMethod::ID_LZMA2 => {
@@ -580,7 +631,7 @@ pub(crate) fn add_encoder<W: Write>(
                 let (block_size, threads) = lzma2_block_plan(&lzma2_options);
                 Encoder::Lzma2(Some(LzmaTurboWriter::new(
                     input,
-                    &lzma2_options.settings.turbo_props(lzma2_options.threads),
+                    &turbo_props(&lzma2_options.settings, lzma2_options.threads),
                     Coder::Lzma2 {
                         block_size,
                         threads,
@@ -591,7 +642,7 @@ pub(crate) fn add_encoder<W: Write>(
             let encoder = {
                 let mut options =
                     lzma_rust2::Lzma2Options::with_preset(lzma2_options.settings.level());
-                options.lzma_options = lzma2_options.settings.rust2_options();
+                options.lzma_options = rust2_options(&lzma2_options.settings);
                 options.set_chunk_size(
                     lzma2_options
                         .block_size()
@@ -851,6 +902,62 @@ mod tests {
         assert_eq!(lzma2_block_plan(&sized(1000)), (32 << 20, 1));
         let solid = crate::encoder_options::Lzma2Options::from_level(5);
         assert_eq!(lzma2_block_plan(&solid), (lzma_turbo::BLOCK_SIZE_SOLID, 1));
+    }
+
+    /// The LZMA2 options `config` holds once it is sized for a folder of
+    /// `size` bytes.
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    fn lzma2_sized_for(
+        config: &crate::EncoderConfiguration,
+        size: u64,
+    ) -> crate::encoder_options::Lzma2Options {
+        match config.sized_for(size).expect("LZMA2").options {
+            Some(crate::encoder_options::EncoderOptions::Lzma2(o)) => o,
+            other => panic!("not LZMA2 options: {other:?}"),
+        }
+    }
+
+    /// The settings the encoder is built with agree with the coder record: a
+    /// folder smaller than the dictionary is coded with one its size, and one
+    /// no smaller with settings that do not move, so the same bytes come out.
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    #[test]
+    fn the_encoder_is_built_with_the_dictionary_the_coder_record_names() {
+        use super::turbo_props;
+        use crate::{EncoderConfiguration, encoder_options::Lzma2Options};
+
+        let config: EncoderConfiguration = Lzma2Options::from_level(5).into();
+        let sized = lzma2_sized_for(&config, 100_000);
+        assert_eq!(turbo_props(&sized.settings, 1).dict_size(), 100_000);
+
+        let mut options = Lzma2Options::from_level(5);
+        options.set_dictionary_size(1 << 16);
+        let config: EncoderConfiguration = options.clone().into();
+        for size in [1 << 16, (1 << 16) + 1, u64::MAX] {
+            let sized = lzma2_sized_for(&config, size);
+            assert_eq!(
+                turbo_props(&sized.settings, 1),
+                turbo_props(&options.settings, 1),
+                "size {size}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    #[test]
+    fn more_than_one_thread_gives_the_binary_tree_finder_a_thread_of_its_own() {
+        use crate::encoder_options::Lzma2Options;
+
+        let mf_threads = |level: u32, threads: u32| {
+            super::turbo_props(&Lzma2Options::from_level(level).settings, threads)
+                .normalized()
+                .num_threads
+        };
+        assert_eq!(mf_threads(5, 1), 1);
+        assert_eq!(mf_threads(5, 2), 2);
+        assert_eq!(mf_threads(9, 18), 2);
+        // The fast levels' hash chain has no threaded finder, as in 7-Zip.
+        assert_eq!(mf_threads(1, 18), 1);
     }
 
     /// Block threads times match-finder threads never exceeds the caller's
