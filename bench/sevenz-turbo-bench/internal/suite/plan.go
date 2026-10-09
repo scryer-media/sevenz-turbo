@@ -110,9 +110,13 @@ type Scenario struct {
 	Stream   bool `json:"stream,omitempty"`
 	// Ledger marks a decode whose candidate keeps the reader's ledger
 	// (decode-bench --ledger) and reports it in its result.
-	Ledger   bool   `json:"ledger,omitempty"`
-	Note     string `json:"note,omitempty"`
-	Variants []Run  `json:"variants"`
+	Ledger bool `json:"ledger,omitempty"`
+	// ParityReference is the reference parity is judged against when it is
+	// not VariantOracle: on the one-thread BCJ2 row, 7zz with -mmtf=off, the
+	// 7zz that also runs on one thread. "" means VariantOracle.
+	ParityReference string `json:"parity_reference,omitempty"`
+	Note            string `json:"note,omitempty"`
+	Variants        []Run  `json:"variants"`
 }
 
 // Run is one variant's command for a scenario.
@@ -301,7 +305,7 @@ func Plan(manifest *fixtures.Manifest, dir, scratch string, tools Tools, setting
 		o := decodeOpts{upstream: true}
 		if name == "bcj2.7z" {
 			o.oneThreadReference = true
-			o.note = "two references: 7zz -mmt=1, which still runs the BCJ2 stage on a second thread, and 7zz -mmt=1 -mmtf=off, which does not; each ratio names the one it is against"
+			o.note = "parity is judged against 7zz -mmt=1 -mmtf=off, which runs on one thread as sevenz-turbo does when asked for one; 7zz -mmt=1 still runs the BCJ2 stage on a second thread, and its ratio is given beside for a user's view"
 		}
 		p.decode("filters", name, "1", o)
 	}
@@ -394,7 +398,8 @@ type decodeOpts struct {
 	// memory limit also runs the candidate without one, as VariantTurboPlain.
 	ledger bool
 	// oneThreadReference adds VariantOracleOneThread, 7zz with -mmtf=off as
-	// well as -mmt=n, as a second reference beside VariantOracle.
+	// well as -mmt=n, as a second reference beside VariantOracle, and makes it
+	// the row's parity reference.
 	oneThreadReference bool
 	memoryLimit        int64
 	note               string
@@ -481,9 +486,11 @@ func (p *planner) decode(group, name, threads string, o decodeOpts) {
 		variants = append(variants, Run{Variant: VariantTurboPlain, Role: RoleCandidate, Tool: p.tools.Candidate, Args: plain, JSON: true})
 	}
 	variants = append(variants, Run{Variant: VariantOracle, Role: RoleReference, Tool: p.tools.Oracle, Args: oracle})
+	parity := ""
 	if o.oneThreadReference {
 		oneThread := append(append([]string(nil), oracle[:len(oracle)-1]...), "-mmtf=off", path)
 		variants = append(variants, Run{Variant: VariantOracleOneThread, Role: RoleReference, Tool: p.tools.Oracle, Args: oneThread})
+		parity = VariantOracleOneThread
 	}
 	if o.upstream {
 		upstream := []string{"op", "decode", "--engine", "upstream", "--archive", path, "--threads", n}
@@ -495,7 +502,7 @@ func (p *planner) decode(group, name, threads string, o decodeOpts) {
 	p.add(Scenario{
 		ID: id, Group: group, Op: OpDecode, Fixture: name, Threads: threads,
 		MemoryLimit: o.memoryLimit, Encrypted: record.Encrypted, NoVerify: o.noVerify, Stream: o.stream,
-		Adaptive: o.adaptive, Ledger: o.ledger, Note: o.note, Variants: variants,
+		Adaptive: o.adaptive, Ledger: o.ledger, ParityReference: parity, Note: o.note, Variants: variants,
 	})
 }
 

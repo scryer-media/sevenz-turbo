@@ -38,6 +38,24 @@ func ratioLabel(ratio Ratio) string {
 	return ratio.Variant + " vs " + ratio.Reference
 }
 
+// hasParityOther reports whether one of a candidate's ratios against a second
+// reference is the one parity is judged by.
+func hasParityOther(others []Ratio) bool {
+	for _, other := range others {
+		if other.Parity {
+			return true
+		}
+	}
+	return false
+}
+
+// parityText is the note a host report gives a scenario judged against a
+// reference other than plain 7zz.
+func parityText(scenario suite.Scenario) string {
+	return fmt.Sprintf("`%s`: parity is judged against `%s` (7zz -mmt=1 -mmtf=off). sevenz-turbo runs on exactly one thread when asked for one, and so does 7-Zip with -mmtf=off; at -mmt=1 alone 7-Zip still runs the BCJ2 stage on a second thread. The ratio against plain `7zz` (-mmt=1) is reported beside it for a user's view, and is not the parity figure.",
+		scenario.ID, scenario.ParityReference)
+}
+
 // throughputText gives a throughput in MiB/s to three significant figures, so
 // a slow row reads as what it is rather than rounding to 0.
 func throughputText(mibs float64) string {
@@ -66,6 +84,11 @@ func Markdown(report *Report) string {
 	m := report.Machine
 	fmt.Fprintf(&b, "# sevenz-turbo bench: %s\n\n", m.Label)
 	fmt.Fprintf(&b, "%s\n\n", Orientation)
+	for _, scenario := range report.Scenarios {
+		if scenario.ParityReference != "" {
+			fmt.Fprintf(&b, "Parity reference: %s\n\n", parityText(scenario))
+		}
+	}
 	fmt.Fprintf(&b, "Each cell is the median [min–max] over %d measured runs (%d warmups discarded); variants are interleaved, their order reversed every repeat. Every run is its own process: wall time from the harness's clock, CPU (user+sys) and peak RSS from the kernel's accounting of the exited child.\n\n", report.Repeats, report.Warmups)
 	fmt.Fprintln(&b, "## Host")
 	fmt.Fprintln(&b)
@@ -196,13 +219,20 @@ func Markdown(report *Report) string {
 				load = fmt.Sprintf("%.2f", row.Load.Median)
 			}
 			extra := row.Extra
+			if hasRatio && !ratio.Parity && hasParityOther(others[row.Scenario][row.Variant]) {
+				extra = strings.TrimSpace("ratios vs 7zz -mmt=1, a user's view; the parity ratio is on the next line. " + extra)
+			}
 			if row.Failed > 0 {
 				extra = strings.TrimSpace(fmt.Sprintf("%s FAILED %d/%d: %s", extra, row.Failed, row.Failed+row.OK, strings.Join(dedupe(row.Failures), ",")))
 			}
 			line += fmt.Sprintf(" %s | %s | %s | %s | %s |", wall, cpu, rss, load, dash(extra))
 			fmt.Fprintln(&b, line)
 			for _, other := range others[row.Scenario][row.Variant] {
-				line := fmt.Sprintf("| | %s | - | - | - | - |", ratioLabel(other))
+				label := ratioLabel(other)
+				if other.Parity {
+					label += " (parity reference)"
+				}
+				line := fmt.Sprintf("| | %s | - | - | - | - |", label)
 				if encode {
 					line += fmt.Sprintf(" - | %s |", ratioText(other.Size))
 				}
@@ -297,6 +327,9 @@ func Merge(reports []*Report) (string, error) {
 	}
 	cells := map[cellKey]string{}
 	groupOf := map[string]string{}
+	// shown is a ratio line's variant cell: its label, marked when the
+	// scenario's parity is judged against a reference other than plain 7zz.
+	shown := map[string]string{}
 	var order []string
 	seen := map[string]bool{}
 	for index, r := range reports {
@@ -304,12 +337,23 @@ func Merge(reports []*Report) (string, error) {
 		for _, row := range r.Rows {
 			walls[row.Scenario+"\x00"+row.Variant] = row.Wall
 		}
+		judged := map[string]bool{}
+		for _, scenario := range r.Scenarios {
+			judged[scenario.ID] = scenario.ParityReference != ""
+		}
 		for _, ratio := range r.Ratios {
 			key := ratio.Scenario + "\x00" + ratioLabel(ratio)
 			if !seen[key] {
 				seen[key] = true
 				order = append(order, key)
 				groupOf[key] = ratio.Group
+				shown[key] = ratioLabel(ratio)
+			}
+			switch {
+			case ratio.Parity && !primaryReference(ratio):
+				shown[key] = ratioLabel(ratio) + " (parity reference)"
+			case judged[ratio.Scenario] && !ratio.Parity && primaryReference(ratio):
+				shown[key] = ratioLabel(ratio) + " (vs 7zz -mmt=1, a user's view)"
 			}
 			cell := fmt.Sprintf("%.3f / %s / %s", walls[ratio.Scenario+"\x00"+ratio.Variant].Median, ratioText(ratio.Wall), ratioText(ratio.RSS))
 			if ratio.Size != nil {
@@ -338,7 +382,7 @@ func Merge(reports []*Report) (string, error) {
 			fmt.Fprintln(&b, rule)
 		}
 		scenario, variant, _ := strings.Cut(key, "\x00")
-		line := fmt.Sprintf("| %s | %s |", scenario, variant)
+		line := fmt.Sprintf("| %s | %s |", scenario, shown[key])
 		for index := range reports {
 			line += " " + dash(cells[cellKey{index, scenario, variant}]) + " |"
 		}

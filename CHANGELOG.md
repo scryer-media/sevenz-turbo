@@ -1024,11 +1024,14 @@ Everything here is new surface; no upstream signature changed meaning.
   reads CRLF line endings as LF, in decode-bench and in the harness, so
   `merge` no longer refuses a report from a CRLF checkout over line endings
   alone.
-- Bench harness: the one-thread BCJ2 row, `decode/bcj2/T1`, has two
-  references: `7zz -mmt=1`, which still runs the BCJ2 stage on a second
-  thread, and `7zz -mmt=1 -mmtf=off`, which does not. Every ratio in
-  report.json now names the reference it is against (`reference`), and both
-  reports label the second as `sevenz-turbo vs 7zz -mmtf=off`.
+- Bench harness: the one-thread BCJ2 row, `decode/bcj2/T1`, judges parity
+  against `7zz -mmt=1 -mmtf=off`, the 7zz that also decodes on one thread;
+  plain `7zz -mmt=1` still runs the BCJ2 stage on a second thread, and its
+  ratio is reported beside for a user's view. Every ratio in report.json
+  names the reference it is against (`reference`) and whether that is the
+  row's parity reference (`parity_reference`). The scenario names a parity
+  reference other than 7zz in `parity_reference`, and both reports mark the
+  parity ratio `(parity reference)`.
 - `crypto-host` now delegates the 7z key derivation's SHA-256 as well as the
   AES-256-CBC decrypt, and a new `crc-host` feature delegates every CRC-32 the
   archive carries (start header, header, members); both on `wasm32` only,

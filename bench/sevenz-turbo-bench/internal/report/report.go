@@ -79,10 +79,13 @@ type Ratio struct {
 	Group    string `json:"group"`
 	Variant  string `json:"variant"`
 	// Reference is the reference variant the ratio is against.
-	Reference string   `json:"reference"`
-	Wall      *float64 `json:"wall,omitempty"`
-	CPU       *float64 `json:"cpu,omitempty"`
-	RSS       *float64 `json:"rss,omitempty"`
+	Reference string `json:"reference"`
+	// Parity marks the ratio parity is judged by: against the scenario's
+	// parity reference, which is 7zz except on the one-thread BCJ2 row.
+	Parity bool     `json:"parity_reference"`
+	Wall   *float64 `json:"wall,omitempty"`
+	CPU    *float64 `json:"cpu,omitempty"`
+	RSS    *float64 `json:"rss,omitempty"`
 	// Size is the archive-size ratio of an encode.
 	Size *float64 `json:"size,omitempty"`
 }
@@ -178,7 +181,8 @@ func Build(raw *suite.Raw) *Report {
 					continue
 				}
 				ratio := Ratio{Scenario: scenario.ID, Group: scenario.Group, Variant: variant, Reference: reference,
-					Wall: divide(against.Wall.Median, ours.Wall.Median), CPU: divide(against.CPU.Median, ours.CPU.Median),
+					Parity: reference == parityReference(scenario),
+					Wall:   divide(against.Wall.Median, ours.Wall.Median), CPU: divide(against.CPU.Median, ours.CPU.Median),
 					RSS: divide(against.RSS.Median, ours.RSS.Median)}
 				if scenario.Op == suite.OpEncode {
 					ratio.Size = divide(float64(against.BytesOut), float64(ours.BytesOut))
@@ -200,6 +204,14 @@ func Build(raw *suite.Raw) *Report {
 	}
 	procmeasure.SortRSSScenarios(report.RSS)
 	return report
+}
+
+// parityReference is the reference a scenario's parity is judged against.
+func parityReference(scenario suite.Scenario) string {
+	if scenario.ParityReference != "" {
+		return scenario.ParityReference
+	}
+	return suite.VariantOracle
 }
 
 func warmupTag(warmup bool) string {

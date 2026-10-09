@@ -178,6 +178,7 @@ func TestSlowThroughputIsNotRoundedToZero(t *testing.T) {
 func TestEveryRatioNamesItsReference(t *testing.T) {
 	raw := sampleRaw()
 	raw.Scenarios[0].Variants = append(raw.Scenarios[0].Variants, suite.Run{Variant: suite.VariantOracleOneThread, Role: suite.RoleReference})
+	raw.Scenarios[0].ParityReference = suite.VariantOracleOneThread
 	for _, wall := range []float64{1.0, 1.2, 1.1} {
 		raw.Runs = append(raw.Runs, run(raw.Scenarios[0].ID, suite.VariantOracleOneThread, suite.RoleReference, wall*3, 40<<20, suite.StatusOK))
 	}
@@ -185,19 +186,32 @@ func TestEveryRatioNamesItsReference(t *testing.T) {
 	against := map[string]float64{}
 	for _, ratio := range built.Ratios {
 		against[ratio.Reference] = *ratio.Wall
+		if ratio.Parity != (ratio.Reference == suite.VariantOracleOneThread) {
+			t.Errorf("ratio against %q has parity_reference %t", ratio.Reference, ratio.Parity)
+		}
 	}
 	if len(built.Ratios) != 2 || against[suite.VariantOracle] != 2 || against[suite.VariantOracleOneThread] != 3 {
 		t.Fatalf("ratios %+v, want 2 against 7zz and 3 against 7zz -mmtf=off", built.Ratios)
 	}
 	md := Markdown(built)
-	if !strings.Contains(md, "| | sevenz-turbo vs 7zz -mmtf=off | - | - | - | - | 3.000 |") {
-		t.Errorf("report.md does not label the second reference's ratio:\n%s", md)
+	for _, want := range []string{
+		"| | sevenz-turbo vs 7zz -mmtf=off (parity reference) | - | - | - | - | 3.000 |",
+		"ratios vs 7zz -mmt=1, a user's view; the parity ratio is on the next line.",
+		"Parity reference: `decode/mt/T4`: parity is judged against `7zz -mmtf=off`",
+	} {
+		if !strings.Contains(md, want) {
+			t.Errorf("report.md lacks %q:\n%s", want, md)
+		}
+	}
+	plain := Markdown(Build(sampleRaw()))
+	if strings.Contains(plain, "parity") {
+		t.Errorf("a report with no parity reference other than 7zz mentions parity:\n%s", plain)
 	}
 	merged, err := Merge([]*Report{built})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"| decode/mt/T4 | sevenz-turbo | 1.100 / 2.000 /", "| decode/mt/T4 | sevenz-turbo vs 7zz -mmtf=off | 1.100 / 3.000 /"} {
+	for _, want := range []string{"| decode/mt/T4 | sevenz-turbo (vs 7zz -mmt=1, a user's view) | 1.100 / 2.000 /", "| decode/mt/T4 | sevenz-turbo vs 7zz -mmtf=off (parity reference) | 1.100 / 3.000 /"} {
 		if !strings.Contains(merged, want) {
 			t.Errorf("merged report lacks %q:\n%s", want, merged)
 		}

@@ -45,7 +45,7 @@ the core count, then `all`; `--quick` runs 1 and `all`):
 | decode ledger | `decode/{media_mx5_3g,media_mx5_2g,mt}/T{2,4,8,all}/ledger` and the same under a limit, `…/budget-<N>MiB/ledger` for 512, 553, 1024, 1065 and 2089 MiB; `decode/{media_mx1,aes_mx1}/T{2,4,8}/ledger`. Full and fleet only | the parallel LZMA2 decoder given more runs than it has threads, at each thread count and under the limits a consumer passes (553, 1065 and 2089 MiB are what weaver passes at 2, 4 and 8 threads), with each decode's memory and dispatch ledger (below). The `-mx1` rows are controls: their runs are small, so a change made for the large-run fixtures must not move them |
 | solid vs non-solid | `decode/tree_{solid,nonsolid}/T{1,all}`, plus `no-verify`, `stream` | many small members: per-member CRC-32, folder setup and header cost vs one large stream |
 | aes-256 | `decode/aes_store/T1`, `decode/aes_mx1/T{1,all}`, `decode/aes_kdf/T1` (+ `list/aes_kdf`) | AES-256-CBC decrypt in both cryptography builds; SHA-256 key derivation dominated rows |
-| filters | `decode/{bcj_x86,bcj_arm64,bcj2,delta}/T1` | the BCJ x86/ARM64, BCJ2 and delta filters; the BCJ2 row has two references, `7zz -mmt=1`, which still runs the BCJ2 stage on a second thread, and `7zz -mmt=1 -mmtf=off` (variant `7zz -mmtf=off`), which does not; its ratio against the second is printed as `sevenz-turbo vs 7zz -mmtf=off` |
+| filters | `decode/{bcj_x86,bcj_arm64,bcj2,delta}/T1` | the BCJ x86/ARM64, BCJ2 and delta filters; the BCJ2 row judges parity against `7zz -mmt=1 -mmtf=off` (variant `7zz -mmtf=off`) and reports plain `7zz -mmt=1` beside it; see [Parity at one thread](#parity-at-one-thread) |
 | ppmd (secondary) | `decode/ppmd/T1` | PPMd through `ppmd-turbo` |
 | encode | `encode/payload-sub/L{1,3,5,7,9}/T{1,all}`, `encode/payload-sub/L5/T<sweep>`, `encode/tree/L5/Tall/{solid,non-solid}` | the `compress` writer (LZMA2 through lzma-turbo's encoder) vs `7zz a -m0=lzma2:d=…:fb=…:mf=…:a=… -mx<L> -mmt<T>`, with the archive-size ratio; 7zz is given this crate's level settings (xz's table, not 7-Zip's `-mx` defaults), so both sides use the same dictionary, match finder and fast bytes; every archive this crate writes is checked once with an untimed `7zz t` |
 | encode aes-256 | `encode/payload-sub/L5/Tall/aes`, `encode/kdf-tree/L5/T1/non-solid/aes` | AES-256 write (`-mhe=on` on the 7zz side; this crate encrypts the header by default) |
@@ -70,6 +70,22 @@ direction rarpar-bench and the weaver bench reports use, so merged reports
 read the same way): ratio = 7zz / sevenz-turbo, >1 = sevenz-turbo better.
 Above 1.000 sevenz-turbo is faster, smaller or lower; below 1.000 it is
 slower, larger or higher. The peak RSS section lists the lowest ratio first.
+
+### Parity at one thread
+
+sevenz-turbo runs on exactly one thread when a caller asks for one, and the
+bench judges parity against 7zz at the same thread count. On the BCJ2 row,
+`decode/bcj2/T1`, that is `7zz -mmt=1 -mmtf=off`: at `-mmt=1` alone 7-Zip
+still runs the BCJ2 stage on a second thread, so plain `-mmt=1` is a
+two-thread decode. The row therefore has two references. Its parity
+reference is `7zz -mmtf=off`: the scenario names it in `parity_reference`, and
+the ratio against it carries `"parity_reference": true` in report.json. The
+ratio against plain `7zz -mmt=1` is reported beside it for a user's view, with
+`"parity_reference": false`. report.md says so in its header. The parity
+ratio's line reads `sevenz-turbo vs 7zz -mmtf=off (parity reference)`, and the
+main row's ratios are noted as a user's view. On every other row the parity
+reference is plain 7zz, and every ratio against it has
+`"parity_reference": true`.
 
 ### The decode ledger
 
