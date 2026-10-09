@@ -25,8 +25,8 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
 use lzma_turbo::{
-    Error as LzmaError, Lzma2Encoder, Lzma2PushEncoder, LzmaEncProps, LzmaEncoder, LzmaPushEncoder,
-    SeqInStream, SeqOutStream,
+    BLOCK_SIZE_SOLID, Error as LzmaError, Lzma2Encoder, Lzma2PushEncoder, LzmaEncProps,
+    LzmaEncoder, LzmaPushEncoder, SeqInStream, SeqOutStream,
 };
 
 /// Bytes per message on the input channel. A caller's large write is cut into
@@ -485,7 +485,26 @@ impl PullCoder {
             Coder::Lzma => true,
             Coder::Lzma2 { threads, .. } => threads <= 1,
         };
-        one_block_thread && props.normalized().num_threads <= 1
+        // A wasm target may or may not start the writer's thread, and the
+        // writer cuts LZMA2 blocks only when it does (see
+        // [`PullCoder::as_written`]): only a solid stream is the same both ways.
+        let same_either_way = !cfg!(target_family = "wasm")
+            || !matches!(coder, Coder::Lzma2 { block_size, .. } if block_size != BLOCK_SIZE_SOLID);
+        one_block_thread && same_either_way && props.normalized().num_threads <= 1
+    }
+
+    /// The coder [`LzmaTurboWriter::new`] actually runs for `coder`. Built
+    /// with `--cfg sevenz_turbo_unthreaded` the writer never has a thread and
+    /// pushes into one solid LZMA2 stream, whatever block plan it was given,
+    /// so a block plan that would cut the stream is dropped here as well.
+    fn as_written(coder: Coder) -> Coder {
+        match coder {
+            Coder::Lzma2 { threads, .. } if cfg!(sevenz_turbo_unthreaded) => Coder::Lzma2 {
+                block_size: BLOCK_SIZE_SOLID,
+                threads,
+            },
+            coder => coder,
+        }
     }
 
     /// Codes everything `input` yields as one stream into `out`, with the
@@ -506,6 +525,7 @@ impl PullCoder {
         out: &mut dyn Write,
     ) -> io::Result<()> {
         debug_assert!(Self::drives(props, coder));
+        let coder = Self::as_written(coder);
         let reuse = self
             .kept
             .as_ref()

@@ -971,5 +971,16 @@ fn from_path_classifies_from_one_metadata_lookup() {
             "{}",
             path.display()
         );
+        // The same entry from metadata the caller already holds.
+        if let Ok(meta) = path.metadata() {
+            let held = sevenz_turbo::ArchiveEntry::from_metadata(&meta, "name".into());
+            assert_eq!(held.name(), entry.name());
+            assert_eq!(held.has_stream(), entry.has_stream());
+            assert_eq!(held.is_directory(), entry.is_directory());
+            assert_eq!(held.size, entry.size);
+            assert_eq!(held.last_modified_date, entry.last_modified_date);
+            assert_eq!(held.creation_date, entry.creation_date);
+            assert_eq!(held.has_access_date, entry.has_access_date);
+        }
     }
 }

@@ -1075,7 +1075,19 @@ Everything here is new surface; no upstream signature changed meaning.
   but still builds an encoder per entry. Folders under 4 KiB now share one set of encoder settings: the
   size hint given to the encoder is at least 4 KiB, below which the
   encoder's dictionary does not shrink further anyway. The archive is the
-  same bytes.
+  same bytes, also built with `--cfg sevenz_turbo_unthreaded`, where the
+  writer ignores an LZMA2 block plan and so does this coder; on wasm an
+  LZMA2 coder with a block plan is left to the writer.
+- New `ArchiveEntry::from_metadata` builds an entry from metadata the caller
+  already holds, such as a directory walk's `DirEntry::metadata`, where
+  `from_path` looks the path up again. On Windows that lookup opens the
+  file, so a tree walked and added with `from_path` opened every file twice.
+  `from_path` is now `from_metadata` over the path's metadata.
+- `push_archive_entries` (a solid folder) also codes a one-thread LZMA or
+  LZMA2 coder on the calling thread, pulling the members itself, where it
+  read them through a 1 MiB buffer and handed them to an encoder thread in
+  1 MiB chunks, up to four in flight. At level 1 on one thread that was
+  half the writer's peak memory. The archive is the same bytes.
 
 ## 0.26.1 - 2026-09-29
 
