@@ -972,6 +972,10 @@ Everything here is new surface; no upstream signature changed meaning.
   message per mebibyte. The output is byte-identical (LZMA2 level 5, BCJ2
   and PPMd checked), and `ArchiveWriter::create` still returns
   `ArchiveWriter<File>`.
+- `ArchiveEntry::from_path` reads the path's metadata once, where it read
+  it three times (`is_file`, `is_dir`, then the metadata itself). What it
+  returns is unchanged: a link is what it points to, and a path whose
+  metadata cannot be read is neither a file nor a directory.
 
 ## 0.26.1 - 2026-09-29
 
