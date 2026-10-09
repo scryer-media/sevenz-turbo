@@ -31,7 +31,7 @@ use lzma_turbo::{
 
 /// Bytes per message on the input channel. A caller's large write is cut into
 /// these so that what sits in flight is bounded whatever it hands over.
-const CHUNK: usize = 1 << 20;
+const CHUNK: usize = 256 << 10;
 
 /// Messages the input channel holds before a write blocks. Small on purpose:
 /// the encoder consumes at most this much ahead of the writer.
@@ -180,6 +180,9 @@ impl Pusher {
 /// The encoder's view of the input channel.
 struct ChannelSource {
     rx: Receiver<Vec<u8>>,
+    /// Where a chunk goes once it has been read, for the writer to fill
+    /// again.
+    spent: Sender<Vec<u8>>,
     pending: Vec<u8>,
     pos: usize,
 }
@@ -200,8 +203,13 @@ impl SeqInStream for ChannelSource {
             // A closed channel is the writer having finished: end of input.
             match self.rx.recv() {
                 Ok(chunk) => {
-                    self.pending = chunk;
+                    let spent = core::mem::replace(&mut self.pending, chunk);
                     self.pos = 0;
+                    // The writer has gone only if it is being dropped; the
+                    // buffer is then freed here.
+                    if spent.capacity() != 0 {
+                        let _ = self.spent.send(spent);
+                    }
                 }
                 Err(_) => return Ok(0),
             }
@@ -210,13 +218,20 @@ impl SeqInStream for ChannelSource {
 }
 
 /// The encoder's view of the output channel.
-struct ChannelSink(Sender<Vec<u8>>);
+struct ChannelSink {
+    tx: Sender<Vec<u8>>,
+    /// Buffers the writer has written out, to be filled again.
+    spare: Receiver<Vec<u8>>,
+}
 
 impl SeqOutStream for ChannelSink {
     fn write(&mut self, data: &[u8]) -> Result<(), LzmaError> {
+        let mut buf = self.spare.try_recv().unwrap_or_default();
+        buf.clear();
+        buf.extend_from_slice(data);
         // The receiver is gone only if the writer was dropped mid-stream;
         // the encoder then has nowhere to put bytes and stops.
-        self.0.send(data.to_vec()).map_err(|_| LzmaError::Write)
+        self.tx.send(buf).map_err(|_| LzmaError::Write)
     }
 }
 
@@ -225,6 +240,13 @@ enum State {
         /// `None` once `finish` has closed it.
         input: Option<SyncSender<Vec<u8>>>,
         output: Receiver<Vec<u8>>,
+        /// Chunks the encoder has read, to be filled again.
+        spent: Receiver<Vec<u8>>,
+        /// Where an output buffer goes once it is written out.
+        spare: Sender<Vec<u8>>,
+        /// Input chunks allocated rather than taken back from `spent`.
+        #[cfg(test)]
+        input_allocs: usize,
         worker: Option<JoinHandle<Result<(), LzmaError>>>,
     },
     /// No encoder thread: the encoder runs inside `write`.
@@ -264,6 +286,12 @@ impl<W: Write> LzmaTurboWriter<W> {
         let mut encoder = Encoder::new(props, coder).map_err(io_error)?;
         let (input_tx, input_rx) = mpsc::sync_channel::<Vec<u8>>(INPUT_DEPTH);
         let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
+        // The way back for both: a chunk the encoder has read returns to the
+        // writer, and a buffer the writer has written out returns to the
+        // encoder, so a stream allocates its buffers once instead of once a
+        // chunk, each on one thread and freed on the other.
+        let (spent_tx, spent_rx) = mpsc::channel::<Vec<u8>>();
+        let (spare_tx, spare_rx) = mpsc::channel::<Vec<u8>>();
         let spawned = if cfg!(sevenz_turbo_unthreaded) {
             Err(io::Error::from(io::ErrorKind::Unsupported))
         } else {
@@ -272,10 +300,14 @@ impl<W: Write> LzmaTurboWriter<W> {
                 .spawn(move || {
                     let mut source = ChannelSource {
                         rx: input_rx,
+                        spent: spent_tx,
                         pending: Vec::new(),
                         pos: 0,
                     };
-                    let mut sink = ChannelSink(output_tx);
+                    let mut sink = ChannelSink {
+                        tx: output_tx,
+                        spare: spare_rx,
+                    };
                     encoder.run(&mut source, &mut sink)
                     // `sink` drops here, which is what ends the writer's drain.
                 })
@@ -284,6 +316,10 @@ impl<W: Write> LzmaTurboWriter<W> {
             Ok(worker) => State::Streaming {
                 input: Some(input_tx),
                 output: output_rx,
+                spent: spent_rx,
+                spare: spare_tx,
+                #[cfg(test)]
+                input_allocs: 0,
                 worker: Some(worker),
             },
             Err(_) => {
@@ -320,12 +356,14 @@ impl<W: Write> LzmaTurboWriter<W> {
 
     /// Hands what the encoder has produced so far to the inner writer.
     fn drain(&mut self) -> io::Result<()> {
-        let State::Streaming { output, .. } = &self.state else {
+        let State::Streaming { output, spare, .. } = &self.state else {
             return Ok(());
         };
         let inner = self.inner.as_mut().expect("open");
         while let Ok(chunk) = output.try_recv() {
             inner.write_all(&chunk)?;
+            // The encoder has gone only once it is done.
+            let _ = spare.send(chunk);
         }
         Ok(())
     }
@@ -351,6 +389,7 @@ impl<W: Write> LzmaTurboWriter<W> {
                 input,
                 output,
                 worker,
+                ..
             } => {
                 // Closing the input is the end-of-stream the encoder waits
                 // for; the output channel then closes when it is done.
@@ -379,11 +418,28 @@ impl<W: Write> Write for LzmaTurboWriter<W> {
         match &mut self.state {
             State::Streaming { .. } => {
                 for chunk in buf.chunks(CHUNK) {
-                    let State::Streaming { input, worker, .. } = &mut self.state else {
+                    let State::Streaming {
+                        input,
+                        worker,
+                        spent,
+                        #[cfg(test)]
+                        input_allocs,
+                        ..
+                    } = &mut self.state
+                    else {
                         unreachable!()
                     };
+                    let mut buf = spent.try_recv().unwrap_or_else(|_| {
+                        #[cfg(test)]
+                        {
+                            *input_allocs += 1;
+                        }
+                        Vec::new()
+                    });
+                    buf.clear();
+                    buf.extend_from_slice(chunk);
                     let sender = input.as_ref().expect("open");
-                    if sender.send(chunk.to_vec()).is_err() {
+                    if sender.send(buf).is_err() {
                         return Err(Self::worker_error(worker));
                     }
                     self.drain()?;
@@ -545,7 +601,7 @@ mod tests {
 
     use lzma_turbo::{BLOCK_SIZE_SOLID, Lzma2Reader, LzmaEncProps, LzmaProps, LzmaReader};
 
-    use super::{CHUNK, Coder, LzmaTurboWriter, PullCoder, SideCoder, State};
+    use super::{CHUNK, Coder, INPUT_DEPTH, LzmaTurboWriter, PullCoder, SideCoder, State};
 
     fn sample(len: usize) -> Vec<u8> {
         // Compressible but not trivial: a short period with a slow drift.
@@ -633,6 +689,40 @@ mod tests {
         w.write_all(&data).expect("write");
         let packed = w.finish().expect("finish");
         assert_eq!(decode_lzma2(&packed, data.len()), data);
+    }
+
+    /// A stream of many chunks allocates its input chunks a few times, not
+    /// once a chunk: the encoder hands each one back once it has read it.
+    /// What can be out at once when the writer finds none to take back is
+    /// the channel's `INPUT_DEPTH`, the chunk the encoder is reading and the
+    /// one it has just replaced, so the writer has allocated at most one more
+    /// than that; the bound holds on any schedule. The bytes are the
+    /// unthreaded path's.
+    #[cfg(not(any(sevenz_turbo_unthreaded, target_family = "wasm")))]
+    #[test]
+    fn a_long_stream_reuses_its_input_chunks() {
+        let chunks = 48;
+        let data = sample(chunks * CHUNK + 777);
+        let coder = Coder::Lzma2 {
+            block_size: BLOCK_SIZE_SOLID,
+            threads: 1,
+        };
+        let mut w = LzmaTurboWriter::new(Vec::new(), &props(), coder).expect("writer");
+        for piece in data.chunks(CHUNK / 2 + 3) {
+            w.write_all(piece).expect("write");
+        }
+        let State::Streaming { input_allocs, .. } = &w.state else {
+            panic!("not streaming");
+        };
+        let allocs = *input_allocs;
+        assert!(
+            allocs <= INPUT_DEPTH + 3,
+            "{allocs} input chunks allocated for {chunks} chunks of input"
+        );
+        let packed = w.finish().expect("finish");
+        let mut inline = unthreaded(coder);
+        inline.write_all(&data).expect("write");
+        assert_eq!(inline.finish().expect("finish"), packed);
     }
 
     /// The writer a target without threads gets, and the one a caller asks

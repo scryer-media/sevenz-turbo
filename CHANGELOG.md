@@ -1069,6 +1069,13 @@ Everything here is new surface; no upstream signature changed meaning.
   size hint given to the encoder is at least 4 KiB, below which the
   encoder's dictionary does not shrink further anyway. The archive is the
   same bytes.
+- An LZMA or LZMA2 folder coded on an encoder thread reuses the buffers that
+  carry its input to that thread and its output back, where it allocated a
+  new one for every 1 MiB of input and for every piece of output, each freed
+  on the other thread. That churn left the allocator holding several
+  megabytes it could not hand back. The input now travels in 256 KiB pieces,
+  and at most five are allocated for a folder of any length. The archive is
+  the same bytes.
 
 ## 0.26.1 - 2026-09-29
 
