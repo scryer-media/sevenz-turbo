@@ -612,6 +612,24 @@ Everything here is new surface; no upstream signature changed meaning.
   adaptive decode went from 4.45 s to 2.46 s (the fixed plan: 2.37 s) at
   the fixed plan's 2.07 GB peak RSS, and from 7.56 s to 4.77 s at 8 threads
   on x86 (fixed: 4.74 s). Incompressible data stays narrow.
+- A parallel LZMA2 decode of more runs than it has threads keeps every
+  thread it can afford busy. The reader hands over whole runs and stops at a
+  run's end; the decoder closes a run only on the control byte after it,
+  which is the first byte of the next piece; and once the input budget was
+  spent on the run in hand and the runs out with workers, that piece was
+  refused for its size while the run it would have closed sat undispatched
+  with a worker idle. Nothing moved it: a drain had no declared run to give,
+  and the room a landing worker freed went on the next whole piece, so after
+  the first wave the decode ran one run short of its width. A piece refused
+  at a run boundary now has its first page fed on its own, the decoder
+  closes the run on the next drain and gives it out, and the rest of the
+  piece is still the next thing offered whole. On an Apple M5 Max a 2 GiB
+  `-mx=5` archive of sixteen 128 MiB runs decodes at 4 threads in 9.0 s
+  instead of 17.3 s and at 8 threads in 4.7 s instead of 6.8 s (medians of
+  three over two alternating passes on a loaded machine; 7-Zip with every
+  core: 3.0 s). Under a memory limit that pays for four runs the 4-thread
+  decode went from 15.4 s to 13.1 s; the remaining gap under a tight limit
+  is the decoder's budgeting, not the reader's.
 - A block of exactly one LZMA2 run (1 MiB) decodes single-threaded. The
   parallel path wins only from the second run, and one run decoded in
   parallel was 4.5% slower; the threshold is the encoder's minimum run size,
