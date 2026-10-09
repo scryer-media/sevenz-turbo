@@ -225,9 +225,13 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Verify the crates.io archive lists cleanly
-        # Listing proves the manifest and the includes are sane. The packaged
-        # crate is not built here.
+        # Listing proves the manifest and the includes are sane.
         run: cargo package --locked --no-verify --list
+      - name: Build the packaged crate from its own archive
+        # Verification unpacks the archive into target/package and builds it
+        # there against the packaged Cargo.lock, so a file the build needs
+        # that the archive leaves out fails here rather than on crates.io.
+        run: cargo package --locked
 
   ci-complete:
     name: ci-complete

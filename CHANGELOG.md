@@ -972,6 +972,9 @@ Everything here is new surface; no upstream signature changed meaning.
   message per mebibyte. The output is byte-identical (LZMA2 level 5, BCJ2
   and PPMd checked), and `ArchiveWriter::create` still returns
   `ArchiveWriter<File>`.
+- CI's package job builds the crate from its own archive (`cargo package
+  --locked`) as well as listing it, so a file the build needs that the
+  archive leaves out fails on the pull request rather than at publish.
 
 ## 0.26.1 - 2026-09-29
 
