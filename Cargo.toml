@@ -161,4 +161,4 @@ codegen-units = 1
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sevenz_turbo_unthreaded)"] }
 
 [patch.crates-io]
-lzma-turbo = { path = "../../../../../turbo-bench/0.27.0/decode-reader/lzma-turbo-0ec973a" }
+lzma-turbo = { path = "../../../lzma-turbo/.worktrees/decode-0.27" }
