@@ -39,25 +39,24 @@ aes256_wasm = ["aes256", "getrandom/wasm_js"]
 # in regardless, as the encryptor of every build that does not select AWS-LC.
 aws-lc-crypto = ["dep:aws-lc-rs", "lzma-turbo/crypto"]
 native-crypto = ["dep:aes", "dep:cbc", "lzma-turbo/native-crypto"]
-# Delegate the bulk AES-256-CBC *decrypt* to an embedder-installed hook (see
-# the `hooks` module) instead of running a block cipher inside the guest.
-# Engaged on `wasm32` only: on a native target the feature is accepted but
-# inert (AWS-LC or RustCrypto stays selected and no hook is ever called), so
-# feature unification in a mixed workspace cannot silently turn a native build
-# into a delegating one. It adds no AES dependency at all — that is the point:
-# `aes256,crypto-host` on wasm carries no in-guest block cipher. It does
-# forward `lzma-turbo/native-crypto`, because the 7z key derivation's SHA-256
-# is still computed in the guest and needs a backend that builds without a C
-# toolchain.
-#
-# FOLLOW-UP: `lzma-turbo` has shipped `crc-host` / `crypto-host` hooks of its
-# own since 0.4.0. This crate does not forward them yet: `crypto-host` below
-# still selects `lzma-turbo/native-crypto`, so a delegating wasm guest computes
-# the member CRC-32 and the KDF's SHA-256 in the guest. Wiring it means a
-# `crc-host = ["lzma-turbo/crc-host"]` feature here, `crypto-host` forwarding
-# `lzma-turbo/crypto-host`, and a `wasm-conformance` case that proves both
-# reach the host.
-crypto-host = ["lzma-turbo/native-crypto"]
+# Delegate the 7z `aes256` cryptography to the embedding host (see the `hooks`
+# module) instead of running it inside the guest: the bulk AES-256-CBC
+# *decrypt* through this crate's own hook, and the key derivation's SHA-256
+# through `lzma-turbo`'s, which this forwards to. Engaged on `wasm32` only: on
+# a native target the feature is accepted but inert (AWS-LC or RustCrypto
+# stays selected and no hook is ever called), so feature unification in a
+# mixed workspace cannot silently turn a native build into a delegating one.
+# It adds no AES dependency at all — that is the point: `aes256,crypto-host`
+# on wasm carries no in-guest block cipher. `lzma-turbo/crypto-host` implies
+# `lzma-turbo/native-crypto`, which is the in-process SHA-256 a native build
+# of this feature set falls back on without needing a C toolchain.
+crypto-host = ["lzma-turbo/crypto-host"]
+# Delegate the CRC-32 every 7z header, folder and member carries to the
+# embedding host, through `lzma-turbo`'s hooks (re-exported from the `hooks`
+# module). Engaged on `wasm32` only, inert on native targets exactly as
+# `crypto-host` is. Checksums inside a bzip2 or zstd stream are those codecs'
+# own and stay in the guest.
+crc-host = ["lzma-turbo/crc-host"]
 brotli = ["dep:brotli"]
 bzip2 = ["dep:bzip2"]
 # Writing archives. LZMA and LZMA2 are encoded by `lzma-turbo`'s port of the
@@ -140,12 +139,12 @@ required-features = ["default"]
 name = "mt_decompress"
 required-features = ["default"]
 
-# The reference embedding of the `hooks` seam: a wasm guest that declares a raw
-# import in a `host` namespace and installs a hook forwarding to it. It only
-# makes sense with the delegating feature on.
+# The reference embedding of the `hooks` seams: a wasm guest that declares raw
+# imports in a `host` namespace and installs hooks forwarding to them. It only
+# makes sense with the delegating features on.
 [[example]]
 name = "wasm_host_extract_conformance"
-required-features = ["aes256", "crypto-host"]
+required-features = ["aes256", "crc-host", "crypto-host"]
 
 [package.metadata.docs.rs]
 all-features = true

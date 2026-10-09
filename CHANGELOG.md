@@ -377,13 +377,8 @@ Everything here is new surface; no upstream signature changed meaning.
   `compress` carries no in-guest block cipher — and the seam mirrors
   `rarpar`'s `unrar-rs` hooks module deliberately, so an embedder wires both
   crates the same way.
-  FOLLOW-UP, not wired yet: `lzma-turbo` ships `crc-host` / `crypto-host`
-  hooks of its own (since its 0.4.0). When this crate forwards them
-  (`crc-host = ["lzma-turbo/crc-host"]`, and `crypto-host` forwarding
-  `lzma-turbo/crypto-host`), the member CRC-32 and the KDF's SHA-256 are
-  delegated too. Until then `crypto-host` forwards `lzma-turbo/native-crypto`,
-  which is what gives a delegating wasm guest a SHA-256 without a C toolchain
-  and without dragging in `native-crypto`'s `aes`/`cbc`.
+  Since 0.27.0 `crypto-host` also delegates the KDF's SHA-256, and
+  `crc-host` the CRC-32, through `lzma-turbo`'s own hooks (see that release).
 - New `sevenz_turbo::crypto_backend() -> &'static str`, reporting which backend
   a build selected (`"aws-lc"`, `"rustcrypto"`, or `"host"` on a delegating
   wasm build), for consumers who want to assert on it.
@@ -1034,6 +1029,25 @@ Everything here is new surface; no upstream signature changed meaning.
   thread, and `7zz -mmt=1 -mmtf=off`, which does not. Every ratio in
   report.json now names the reference it is against (`reference`), and both
   reports label the second as `sevenz-turbo vs 7zz -mmtf=off`.
+- `crypto-host` now delegates the 7z key derivation's SHA-256 as well as the
+  AES-256-CBC decrypt, and a new `crc-host` feature delegates every CRC-32 the
+  archive carries (start header, header, members); both on `wasm32` only,
+  inert on native targets. They forward `lzma-turbo/crypto-host` and
+  `lzma-turbo/crc-host`: until now `crypto-host` forwarded
+  `lzma-turbo/native-crypto` and kept SHA-256 in the guest, and `crc-host` did
+  not exist. `sevenz_turbo::hooks` re-exports `lzma-turbo`'s hook API
+  (`HostHashHooks`, `install_host_hash_hooks`, …), so an embedder installs both
+  seams without depending on `lzma-turbo` directly; the module is present with
+  either feature. A wasm embedder that enables `crypto-host` must now install
+  the hash hooks too, or the key derivation panics naming
+  `install_host_hash_hooks`. The conformance guest builds with
+  `aes256,crc-host,crypto-host`, and the `wasmtime` harness serves a reference
+  SHA-256 and CRC-32 beside its AES, asserts that each import was called and
+  every SHA-256 handle closed, and checks that a guest missing either set of
+  hooks panics with that set's message.
+- CI's package job builds the crate from its own archive (`cargo package
+  --locked`) as well as listing it, so a file the build needs that the
+  archive leaves out fails on the pull request rather than at publish.
 
 ## 0.26.1 - 2026-09-29
 
