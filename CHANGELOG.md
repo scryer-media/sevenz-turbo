@@ -581,7 +581,10 @@ Everything here is new surface; no upstream signature changed meaning.
   any of them is built: every coder, the filters and the fixed-size codecs
   at the figures `Archive::decoder_memory_estimate` gives them. A block
   whose pipes do not fit beside them keeps the sequential chain; nothing is
-  refused for it. So does the rest of a chain from the first coder whose thread
+  refused for it. The parallel LZMA2 plan's run buffers are sized against
+  the same remainder: the limit less every other coder of the chain, the
+  fixed-size ones at those figures too, where they were sized against the
+  limit less the sized coders alone. So does the rest of a chain from the first coder whose thread
   cannot be started: it decodes on the caller's thread, reading the stages
   already running. One thread, and wasm32, keep the sequential chain. A
   BCJ2 archive written by 7-Zip (LZMA2 main stream, LZMA call and jump

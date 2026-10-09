@@ -77,6 +77,13 @@ pub(crate) struct DecodeOptions<'a> {
     /// limit as a whole rather than each coder within it alone.
     #[cfg_attr(not(feature = "zstd"), allow(dead_code))]
     pub(crate) reserved_kb: usize,
+    /// Kilobytes the memory model holds for the coders of this chain that
+    /// [`check_chain_memory`] does not size, the filters and the fixed-size
+    /// codecs, at [`unsized_coders_memory_kb`]'s figures. Not in
+    /// `reserved_kb`, and never a reason to refuse a chain; what the chain
+    /// may hold beyond its coders, the parallel LZMA2 plan's buffers and the
+    /// pipeline's pipes, is sized against the limit less these as well.
+    pub(crate) unsized_kb: usize,
     /// Whether the chain being built decrypts (`Block::is_encrypted`): a
     /// coder that cannot make sense of its input then reports a possible
     /// wrong password, and otherwise damage, whatever password was supplied.
@@ -96,16 +103,18 @@ impl<'a> DecodeOptions<'a> {
             checksum_splits: &[],
             files_verified: false,
             reserved_kb: 0,
+            unsized_kb: 0,
             // Set from the header's own block once it has been read.
             encrypted: false,
         }
     }
 
     /// The same options, with `reserved_kb` already granted to the chain's
-    /// sized coders.
-    pub(crate) fn reserving(self, reserved_kb: usize) -> Self {
+    /// sized coders and `unsized_kb` held by the model for the rest of them.
+    pub(crate) fn reserving(self, reserved_kb: usize, unsized_kb: usize) -> Self {
         Self {
             reserved_kb,
+            unsized_kb,
             ..self
         }
     }
@@ -228,15 +237,25 @@ fn ppmd_memory_kb(memory_size: u32) -> usize {
 
 /// The memory limit a block's LZMA2 plan is sized against: the caller's
 /// limit less what the rest of the chain was granted by
-/// [`check_chain_memory`]. `reserved_kb` is the whole chain's reservation,
-/// this coder's own `own_kb` included, and the plan subtracts its own
-/// dictionary and state itself, so only the others' share comes off here. A
-/// limit of `u64::MAX` is no limit and stays so.
-fn lzma2_plan_budget(memory_limit_bytes: u64, reserved_kb: usize, own_kb: usize) -> u64 {
+/// [`check_chain_memory`], and what the model holds for the coders that check
+/// does not size. `reserved_kb` is the whole chain's reservation, this
+/// coder's own `own_kb` included, and the plan subtracts its own dictionary
+/// and state itself, so only the others' share comes off here; `unsized_kb`
+/// is [`unsized_coders_memory_kb`]'s figure for the chain, which is live
+/// beside the plan's buffers as much as a sized coder is. A limit of
+/// `u64::MAX` is no limit and stays so.
+fn lzma2_plan_budget(
+    memory_limit_bytes: u64,
+    reserved_kb: usize,
+    unsized_kb: usize,
+    own_kb: usize,
+) -> u64 {
     if memory_limit_bytes == u64::MAX {
         return u64::MAX;
     }
-    let others_kb = reserved_kb.saturating_sub(own_kb) as u64;
+    let others_kb = reserved_kb
+        .saturating_sub(own_kb)
+        .saturating_add(unsized_kb) as u64;
     memory_limit_bytes.saturating_sub(others_kb.saturating_mul(1024))
 }
 
@@ -284,8 +303,10 @@ pub(crate) fn check_chain_memory<'c>(
 ///
 /// No chain is refused on these: they are margins over what such a coder
 /// allocates, and a decode-time refusal on a margin would turn away blocks
-/// that fit. They decide only whether a chain has room for more than its
-/// coders, which `pipeline::Chain::new` asks before it opens its pipes.
+/// that fit. They decide only how much room a chain has beyond its coders:
+/// `pipeline::Chain::new` asks before it opens its pipes, and
+/// [`lzma2_plan_budget`] takes them off what the parallel LZMA2 plan may
+/// hold in run buffers. They reach both as [`DecodeOptions::unsized_kb`].
 ///
 /// `coders` is as [`check_chain_memory`] takes it.
 pub(crate) fn unsized_coders_memory_kb<'c>(
@@ -368,7 +389,12 @@ pub fn add_decoder<I: Read>(
                 Some(control) => Lzma2Plan::for_block(
                     opts.threads,
                     opts.adaptive_lzma2,
-                    lzma2_plan_budget(opts.limits.memory_limit_bytes, opts.reserved_kb, mem_size),
+                    lzma2_plan_budget(
+                        opts.limits.memory_limit_bytes,
+                        opts.reserved_kb,
+                        opts.unsized_kb,
+                        mem_size,
+                    ),
                     dic_size,
                     uncompressed_len as u64,
                     control,
@@ -538,22 +564,31 @@ fn get_ppmd_params(coder: &Coder, max_mem_limit_kb: usize) -> Result<PpmdParams,
 mod budget_tests {
     use super::lzma2_plan_budget;
 
-    /// What the chain's other coders hold comes off the LZMA2 plan's limit;
-    /// the coder's own share does not, because the plan subtracts that
-    /// itself; and no limit stays no limit.
+    /// What the chain's other coders hold comes off the LZMA2 plan's limit,
+    /// the sized ones out of the reservation and the rest at the model's
+    /// figures; the coder's own share does not, because the plan subtracts
+    /// that itself; and no limit stays no limit.
     #[test]
     fn the_plan_budget_is_the_limit_less_the_other_coders_share() {
         let limit = 64 << 20;
-        assert_eq!(lzma2_plan_budget(limit, 0, 0), limit);
+        assert_eq!(lzma2_plan_budget(limit, 0, 0, 0), limit);
         // Own share only: nothing comes off.
-        assert_eq!(lzma2_plan_budget(limit, 9 << 10, 9 << 10), limit);
-        // The pack buffer (64 KiB) and an AES coder's share come off.
+        assert_eq!(lzma2_plan_budget(limit, 9 << 10, 0, 9 << 10), limit);
+        // The pack buffer (64 KiB) and a sized coder's share come off.
         assert_eq!(
-            lzma2_plan_budget(limit, (9 << 10) + 64 + 1024, 9 << 10),
+            lzma2_plan_budget(limit, (9 << 10) + 64 + 1024, 0, 9 << 10),
             limit - ((64 + 1024) << 10)
         );
+        // So does what the model holds for a coder the chain check does not
+        // size: the cipher's megabyte, BCJ2's sixteen, a BZip2 or Zstandard
+        // coder's figure. A chain of LZMA2 under BCJ2 with the pack buffer:
+        assert_eq!(
+            lzma2_plan_budget(limit, (9 << 10) + 64, 16 << 10, 9 << 10),
+            limit - ((64 + (16 << 10)) << 10)
+        );
         // A reservation past the limit leaves nothing, not a wrap.
-        assert_eq!(lzma2_plan_budget(1 << 20, 4 << 20, 0), 0);
-        assert_eq!(lzma2_plan_budget(u64::MAX, 4 << 20, 0), u64::MAX);
+        assert_eq!(lzma2_plan_budget(1 << 20, 4 << 20, 0, 0), 0);
+        assert_eq!(lzma2_plan_budget(1 << 20, 0, 4 << 20, 0), 0);
+        assert_eq!(lzma2_plan_budget(u64::MAX, 4 << 20, 4 << 20, 0), u64::MAX);
     }
 }

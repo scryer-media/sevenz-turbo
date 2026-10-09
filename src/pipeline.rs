@@ -33,7 +33,7 @@ use std::thread::JoinHandle;
 use crate::archive::EncoderMethod;
 use crate::block::Block;
 use crate::codec::lzma_turbo::MT_MIN_BLOCK_BYTES;
-use crate::decoder::{DecodeOptions, INPUT_BUF_SIZE, add_decoder, unsized_coders_memory_kb};
+use crate::decoder::{DecodeOptions, INPUT_BUF_SIZE, add_decoder};
 use crate::{Error, Password};
 
 /// Bytes a stage hands on at a time.
@@ -713,10 +713,10 @@ impl<'r> Chain<'r> {
     ///
     /// Beside every coder, that is, and not the sized ones alone: the
     /// filters and the fixed-size codecs are counted at the memory model's
-    /// figures (see `unsized_coders_memory_kb`), so the pipes are opened only
-    /// where the limit holds the whole chain and them. Those figures stay
-    /// out of `opts.reserved_kb`, which a coder fitting itself to what is
-    /// left subtracts: its own would be in it.
+    /// figures (`opts.unsized_kb`, from `unsized_coders_memory_kb`), so the
+    /// pipes are opened only where the limit holds the whole chain and them.
+    /// Those figures stay out of `opts.reserved_kb`, which a coder fitting
+    /// itself to what is left subtracts: its own would be in it.
     pub(crate) fn new(block: &Block, opts: &mut DecodeOptions<'_>) -> Self {
         let mut offload = offload_plan(block, opts.threads);
         if offload != 0 {
@@ -724,14 +724,7 @@ impl<'r> Chain<'r> {
                 .saturating_mul(PIPE_BYTES)
                 .div_ceil(1024);
             let chain_kb = opts.reserved_kb.saturating_add(pipes_kb);
-            let others_kb = unsized_coders_memory_kb(
-                block
-                    .coders
-                    .iter()
-                    .enumerate()
-                    .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index))),
-            );
-            if chain_kb.saturating_add(others_kb) > opts.limits.memory_limit_kb() {
+            if chain_kb.saturating_add(opts.unsized_kb) > opts.limits.memory_limit_kb() {
                 offload = 0;
             } else {
                 opts.reserved_kb = chain_kb;
@@ -797,6 +790,7 @@ impl<'r> Chain<'r> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decoder::unsized_coders_memory_kb;
 
     fn data(len: usize) -> Vec<u8> {
         (0..len).map(|i| (i * 7 + i / 300) as u8).collect()
@@ -1074,6 +1068,15 @@ mod tests {
             let mut opts = DecodeOptions::header(&limits);
             opts.threads = threads;
             opts.reserved_kb = coders_kb;
+            // As the reader sets it: the model's figures for the chain's
+            // unsized coders.
+            opts.unsized_kb = unsized_coders_memory_kb(
+                block
+                    .coders
+                    .iter()
+                    .enumerate()
+                    .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index))),
+            );
             let chain = Chain::new(block, &mut opts);
             (chain.offload, opts.reserved_kb)
         };

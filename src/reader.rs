@@ -18,7 +18,7 @@ use crate::{
     codec::filter::bcj2::Bcj2Reader,
     codec::lzma_turbo::{Lzma2Control, Lzma2Handle, Lzma2Progress},
     container::{ArchiveLimits, BlockCompletion, SubStreamCompletion},
-    decoder::{DecodeOptions, add_decoder, check_chain_memory},
+    decoder::{DecodeOptions, add_decoder, check_chain_memory, unsized_coders_memory_kb},
     error::{Error, Limit},
     pipeline::{Chain, Stage},
     positional::{ReadAt, ReadAtCursor},
@@ -691,14 +691,16 @@ impl Archive {
         // Each coder is checked against the memory limit as it is built, which
         // alone lets a chain of them hold the limit several times over; the
         // chain is refused here, as a whole, before any of them allocates.
-        let reserved_kb = check_chain_memory(
+        let coder_sizes = || {
             block
                 .ordered_coder_iter()
-                .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index))),
-            opts.limits,
-            0,
-        )?;
-        let opts = &opts.reserving(reserved_kb).decrypting(block.is_encrypted());
+                .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index)))
+        };
+        let reserved_kb = check_chain_memory(coder_sizes(), opts.limits, 0)?;
+        let unsized_kb = unsized_coders_memory_kb(coder_sizes());
+        let opts = &opts
+            .reserving(reserved_kb, unsized_kb)
+            .decrypting(block.is_encrypted());
         let pack_size = archive.pack_sizes[first_pack_stream_index] as usize;
         let input_reader = BoundedReader::new(reader, pack_size);
         let mut decoder: Box<dyn Read> = Box::new(input_reader);
@@ -2158,28 +2160,32 @@ impl<R: Read + Seek> ArchiveReader<R> {
         // this never refuses anything, because `decoder_memory_estimate` has
         // already bounded the same sum from above; it is what bounds a
         // `BlockDecoder` built with limits of its own.
-        let reserved_kb = if block.total_input_streams > block.total_output_streams {
+        let (reserved_kb, unsized_kb) = if block.total_input_streams > block.total_output_streams {
             // Every coder of a multi-stream graph is built.
-            check_chain_memory(
+            let graph = || {
                 block
                     .coders
                     .iter()
                     .enumerate()
-                    .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index))),
-                opts.limits,
-                0,
-            )?
+                    .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index)))
+            };
+            (
+                check_chain_memory(graph(), opts.limits, 0)?,
+                unsized_coders_memory_kb(graph()),
+            )
         } else {
             // Under the chain, the pack stream's read buffer (below).
-            check_chain_memory(
+            let chain = || {
                 block
                     .ordered_coder_iter()
-                    .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index))),
-                opts.limits,
-                crate::decoder::INPUT_BUF_SIZE / 1024,
-            )?
+                    .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index)))
+            };
+            (
+                check_chain_memory(chain(), opts.limits, crate::decoder::INPUT_BUF_SIZE / 1024)?,
+                unsized_coders_memory_kb(chain()),
+            )
         };
-        let mut opts = opts.reserving(reserved_kb);
+        let mut opts = opts.reserving(reserved_kb, unsized_kb);
         if block.total_input_streams > block.total_output_streams {
             return Self::build_decode_stack2(source, archive, block_index, password, &opts);
         }
@@ -2787,6 +2793,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     // Below, against the file's own CRC.
                     files_verified: true,
                     reserved_kb: 0,
+                    unsized_kb: 0,
                     encrypted: self.archive.blocks[block_index].is_encrypted(),
                 };
                 self.lzma2.set_block_index(block_index);
@@ -3154,6 +3161,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
             // Every file below is checked against its CRC as it is read, on
             // this thread or folded from the workers'.
             files_verified: verify_checksums,
+            unsized_kb: 0,
             reserved_kb: 0,
             encrypted: archive.blocks[block_index].is_encrypted(),
         };
