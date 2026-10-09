@@ -125,13 +125,34 @@ fn is_heavy(method: &[u8]) -> bool {
     .contains(&method)
 }
 
+/// The LZMA2 coder of `block` that may decode on worker threads of its own:
+/// the one with the most to decode, and the first of several that tie.
+///
+/// A chain has one parallel reader. Each LZMA2 coder used to plan for itself,
+/// so a chain of two started twice the workers the block was given threads
+/// for, each with the whole of the in-flight budget the memory limit leaves.
+pub(crate) fn parallel_lzma2_coder(block: &Block) -> Option<usize> {
+    let mut best: Option<(usize, u64)> = None;
+    for (index, coder) in block.coders.iter().enumerate() {
+        if coder.encoder_method_id() != EncoderMethod::ID_LZMA2 {
+            continue;
+        }
+        let size = block.get_unpack_size_at_index(index);
+        if best.is_none_or(|(_, largest)| size > largest) {
+            best = Some((index, size));
+        }
+    }
+    best.map(|(index, _)| index)
+}
+
 /// Which of a block's coders, as a bit per coder index, decode on a thread of
 /// their own when the block is given `threads`.
 ///
 /// None of them unless at least two coders that cost real CPU would otherwise
 /// share the caller's thread, and there is more than one thread to run them
-/// on. An LZMA2 coder that will decode in parallel is not one of the two: its
-/// work is on its own workers already, and the caller's thread only hands its
+/// on. The LZMA2 coder that will decode in parallel, which is one coder of a
+/// chain at most ([`parallel_lzma2_coder`]), is not one of the two: its work
+/// is on its own workers already, and the caller's thread only hands its
 /// output on. That is the AES-over-LZMA2 chain, where the cipher alone was
 /// left on the caller's thread and a thread of its own measured as a wash.
 ///
@@ -153,10 +174,8 @@ pub(crate) fn offload_plan(block: &Block, threads: u32) -> u64 {
         return 0;
     }
     let size = |index: usize| block.get_unpack_size_at_index(index);
-    let parallel = |index: usize| {
-        coders[index].encoder_method_id() == EncoderMethod::ID_LZMA2
-            && size(index) > MT_MIN_BLOCK_BYTES
-    };
+    let parallel_coder = parallel_lzma2_coder(block);
+    let parallel = |index: usize| parallel_coder == Some(index) && size(index) > MT_MIN_BLOCK_BYTES;
     let heavy: Vec<bool> = (0..count)
         .map(|index| is_heavy(coders[index].encoder_method_id()) && !parallel(index))
         .collect();
@@ -678,6 +697,9 @@ pub(crate) struct Reserved {
 pub(crate) struct Chain<'r> {
     pub(crate) pipeline: Pipeline<'r>,
     offload: u64,
+    /// The one coder that is built with the reader's live LZMA2 control, and
+    /// so may decode in parallel: see [`parallel_lzma2_coder`].
+    parallel_lzma2: Option<usize>,
 }
 
 impl<'r> Chain<'r> {
@@ -718,6 +740,7 @@ impl<'r> Chain<'r> {
         Self {
             pipeline: Pipeline::default(),
             offload,
+            parallel_lzma2: parallel_lzma2_coder(block),
         }
     }
 
@@ -732,6 +755,20 @@ impl<'r> Chain<'r> {
     ) -> Result<Stage<'r>, Error> {
         let coder = &block.coders[index];
         let len = block.get_unpack_size_at_index(index) as usize;
+        // Every other LZMA2 coder of the chain is built without the control,
+        // which is what a single-threaded plan is.
+        let single_threaded;
+        let opts = if coder.encoder_method_id() == EncoderMethod::ID_LZMA2
+            && self.parallel_lzma2 != Some(index)
+        {
+            single_threaded = DecodeOptions {
+                lzma2_control: None,
+                ..*opts
+            };
+            &single_threaded
+        } else {
+            opts
+        };
         if index < 64 && self.offload & (1 << index) != 0 {
             match self.pipeline.reserve() {
                 Ok(thread) => {
@@ -886,6 +923,61 @@ mod tests {
             unpack_sizes: vec![main_len + 2 * side_len, main_len, side_len, side_len],
             ..Default::default()
         }
+    }
+
+    /// A chain of LZMA2 coders, the first on top and each reading the next,
+    /// over AES when `aes` gives its length.
+    fn lzma2_chain(sizes: &[u64], aes: Option<u64>) -> Block {
+        let mut coders: Vec<_> = sizes
+            .iter()
+            .map(|_| coder(EncoderMethod::ID_LZMA2, 1))
+            .collect();
+        let mut unpack_sizes = sizes.to_vec();
+        if let Some(len) = aes {
+            coders.push(coder(EncoderMethod::ID_AES256_SHA256, 1));
+            unpack_sizes.push(len);
+        }
+        let count = coders.len() as u64;
+        Block {
+            coders,
+            total_input_streams: count as usize,
+            total_output_streams: count as usize,
+            bind_pairs: (1..count).map(|index| bind(index - 1, index)).collect(),
+            packed_streams: vec![count - 1],
+            unpack_sizes,
+            ..Default::default()
+        }
+    }
+
+    /// One LZMA2 coder of a chain decodes in parallel: the one with the most
+    /// to decode. Each used to be planned for by itself, and counted as
+    /// parallel here whether or not it was the one.
+    #[test]
+    fn a_chain_has_one_parallel_lzma2_coder() {
+        const MIB: u64 = 1 << 20;
+        let lzma = aes_under(EncoderMethod::ID_LZMA, 64 * MIB, 32 * MIB);
+        assert_eq!(parallel_lzma2_coder(&lzma), None);
+        let one = aes_under(EncoderMethod::ID_LZMA2, 64 * MIB, 32 * MIB);
+        assert_eq!(parallel_lzma2_coder(&one), Some(0));
+        let main = bcj2(EncoderMethod::ID_LZMA2, 64 * MIB, 2 * MIB);
+        assert_eq!(parallel_lzma2_coder(&main), Some(1));
+
+        // Of two, the larger, wherever it sits; of two the same, the first.
+        let top = lzma2_chain(&[64 * MIB, 60 * MIB], None);
+        assert_eq!(parallel_lzma2_coder(&top), Some(0));
+        let under = lzma2_chain(&[60 * MIB, 64 * MIB], None);
+        assert_eq!(parallel_lzma2_coder(&under), Some(1));
+        let same = lzma2_chain(&[64 * MIB, 64 * MIB], None);
+        assert_eq!(parallel_lzma2_coder(&same), Some(0));
+
+        // The other one decodes on one thread, so it is a coder that costs
+        // real CPU on whichever thread it is given: alone with the caller's
+        // thread it stays there, and beside a cipher both get a thread.
+        assert_eq!(offload_plan(&top, 8), 0);
+        assert_eq!(offload_plan(&under, 8), 0);
+        let over_aes = lzma2_chain(&[64 * MIB, 60 * MIB], Some(60 * MIB));
+        assert_eq!(parallel_lzma2_coder(&over_aes), Some(0));
+        assert_eq!(offload_plan(&over_aes, 8), 0b110);
     }
 
     /// The decisions, for the chains 7-Zip writes.

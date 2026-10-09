@@ -566,6 +566,12 @@ Everything here is new surface; no upstream signature changed meaning.
   BCJ2 archive written by 7-Zip (LZMA2 main stream, LZMA call and jump
   streams) decodes 1.07-1.08x faster at 2-18 threads on Apple M5 Max and
   1.08-1.11x at 2-8 threads on x86.
+- A chain has one parallel LZMA2 reader. Each LZMA2 coder of a block planned
+  for itself, so a chain of two with enough to decode started twice the
+  workers the block was given threads for, each sized to the whole of what
+  the memory limit leaves. The coder with the most to decode keeps the plan,
+  the first of several that tie; every other LZMA2 coder of the chain decodes
+  on one thread, and counts for the pipeline as any other CPU-heavy coder.
 - An adaptive LZMA2 decode reaches the fixed plan's width. It started at one
   thread with the first run decoded on the calling thread, which held the
   stream's cursor; a widening was only heard once a whole run had landed;

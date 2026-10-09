@@ -4243,6 +4243,62 @@ mod header_damage_tests {
     }
 }
 
+#[cfg(all(test, feature = "compress"))]
+mod chain_plan_tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::{ArchiveWriter, encoder_options::Lzma2Options};
+
+    /// A chain of two LZMA2 coders with enough to decode in parallel each is
+    /// given one parallel reader. Each coder used to plan for itself: two
+    /// readers of four threads at four threads, each with the whole of the
+    /// in-flight budget.
+    #[test]
+    fn a_chain_of_two_lzma2_coders_is_given_one_parallel_reader() {
+        // Bytes that do not compress, so that the coder underneath has as
+        // much to decode as the one on top.
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let data: Vec<u8> = (0..8 << 20)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 32) as u8
+            })
+            .collect();
+        let mut options = Lzma2Options::from_level_mt(1, 4, 1 << 20);
+        options.set_dictionary_size(1 << 20);
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+        writer.set_content_methods(vec![options.clone().into(), options.into()]);
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("one"), Some(data.as_slice()))
+            .expect("push");
+        let mut source = writer.finish().expect("finish");
+        let archive = Archive::read(&mut source, &Password::empty()).expect("parse");
+        let block = &archive.blocks[0];
+        assert_eq!(block.coders.len(), 2);
+        for index in 0..2 {
+            assert!(
+                block.get_unpack_size_at_index(index) > 4 << 20,
+                "coder {index} has too little to decode in parallel"
+            );
+        }
+
+        let password = Password::empty();
+        crate::decoder::PARALLEL_LZMA2_PLANS.with(|plans| plans.set(0));
+        let mut out = Vec::new();
+        BlockDecoder::new(4, 0, &archive, &password, &mut source)
+            .for_each_entries(&mut |_, rd| {
+                rd.read_to_end(&mut out)?;
+                Ok(true)
+            })
+            .expect("decodes");
+        assert!(out == data, "the chain decoded to other bytes");
+        assert_eq!(crate::decoder::PARALLEL_LZMA2_PLANS.with(Cell::get), 1);
+    }
+}
+
 #[cfg(test)]
 mod folder_plan_tests {
     use super::*;

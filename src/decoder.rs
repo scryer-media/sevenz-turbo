@@ -130,6 +130,14 @@ impl<'a> DecodeOptions<'a> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many LZMA2 coders this thread has built with a parallel plan, for
+    /// a test that counts a chain's.
+    pub(crate) static PARALLEL_LZMA2_PLANS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 pub enum Decoder<R: Read> {
     Copy(R),
     Lzma(Box<LzmaReader<R>>),
@@ -368,6 +376,10 @@ pub fn add_decoder<I: Read>(
                 ),
                 None => Lzma2Plan::SingleThreaded,
             };
+            #[cfg(test)]
+            if !matches!(plan, Lzma2Plan::SingleThreaded) {
+                PARALLEL_LZMA2_PLANS.with(|plans| plans.set(plans.get() + 1));
+            }
             let lz = lzma2_decoder(input, dict_prop, plan)
                 .map_err(|e| Error::bad_password(e, opts.encrypted))?;
             Ok(Decoder::Lzma2(Box::new(lz)))
