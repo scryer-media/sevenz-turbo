@@ -929,6 +929,10 @@ Everything here is new surface; no upstream signature changed meaning.
   it). The quick profile plans none of these rows.
 - Bench harness: report.md gives throughput to three significant figures, so
   a row under 0.5 MiB/s no longer reads as 0.
+- Bench harness: raw.json and the reports built from it name the corpus, the
+  run's scratch and output directories, the checkout and the home directory
+  as `<fixtures>`, `<scratch>`, `<out>`, `<repo>` and `~`, not by their
+  absolute paths.
 ## 0.26.1 - 2026-09-29
 
 - Fixed: `ArchiveLimits::memory_limit_bytes` bounds a coder chain as a whole,
