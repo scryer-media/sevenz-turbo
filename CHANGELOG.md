@@ -482,6 +482,24 @@ Everything here is new surface; no upstream signature changed meaning.
   The buffer is at most 64 KiB whatever the password's length: a password
   past about a kilobyte gets fewer rounds to a call, and one past 64 KiB is
   hashed where it lies, three calls a round as before, with no copy made.
+- An entry can be written on straight from the decoder's output. A new
+  `EntryRead` trait (a `Read` with `write_rest`) is what
+  `ArchiveReader::for_each_entries_direct` and
+  `BlockDecoder::for_each_entries_direct` hand each entry over as; `write_rest`
+  passes the bytes to the sink in the pieces the decoder made them in, so a
+  consumer that only writes an entry to a file needs no buffer of its own and
+  copies nothing. `for_each_entries` is unchanged and is now built on it. The
+  multi-threaded LZMA2 reader reads its input 256 KiB at a time, the size
+  7-Zip reads a parallel block's input in, with one piece of slack, and a run
+  is dispatched as soon as the feed completes it, so every thread starts on
+  its own block instead of waiting for a wave to be read whole; the first wave
+  of a 2 GiB archive used to be read whole, up to half a gibibyte, before any
+  worker started. Verified, medians of three on an x86-64 Linux host against
+  7-Zip (time s / peak RSS MiB, ours vs 7-Zip): LZMA2 mx1 AES two threads
+  11.41 / 10.7 vs 11.43 / 11.4, eight threads 3.78 / 23.4 vs 3.95 / 25.0;
+  mx1 two threads 11.85 / 10.2 vs 11.82 / 10.6, eight threads 3.91 / 23.3 vs
+  4.08 / 23.8; stored AES two threads 0.23 / 6.4 vs 0.48 / 8.5; a 2 GiB mx5
+  archive on four threads 14.15 / 1035.8 vs 14.12 / 1035.7.
 - The folders of a non-solid archive decode in parallel. A new `ReadAt` trait
   reads archive bytes at an offset with no shared cursor; it is implemented
   for `std::fs::File` (`pread` on Unix, `seek_read` on Windows), for bytes in
