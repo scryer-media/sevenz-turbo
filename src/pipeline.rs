@@ -33,7 +33,7 @@ use std::thread::JoinHandle;
 use crate::archive::EncoderMethod;
 use crate::block::Block;
 use crate::codec::lzma_turbo::MT_MIN_BLOCK_BYTES;
-use crate::decoder::{DecodeOptions, INPUT_BUF_SIZE, add_decoder};
+use crate::decoder::{DecodeOptions, DecodeRead, INPUT_BUF_SIZE, ReadOnly, add_decoder};
 use crate::{Error, Password};
 
 /// Bytes a stage hands on at a time.
@@ -249,7 +249,7 @@ pub(crate) enum Stage<'r> {
     /// A pack stream, read on the caller's thread.
     Leaf(Box<dyn Read + 'r>),
     /// A coder on the caller's thread.
-    Here(Box<dyn Read + 'r>),
+    Here(Box<dyn DecodeRead + 'r>),
     /// The pipe a coder on a thread of its own writes.
     There(usize),
 }
@@ -590,13 +590,24 @@ impl<'r> Pipeline<'r> {
     /// The input for a coder on the caller's thread.
     pub(crate) fn here(&mut self, stage: Stage<'r>) -> Box<dyn Read + 'r> {
         match stage {
-            Stage::Leaf(reader) | Stage::Here(reader) => reader,
+            Stage::Leaf(reader) => reader,
+            Stage::Here(reader) => reader,
             Stage::There(pipe) => Box::new(CallerInput {
                 inner: Rc::clone(self.inner()),
                 pipe,
                 buf: Vec::new(),
                 pos: 0,
             }),
+        }
+    }
+
+    /// The last stage of a chain, which the caller reads its bytes from:
+    /// as [`Pipeline::here`], keeping a coder's own output for
+    /// [`DecodeRead::push`].
+    pub(crate) fn top(&mut self, stage: Stage<'r>) -> Box<dyn DecodeRead + 'r> {
+        match stage {
+            Stage::Here(reader) => reader,
+            stage => Box::new(ReadOnly(self.here(stage))),
         }
     }
 

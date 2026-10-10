@@ -477,6 +477,24 @@ Everything here is new surface; no upstream signature changed meaning.
   The buffer is at most 64 KiB whatever the password's length: a password
   past about a kilobyte gets fewer rounds to a call, and one past 64 KiB is
   hashed where it lies, three calls a round as before, with no copy made.
+- An entry can be written on straight from the decoder's output. A new
+  `EntryRead` trait (a `Read` with `write_rest`) is what
+  `ArchiveReader::for_each_entries_direct` and
+  `BlockDecoder::for_each_entries_direct` hand each entry over as; `write_rest`
+  passes the bytes to the sink in the pieces the decoder made them in, so a
+  consumer that only writes an entry to a file needs no buffer of its own and
+  copies nothing. `for_each_entries` is unchanged and is now built on it. The
+  multi-threaded LZMA2 reader reads its input 256 KiB at a time, the size
+  7-Zip reads a parallel block's input in, with one piece of slack, and a run
+  is dispatched as soon as the feed completes it, so every thread starts on
+  its own block instead of waiting for a wave to be read whole; the first wave
+  of a 2 GiB archive used to be read whole, up to half a gibibyte, before any
+  worker started. Verified, medians of three on an x86-64 Linux host against
+  7-Zip (time s / peak RSS MiB, ours vs 7-Zip): LZMA2 mx1 AES two threads
+  11.41 / 10.7 vs 11.43 / 11.4, eight threads 3.78 / 23.4 vs 3.95 / 25.0;
+  mx1 two threads 11.85 / 10.2 vs 11.82 / 10.6, eight threads 3.91 / 23.3 vs
+  4.08 / 23.8; stored AES two threads 0.23 / 6.4 vs 0.48 / 8.5; a 2 GiB mx5
+  archive on four threads 14.15 / 1035.8 vs 14.12 / 1035.7.
 - The folders of a non-solid archive decode in parallel. A new `ReadAt` trait
   reads archive bytes at an offset with no shared cursor; it is implemented
   for `std::fs::File` (`pread` on Unix, `seek_read` on Windows), for bytes in
@@ -1088,6 +1106,87 @@ Everything here is new surface; no upstream signature changed meaning.
   read them through a 1 MiB buffer and handed them to an encoder thread in
   1 MiB chunks, up to four in flight. At level 1 on one thread that was
   half the writer's peak memory. The archive is the same bytes.
+- The `SEVENZ_TURBO_MT_TRACE` line of the parallel LZMA2 reader also gives
+  the most the decoder held (`peak_held`, what a memory limit governs), the
+  most the reader had queued for it (`peak_queue`, outside the limit), the
+  most the two came to at one moment (`peak_sum`), and the waves of the
+  decode (`waves`): for each time the delivering thread went to wait, the
+  runs claimed since the last wait and the runs out with workers. Nothing
+  is sampled when the variable is unset. `peak_held` and the decoder's
+  reasons for holding a run back (`dispatch_held_back`, `input_refused`,
+  `sheds`) come from `lzma-turbo`'s `AdaptiveLedger`. `wait` splits the
+  delivering thread's waits on a worker by why fewer runs were being
+  decoded than there are threads: none (`full`), finished blocks queued
+  behind the one waited on (`ordered`), no complete run at the cursor
+  (`input`), or a complete run held back (`held`).
+- A parallel LZMA2 decode under a memory limit keeps the decoder and the
+  reader's queue inside it together. The memory contract: the limit governs
+  the decoder's held bytes (`AdaptiveLedger`'s `input_bytes`,
+  `runs_out_bytes`, `runs_waiting_bytes` and `parked_bytes`) plus the
+  reader's queue (pieces read and not yet handed over, at their capacity).
+  Dictionaries, coder state and allocator slack are documented additions,
+  not bounded by it. The queue used to sit outside the limit, and a decode
+  could hold a read more than it allowed. The reader now does four things.
+  It sets the decoder's limit to what is left after its queue before every
+  feed and drain. It reads again only when a read fits beside both. It asks
+  the decoder's own `dispatch_cost` whether another run fits, so a parked
+  output buffer is not charged twice. And it cuts a small head off a read
+  as an exact-size copy, so a few kilobytes are not charged, or kept, as
+  the whole 4 MiB read. Requires `lzma-turbo` 0.8.0.
+- A parallel LZMA2 decode gives every thread a run in the first wave. The
+  decoder holds one run pair (input and output) per thread under any larger
+  limit, but it learns the pair's size only when it scans, which it does in
+  a drain. The reader used to feed its whole read-ahead before the first
+  drain, so that drain found no room for some of the outputs. On 128 MiB
+  runs at four threads, two workers started a run late, and every later
+  wave waited on that offset. Until the decoder has scanned a run, the
+  read-ahead now reserves an output for every run fed, and works to the
+  pair bound itself.
+  It also declares the last run of that first wave, by handing over the
+  next run's header, so that run's worker is not left idle until a run is
+  handed back. After the first scan the decoder's own bound governs, as
+  before: reserving there as well held back the run a finishing worker
+  would have taken next and lost a thread for the rest of the decode.
+- A parallel LZMA2 decode no longer holds a run's input queued in the
+  reader while the decoder refuses it. The reader used to hand a run over
+  only once it had read the run's end, so on 128 MiB runs a whole run sat in
+  its queue (130 MiB at peak) while the decoder, holding one run pair per
+  thread, refused it. Past the first wave the reader now hands each read over
+  as it is read, and lets the decoder's refusal stop the feed. While the
+  decoder refuses, the reader reads no more than two pieces ahead. The queue
+  now peaks at one 4 MiB read.
+- A parallel LZMA2 decode of small runs stops reading ahead where it means
+  to. Past the first wave each read goes over whole, and the feed stopped
+  only if it happened to end at a run boundary, which it seldom did; and it
+  counted only the runs the decoder had scanned, which it does in a drain,
+  so the runs just fed were invisible to it. So it fed on until the decoder
+  refused input at its pair bound: on the 1 MiB runs `7zz -mx1` writes, at
+  eight threads, about seventy runs held where the read-ahead asks for
+  sixteen. The feed now counts every run fed that no worker has taken, and
+  once the read-ahead is full it hands over the run in hand to its end and
+  stops there, declaring it with the next header. Linux x86-64, 1 GiB,
+  median of 3, peak RSS: `aes_mx1` 33 to 28 MiB at two threads and 81 to 63
+  MiB at eight; `media_mx1` 33 to 29 MiB and 81 to 69 MiB. Wall time is
+  unchanged within 1.5%.
+- A parallel LZMA2 decode of runs of at most 4 MiB, which is what `7zz` writes
+  at `-mx1` and for dictionaries up to 1 MiB, reads its input in 1 MiB pieces
+  and keeps one run per thread waiting instead of two. A piece is let go
+  only once every run in it is done, so a 4 MiB read held four small runs for
+  each one being decoded. The run size comes from the runs already scanned,
+  and before the first has closed from the dictionary, so the first reads
+  are already the right size. Larger runs are read as before: on 128 MiB
+  runs either change alone cost a sixth of the wall time at four threads.
+  Linux x86-64, 1 GiB, median of 3, peak RSS: `aes_mx1` 28 to 19 MiB at two
+  threads and 63 to 48 MiB at eight; `media_mx1` 28 to 18 MiB and 66 to 52
+  MiB; 4 MiB runs at two threads 50 to 33 MiB. Wall time is unchanged within
+  the run-to-run spread, and the 2 GiB, 128 MiB-run decode at four threads is
+  unchanged.
+- A parallel LZMA2 decode of those small runs keeps no more of them waiting
+  than its idle workers can take plus two, so with every thread busy two
+  runs wait instead of one per thread. Linux x86-64, 1 GiB, median of 3,
+  peak RSS at eight threads: `aes_mx1` 46 to 39-41 MiB and `media_mx1` 50
+  to 40-43 MiB; at two threads within 1 MiB of before. Wall time is
+  unchanged within the run-to-run spread.
 
 ## 0.26.1 - 2026-09-29
 

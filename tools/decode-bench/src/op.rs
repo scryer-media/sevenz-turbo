@@ -335,6 +335,30 @@ fn version() -> Fields {
 
 /// Where a decode's bytes go: counted, and digested only when `--digest`
 /// asked, so a timed row does no work on the output that `7zz t` does not.
+/// The decode's [`Output`] as a writer, noting the parallel decoder's
+/// progress at each piece as the read loop it replaces did at each read.
+struct DirectSink<'a> {
+    out: Output,
+    handle: &'a sevenz_turbo::Lzma2Handle,
+    max_spawned: u32,
+    parallel_seen: bool,
+}
+
+impl std::io::Write for DirectSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.out.update(bytes);
+        if let Some(progress) = self.handle.progress() {
+            self.parallel_seen = true;
+            self.max_spawned = self.max_spawned.max(progress.spawned_threads);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 struct Output {
     bytes: u64,
     digest: Option<Sink>,
@@ -535,27 +559,22 @@ fn decode_turbo(opts: &Opts) -> Result<Fields, String> {
         )
     });
 
-    let mut sink = Output::new(opts.digest);
-    let mut buf = vec![0u8; 1 << 20];
+    // The entries are written to the sink from the decoder's own output, as
+    // 7-Zip writes from its block buffer: there is no buffer here to read
+    // them into.
+    let mut sink = DirectSink {
+        out: Output::new(opts.digest),
+        handle: &handle,
+        max_spawned: 0,
+        parallel_seen: false,
+    };
     let mut entries = 0u64;
-    let mut max_spawned = 0u32;
-    let mut parallel_seen = false;
     let mut each = |entry: &sevenz_turbo::ArchiveEntry,
-                    rd: &mut dyn std::io::Read|
+                    rd: &mut dyn sevenz_turbo::EntryRead|
      -> Result<bool, sevenz_turbo::Error> {
         if !entry.is_directory() {
             entries += 1;
-            loop {
-                let read = rd.read(&mut buf)?;
-                if read == 0 {
-                    break;
-                }
-                sink.update(&buf[..read]);
-                if let Some(progress) = handle.progress() {
-                    parallel_seen = true;
-                    max_spawned = max_spawned.max(progress.spawned_threads);
-                }
-            }
+            rd.write_rest(&mut sink)?;
         }
         Ok(true)
     };
@@ -586,14 +605,20 @@ fn decode_turbo(opts: &Opts) -> Result<Fields, String> {
             }
             let decoder = reader.block_decoder(block).map_err(|e| e.to_string())?;
             decoder
-                .for_each_entries(&mut each)
+                .for_each_entries_direct(&mut each)
                 .map_err(|e| e.to_string())?;
         }
     } else {
         reader
-            .for_each_entries(&mut each)
+            .for_each_entries_direct(&mut each)
             .map_err(|e| e.to_string())?;
     }
+    let DirectSink {
+        out: sink,
+        max_spawned,
+        parallel_seen,
+        ..
+    } = sink;
     let widest = governor.map(Governor::finish);
     let crcs_reported = if opts.stream {
         let reported = reported

@@ -43,6 +43,13 @@ pub struct ArchiveLimits {
     /// is dominated by the dictionary a block declares, and, when a header or
     /// block is decoded, the sum of its coder chain's dictionaries and models
     /// rather than each coder alone.
+    ///
+    /// A parallel LZMA2 decode keeps its buffers inside what is left of the
+    /// limit once the chain's dictionaries and coder state are reserved: the
+    /// decoder's held bytes (input pieces, runs out with workers, decoded
+    /// runs waiting, parked buffers) plus the reader's queue of pieces read
+    /// and not yet handed over. Dictionaries, coder state and allocator slack
+    /// are additions to that, not bounded by it.
     pub memory_limit_bytes: u64,
     /// Largest end header the caller will allow to be buffered, in bytes.
     ///
