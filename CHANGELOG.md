@@ -1187,6 +1187,23 @@ Everything here is new surface; no upstream signature changed meaning.
   peak RSS at eight threads: `aes_mx1` 46 to 39-41 MiB and `media_mx1` 50
   to 40-43 MiB; at two threads within 1 MiB of before. Wall time is
   unchanged within the run-to-run spread.
+- An LZMA or LZMA2 folder coded on an encoder thread reuses the buffers that
+  carry its input to that thread and its output back, where it allocated a
+  new one for every 1 MiB of input and for every piece of output, each freed
+  on the other thread. That churn left the allocator holding several
+  megabytes it could not hand back. The input now travels in 256 KiB pieces,
+  and at most five are allocated for a folder of any length. A folder coded
+  in parallel blocks hands each finished block to the writer as the buffer
+  it was coded into, where it copied it, so a block is no longer held twice
+  (about 56 MiB less at level 5 on four threads). The archive is the same
+  bytes.
+- The compressed output of an LZMA or LZMA2 folder coded on an encoder
+  thread no longer queues without bound while it waits for the writer. A
+  block-parallel coder whose output outran the sink held every finished
+  block until the writer drained them. The encoder now waits once 4 MiB of
+  output is queued (a single larger block waits alone), and the writer takes
+  output while it waits for room to queue input, so neither side stalls the
+  other. The archive is the same bytes.
 
 ## 0.26.1 - 2026-09-29
 
