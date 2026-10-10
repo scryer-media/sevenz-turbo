@@ -6,7 +6,7 @@
 //!
 //! 1. LZMA and LZMA2 decode - and, with `compress`, encode - through
 //!    [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a port of the
-//!    7-Zip reference coders, instead of `lzma-rust2`.
+//!    7-Zip reference coders, instead of upstream's pure-Rust coders.
 //! 2. It adds the container API a streaming consumer needs: memory limits
 //!    enforced before allocation, per-member CRCs, folder-to-pack-stream byte
 //!    ranges, a borrowing reader, typed corruption errors carrying a block
@@ -89,20 +89,12 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     sha.finalize()
 }
 
-/// Names the LZMA and LZMA2 encoder this build of the crate selected:
-/// `"lzma-turbo"`, or `"lzma-rust2"` when the `lzma-rust2-encoder` feature is
-/// on.
-///
-/// Like [`crypto_backend`], a dependency can turn that feature on without the
-/// top-level crate noticing; this is here to be asserted on.
+/// Names the LZMA and LZMA2 encoder this crate writes archives with:
+/// `"lzma-turbo"`.
 #[cfg(feature = "compress")]
 #[must_use]
 pub fn lzma_encoder() -> &'static str {
-    if cfg!(feature = "lzma-rust2-encoder") {
-        "lzma-rust2"
-    } else {
-        "lzma-turbo"
-    }
+    "lzma-turbo"
 }
 
 /// Embedder-supplied delegation hooks for the bulk AES-256-CBC decrypt, the

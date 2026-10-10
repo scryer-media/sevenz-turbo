@@ -1,9 +1,5 @@
 use std::{cell::RefCell, io::Write, rc::Rc};
 
-#[cfg(feature = "lzma-rust2-encoder")]
-use lzma_rust2::{Lzma2Writer, Lzma2WriterMt, LzmaWriter};
-
-#[cfg(not(feature = "lzma-rust2-encoder"))]
 use crate::codec::lzma_turbo::writer::{Coder, LzmaTurboWriter, PullCoder, SideCoder};
 
 use crate::codec::filter::{
@@ -50,18 +46,9 @@ pub(crate) enum Encoder<W: Write> {
     Bcj(Option<BcjWriter<CountingWriter<W>>>),
     Bcj2(Option<Box<Bcj2ChainWriter<W>>>, Bcj2Side),
     Delta(DeltaWriter<CountingWriter<W>>),
-    // LZMA and LZMA2 are `lzma-turbo`'s encoders unless the build asked for
-    // `lzma-rust2`'s; see `Cargo.toml`. Both fronts have the same shape here.
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
+    // LZMA and LZMA2 are `lzma-turbo`'s encoders, one front for both.
     Lzma(Option<LzmaTurboWriter<CountingWriter<W>>>),
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     Lzma2(Option<LzmaTurboWriter<CountingWriter<W>>>),
-    #[cfg(feature = "lzma-rust2-encoder")]
-    Lzma(Option<LzmaWriter<CountingWriter<W>>>),
-    #[cfg(feature = "lzma-rust2-encoder")]
-    Lzma2(Option<Lzma2Writer<CountingWriter<W>>>),
-    #[cfg(feature = "lzma-rust2-encoder")]
-    Lzma2Mt(Option<Lzma2WriterMt<CountingWriter<W>>>),
     #[cfg(feature = "ppmd")]
     Ppmd(Option<Box<ppmd_turbo::io::SevenZWriter<CountingWriter<W>>>>),
     #[cfg(feature = "brotli")]
@@ -146,16 +133,6 @@ impl<W: Write> Write for Encoder<W> {
                 }
                 false => w.as_mut().unwrap().write(buf),
             },
-            #[cfg(feature = "lzma-rust2-encoder")]
-            Encoder::Lzma2Mt(w) => match buf.is_empty() {
-                true => {
-                    let writer = w.take().unwrap();
-                    let mut inner = writer.finish()?;
-                    let _ = inner.write(buf);
-                    Ok(0)
-                }
-                false => w.as_mut().unwrap().write(buf),
-            },
             #[cfg(feature = "ppmd")]
             Encoder::Ppmd(w) => match buf.is_empty() {
                 true => {
@@ -225,8 +202,6 @@ impl<W: Write> Write for Encoder<W> {
             Encoder::Delta(w) => w.flush(),
             Encoder::Lzma(w) => w.as_mut().unwrap().flush(),
             Encoder::Lzma2(w) => w.as_mut().unwrap().flush(),
-            #[cfg(feature = "lzma-rust2-encoder")]
-            Encoder::Lzma2Mt(w) => w.as_mut().unwrap().flush(),
             #[cfg(feature = "brotli")]
             Encoder::Brotli(w) => w.flush(),
             // Only passes down to the sink: the writer's flush never ends the
@@ -339,7 +314,6 @@ pub(crate) enum Bcj2Sides {
 /// An LZMA coder for a BCJ2 call or jump stream, writing into `sink`.
 fn bcj2_side_encoder(sink: SharedBuf, sides: Bcj2Sides) -> Result<Box<dyn Write>, Error> {
     let input = CountingWriter::new(sink);
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     let lz = {
         // 7-Zip's side coders run its default level (5, the binary-tree
         // match finder) with the settings above.
@@ -355,19 +329,6 @@ fn bcj2_side_encoder(sink: SharedBuf, sides: Bcj2Sides) -> Result<Box<dyn Write>
             Bcj2Sides::Threads => coder.writer(input)?,
             Bcj2Sides::Inline => coder.inline_writer(input)?,
         }
-    };
-    // This encoder never starts a thread of its own.
-    #[cfg(feature = "lzma-rust2-encoder")]
-    let _ = sides;
-    #[cfg(feature = "lzma-rust2-encoder")]
-    let lz = {
-        let mut options = lzma_rust2::LzmaOptions::with_preset(5);
-        options.dict_size = BCJ2_SIDE_DICT_SIZE;
-        options.nice_len = BCJ2_SIDE_FAST_BYTES;
-        options.lc = u32::from(BCJ2_SIDE_LC);
-        options.lp = u32::from(BCJ2_SIDE_LP);
-        options.pb = u32::from(BCJ2_SIDE_PB);
-        LzmaWriter::new_no_header(input, &options, false)?
     };
     Ok(Box::new(Encoder::Lzma(Some(lz))))
 }
@@ -436,7 +397,6 @@ fn lzma2_property_for(dict_size: u32) -> u8 {
 ///
 /// Here and not with the settings: the option types name no encoder, so that
 /// which one codes them is decided in this file alone.
-#[cfg(not(feature = "lzma-rust2-encoder"))]
 fn turbo_props(settings: &LzmaSettings, threads: u32) -> lzma_turbo::LzmaEncProps {
     use lzma_turbo::MatchFinderKind;
 
@@ -473,7 +433,6 @@ fn turbo_props(settings: &LzmaSettings, threads: u32) -> lzma_turbo::LzmaEncProp
 
 /// C: `kReduceMin` in `LzmaEncProps_Normalize`: a dictionary is never shrunk
 /// below 4 KiB to fit the input.
-#[cfg(not(feature = "lzma-rust2-encoder"))]
 const REDUCE_SIZE_FLOOR: u64 = 1 << 12;
 
 /// What one thread coding folder after folder keeps between them: the LZMA
@@ -488,20 +447,14 @@ const REDUCE_SIZE_FLOOR: u64 = 1 << 12;
 /// the same - every folder under 4 KiB, and every folder at least the
 /// dictionary's size - share one encoder; any other folder builds its own,
 /// in place of the one kept.
-///
-/// With the `lzma-rust2-encoder` feature nothing is planned here: that
-/// encoder already codes on the thread that writes into it.
 #[derive(Default)]
 pub(crate) struct FolderCoder {
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     pull: PullCoder,
 }
 
 /// A coder [`FolderCoder::plan`] accepted, ready for [`FolderCoder::encode`].
 pub(crate) struct PulledCoder {
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     props: lzma_turbo::LzmaEncProps,
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     coder: Coder,
 }
 
@@ -513,41 +466,33 @@ impl FolderCoder {
     ///
     /// A dictionary size the encoder refuses, as [`add_encoder`] refuses it.
     pub(crate) fn plan(mc: &EncoderConfiguration) -> Result<Option<PulledCoder>, Error> {
-        #[cfg(not(feature = "lzma-rust2-encoder"))]
-        {
-            let (props, coder) = match (mc.method.id(), &mc.options) {
-                (EncoderMethod::ID_LZMA, options) => {
-                    let options = match options {
-                        Some(EncoderOptions::Lzma(options)) => options.clone(),
-                        _ => LzmaOptions::default(),
-                    };
-                    validate_lzma_dictionary_size(options.0.dict_size())?;
-                    (turbo_props(&options.0, 1), Coder::Lzma)
-                }
-                (EncoderMethod::ID_LZMA2, options) => {
-                    let options = match options {
-                        Some(EncoderOptions::Lzma2(options)) => options.clone(),
-                        _ => Lzma2Options::default(),
-                    };
-                    validate_lzma_dictionary_size(options.settings.dict_size())?;
-                    let (block_size, threads) = lzma2_block_plan(&options);
-                    (
-                        turbo_props(&options.settings, options.threads),
-                        Coder::Lzma2 {
-                            block_size,
-                            threads,
-                        },
-                    )
-                }
-                _ => return Ok(None),
-            };
-            Ok(PullCoder::drives(&props, coder).then_some(PulledCoder { props, coder }))
-        }
-        #[cfg(feature = "lzma-rust2-encoder")]
-        {
-            let _ = mc;
-            Ok(None)
-        }
+        let (props, coder) = match (mc.method.id(), &mc.options) {
+            (EncoderMethod::ID_LZMA, options) => {
+                let options = match options {
+                    Some(EncoderOptions::Lzma(options)) => options.clone(),
+                    _ => LzmaOptions::default(),
+                };
+                validate_lzma_dictionary_size(options.0.dict_size())?;
+                (turbo_props(&options.0, 1), Coder::Lzma)
+            }
+            (EncoderMethod::ID_LZMA2, options) => {
+                let options = match options {
+                    Some(EncoderOptions::Lzma2(options)) => options.clone(),
+                    _ => Lzma2Options::default(),
+                };
+                validate_lzma_dictionary_size(options.settings.dict_size())?;
+                let (block_size, threads) = lzma2_block_plan(&options);
+                (
+                    turbo_props(&options.settings, options.threads),
+                    Coder::Lzma2 {
+                        block_size,
+                        threads,
+                    },
+                )
+            }
+            _ => return Ok(None),
+        };
+        Ok(PullCoder::drives(&props, coder).then_some(PulledCoder { props, coder }))
     }
 
     /// Codes everything `input` yields with `coder` into `out`, on this
@@ -562,34 +507,14 @@ impl FolderCoder {
         input: &mut dyn std::io::Read,
         out: &mut dyn Write,
     ) -> std::io::Result<()> {
-        #[cfg(not(feature = "lzma-rust2-encoder"))]
-        {
-            self.pull.encode(&coder.props, coder.coder, input, out)
-        }
-        #[cfg(feature = "lzma-rust2-encoder")]
-        {
-            // `plan` never hands one out with this feature.
-            let _ = (coder, input, out);
-            unreachable!("no coder is pulled with the lzma-rust2 encoder")
-        }
+        self.pull.encode(&coder.props, coder.coder, input, out)
     }
-}
-
-/// The `lzma-rust2` setting for `settings`: its preset for the level, which
-/// is the settings' own table, with the caller's overrides applied.
-#[cfg(feature = "lzma-rust2-encoder")]
-fn rust2_options(settings: &LzmaSettings) -> lzma_rust2::LzmaOptions {
-    let mut options = lzma_rust2::LzmaOptions::with_preset(settings.level());
-    options.dict_size = settings.dict_size();
-    options.nice_len = settings.nice_len();
-    options
 }
 
 /// Whether the folder these options were sized for is known to fit one LZMA2
 /// block.
 ///
-/// Such a folder is that block on one thread, whichever encoder codes it: the
-/// same bytes the block-parallel coder would produce, without starting its
+/// Such a folder is that block on one thread: the same bytes the block-parallel coder would produce, without starting its
 /// pool and buffering the block per folder.
 fn lzma2_fits_one_block(options: &Lzma2Options) -> bool {
     options.block_size().is_some_and(|block_size| {
@@ -611,7 +536,6 @@ fn lzma2_fits_one_block(options: &Lzma2Options) -> bool {
 /// is divided by that, as `Lzma2EncProps_Normalize` divides
 /// `numTotalThreads` by `numThreads`: block threads times match-finder
 /// threads stays within the caller's count.
-#[cfg(not(feature = "lzma-rust2-encoder"))]
 fn lzma2_block_plan(options: &Lzma2Options) -> (u64, usize) {
     match (options.threads, options.block_size()) {
         (0 | 1, _) | (_, None) => (lzma_turbo::BLOCK_SIZE_SOLID, 1),
@@ -623,33 +547,16 @@ fn lzma2_block_plan(options: &Lzma2Options) -> (u64, usize) {
     }
 }
 
-/// Whether `lzma-rust2`'s multi-threaded LZMA2 writer codes a folder: only
-/// with more than one thread, and not for a folder that fits one block (see
-/// [`lzma2_fits_one_block`]).
-#[cfg(feature = "lzma-rust2-encoder")]
-fn lzma2_rust2_uses_mt(options: &Lzma2Options) -> bool {
-    options.threads > 1 && !lzma2_fits_one_block(options)
-}
-
 /// The threads of its own the coder of `mc` runs on: a block-parallel LZMA2
 /// coder's block threads, and with `lzma-turbo`'s encoder every other LZMA
 /// and LZMA2 coder's one. Any other coder has none: it runs on the thread
 /// writing into the chain.
 fn coder_threads(mc: &EncoderConfiguration) -> u32 {
     match (mc.method.id(), &mc.options) {
-        #[cfg(not(feature = "lzma-rust2-encoder"))]
         (EncoderMethod::ID_LZMA2, Some(EncoderOptions::Lzma2(options))) => {
             lzma2_block_plan(options).1 as u32
         }
-        #[cfg(not(feature = "lzma-rust2-encoder"))]
         (EncoderMethod::ID_LZMA | EncoderMethod::ID_LZMA2, _) => 1,
-        // `lzma-rust2`'s single-threaded writers code inside `write`.
-        #[cfg(feature = "lzma-rust2-encoder")]
-        (EncoderMethod::ID_LZMA2, Some(EncoderOptions::Lzma2(options)))
-            if lzma2_rust2_uses_mt(options) =>
-        {
-            options.threads
-        }
         _ => 0,
     }
 }
@@ -756,10 +663,7 @@ pub(crate) fn add_encoder<W: Write>(
                 _ => LzmaOptions::default(),
             };
             validate_lzma_dictionary_size(options.0.dict_size())?;
-            #[cfg(not(feature = "lzma-rust2-encoder"))]
             let lz = LzmaTurboWriter::new(input, &turbo_props(&options.0, 1), Coder::Lzma)?;
-            #[cfg(feature = "lzma-rust2-encoder")]
-            let lz = LzmaWriter::new_no_header(input, &rust2_options(&options.0), false)?;
             Ok(Encoder::Lzma(Some(lz)))
         }
         EncoderMethod::ID_LZMA2 => {
@@ -769,7 +673,6 @@ pub(crate) fn add_encoder<W: Write>(
             };
 
             validate_lzma_dictionary_size(lzma2_options.settings.dict_size())?;
-            #[cfg(not(feature = "lzma-rust2-encoder"))]
             let encoder = {
                 let (block_size, threads) = lzma2_block_plan(&lzma2_options);
                 Encoder::Lzma2(Some(LzmaTurboWriter::new(
@@ -780,26 +683,6 @@ pub(crate) fn add_encoder<W: Write>(
                         threads,
                     },
                 )?))
-            };
-            #[cfg(feature = "lzma-rust2-encoder")]
-            let encoder = {
-                let mut options =
-                    lzma_rust2::Lzma2Options::with_preset(lzma2_options.settings.level());
-                options.lzma_options = rust2_options(&lzma2_options.settings);
-                options.set_chunk_size(
-                    lzma2_options
-                        .block_size()
-                        .and_then(std::num::NonZeroU64::new),
-                );
-                if lzma2_rust2_uses_mt(&lzma2_options) {
-                    Encoder::Lzma2Mt(Some(Lzma2WriterMt::new(
-                        input,
-                        options,
-                        lzma2_options.threads,
-                    )?))
-                } else {
-                    Encoder::Lzma2(Some(Lzma2Writer::new(input, options)))
-                }
             };
 
             Ok(encoder)
@@ -990,7 +873,6 @@ pub(crate) fn get_options_as_properties<'a>(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     use super::lzma2_block_plan;
     use super::lzma2_property_for;
     use crate::codec::lzma_turbo::lzma2_dictionary_size;
@@ -1023,7 +905,6 @@ mod tests {
 
     /// A folder that fits one block skips the block-parallel coder; one that
     /// does not, or whose size is unknown, keeps the threads it was given.
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     #[test]
     fn a_folder_that_fits_one_block_is_coded_on_one_thread() {
         use crate::{EncoderConfiguration, encoder_options::EncoderOptions};
@@ -1049,7 +930,6 @@ mod tests {
 
     /// The LZMA2 options `config` holds once it is sized for a folder of
     /// `size` bytes.
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     fn lzma2_sized_for(
         config: &crate::EncoderConfiguration,
         size: u64,
@@ -1063,7 +943,6 @@ mod tests {
     /// The settings the encoder is built with agree with the coder record: a
     /// folder smaller than the dictionary is coded with one its size, and one
     /// no smaller with settings that do not move, so the same bytes come out.
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     #[test]
     fn the_encoder_is_built_with_the_dictionary_the_coder_record_names() {
         use super::turbo_props;
@@ -1086,7 +965,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     #[test]
     fn more_than_one_thread_gives_the_binary_tree_finder_a_thread_of_its_own() {
         use crate::encoder_options::Lzma2Options;
@@ -1106,7 +984,6 @@ mod tests {
     /// Block threads times match-finder threads never exceeds the caller's
     /// count: halved for the binary-tree finder, as 7-Zip does, and whole for
     /// the fast levels' hash chain, which has no thread of its own.
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     #[test]
     fn block_threads_leave_room_for_the_match_finder_threads() {
         use crate::encoder_options::Lzma2Options;
@@ -1134,7 +1011,6 @@ mod tests {
     /// at once, so a folder costs their sum; a filter beside them costs
     /// nothing more, and a chain with none of them costs the one thread
     /// writing into it.
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     #[test]
     fn a_folder_costs_a_thread_for_each_lzma_coder_in_its_chain() {
         use super::{folder_threads, one_thread_each};
@@ -1172,7 +1048,6 @@ mod tests {
     /// into the chain, and beside an LZMA or LZMA2 coder that thread is at
     /// work while the coder's is: it counts. A filter or the cipher there
     /// does not, and neither does a chain that runs on the one thread anyway.
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     #[test]
     fn a_second_compressor_costs_the_thread_writing_into_the_chain() {
         use super::{folder_threads, one_thread_each};
@@ -1244,59 +1119,5 @@ mod tests {
         ];
         assert_eq!(folder_threads(&wide), 5);
         assert_eq!(folder_threads(&one_thread_each(&wide)), 2);
-    }
-
-    /// `lzma-rust2`'s single-threaded writers code on the thread writing into
-    /// the chain, so only its multi-threaded LZMA2 writer costs threads of
-    /// its own; a single-threaded writer beside it is a compressor on the
-    /// writing thread, and costs that one.
-    #[cfg(feature = "lzma-rust2-encoder")]
-    #[test]
-    fn only_the_rust2_mt_writer_costs_a_folder_threads() {
-        use super::{folder_threads, one_thread_each};
-        use crate::encoder_options::{Lzma2Options, LzmaOptions};
-        use crate::{EncoderConfiguration, EncoderMethod};
-
-        let lzma2 = || EncoderConfiguration::from(Lzma2Options::from_level(5));
-        let lzma = || EncoderConfiguration::from(LzmaOptions::from_level(5));
-        let mt = || EncoderConfiguration::from(Lzma2Options::from_level_mt(5, 8, 32 << 20));
-        assert_eq!(folder_threads(&[lzma2()]), 1);
-        assert_eq!(folder_threads(&[lzma2(), lzma()]), 1);
-        assert_eq!(folder_threads(&[mt()]), 8);
-        assert_eq!(
-            folder_threads(&[
-                EncoderConfiguration::from(EncoderMethod::AES256_SHA256),
-                mt()
-            ]),
-            8
-        );
-        let wide = [mt(), lzma()];
-        assert_eq!(folder_threads(&wide), 9);
-        assert_eq!(folder_threads(&one_thread_each(&wide)), 1);
-    }
-
-    /// The `lzma-rust2` encoder makes the same one-block decision: a folder
-    /// that fits one block is not handed to its multi-threaded writer.
-    #[cfg(feature = "lzma-rust2-encoder")]
-    #[test]
-    fn a_folder_that_fits_one_block_skips_the_rust2_mt_writer() {
-        use super::lzma2_rust2_uses_mt;
-        use crate::{EncoderConfiguration, encoder_options::EncoderOptions};
-
-        let options = crate::encoder_options::Lzma2Options::from_level_mt(5, 8, 32 << 20);
-        let sized = |size: u64| {
-            let config: EncoderConfiguration = options.clone().into();
-            match config.sized_for(size).expect("LZMA2").options {
-                Some(EncoderOptions::Lzma2(o)) => o,
-                other => panic!("not LZMA2 options: {other:?}"),
-            }
-        };
-        assert!(lzma2_rust2_uses_mt(&options));
-        assert!(!lzma2_rust2_uses_mt(&sized(16 << 20)));
-        assert!(!lzma2_rust2_uses_mt(&sized(32 << 20)));
-        assert!(lzma2_rust2_uses_mt(&sized((32 << 20) + 1)));
-        assert!(!lzma2_rust2_uses_mt(&sized(1000)));
-        let solid = crate::encoder_options::Lzma2Options::from_level(5);
-        assert!(!lzma2_rust2_uses_mt(&solid));
     }
 }

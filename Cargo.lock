@@ -1763,7 +1763,6 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "lz4_flex",
- "lzma-rust2",
  "lzma-turbo",
  "nt-time",
  "ppmd-turbo",

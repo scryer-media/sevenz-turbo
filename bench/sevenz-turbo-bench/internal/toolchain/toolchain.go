@@ -221,8 +221,8 @@ const (
 	BackendNative  = "rustcrypto"
 )
 
-// LzmaEncoder is the encoder every candidate must report: a build with
-// sevenz-turbo's lzma-rust2-encoder feature measures another encoder.
+// LzmaEncoder is the encoder every candidate must report: a build that
+// reports another measures another encoder.
 const LzmaEncoder = "lzma-turbo"
 
 // BuildPaths are the checkout paths compiled into decode-bench; its build
@@ -244,7 +244,7 @@ func CheckProfile(candidate Candidate, flag string) error {
 // CheckEncoder fails unless the candidate reports the default LZMA encoder.
 func CheckEncoder(candidate Candidate, flag string) error {
 	if got := candidate.Field("lzma_encoder"); got != LzmaEncoder {
-		return fmt.Errorf("%s %s reports LZMA encoder %q, want %q (build without sevenz-turbo/lzma-rust2-encoder; an older decode-bench reports none)", flag, candidate.Path, got, LzmaEncoder)
+		return fmt.Errorf("%s %s reports LZMA encoder %q, want %q (an older decode-bench reports none)", flag, candidate.Path, got, LzmaEncoder)
 	}
 	return nil
 }

@@ -1,7 +1,7 @@
 //! Branch/call/jump filters, over `lzma-turbo`'s converters.
 //!
-//! The readers and writers below are still `lzma-rust2`'s, vendored (see the
-//! module doc a level up). What sat under them was a second port of the same
+//! The readers and writers below are this crate's, ported from the SDK's.
+//! What sat under them was a second port of the same
 //! eight converters from the same public-domain C, and `lzma-turbo` already
 //! carries one that is tested byte for byte against the SDK's own harness and
 //! is where this crate's LZMA comes from. Two ports of one filter is one too

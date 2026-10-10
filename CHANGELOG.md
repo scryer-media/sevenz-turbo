@@ -430,6 +430,10 @@ Everything here is new surface; no upstream signature changed meaning.
 
 ## 0.27.0 - 2026-10-09
 
+- Removed: the `lzma-rust2-encoder` feature and the `lzma-rust2` dependency
+  are gone; archives are written by `lzma-turbo`'s encoder only, and
+  `lzma_encoder()` always returns `"lzma-turbo"`. The BCJ and delta filter
+  modules no longer reference `lzma-rust2`.
 - Security fix: every AES-256 folder, and the encrypted header, is now
   encrypted under its own random IV, as 7-Zip's writer does.
   `AesEncoderOptions::new` drew one IV, and every folder written with those

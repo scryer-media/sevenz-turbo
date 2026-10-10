@@ -63,10 +63,6 @@ bzip2 = ["dep:bzip2"]
 # SDK encoder (see `src/codec/lzma_turbo/writer.rs`); the AES-256 encryptor
 # is RustCrypto's unless AWS-LC is the selected backend.
 compress = ["lzma-turbo/enc", "dep:aes", "dep:cbc"]
-# The alternative: encode LZMA and LZMA2 with `lzma-rust2`'s pure-Rust
-# encoders instead. Off by default; with it on, `lzma-turbo`'s encoder is not
-# used. Same option types, same archives, different bytes.
-lzma-rust2-encoder = ["compress", "dep:lzma-rust2"]
 deflate = ["dep:flate2"]
 lz4 = ["dep:lz4_flex"]
 # PPMd decodes and encodes through `ppmd-turbo`.
@@ -90,9 +86,6 @@ getrandom = { version = "0.4", optional = true }
 # sibling checkout is added here and dropped again before release
 # (`cargo xtask release` refuses to tag while it is here).
 lzma-turbo = { version = "0.8.0", default-features = false, features = ["std", "asm", "crc", "filters"] }
-# Encoders only, behind `lzma-rust2-encoder`, as the alternative to
-# `lzma-turbo`'s. The decode path never reaches lzma-rust2; see AGENTS.md.
-lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "encoder", "optimization"], optional = true }
 ppmd-turbo = { version = "0.1.1", optional = true }
 lz4_flex = { version = "0.14", optional = true }
 nt-time = { version = "0.15", optional = true }

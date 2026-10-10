@@ -8,13 +8,12 @@ use crate::Password;
 /// The LZMA settings both option types carry, independent of which encoder
 /// runs them. `None` is "the level's default".
 ///
-/// The levels are the table `lzma-rust2` uses, which is xz's: the dictionary
-/// doubles from 256 KiB at level 0 to 64 MiB at level 9, levels 0 to 3 are
-/// the fast parser over a hash chain and the rest the optimal parser over a
-/// binary tree. Both encoders are given these numbers outright, so a level
-/// means the same dictionary, and the same archive memory, whichever one the
-/// build compiles - the SDK's own level defaults, which reach 256 MiB, are
-/// not used.
+/// The levels are xz's table: the dictionary doubles from 256 KiB at level 0
+/// to 64 MiB at level 9, levels 0 to 3 are the fast parser over a hash chain
+/// and the rest the optimal parser over a binary tree. The encoder is given
+/// these numbers outright, so a level means the same dictionary, and the same
+/// archive memory, as before - the SDK's own level defaults, which reach
+/// 256 MiB, are not used.
 #[cfg(feature = "compress")]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LzmaSettings {
@@ -31,7 +30,7 @@ pub(crate) struct LzmaSettings {
 
 #[cfg(feature = "compress")]
 impl LzmaSettings {
-    /// The smallest dictionary either encoder accepts.
+    /// The smallest dictionary the encoder accepts.
     pub(crate) const DICT_SIZE_MIN: u32 = 4096;
     /// The largest dictionary the option setters allow; the encoder's own
     /// limit, checked when the coder is built, is lower.
@@ -56,7 +55,6 @@ impl LzmaSettings {
     const LEVEL_NICE_LEN: [u32; 10] = [128, 128, 273, 273, 16, 32, 64, 64, 64, 64];
     /// Hash-chain depth for the fast levels; the optimal levels leave it to
     /// the encoder.
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     const LEVEL_DEPTH: [u32; 4] = [4, 8, 24, 48];
 
     const fn from_level(level: u32) -> Self {
@@ -74,14 +72,12 @@ impl LzmaSettings {
 
     /// Whether the level is one of the fast ones: a hash-chain match finder
     /// and no optimal parse.
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     pub(crate) const fn fast(&self) -> bool {
         self.level <= 3
     }
 
     /// The hash-chain depth of a fast level. `None` for the optimal levels,
     /// which leave it to the encoder.
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     pub(crate) const fn hash_chain_depth(&self) -> Option<u32> {
         if self.fast() {
             Some(Self::LEVEL_DEPTH[self.level as usize])
@@ -140,13 +136,12 @@ impl LzmaSettings {
     /// allowed `threads`: two, the coder's and its match finder's, for the
     /// normal mode's binary-tree finder with more than one thread allowed;
     /// otherwise one. C++: `numThreads = (algo == 0 || btMode == 0) ? 1 : 2`.
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     pub(crate) const fn match_finder_threads(&self, threads: u32) -> u32 {
         if !self.fast() && threads > 1 { 2 } else { 1 }
     }
 
     /// The LZMA properties byte, `(pb * 5 + lp) * 9 + lc`. Neither option
-    /// type exposes lc, lp or pb, so both encoders run the defaults of 3, 0
+    /// type exposes lc, lp or pb, so the encoder runs the defaults of 3, 0
     /// and 2.
     pub(crate) const fn props_byte() -> u8 {
         const LC: u8 = 3;

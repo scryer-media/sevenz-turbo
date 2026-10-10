@@ -134,8 +134,7 @@ jobs:
     timeout-minutes: 30
     env:
       # The LZMA and LZMA2 writers take the path a target without threads
-      # takes (see Cargo.toml). Default features only: `lzma-rust2-encoder`
-      # takes the writers this changes out of the build.
+      # takes (see Cargo.toml). Default features only.
       RUSTFLAGS: --cfg sevenz_turbo_unthreaded
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

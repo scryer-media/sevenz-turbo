@@ -137,7 +137,7 @@ func TestCheckEncoder(t *testing.T) {
 	if CheckEncoder(Candidate{Version: map[string]any{"lzma_encoder": "lzma-turbo"}}, "--candidate") != nil {
 		t.Fatal("the default encoder was refused")
 	}
-	for _, version := range []map[string]any{{"lzma_encoder": "lzma-rust2"}, {}} {
+	for _, version := range []map[string]any{{"lzma_encoder": "other"}, {}} {
 		if CheckEncoder(Candidate{Version: version}, "--candidate") == nil {
 			t.Errorf("%v was accepted", version)
 		}

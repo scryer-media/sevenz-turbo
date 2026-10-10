@@ -9,10 +9,6 @@ project carry over unchanged.
 <https://github.com/hasenbanck/sevenz-rust2> — maintained by **Nils Hasenbanck**,
 itself a fork of the unmaintained `sevenz-rust` by **dyz1990**.
 
-The BCJ, BCJ2 and delta filters under `src/codec/filter/` are vendored from
-[`lzma-rust2`](https://github.com/hasenbanck/lzma-rust2) 0.20.1, also by Nils
-Hasenbanck, also Apache-2.0.
-
 ## This fork
 
 - NZB Man (maintainer)

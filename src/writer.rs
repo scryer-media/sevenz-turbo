@@ -407,8 +407,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     /// **Threads.** A folder is coded by its worker and that worker's coder
     /// thread, which `threads` counts as one: the worker feeds the coder and
     /// waits for it. Every LZMA and LZMA2 coder in the chain has such a
-    /// thread (but not with the `lzma-rust2-encoder` feature, whose coders
-    /// run on the worker), so a chain with two of them has `threads / 2`
+    /// thread, so a chain with two of them has `threads / 2`
     /// folders in flight, and where that is one its folders are coded one at
     /// a time. A filter or AES-256 in such a chain runs on the worker between
     /// its waits and costs no thread. Any other compressor (PPMd, BZip2 and

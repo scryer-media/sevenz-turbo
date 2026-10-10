@@ -14,10 +14,8 @@ reasons:
 
 1. **Codec swap.** LZMA (`03 01 01`) and LZMA2 (`21`) decode through
    [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a port of Igor
-   Pavlov's reference decoder, instead of `lzma-rust2`, and are encoded by
-   its port of the SDK encoder when archives are written. `lzma-rust2` is not
-   in the dependency graph unless the non-default `lzma-rust2-encoder`
-   feature asks for its encoders instead.
+   Pavlov's reference decoder, instead of upstream's pure-Rust coders, and
+   are encoded by its port of the SDK encoder when archives are written.
 2. **Container API.** The 7z detail a streaming consumer needs and upstream
    does not expose: memory limits enforced before allocation, per-member CRCs,
    folder-to-pack-stream byte ranges, a reader that parses once and decodes
@@ -50,14 +48,13 @@ with a version bump and a changelog entry like any other.
   see `docs/lzma-turbo-requests.md`) and `src/codec/lzma_turbo/writer.rs`
   (encoding: the `Write` bridge over its pull-driven encoders). Nothing else
   in the crate names `lzma_turbo::` except the filter wrappers below. The
-  `lzma-rust2-encoder` feature swaps the encoders for `lzma-rust2`'s; the
-  option types in `src/encoder_options.rs` are encoder-agnostic so that the
-  swap is confined to `src/encoder.rs`.
+  option types in `src/encoder_options.rs` name no encoder; what codes them
+  is decided in `src/encoder.rs` alone.
 - The BCJ and delta filters are `lzma-turbo`'s (`lzma_turbo::filters`, behind
   its `filters` feature); `src/codec/filter/bcj.rs` and `delta.rs` are handles
   on them, and `bcj2.rs` is this crate's `Read` over `lzma_turbo::filters::bcj2`.
-  No conversion is vendored from `lzma-rust2` any more; what is left of it
-  under `src/codec/filter/` is the readers and writers of `bcj` and `delta`.
+  The readers and writers of `bcj` and `delta` are this crate's, ported from
+  the SDK's.
 - Crypto goes through `src/crypto_backend.rs` — SHA-256 *and* AES-256-CBC:
   `aws-lc-rs` by default, RustCrypto when the `native-crypto` feature is on.
   Never call a backend crate directly from anywhere else. The one exception is

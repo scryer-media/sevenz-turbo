@@ -1,7 +1,7 @@
 //! The delta filter, over `lzma-turbo`'s.
 //!
-//! The readers and writers below are still `lzma-rust2`'s, vendored (see the
-//! module doc a level up). What sat under them was a 256-byte ring with a
+//! The readers and writers below are this crate's, ported from the SDK's.
+//! What sat under them was a 256-byte ring with a
 //! moving index, walked one byte at a time in both directions: per byte, two
 //! masked index computations, a load, an add and a store. The filter it
 //! implements is `out[i] = in[i] + out[i - distance]`, and the ring exists
@@ -27,7 +27,7 @@ impl Delta {
         // Spec: the property byte is the distance minus one, so distances run
         // from 1 to 256. The 7z method properties are one byte, so a distance
         // outside that range cannot have come off a disk; clamping rather than
-        // failing keeps the vendored signature, which cannot fail.
+        // failing keeps the signature, which cannot fail.
         let props = u8::try_from(distance.clamp(1, 256) - 1).expect("clamped to 0..=255");
         Self(TurboDelta::new(props).expect("every one-byte property is a valid distance"))
     }

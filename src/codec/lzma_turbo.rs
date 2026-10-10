@@ -1,7 +1,7 @@
 //! The one place in this crate that names `lzma_turbo`.
 //!
 //! Upstream `sevenz-rust2` decodes the LZMA (`03 01 01`) and LZMA2 (`21`)
-//! coders with `lzma-rust2`. This fork decodes them with
+//! coders with a pure-Rust decoder. This fork decodes them with
 //! [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a port of Igor
 //! Pavlov's reference decoder. Everything that swap needs is behind this
 //! module: adopting `lzma-turbo`'s multi-threaded LZMA2 decoder was a change to
@@ -23,8 +23,8 @@ use lzma_turbo::{
 use crate::error::Error;
 
 /// The `Write` fronts over `lzma-turbo`'s encoders, which the coder chain
-/// in `crate::encoder` builds unless the build chose `lzma-rust2`'s.
-#[cfg(all(feature = "compress", not(feature = "lzma-rust2-encoder")))]
+/// in `crate::encoder` builds.
+#[cfg(feature = "compress")]
 pub(crate) mod writer;
 
 /// What a parallel LZMA2 decode held and how its runs went out, for a caller
@@ -4615,7 +4615,7 @@ mod stall_tests {
     /// The shape rule against streams an encoder actually produced, which is
     /// the only way to get a run that is genuinely smaller than what it
     /// decodes to.
-    #[cfg(all(feature = "compress", not(feature = "lzma-rust2-encoder")))]
+    #[cfg(feature = "compress")]
     mod shape {
         use std::io::{Cursor, Read, Write};
 

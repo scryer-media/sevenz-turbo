@@ -28,17 +28,14 @@ hostile archives below also differ from upstream.
 
 ### 1. LZMA and LZMA2 decode and encode with `lzma-turbo`
 
-Upstream decodes LZMA/LZMA2 with
-[`lzma-rust2`](https://github.com/hasenbanck/lzma-rust2), which is the fastest
-pure-Rust LZMA decoder published but still well behind 7-Zip single-threaded
+Upstream decodes LZMA/LZMA2 with a pure-Rust decoder, the fastest published
+but still well behind 7-Zip single-threaded
 (28.7 s against 20.2 s through `sevenz-rust2` in the [Speed](#speed) table).
 This fork routes those two coders to
 [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a port of Igor
 Pavlov's reference decoder (including the LZMA SDK's assembly loops) that is at
 parity with `7zz` single-threaded. Archives are written with `lzma-turbo`'s
-encoder too, a port of the SDK's, so `lzma-rust2` is not in the dependency
-graph at all unless the `lzma-rust2-encoder` feature asks for its encoders
-instead.
+encoder too, a port of the SDK's.
 
 LZMA2 also decodes on several threads, by cutting the stream at the dictionary
 resets that make a run independently decodable. **The default is one thread**,
@@ -148,11 +145,8 @@ left its origin behind.
 ### Encoders
 
 Writing archives (`compress`) encodes LZMA and LZMA2 with `lzma-turbo`'s port
-of the SDK encoder. The alternative is `lzma-rust2`'s pure-Rust encoders,
-behind the `lzma-rust2-encoder` feature (off by default), which is what every
-version before 0.25.0 used; the option types and the archives are the same
-either way, only the compressed bytes differ. A compression level means the
-same dictionary under both: 256 KiB at level 0, rising to 64 MiB at level 9.
+of the SDK encoder. A compression level means the same dictionary as in
+every earlier version: 256 KiB at level 0, rising to 64 MiB at level 9.
 
 ### Crypto backends
 
@@ -313,8 +307,8 @@ writer.finish().expect("compress ok");
 | Codec       | Decompression | Compression | Implemented by |
 |-------------|---------------|-------------|----------------|
 | COPY        | ✓            | ✓          | this crate |
-| LZMA        | ✓            | ✓          | `lzma-turbo`, decoder and encoder (the `lzma-rust2-encoder` feature swaps in `lzma-rust2`'s encoder instead) |
-| LZMA2       | ✓            | ✓          | `lzma-turbo`, decoder, parallel decoder and encoder (the `lzma-rust2-encoder` feature swaps in `lzma-rust2`'s encoder instead) |
+| LZMA        | ✓            | ✓          | `lzma-turbo`, decoder and encoder |
+| LZMA2       | ✓            | ✓          | `lzma-turbo`, decoder, parallel decoder and encoder |
 | BROTLI (*)  | ✓            | ✓          | `brotli` crate |
 | BZIP2       | ✓            | ✓          | `bzip2` crate |
 | DEFLATE (*) | ✓            | ✓          | `flate2` crate (`zlib-rs`) |
@@ -339,8 +333,8 @@ writer.finish().expect("compress ok");
 
 Every branch converter, BCJ2 and the delta filter are `lzma-turbo`'s
 (`lzma_turbo::filters`). The `Read`/`Write` wrappers around the BCJ and delta
-converters were vendored from `lzma-rust2` 0.20.1 (`src/codec/filter/`); the
-BCJ2 reader is this crate's own. CRC-32 everywhere is `crc-fast`, through
+converters are this crate's, ported from the SDK's (`src/codec/filter/`), as
+is the BCJ2 reader. CRC-32 everywhere is `crc-fast`, through
 `lzma-turbo`'s `crc` module (the host's, on a wasm build with `crc-host`).
 
 ### WASM support
@@ -445,11 +439,8 @@ named before the licence is.
   [`sevenz-rust2`](https://github.com/hasenbanck/sevenz-rust2), which is
   where the code in this repository comes from: the archive reader and
   writer, the coders, the encryption, the tests and the examples all started
-  as his. He also wrote
-  [`lzma-rust2`](https://github.com/hasenbanck/lzma-rust2), whose encoders
-  are the `lzma-rust2-encoder` alternative and whose filter readers and
-  writers are vendored here. This fork is built on his work, and if you are
-  not sure you need what it changes, his crate is the one to use.
+  as his. This fork is built on his work, and if you are not sure you need
+  what it changes, his crate is the one to use.
 - **dyz1990** wrote the original
   [`sevenz-rust`](https://github.com/dyz1990/sevenz-rust) that `sevenz-rust2`
   continued, and with it the first 7z implementation in pure Rust.
