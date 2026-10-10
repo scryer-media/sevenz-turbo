@@ -139,6 +139,60 @@ impl<'a> DecodeOptions<'a> {
     }
 }
 
+/// A stage of a decode chain that may hand its output over from a buffer of
+/// its own, rather than copying it into one of the caller's.
+///
+/// A coder that decodes into blocks it holds anyway, the parallel LZMA2 coder,
+/// can give a consumer each block as it stands; read through `Read`, the same
+/// bytes are copied into the caller's buffer first, and a consumer that only
+/// writes them on has paid for a buffer and a copy it did not need. Every
+/// other stage keeps the default and is read.
+pub(crate) trait DecodeRead: Read {
+    /// Hands up to `max` of the next bytes to `sink`, in order and straight
+    /// from this stage's own output, and says how many that was. `Ok(0)` is
+    /// the end of the stream, as it is from `read`.
+    ///
+    /// `None` means this stage keeps no output of its own to hand over, and
+    /// is to be read instead.
+    fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<std::io::Result<usize>> {
+        let _ = (max, sink);
+        None
+    }
+}
+
+impl<T: DecodeRead + ?Sized> DecodeRead for Box<T> {
+    fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<std::io::Result<usize>> {
+        (**self).push(max, sink)
+    }
+}
+
+impl<T: DecodeRead + ?Sized> DecodeRead for &mut T {
+    fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<std::io::Result<usize>> {
+        (**self).push(max, sink)
+    }
+}
+
+/// A stage that is only ever read: a pack stream, or a pipe from a coder on
+/// a thread of its own.
+pub(crate) struct ReadOnly<R>(pub(crate) R);
+
+impl<R: Read> Read for ReadOnly<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl<R: Read> DecodeRead for ReadOnly<R> {}
+
+impl<R: Read> DecodeRead for Decoder<R> {
+    fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<std::io::Result<usize>> {
+        match self {
+            Decoder::Lzma2(r) => r.push(max, sink),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     /// How many LZMA2 coders this thread has built with a parallel plan, for

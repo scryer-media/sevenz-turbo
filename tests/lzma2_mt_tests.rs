@@ -517,3 +517,76 @@ fn a_corrupt_block_is_still_refused_when_the_workers_checksum() {
         "a corrupt block decoded without complaint"
     );
 }
+
+/// Each entry written on with `write_rest`, from the decoder's own output.
+fn extract_direct(reader: &mut ArchiveReader<std::fs::File>) -> Vec<u8> {
+    let mut out = Vec::new();
+    reader
+        .for_each_entries_direct(|entry, rd| {
+            if entry.is_directory() {
+                return Ok(true);
+            }
+            rd.write_rest(&mut out)?;
+            Ok(true)
+        })
+        .expect("extract");
+    out
+}
+
+/// Writing an entry on from the decoder's blocks gives the bytes reading it
+/// does, at every thread count.
+#[test]
+fn writing_entries_from_the_decoder_gives_what_7zz_decodes() {
+    if !have_7zz() {
+        eprintln!("skipping: 7zz is not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let archive = multi_run_archive(tmp.path());
+    let expected = oracle(&archive);
+
+    let all = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    for threads in [1, 2, 8, all] {
+        let mut reader = open(&archive, threads);
+        let got = extract_direct(&mut reader);
+        assert_eq!(got.len(), expected.len(), "length differs at {threads}");
+        assert!(got == expected, "bytes differ at {threads} threads");
+    }
+}
+
+/// A sink that fails is the caller's failure, passed through as it was
+/// raised, and never reported as damage to the block being written from.
+#[test]
+fn a_failing_sink_is_not_a_damaged_block() {
+    if !have_7zz() {
+        eprintln!("skipping: 7zz is not on PATH");
+        return;
+    }
+    struct FailsAfter(usize);
+    impl std::io::Write for FailsAfter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.0 < bytes.len() {
+                return Err(std::io::Error::other("the sink is full"));
+            }
+            self.0 -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let archive = multi_run_archive(tmp.path());
+    let mut reader = open(&archive, 4);
+    let err = reader
+        .for_each_entries_direct(|_entry, rd| {
+            rd.write_rest(&mut FailsAfter(3 << 20))?;
+            Ok(true)
+        })
+        .expect_err("the sink fails");
+    assert!(
+        !matches!(err, sevenz_turbo::Error::BlockDecode { .. }),
+        "the sink's failure was blamed on the block: {err:?}"
+    );
+    assert!(err.to_string().contains("the sink is full"), "{err}");
+}

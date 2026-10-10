@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fs::File,
     io,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     rc::Rc,
     sync::{Arc, OnceLock},
 };
@@ -18,7 +18,9 @@ use crate::{
     codec::filter::bcj2::Bcj2Reader,
     codec::lzma_turbo::{Lzma2Control, Lzma2Handle, Lzma2Progress},
     container::{ArchiveLimits, BlockCompletion, SubStreamCompletion},
-    decoder::{DecodeOptions, add_decoder, check_chain_memory, unsized_coders_memory_kb},
+    decoder::{
+        DecodeOptions, DecodeRead, add_decoder, check_chain_memory, unsized_coders_memory_kb,
+    },
     error::{Error, Limit},
     pipeline::{Chain, Stage},
     positional::{ReadAt, ReadAtCursor},
@@ -58,6 +60,21 @@ impl<R: Read> Read for BoundedReader<R> {
     }
 }
 
+impl<R: DecodeRead> DecodeRead for BoundedReader<R> {
+    fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<io::Result<usize>> {
+        if self.remain == 0 || max == 0 {
+            return Some(Ok(0));
+        }
+        let size = match self.inner.push(max.min(self.remain), sink)? {
+            Ok(0) => return Some(Err(ended_early())),
+            Ok(size) => size,
+            Err(e) => return Some(Err(e)),
+        };
+        self.remain -= size;
+        Some(Ok(size))
+    }
+}
+
 /// The error of a stream that ended while bytes its header declared were
 /// still owed.
 ///
@@ -93,6 +110,23 @@ impl<R: Read> Read for DeclaredLength<R> {
         }
         self.owed = self.owed.saturating_sub(size as u64);
         Ok(size)
+    }
+}
+
+impl<R: DecodeRead> DecodeRead for DeclaredLength<R> {
+    fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<io::Result<usize>> {
+        if max == 0 {
+            return Some(Ok(0));
+        }
+        let size = match self.inner.push(max, sink)? {
+            Ok(size) => size,
+            Err(e) => return Some(Err(e)),
+        };
+        if size == 0 && self.owed > 0 {
+            return Some(Err(ended_early()));
+        }
+        self.owed = self.owed.saturating_sub(size as u64);
+        Some(Ok(size))
     }
 }
 
@@ -178,6 +212,110 @@ impl<R: Read> Read for FaultRecordingReader<R> {
     }
 }
 
+impl<R: DecodeRead> DecodeRead for FaultRecordingReader<R> {
+    fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<io::Result<usize>> {
+        let pushed = self.inner.push(max, sink)?;
+        Some(pushed.inspect_err(|_| self.faulted.set(true)))
+    }
+}
+
+/// An entry's bytes, as a [`ArchiveReader::for_each_entries_direct`] or
+/// [`BlockDecoder::for_each_entries_direct`] callback is handed them.
+///
+/// It is a [`Read`], and [`EntryRead::write_rest`] is the other way to take
+/// the bytes: it writes them on from the decoder's own output wherever the
+/// decoder keeps one, so a consumer that only writes an entry somewhere needs
+/// no buffer of its own and copies nothing into one.
+pub trait EntryRead: Read {
+    /// Writes the rest of the entry to `sink`, and returns how many bytes
+    /// that was.
+    ///
+    /// The bytes are handed to `sink` in the pieces the decoder made them in,
+    /// as large as a whole block of its output, so `sink` is best unbuffered:
+    /// a `BufWriter` passes a write at least as large as its buffer straight
+    /// through when it holds nothing, and is only a copy otherwise.
+    ///
+    /// # Errors
+    ///
+    /// What reading the entry fails with, as [`Read::read`] reports it, or
+    /// what `sink` does.
+    fn write_rest(&mut self, sink: &mut dyn Write) -> io::Result<u64> {
+        copy_rest(self, sink)
+    }
+}
+
+/// Bytes [`copy_rest`] reads at a time, on the stack.
+const COPY_REST_BYTES: usize = 64 << 10;
+
+/// [`EntryRead::write_rest`] for a reader that keeps no output to write from:
+/// read, then written, a piece at a time.
+fn copy_rest<R: Read + ?Sized>(reader: &mut R, sink: &mut dyn Write) -> io::Result<u64> {
+    let mut buf = [0u8; COPY_REST_BYTES];
+    let mut total = 0u64;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => return Ok(total),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        sink.write_all(&buf[..n])?;
+        total += n as u64;
+    }
+}
+
+/// Bytes one [`DecodeRead::push`] of [`write_pushed`] asks for: a block of
+/// the parallel decoder's output, after which the coder gets to read ahead
+/// again before the next.
+const PUSH_STEP_BYTES: usize = 1 << 20;
+
+/// [`EntryRead::write_rest`] for a decode chain: each block of output written
+/// to `sink` from the coder that made it, or read and copied when the chain
+/// keeps no output of its own.
+///
+/// `sink` is not told about the decoder's errors, nor the decoder about
+/// `sink`'s: a write that fails stops the walk with that error, after the
+/// push it failed in, and the chain's own recording of its failures never
+/// sees it.
+fn write_pushed<R: DecodeRead + ?Sized>(reader: &mut R, sink: &mut dyn Write) -> io::Result<u64> {
+    let mut total = 0u64;
+    loop {
+        let mut failed = None;
+        let pushed = reader.push(PUSH_STEP_BYTES, &mut |bytes| {
+            if failed.is_none()
+                && let Err(e) = sink.write_all(bytes)
+            {
+                failed = Some(e);
+            }
+        });
+        let Some(pushed) = pushed else {
+            return copy_rest(reader, sink).map(|rest| total + rest);
+        };
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        match pushed? {
+            0 => return Ok(total),
+            n => total += n as u64,
+        }
+    }
+}
+
+impl<R: DecodeRead> EntryRead for FaultRecordingReader<R> {
+    fn write_rest(&mut self, sink: &mut dyn Write) -> io::Result<u64> {
+        write_pushed(self, sink)
+    }
+}
+
+impl EntryRead for &[u8] {
+    fn write_rest(&mut self, sink: &mut dyn Write) -> io::Result<u64> {
+        sink.write_all(self)?;
+        let n = self.len() as u64;
+        *self = &self[self.len()..];
+        Ok(n)
+    }
+}
+
 struct Crc32VerifyingReader<R> {
     inner: R,
     crc_digest: Crc32,
@@ -223,6 +361,33 @@ impl<R: Read> Read for Crc32VerifyingReader<R> {
             self.remaining -= size as i64;
             self.crc_digest.update(&buf[..size]);
         }
+        self.check_at_end()?;
+        Ok(size)
+    }
+}
+
+impl<R: DecodeRead> DecodeRead for Crc32VerifyingReader<R> {
+    fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<io::Result<usize>> {
+        if self.remaining <= 0 {
+            return Some(Ok(0));
+        }
+        let digest = &mut self.crc_digest;
+        let pushed = self.inner.push(max, &mut |bytes| {
+            digest.update(bytes);
+            sink(bytes);
+        })?;
+        let size = match pushed {
+            Ok(size) => size,
+            Err(e) => return Some(Err(e)),
+        };
+        self.remaining -= size as i64;
+        Some(self.check_at_end().map(|()| size))
+    }
+}
+
+impl<R> Crc32VerifyingReader<R> {
+    /// Compares the checksum once every byte it covers has been through.
+    fn check_at_end(&mut self) -> io::Result<()> {
         if self.remaining <= 0 {
             let d = std::mem::replace(&mut self.crc_digest, Crc32::new()).finalize();
             if d as u64 != self.expected_value {
@@ -232,7 +397,7 @@ impl<R: Read> Read for Crc32VerifyingReader<R> {
                 report.set(Some(d));
             }
         }
-        Ok(size)
+        Ok(())
     }
 }
 
@@ -2152,7 +2317,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         block_index: usize,
         password: &Password,
         opts: &DecodeOptions<'_>,
-    ) -> Result<(Box<dyn Read + 'r>, usize), Error> {
+    ) -> Result<(Box<dyn DecodeRead + 'r>, usize), Error> {
         let block = &archive.blocks[block_index];
         crate::container::check_aes_coders(block.coders.iter(), opts.limits)?;
         // The chain as a whole against the memory limit, before any coder is
@@ -2241,8 +2406,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
             }
             stage = chain.add(block, stage, index, password, opts)?;
         }
-        let mut decoder: Box<dyn Read + 'r> = Box::new(DeclaredLength {
-            inner: chain.pipeline.here(stage),
+        let mut decoder: Box<dyn DecodeRead + 'r> = Box::new(DeclaredLength {
+            inner: chain.pipeline.top(stage),
             owed: block.get_unpack_size(),
         });
         // Read after the coders are built: the LZMA2 coder decides there
@@ -2273,7 +2438,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         block_index: usize,
         password: &Password,
         opts: &DecodeOptions<'_>,
-    ) -> Result<(Box<dyn Read + 'r>, usize), Error> {
+    ) -> Result<(Box<dyn DecodeRead + 'r>, usize), Error> {
         const MAX_CODER_COUNT: usize = 32;
         let block = &archive.blocks[block_index];
         if block.coders.len() > MAX_CODER_COUNT {
@@ -2355,8 +2520,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
             opts,
             &mut chain,
         )?;
-        let mut decoder: Box<dyn Read + 'r> = Box::new(DeclaredLength {
-            inner: chain.pipeline.here(stage),
+        let mut decoder: Box<dyn DecodeRead + 'r> = Box::new(DeclaredLength {
+            inner: chain.pipeline.top(stage),
             owed: block.get_unpack_size(),
         });
         // On this thread, where the graph's last coder makes the bytes: see
@@ -2498,9 +2663,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 )?;
                 inputs.push(chain.pipeline.here(input));
             }
-            return Ok(Stage::Here(Box::new(Bcj2Reader::new(
-                inputs,
-                uncompressed_len as u64,
+            return Ok(Stage::Here(Box::new(crate::decoder::ReadOnly(
+                Bcj2Reader::new(inputs, uncompressed_len as u64),
             ))));
         }
 
@@ -2519,6 +2683,16 @@ impl<R: Read + Seek> ArchiveReader<R> {
         &mut self,
         mut each: F,
     ) -> Result<(), Error> {
+        self.for_each_entries_direct(|entry, reader| each(entry, reader))
+    }
+
+    /// As [`ArchiveReader::for_each_entries`], handing each entry over as an
+    /// [`EntryRead`], which can also write itself on with
+    /// [`EntryRead::write_rest`] straight from the decoder's output.
+    pub fn for_each_entries_direct<F>(&mut self, mut each: F) -> Result<(), Error>
+    where
+        F: FnMut(&ArchiveEntry, &mut dyn EntryRead) -> Result<bool, Error>,
+    {
         for phase in self.folder_phases() {
             match phase {
                 FolderPhase::Alone { block } => self.decode_block_alone(block, &mut each)?,
@@ -2542,7 +2716,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             let block_index = self.archive.stream_map.file_block_index[file_index];
             if block_index.is_none() {
                 let file = &self.archive.files[file_index];
-                let empty_reader: &mut dyn Read = &mut ([0u8; 0].as_slice());
+                let empty_reader: &mut dyn EntryRead = &mut ([0u8; 0].as_slice());
                 if !each(file, empty_reader)? {
                     return Ok(());
                 }
@@ -2576,7 +2750,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
     /// count: the sequential path, unchanged.
     fn decode_block_alone<F>(&mut self, block_index: usize, each: &mut F) -> Result<(), Error>
     where
-        F: FnMut(&ArchiveEntry, &mut dyn Read) -> Result<bool, Error>,
+        F: FnMut(&ArchiveEntry, &mut dyn EntryRead) -> Result<bool, Error>,
     {
         let block_decoder = BlockDecoder {
             thread_count: self.thread_count,
@@ -2593,7 +2767,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 .as_mut()
                 .map(|hook| &mut **hook as &mut (dyn FnMut(SubStreamCompletion) + Send + '_)),
         };
-        let finished = block_decoder.for_each_entries(each)?;
+        let finished = block_decoder.for_each_entries_direct(each)?;
         // Upstream moves on to the next block when a callback returns
         // `false`, and consumers rely on that; only the hook treats it as
         // "this block was not decoded in full".
@@ -2647,7 +2821,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         each: &mut F,
     ) -> Result<(), Error>
     where
-        F: FnMut(&ArchiveEntry, &mut dyn Read) -> Result<bool, Error>,
+        F: FnMut(&ArchiveEntry, &mut dyn EntryRead) -> Result<bool, Error>,
     {
         let Some(source) = self.positional.clone() else {
             for block in blocks {
@@ -3130,6 +3304,16 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         self,
         each: &mut F,
     ) -> Result<bool, Error> {
+        self.for_each_entries_direct(&mut |entry, reader| each(entry, reader))
+    }
+
+    /// As [`BlockDecoder::for_each_entries`], handing each entry over as an
+    /// [`EntryRead`], which can also write itself on with
+    /// [`EntryRead::write_rest`] straight from the decoder's output.
+    pub fn for_each_entries_direct<F>(self, each: &mut F) -> Result<bool, Error>
+    where
+        F: FnMut(&ArchiveEntry, &mut dyn EntryRead) -> Result<bool, Error>,
+    {
         let Self {
             thread_count,
             adaptive_lzma2,
@@ -3320,7 +3504,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                 if file.has_stream {
                     sub_stream += 1;
                 }
-                let empty_reader: &mut dyn Read = &mut ([0u8; 0].as_slice());
+                let empty_reader: &mut dyn EntryRead = &mut ([0u8; 0].as_slice());
                 if !each(file, empty_reader)? {
                     finished = false;
                     break;
@@ -3712,7 +3896,7 @@ fn replay_folder<F>(
     mut on_sub_stream_complete: Option<&mut (dyn FnMut(SubStreamCompletion) + Send)>,
 ) -> Result<bool, Error>
 where
-    F: FnMut(&ArchiveEntry, &mut dyn Read) -> Result<bool, Error>,
+    F: FnMut(&ArchiveEntry, &mut dyn EntryRead) -> Result<bool, Error>,
 {
     let packed_offset = archive
         .block_pack_streams(block_index)
@@ -3749,7 +3933,7 @@ where
                         Some(FolderMessage::End) => {}
                         _ => return Err(lost()),
                     }
-                    let empty_reader: &mut dyn Read = &mut ([0u8; 0].as_slice());
+                    let empty_reader: &mut dyn EntryRead = &mut ([0u8; 0].as_slice());
                     if each(file, empty_reader)? {
                         continue;
                     }
@@ -3926,17 +4110,45 @@ impl ReplayEntry<'_, '_> {
 #[cfg(not(target_arch = "wasm32"))]
 impl Read for ReplayEntry<'_, '_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() || !self.next_chunk()? {
+            return Ok(0);
+        }
+        let n = buf.len().min(self.chunk.len() - self.pos);
+        buf[..n].copy_from_slice(&self.chunk[self.pos..self.pos + n]);
+        self.pos += n;
+        self.delivered += n as u64;
+        Ok(n)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl EntryRead for ReplayEntry<'_, '_> {
+    fn write_rest(&mut self, sink: &mut dyn Write) -> io::Result<u64> {
+        let mut total = 0u64;
+        while self.next_chunk()? {
+            let rest = &self.chunk[self.pos..];
+            sink.write_all(rest)?;
+            let n = rest.len();
+            self.pos += n;
+            self.delivered += n as u64;
+            total += n as u64;
+        }
+        Ok(total)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ReplayEntry<'_, '_> {
+    /// Makes sure there are bytes left in [`Self::chunk`], waiting for the
+    /// worker's next piece if there are not. False at the end of the file.
+    fn next_chunk(&mut self) -> io::Result<bool> {
         loop {
             if self.pos < self.chunk.len() {
-                let n = buf.len().min(self.chunk.len() - self.pos);
-                buf[..n].copy_from_slice(&self.chunk[self.pos..self.pos + n]);
-                self.pos += n;
-                self.delivered += n as u64;
-                return Ok(n);
+                return Ok(true);
             }
             match self.state {
                 ReplayState::Open => {}
-                ReplayState::Ended => return Ok(0),
+                ReplayState::Ended => return Ok(false),
                 ReplayState::Faulted | ReplayState::Lost => {
                     let (kind, message) = self
                         .fault
@@ -3945,9 +4157,6 @@ impl Read for ReplayEntry<'_, '_> {
                     return Err(io::Error::new(kind, message));
                 }
             }
-            if buf.is_empty() {
-                return Ok(0);
-            }
             match self.rx.recv() {
                 Some(FolderMessage::Data(chunk)) => {
                     self.chunk = chunk;
@@ -3955,7 +4164,7 @@ impl Read for ReplayEntry<'_, '_> {
                 }
                 Some(FolderMessage::End) => {
                     self.state = ReplayState::Ended;
-                    return Ok(0);
+                    return Ok(false);
                 }
                 Some(FolderMessage::Fault(error)) => {
                     self.state = ReplayState::Faulted;
