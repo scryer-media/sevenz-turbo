@@ -791,9 +791,9 @@ mod tests {
 
     use lzma_turbo::{BLOCK_SIZE_SOLID, Lzma2Reader, LzmaEncProps, LzmaProps, LzmaReader};
 
-    use super::{
-        CHUNK, Coder, INPUT_DEPTH, LzmaTurboWriter, OUTPUT_CAP, PullCoder, SideCoder, State,
-    };
+    use super::{CHUNK, Coder, LzmaTurboWriter, PullCoder, SideCoder, State};
+    #[cfg(not(any(sevenz_turbo_unthreaded, target_family = "wasm")))]
+    use super::{INPUT_DEPTH, OUTPUT_CAP};
 
     fn sample(len: usize) -> Vec<u8> {
         // Compressible but not trivial: a short period with a slow drift.
@@ -919,6 +919,7 @@ mod tests {
 
     /// Output the encoder cannot compress, so that what it queues is as large
     /// as what it reads.
+    #[cfg(not(any(sevenz_turbo_unthreaded, target_family = "wasm")))]
     fn noise(len: usize) -> Vec<u8> {
         let mut x = 0x9E37_79B9_7F4A_7C15u64;
         (0..len)
