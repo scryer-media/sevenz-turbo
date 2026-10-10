@@ -653,7 +653,10 @@ Everything here is new surface; no upstream signature changed meaning.
   three over two alternating passes on a loaded machine; 7-Zip with every
   core: 3.0 s). Under a memory limit that pays for four runs the 4-thread
   decode went from 15.4 s to 13.1 s; the remaining gap under a tight limit
-  is the decoder's budgeting, not the reader's.
+  is the decoder's budgeting, not the reader's. At one thread the page stops
+  short of the end of the run after the one it closes: on runs smaller than
+  a page it otherwise handed the decoder many runs at once, and a second
+  worker decoded the next run while the first was still undelivered.
 - A block of exactly one LZMA2 run (1 MiB) decodes single-threaded. The
   parallel path wins only from the second run, and one run decoded in
   parallel was 4.5% slower; the threshold is the encoder's minimum run size,

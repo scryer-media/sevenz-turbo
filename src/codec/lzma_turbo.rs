@@ -2236,8 +2236,26 @@ impl<R: Read> Lzma2MtReader<R> {
     /// copy is counted where the limit can see it, it is the smallest the
     /// decoder's floor always has room for, and the piece it was cut from is
     /// still the next thing offered whole.
+    ///
+    /// At one thread the page stops short of the end of the run after the
+    /// one it declares. A page is larger than a small run: on runs of a
+    /// couple of hundred packed bytes one page handed the decoder twenty
+    /// more of them whole, past the gate that keeps one run out at a time,
+    /// and the decoder's idle second worker took the next while the first
+    /// was still undelivered. See [`Self::decoder_threads`].
     fn declare_run(&mut self) -> std::io::Result<usize> {
-        let (took, tail) = self.feed_front_by_copy(MT_DECLARE_BYTES)?;
+        let mut page = MT_DECLARE_BYTES;
+        if self.applied_threads <= 1 && !self.scan_broken {
+            let reached = self.run_ends.partition_point(|&e| e <= self.fed_to);
+            if let Some(&next) = self.run_ends.get(reached) {
+                let short = next.saturating_sub(self.fed_to).saturating_sub(1);
+                page = page.min(usize::try_from(short).unwrap_or(usize::MAX));
+            }
+        }
+        if page == 0 {
+            return Ok(0);
+        }
+        let (took, tail) = self.feed_front_by_copy(page)?;
         if took > 0
             && let Some(t) = self.trace.as_mut()
         {
