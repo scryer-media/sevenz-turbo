@@ -39,38 +39,34 @@ aes256_wasm = ["aes256", "getrandom/wasm_js"]
 # in regardless, as the encryptor of every build that does not select AWS-LC.
 aws-lc-crypto = ["dep:aws-lc-rs", "lzma-turbo/crypto"]
 native-crypto = ["dep:aes", "dep:cbc", "lzma-turbo/native-crypto"]
-# Delegate the bulk AES-256-CBC *decrypt* to an embedder-installed hook (see
-# the `hooks` module) instead of running a block cipher inside the guest.
-# Engaged on `wasm32` only: on a native target the feature is accepted but
-# inert (AWS-LC or RustCrypto stays selected and no hook is ever called), so
-# feature unification in a mixed workspace cannot silently turn a native build
-# into a delegating one. It adds no AES dependency at all — that is the point:
-# `aes256,crypto-host` on wasm carries no in-guest block cipher. It does
-# forward `lzma-turbo/native-crypto`, because the 7z key derivation's SHA-256
-# is still computed in the guest and needs a backend that builds without a C
-# toolchain.
-#
-# FOLLOW-UP (wire once `lzma-turbo` 0.3.6 lands, not before): `lzma-turbo` is
-# growing its own `crc-host` / `crypto-host` hooks on branch
-# `feature/wasm-host-hooks`. When that is published, this crate gains a
-# `crc-host = ["lzma-turbo/crc-host"]` feature and `crypto-host` forwards
-# `lzma-turbo/crypto-host`, so a wasm guest delegates the member CRC-32 and the
-# KDF's SHA-256 as well. Deliberately NOT wired here: nothing may depend on an
-# unpublished branch of `lzma-turbo`.
-crypto-host = ["lzma-turbo/native-crypto"]
+# Delegate the 7z `aes256` cryptography to the embedding host (see the `hooks`
+# module) instead of running it inside the guest: the bulk AES-256-CBC
+# *decrypt* through this crate's own hook, and the key derivation's SHA-256
+# through `lzma-turbo`'s, which this forwards to. Engaged on `wasm32` only: on
+# a native target the feature is accepted but inert (AWS-LC or RustCrypto
+# stays selected and no hook is ever called), so feature unification in a
+# mixed workspace cannot silently turn a native build into a delegating one.
+# It adds no AES dependency at all — that is the point: `aes256,crypto-host`
+# on wasm carries no in-guest block cipher. `lzma-turbo/crypto-host` implies
+# `lzma-turbo/native-crypto`, which is the in-process SHA-256 a native build
+# of this feature set falls back on without needing a C toolchain.
+crypto-host = ["lzma-turbo/crypto-host"]
+# Delegate the CRC-32 every 7z header, folder and member carries to the
+# embedding host, through `lzma-turbo`'s hooks (re-exported from the `hooks`
+# module). Engaged on `wasm32` only, inert on native targets exactly as
+# `crypto-host` is. Checksums inside a bzip2 or zstd stream are those codecs'
+# own and stay in the guest.
+crc-host = ["lzma-turbo/crc-host"]
 brotli = ["dep:brotli"]
 bzip2 = ["dep:bzip2"]
 # Writing archives. LZMA and LZMA2 are encoded by `lzma-turbo`'s port of the
 # SDK encoder (see `src/codec/lzma_turbo/writer.rs`); the AES-256 encryptor
 # is RustCrypto's unless AWS-LC is the selected backend.
 compress = ["lzma-turbo/enc", "dep:aes", "dep:cbc"]
-# The alternative: encode LZMA and LZMA2 with `lzma-rust2`'s pure-Rust
-# encoders instead. Off by default; with it on, `lzma-turbo`'s encoder is not
-# used. Same option types, same archives, different bytes.
-lzma-rust2-encoder = ["compress", "dep:lzma-rust2"]
 deflate = ["dep:flate2"]
 lz4 = ["dep:lz4_flex"]
-ppmd = ["dep:ppmd-rust"]
+# PPMd decodes and encodes through `ppmd-turbo`.
+ppmd = ["dep:ppmd-turbo"]
 util = ["dep:cap-std"]
 zstd = ["dep:zstd"]
 
@@ -80,21 +76,17 @@ aes = { version = "0.9", features = ["zeroize"], optional = true }
 # The same pin and the same features `lzma-turbo` uses, so a build that has both
 # crates resolves one copy of AWS-LC. AES-256-CBC is this crate's own (7z
 # cryptography is not `lzma-turbo`'s job), so the dependency is direct.
-aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
 brotli = { version = ">= 7, < 10", default-features = false, optional = true, features = ["std"] }
 bzip2 = { version = "0.6", optional = true }
 cbc = { version = "0.2", optional = true }
 flate2 = { version = "1", optional = true, features = ["zlib-rs"] }
 getrandom = { version = "0.4", optional = true }
-# The version is what is published; the path is the sibling checkout used
-# while the two crates are developed together, and is dropped for a release
-# (`cargo xtask release` refuses to tag while it is here). Consumers get both
-# crates from crates.io.
-lzma-turbo = { version = "0.6.0", default-features = false, features = ["std", "asm", "crc", "filters"] }
-# Encoders only, behind `lzma-rust2-encoder`, as the alternative to
-# `lzma-turbo`'s. The decode path never reaches lzma-rust2; see AGENTS.md.
-lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "encoder", "optimization"], optional = true }
-ppmd-rust = { version = "1", optional = true }
+# From crates.io. While the two crates are developed together a `path` to the
+# sibling checkout is added here and dropped again before release
+# (`cargo xtask release` refuses to tag while it is here).
+lzma-turbo = { version = "0.8.0", default-features = false, features = ["std", "asm", "crc", "filters"] }
+ppmd-turbo = { version = "0.1.1", optional = true }
 lz4_flex = { version = "0.14", optional = true }
 nt-time = { version = "0.15", optional = true }
 zstd = { version = "0.14", optional = true }
@@ -140,12 +132,12 @@ required-features = ["default"]
 name = "mt_decompress"
 required-features = ["default"]
 
-# The reference embedding of the `hooks` seam: a wasm guest that declares a raw
-# import in a `host` namespace and installs a hook forwarding to it. It only
-# makes sense with the delegating feature on.
+# The reference embedding of the `hooks` seams: a wasm guest that declares raw
+# imports in a `host` namespace and installs hooks forwarding to them. It only
+# makes sense with the delegating features on.
 [[example]]
 name = "wasm_host_extract_conformance"
-required-features = ["aes256", "crypto-host"]
+required-features = ["aes256", "crc-host", "crypto-host"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -153,3 +145,9 @@ all-features = true
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# `--cfg sevenz_turbo_unthreaded` (through RUSTFLAGS) makes the LZMA and LZMA2
+# writers take the path a target without threads takes, so that it can be
+# tested and measured on a host that has them. Never set for a build that ships.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sevenz_turbo_unthreaded)"] }

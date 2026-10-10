@@ -171,7 +171,69 @@ impl ArchiveEntry {
     /// * `path` - The filesystem path to extract metadata from
     /// * `entry_name` - The name/path to use for this entry within the archive
     pub fn from_path(path: impl AsRef<std::path::Path>, entry_name: String) -> Self {
-        let path = path.as_ref();
+        // One lookup for everything: `Path::is_file` and `Path::is_dir` are
+        // each a `metadata` call of their own, and a tree of tiny files pays
+        // for every lookup (on Windows an open, a query and a close each). A
+        // path whose metadata cannot be read is neither, as those two say.
+        match path.as_ref().metadata() {
+            Ok(meta) => Self::from_metadata(&meta, entry_name),
+            Err(_) => Self {
+                name: Self::archive_name(entry_name),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Creates a new archive entry from metadata the caller already holds,
+    /// such as [`std::fs::DirEntry::metadata`] from a directory walk.
+    ///
+    /// The same as [`ArchiveEntry::from_path`] given that metadata, without
+    /// looking the path up again. On Windows a directory walk's metadata
+    /// comes with the listing, where a lookup by path opens the file, so a
+    /// tree of small files is added with one open per file instead of two.
+    /// The metadata is taken as it is: a walk's metadata describes a link
+    /// itself, where `from_path` follows it.
+    ///
+    /// # Arguments
+    /// * `meta` - The entry's metadata
+    /// * `entry_name` - The name/path to use for this entry within the archive
+    pub fn from_metadata(meta: &std::fs::Metadata, entry_name: String) -> Self {
+        let mut entry = ArchiveEntry {
+            name: Self::archive_name(entry_name),
+            has_stream: meta.is_file(),
+            is_directory: meta.is_dir(),
+            ..Default::default()
+        };
+        // How much the file holds now. Pushing the entry replaces it with
+        // what was actually read; until then the writer takes it as the
+        // folder's size, to size the dictionary.
+        if meta.is_file() {
+            entry.size = meta.len();
+        }
+        if let Ok(modified) = meta.modified()
+            && let Ok(date) = NtTime::try_from(modified)
+        {
+            entry.last_modified_date = date;
+            entry.has_last_modified_date = entry.last_modified_date.0 > 0;
+        }
+        if let Ok(date) = meta.created()
+            && let Ok(date) = NtTime::try_from(date)
+        {
+            entry.creation_date = date;
+            entry.has_creation_date = entry.creation_date.0 > 0;
+        }
+        if let Ok(date) = meta.accessed()
+            && let Ok(date) = NtTime::try_from(date)
+        {
+            entry.access_date = date;
+            entry.has_access_date = entry.access_date.0 > 0;
+        }
+        entry
+    }
+
+    /// The name an entry is stored under: on Windows, backslashes become the
+    /// forward slashes 7z names use.
+    fn archive_name(entry_name: String) -> String {
         #[cfg(target_os = "windows")]
         let entry_name = {
             let mut name_bytes = entry_name.into_bytes();
@@ -182,40 +244,7 @@ impl ArchiveEntry {
             }
             String::from_utf8(name_bytes).unwrap()
         };
-        let mut entry = ArchiveEntry {
-            name: entry_name,
-            has_stream: path.is_file(),
-            is_directory: path.is_dir(),
-            ..Default::default()
-        };
-
-        if let Ok(meta) = path.metadata() {
-            // How much the file holds now. Pushing the entry replaces it with
-            // what was actually read; until then the writer takes it as the
-            // folder's size, to size the dictionary.
-            if meta.is_file() {
-                entry.size = meta.len();
-            }
-            if let Ok(modified) = meta.modified()
-                && let Ok(date) = NtTime::try_from(modified)
-            {
-                entry.last_modified_date = date;
-                entry.has_last_modified_date = entry.last_modified_date.0 > 0;
-            }
-            if let Ok(date) = meta.created()
-                && let Ok(date) = NtTime::try_from(date)
-            {
-                entry.creation_date = date;
-                entry.has_creation_date = entry.creation_date.0 > 0;
-            }
-            if let Ok(date) = meta.accessed()
-                && let Ok(date) = NtTime::try_from(date)
-            {
-                entry.access_date = date;
-                entry.has_access_date = entry.access_date.0 > 0;
-            }
-        }
-        entry
+        entry_name
     }
 
     /// Returns the name/path of this entry within the archive.

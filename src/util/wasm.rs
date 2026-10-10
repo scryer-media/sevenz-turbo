@@ -43,8 +43,7 @@ pub fn decompress_with_limits(
     seven
         .for_each_entries(|entry, reader| {
             if !entry.is_directory() {
-                let path =
-                    sanitize_entry_name(entry.name()).map_err(|e| std::io::Error::other(e))?;
+                let path = sanitize_entry_name(entry.name()).map_err(std::io::Error::other)?;
 
                 if entry.size() > 0 {
                     let mut writer = Vec::new();
@@ -113,7 +112,7 @@ pub fn compress(entries: Vec<JsString>, datas: Vec<Uint8Array>) -> Result<Uint8A
     let mut sz = ArchiveWriter::new(writer).map_err(|e| e.to_string())?;
     let reader: Vec<SourceReader<_>> = datas
         .into_iter()
-        .map(|d| Uint8ArrayStream::new(d))
+        .map(Uint8ArrayStream::new)
         .map(SourceReader::new)
         .collect();
     let entries = entries

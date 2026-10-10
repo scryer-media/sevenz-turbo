@@ -44,9 +44,12 @@ parse, a full decode on the convenience or the single-parse streaming path,
 optionally under `--memory-limit` or with the upstream engine, or an encode
 at a level and thread count), printing one JSON line, so the caller can take
 the operation's peak RSS from the exited process. `op version` reports the
-crypto backend, the Cargo build profile and the locked `lzma-turbo`,
-`sevenz-rust2`, `aws-lc-rs`, `crc-fast` and `ppmd-rust` versions; the harness
-refuses a candidate that was not built with the `release` profile.
+crypto backend, which LZMA encoder is linked (`lzma_encoder`), the Cargo build
+profile, the commit and whether the tree was dirty, the lock file's SHA-256,
+the locked `lzma-turbo`, `sevenz-rust2`, `aws-lc-rs` and `crc-fast` versions,
+and every `ppmd-*` crate the lock carries with its version (`ppmd_crates`, and
+`ppmd_turbo` on its own); the harness refuses a candidate that was not built
+with the `release` profile.
 
 It reports the median wall time of `--runs` repetitions, the MiB/s of
 *uncompressed* output, and a 64-bit digest of the extracted bytes, so "the two
@@ -110,7 +113,7 @@ mt-trace: threads=2 spawned=2 drains=2 drain=10.768s sink=0.377s/8 small=0 MiB \
 
 Measured 2026-09-16 and 2026-09-17 at sevenz-turbo 0.23.0 (on `lzma-fast`
 0.2.0 to 0.3.0, since renamed `lzma-turbo`), with the human-oriented
-`decode-bench` modes above. The crate and `lzma-turbo` (now 0.6.0) have
+`decode-bench` modes above. The crate and `lzma-turbo` (now 0.7.0) have
 changed since; these are a dated record, not
 current figures.
 

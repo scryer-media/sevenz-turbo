@@ -6,11 +6,16 @@
 //!
 //! 1. LZMA and LZMA2 decode - and, with `compress`, encode - through
 //!    [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a port of the
-//!    7-Zip reference coders, instead of `lzma-rust2`.
+//!    7-Zip reference coders, instead of upstream's pure-Rust coders.
 //! 2. It adds the container API a streaming consumer needs: memory limits
 //!    enforced before allocation, per-member CRCs, folder-to-pack-stream byte
 //!    ranges, a borrowing reader, typed corruption errors carrying a block
 //!    index and packed offset, and a per-block completion hook.
+//!
+//! PPMd also goes through a different engine,
+//! [`ppmd-turbo`](https://github.com/scryer-media/ppmd-turbo), and the default
+//! thread count, the cryptography backends and the limits on hostile archives
+//! differ; the README lists them.
 //!
 //! The `CHANGELOG.md` section "Fork" is the exhaustive divergence list.
 //!
@@ -84,29 +89,25 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     sha.finalize()
 }
 
-/// Names the LZMA and LZMA2 encoder this build of the crate selected:
-/// `"lzma-turbo"`, or `"lzma-rust2"` when the `lzma-rust2-encoder` feature is
-/// on.
-///
-/// Like [`crypto_backend`], a dependency can turn that feature on without the
-/// top-level crate noticing; this is here to be asserted on.
+/// Names the LZMA and LZMA2 encoder this crate writes archives with:
+/// `"lzma-turbo"`.
 #[cfg(feature = "compress")]
 #[must_use]
 pub fn lzma_encoder() -> &'static str {
-    if cfg!(feature = "lzma-rust2-encoder") {
-        "lzma-rust2"
-    } else {
-        "lzma-turbo"
-    }
+    "lzma-turbo"
 }
 
-/// Embedder-supplied delegation hooks for the bulk AES-256-CBC decrypt
-/// (the `crypto-host` feature). See the module documentation for the contract
-/// a host must satisfy.
-#[cfg(all(feature = "aes256", feature = "crypto-host"))]
+/// Embedder-supplied delegation hooks for the bulk AES-256-CBC decrypt, the
+/// key derivation's SHA-256 and the 7z CRC-32 (the `crypto-host` and
+/// `crc-host` features). See the module documentation for the contract a host
+/// must satisfy.
+#[cfg(any(feature = "crc-host", feature = "crypto-host"))]
 pub mod hooks;
 
 mod error;
+#[cfg(not(target_arch = "wasm32"))]
+mod ordered;
+mod positional;
 mod reader;
 
 #[cfg(feature = "compress")]
@@ -117,6 +118,7 @@ pub(crate) mod bitset;
 pub(crate) mod block;
 pub(crate) mod codec;
 pub(crate) mod decoder;
+pub(crate) mod pipeline;
 
 mod time;
 #[cfg(feature = "util")]
@@ -129,14 +131,15 @@ use std::{
 
 pub use archive::*;
 pub use block::*;
-pub use codec::lzma_turbo::{Lzma2Handle, Lzma2Progress};
+pub use codec::lzma_turbo::{Lzma2Handle, Lzma2Ledger, Lzma2Progress};
 pub use container::{
     ArchiveLimits, BlockCompletion, CrcFolder, PackStreamRange, SubStream, SubStreamCompletion,
     UnsizedCoder, coder_memory_estimate, crc32_combine,
 };
 pub use encryption::Password;
 pub use error::{BlockErrorKind, Error, Limit};
-pub use reader::{ArchiveReader, BlockDecoder};
+pub use positional::{ReadAt, ReadAtCursor, SerialReadAt};
+pub use reader::{ArchiveReader, BlockDecoder, EntryRead};
 pub use time::NtTime;
 #[cfg(all(feature = "compress", feature = "util", not(target_arch = "wasm32")))]
 pub use util::compress::*;

@@ -43,6 +43,13 @@ pub struct ArchiveLimits {
     /// is dominated by the dictionary a block declares, and, when a header or
     /// block is decoded, the sum of its coder chain's dictionaries and models
     /// rather than each coder alone.
+    ///
+    /// A parallel LZMA2 decode keeps its buffers inside what is left of the
+    /// limit once the chain's dictionaries and coder state are reserved: the
+    /// decoder's held bytes (input pieces, runs out with workers, decoded
+    /// runs waiting, parked buffers) plus the reader's queue of pieces read
+    /// and not yet handed over. Dictionaries, coder state and allocator slack
+    /// are additions to that, not bounded by it.
     pub memory_limit_bytes: u64,
     /// Largest end header the caller will allow to be buffered, in bytes.
     ///
@@ -129,7 +136,8 @@ pub struct ArchiveLimits {
     /// including encoded headers and repeated block decodes. Cache hits and
     /// raw-key mode cost zero; cache eviction does not reset the counter.
     /// Default: 2^28. Checked before each derivation, so payload work can fail
-    /// during extraction. A fresh password or clone starts a fresh budget.
+    /// during extraction. A fresh password or clone starts a fresh budget; a
+    /// clone shares the keys already derived, so a hit on one costs it nothing.
     pub max_aes_kdf_rounds: u64,
     /// Whether an entry whose stored name would escape the extraction
     /// directory makes the archive unreadable.
@@ -399,7 +407,8 @@ const ZSTD_BYTES: u64 = 160 * MIB;
 /// An LZ4 frame block is at most 4 MiB, plus a 64 KiB dictionary.
 const LZ4_BYTES: u64 = 16 * MIB;
 /// Branch/call/jump filters and the delta filter keep a few hundred bytes of
-/// state; AES keeps a block. One megabyte covers any of them with room.
+/// state; AES keeps a block and, for a caller reading under 64 KiB at a time,
+/// a 64 KiB plaintext buffer. One megabyte covers any of them with room.
 const FILTER_BYTES: u64 = MIB;
 /// BCJ2 reads four streams at once and keeps a range coder over one of them.
 /// Its sub-streams' own decoders are separate coders in the same block and are
@@ -466,7 +475,14 @@ impl Archive {
     /// crate currently uses for every coder. A multi-threaded LZMA2 reader
     /// buffers a whole run of dependent chunks before decoding any of it, so
     /// its footprint scales with the block rather than with the dictionary,
-    /// and this estimate would not describe it.
+    /// and this estimate would not describe it. Nor does it count the pipes
+    /// of a block decoded as a pipeline on more than one thread, 1.25 MiB
+    /// each and one or two for every coder given a thread of its own: those
+    /// are charged to [`ArchiveLimits::memory_limit_bytes`] when the block
+    /// is decoded, beside every coder of its chain at this table's figures,
+    /// and a block they do not fit decodes without them.
+    ///
+    /// [`ArchiveLimits::memory_limit_bytes`]: crate::ArchiveLimits::memory_limit_bytes
     ///
     /// # Errors
     ///

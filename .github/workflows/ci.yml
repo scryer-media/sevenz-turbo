@@ -55,7 +55,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt
@@ -69,7 +69,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
@@ -86,7 +86,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - run: cargo doc --locked --no-deps --all-features
@@ -111,7 +111,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       # aws-lc-rs assembles AWS-LC with NASM on Windows. Every other lane on
@@ -128,6 +128,25 @@ jobs:
       - name: Test the RustCrypto backend
         run: cargo test --locked --no-default-features --features aes256,native-crypto,bzip2,compress,ppmd,util --no-fail-fast
 
+  unthreaded:
+    name: unthreaded
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # The LZMA and LZMA2 writers take the path a target without threads
+      # takes (see Cargo.toml). Default features only.
+      RUSTFLAGS: --cfg sevenz_turbo_unthreaded
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --no-fail-fast
+
   wasm:
     name: wasm
     runs-on: ubuntu-24.04
@@ -136,7 +155,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32-unknown-unknown, wasm32-wasip1
@@ -154,10 +173,11 @@ jobs:
         env:
           RUSTFLAGS: --cfg getrandom_backend="wasm_js"
       # Decode-only and delegating: the configuration a wasm embedder actually
-      # ships, which carries no in-guest block cipher at all. Without `util`,
-      # so the crate is proven to build with no `wasm-bindgen` export surface.
+      # ships, which carries no in-guest block cipher at all and hands the
+      # CRC-32 to the host as well. Without `util`, so the crate is proven to
+      # build with no `wasm-bindgen` export surface.
       - name: Check the delegating wasm guest without an in-guest AES
-        run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features aes256_wasm,crypto-host,bzip2,ppmd
+        run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features aes256_wasm,crc-host,crypto-host,bzip2,ppmd
         env:
           RUSTFLAGS: --cfg getrandom_backend="wasm_js"
       # The same set with `util`: the `wasm-bindgen` surface compiles without
@@ -168,9 +188,9 @@ jobs:
         env:
           RUSTFLAGS: --cfg getrandom_backend="wasm_js"
       # The conformance harness builds the wasm32-wasip1 guest example itself
-      # and runs it under `wasmtime` with a reference host AES, comparing the
-      # guest's extraction with the native decoder's.
-      - name: Run the wasm host-AES conformance harness
+      # and runs it under `wasmtime` with a reference host AES, SHA-256 and
+      # CRC-32, comparing the guest's extraction with the native decoder's.
+      - name: Run the wasm host-delegation conformance harness
         run: |
           cargo clippy --locked -p wasm-conformance --all-targets -- -D warnings
           cargo test --locked -p wasm-conformance
@@ -188,7 +208,7 @@ jobs:
         run: |
           version="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - run: cargo check --locked --all-features
@@ -201,20 +221,22 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - name: Verify the crates.io archive lists cleanly
-        # `cargo package` cannot build while `lzma-turbo` is a path dependency
-        # without a version; listing still proves the manifest and includes are
-        # sane. The build check comes back when the dependency is a published
-        # version pin (see docs/lzma-turbo-requests.md).
+        # Listing proves the manifest and the includes are sane.
         run: cargo package --locked --no-verify --list
+      - name: Build the packaged crate from its own archive
+        # Verification unpacks the archive into target/package and builds it
+        # there against the packaged Cargo.lock, so a file the build needs
+        # that the archive leaves out fails here rather than on crates.io.
+        run: cargo package --locked
 
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [hygiene, fmt, clippy, docs, test, wasm, msrv, package]
+    needs: [hygiene, fmt, clippy, docs, test, unthreaded, wasm, msrv, package]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

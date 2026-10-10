@@ -370,6 +370,10 @@ func cmdRun(ctx context.Context, args []string) int {
 		if err := os.MkdirAll(scratch, 0o755); err != nil {
 			return fail(err)
 		}
+		// From here the directory is the run's, so it goes whichever way
+		// the run ends: a planning failure must not leave it to refuse the
+		// next run with the same --out.
+		defer func() { _ = os.RemoveAll(scratch) }()
 	}
 	scratch, _ = filepath.Abs(scratch)
 	settings := suite.DefaultSettings(*quick, cpus)
@@ -400,7 +404,9 @@ func cmdRun(ctx context.Context, args []string) int {
 		raw.Machine.OS, raw.Machine.Architecture, raw.Machine.CPUCount, chain.Oracle.Version, chain.LinkedLzmaTurbo)
 	suite.Execute(ctx, raw, suite.Options{Warmups: *warmups, Repeats: *repeats, PinCPUs: *pin, Timeout: *timeout, Log: os.Stderr, Oracle: binaries.Oracle})
 	raw.FinishedUTC = time.Now().UTC().Format(time.RFC3339)
-	_ = os.RemoveAll(scratch)
+	if err := suite.Redact(raw, runPlaces(absolute, scratch, *out, *tools.repo)); err != nil {
+		return fail(err)
+	}
 	if err := suite.Write(filepath.Join(*out, "raw.json"), raw); err != nil {
 		return fail(err)
 	}
@@ -418,6 +424,27 @@ func cmdRun(ctx context.Context, args []string) int {
 		return exitFailed
 	}
 	return exitOK
+}
+
+// runPlaces is the directories a run's records name, with the labels a
+// published report gives them in place of their absolute paths.
+func runPlaces(fixtureDir, scratch, out, repo string) []suite.Place {
+	places := []suite.Place{{Path: fixtureDir, Label: "<fixtures>"}, {Path: scratch, Label: "<scratch>"}}
+	if absolute, err := filepath.Abs(out); err == nil {
+		places = append(places, suite.Place{Path: absolute, Label: "<out>"})
+	}
+	if repo == "" {
+		if top, err := gitTop(context.Background()); err == nil {
+			repo = top
+		}
+	}
+	if absolute, err := filepath.Abs(repo); err == nil && repo != "" {
+		places = append(places, suite.Place{Path: absolute, Label: "<repo>"})
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		places = append(places, suite.Place{Path: home, Label: "~"})
+	}
+	return places
 }
 
 func writeReport(built *report.Report, jsonPath, mdPath string) error {

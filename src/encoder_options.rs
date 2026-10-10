@@ -1,8 +1,5 @@
 use std::{fmt::Debug, num::NonZeroU64};
 
-#[cfg(feature = "ppmd")]
-use ppmd_rust::{PPMD7_MAX_MEM_SIZE, PPMD7_MAX_ORDER, PPMD7_MIN_MEM_SIZE, PPMD7_MIN_ORDER};
-
 #[cfg(feature = "compress")]
 use crate::EncoderConfiguration;
 #[cfg(feature = "aes256")]
@@ -11,13 +8,12 @@ use crate::Password;
 /// The LZMA settings both option types carry, independent of which encoder
 /// runs them. `None` is "the level's default".
 ///
-/// The levels are the table `lzma-rust2` uses, which is xz's: the dictionary
-/// doubles from 256 KiB at level 0 to 64 MiB at level 9, levels 0 to 3 are
-/// the fast parser over a hash chain and the rest the optimal parser over a
-/// binary tree. Both encoders are given these numbers outright, so a level
-/// means the same dictionary, and the same archive memory, whichever one the
-/// build compiles - the SDK's own level defaults, which reach 256 MiB, are
-/// not used.
+/// The levels are xz's table: the dictionary doubles from 256 KiB at level 0
+/// to 64 MiB at level 9, levels 0 to 3 are the fast parser over a hash chain
+/// and the rest the optimal parser over a binary tree. The encoder is given
+/// these numbers outright, so a level means the same dictionary, and the same
+/// archive memory, as before - the SDK's own level defaults, which reach
+/// 256 MiB, are not used.
 #[cfg(feature = "compress")]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LzmaSettings {
@@ -34,7 +30,7 @@ pub(crate) struct LzmaSettings {
 
 #[cfg(feature = "compress")]
 impl LzmaSettings {
-    /// The smallest dictionary either encoder accepts.
+    /// The smallest dictionary the encoder accepts.
     pub(crate) const DICT_SIZE_MIN: u32 = 4096;
     /// The largest dictionary the option setters allow; the encoder's own
     /// limit, checked when the coder is built, is lower.
@@ -59,7 +55,6 @@ impl LzmaSettings {
     const LEVEL_NICE_LEN: [u32; 10] = [128, 128, 273, 273, 16, 32, 64, 64, 64, 64];
     /// Hash-chain depth for the fast levels; the optimal levels leave it to
     /// the encoder.
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
     const LEVEL_DEPTH: [u32; 4] = [4, 8, 24, 48];
 
     const fn from_level(level: u32) -> Self {
@@ -71,14 +66,24 @@ impl LzmaSettings {
         }
     }
 
-    #[cfg(feature = "lzma-rust2-encoder")]
     pub(crate) const fn level(&self) -> u32 {
         self.level
     }
 
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
-    const fn fast(&self) -> bool {
+    /// Whether the level is one of the fast ones: a hash-chain match finder
+    /// and no optimal parse.
+    pub(crate) const fn fast(&self) -> bool {
         self.level <= 3
+    }
+
+    /// The hash-chain depth of a fast level. `None` for the optimal levels,
+    /// which leave it to the encoder.
+    pub(crate) const fn hash_chain_depth(&self) -> Option<u32> {
+        if self.fast() {
+            Some(Self::LEVEL_DEPTH[self.level as usize])
+        } else {
+            None
+        }
     }
 
     fn set_dict_size(&mut self, dict_size: u32) {
@@ -121,52 +126,22 @@ impl LzmaSettings {
         self.input_size = Some(size);
     }
 
-    fn nice_len(&self) -> u32 {
+    /// The nice match length the caller asked for: theirs, or the level's.
+    pub(crate) fn nice_len(&self) -> u32 {
         self.nice_len
             .unwrap_or(Self::LEVEL_NICE_LEN[self.level as usize])
     }
 
-    /// The `lzma-turbo` setting.
-    #[cfg(not(feature = "lzma-rust2-encoder"))]
-    pub(crate) fn turbo_props(&self) -> lzma_turbo::LzmaEncProps {
-        use lzma_turbo::MatchFinderKind;
-
-        let fast = self.fast();
-        let mut props = lzma_turbo::LzmaEncProps::new()
-            .with_level(self.level)
-            .with_dict_size(self.requested_dict_size())
-            .with_fast_bytes(self.nice_len())
-            .with_fast_mode(fast)
-            .with_match_finder(if fast {
-                MatchFinderKind::Hc4
-            } else {
-                MatchFinderKind::Bt4
-            });
-        if fast {
-            props = props.with_match_cycles(Self::LEVEL_DEPTH[self.level as usize]);
-        }
-        // C: `props.reduceSize`. Only where it shrinks the dictionary, so an
-        // input at least the dictionary's size is coded exactly as before.
-        if let Some(size) = self.input_size
-            && size < u64::from(self.requested_dict_size())
-        {
-            props = props.with_reduce_size(size);
-        }
-        props
-    }
-
-    /// The `lzma-rust2` setting: its preset for the level, which is this
-    /// table, with the caller's overrides applied.
-    #[cfg(feature = "lzma-rust2-encoder")]
-    pub(crate) fn rust2_options(&self) -> lzma_rust2::LzmaOptions {
-        let mut options = lzma_rust2::LzmaOptions::with_preset(self.level);
-        options.dict_size = self.dict_size();
-        options.nice_len = self.nice_len();
-        options
+    /// The threads one LZMA coder of these settings runs on when the caller
+    /// allowed `threads`: two, the coder's and its match finder's, for the
+    /// normal mode's binary-tree finder with more than one thread allowed;
+    /// otherwise one. C++: `numThreads = (algo == 0 || btMode == 0) ? 1 : 2`.
+    pub(crate) const fn match_finder_threads(&self, threads: u32) -> u32 {
+        if !self.fast() && threads > 1 { 2 } else { 1 }
     }
 
     /// The LZMA properties byte, `(pb * 5 + lp) * 9 + lc`. Neither option
-    /// type exposes lc, lp or pb, so both encoders run the defaults of 3, 0
+    /// type exposes lc, lp or pb, so the encoder runs the defaults of 3, 0
     /// and 2.
     pub(crate) const fn props_byte() -> u8 {
         const LC: u8 = 3;
@@ -498,21 +473,11 @@ impl PpmdOptions {
     /// * `order` - Model order (clamped to valid PPMD range)
     /// * `memory_size` - Memory size in bytes (clamped to valid PPMD range)
     pub const fn from_order_memory_size(order: u32, memory_size: u32) -> Self {
-        let order = if order > PPMD7_MAX_ORDER {
-            PPMD7_MAX_ORDER
-        } else if order < PPMD7_MIN_ORDER {
-            PPMD7_MIN_ORDER
-        } else {
-            order
-        };
-        let memory_size = if memory_size > PPMD7_MAX_MEM_SIZE {
-            PPMD7_MAX_MEM_SIZE
-        } else if memory_size < PPMD7_MIN_MEM_SIZE {
-            PPMD7_MIN_MEM_SIZE
-        } else {
-            memory_size
-        };
-        Self { order, memory_size }
+        let params = ppmd_turbo::Params::clamped(order, memory_size);
+        Self {
+            order: params.order(),
+            memory_size: params.mem_size(),
+        }
     }
 }
 
@@ -557,15 +522,27 @@ pub struct AesEncoderOptions {
     pub iv: [u8; 16],
     /// Salt for key derivation.
     pub salt: [u8; 16],
-    /// Number of cycles power for key derivation.
+    /// The key-derivation work factor: the key is `2^num_cycles_power`
+    /// SHA-256 rounds over the salt and password. Defaults to
+    /// [`Self::DEFAULT_NUM_CYCLES_POWER`]; see [`Self::with_num_cycles_power`].
     pub num_cycles_power: u8,
 }
 
 #[cfg(feature = "aes256")]
 impl AesEncoderOptions {
+    /// The default key-derivation work factor, 19 (`2^19` SHA-256 rounds):
+    /// 7-Zip's `kNumCyclesPower`, what every archive 7-Zip writes uses.
+    ///
+    /// The key is derived once per archive, not per folder, so this is a
+    /// one-off cost of a fraction of a second when an archive is written, and
+    /// the same again for whoever opens it. It is the price a password
+    /// guesser pays per guess too, which is what it is for.
+    pub const DEFAULT_NUM_CYCLES_POWER: u8 = 19;
+
     /// Creates new AES encoder options with the specified password.
     ///
-    /// Generates random IV and salt values automatically.
+    /// Generates random IV and salt values automatically, and derives the key
+    /// with [`Self::DEFAULT_NUM_CYCLES_POWER`] rounds.
     ///
     /// # Arguments
     /// * `password` - Password for encryption
@@ -580,8 +557,51 @@ impl AesEncoderOptions {
             password,
             iv,
             salt,
-            num_cycles_power: 8,
+            num_cycles_power: Self::DEFAULT_NUM_CYCLES_POWER,
         }
+    }
+
+    /// Sets the key-derivation work factor to `2^power` SHA-256 rounds.
+    ///
+    /// Each step down halves what one password guess costs an attacker, so
+    /// lowering it trades the archive's resistance to guessing for a faster
+    /// first read; below the default it is a deliberate choice. Readers
+    /// (this crate's default `ArchiveLimits`, and 7-Zip) refuse a power above
+    /// 24, and so does the encoder. 63 is not a work factor: the format
+    /// reads it as "the key is the salt and password themselves, unhashed".
+    ///
+    /// The format has six bits for the value. Anything above 24 other than
+    /// 63 is refused when the archive is written, with
+    /// [`Limit::AesCyclesPower`](crate::Limit::AesCyclesPower); a value over
+    /// 63 is never cut down to the six bits it would leave.
+    pub fn with_num_cycles_power(mut self, power: u8) -> Self {
+        self.num_cycles_power = power;
+        self
+    }
+
+    /// What the format reads as "no derivation": see
+    /// [`Self::with_num_cycles_power`].
+    #[cfg(feature = "compress")]
+    const RAW_KEY_POWER: u8 = 0x3F;
+
+    /// The work factor, refused when the coder properties cannot say it.
+    ///
+    /// They hold its low six bits, so a larger value written as it stands
+    /// would be another work factor altogether: 64 would be written as zero,
+    /// one round, and 127 as 63, no derivation at all. The field is public,
+    /// so this is checked where the value is used and not where it is set.
+    #[cfg(feature = "compress")]
+    pub(crate) fn checked_num_cycles_power(&self) -> Result<u8, crate::Error> {
+        let power = self.num_cycles_power;
+        let max = crate::encryption::MAX_AES_CYCLES_POWER;
+        if power > max && power != Self::RAW_KEY_POWER {
+            return Err(crate::Error::limit(
+                crate::Limit::AesCyclesPower,
+                u64::from(max),
+                u64::from(power),
+            ));
+        }
+        Ok(power)
     }
 
     pub(crate) fn properties(&self) -> [u8; 34] {
@@ -845,14 +865,6 @@ mod tests {
         let sized = config.sized_for(100_000).expect("shrunk");
         assert_eq!(dict(&sized), 100_000);
         assert_eq!(sized.method, EncoderMethod::LZMA2);
-        // The settings the encoder is built with agree with the coder record.
-        #[cfg(not(feature = "lzma-rust2-encoder"))]
-        match &sized.options {
-            Some(EncoderOptions::Lzma2(o)) => {
-                assert_eq!(o.settings.turbo_props().dict_size(), 100_000);
-            }
-            other => panic!("not LZMA2 options: {other:?}"),
-        }
     }
 
     #[test]
@@ -869,18 +881,10 @@ mod tests {
     fn a_folder_no_smaller_than_the_dictionary_keeps_it() {
         let mut options = Lzma2Options::from_level(5);
         options.set_dictionary_size(1 << 16);
-        let config: EncoderConfiguration = options.clone().into();
+        let config: EncoderConfiguration = options.into();
         for size in [1 << 16, (1 << 16) + 1, u64::MAX] {
             let sized = config.sized_for(size).expect("LZMA2");
             assert_eq!(dict(&sized), 1 << 16, "size {size}");
-            // Not even the encoder's settings move: the same bytes come out.
-            #[cfg(not(feature = "lzma-rust2-encoder"))]
-            match &sized.options {
-                Some(EncoderOptions::Lzma2(o)) => {
-                    assert_eq!(o.settings.turbo_props(), options.settings.turbo_props());
-                }
-                other => panic!("not LZMA2 options: {other:?}"),
-            }
         }
         assert_eq!(
             dict(&config.sized_for((1 << 16) - 1).unwrap()),

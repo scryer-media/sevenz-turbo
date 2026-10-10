@@ -45,8 +45,10 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   hooks, renovate, issue templates, `AGENTS.md`, `SECURITY.md`,
   `CONTRIBUTORS.md`. Upstream's `.github/workflows/rust.yml` and
   `.github/dependabot.yml` were removed as duplicates of these.
-- The `lzma-turbo` dependency is a path dependency for now. It becomes a
-  crates.io version pin before this crate is published.
+- The `lzma-turbo` dependency is a crates.io version pin. While the two
+  crates are developed together a `path` to the sibling checkout is added and
+  dropped again before release; `cargo xtask release` refuses to tag while it
+  is there.
 
 ### Decoding
 
@@ -65,16 +67,18 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   only through the non-default `lzma-rust2-encoder` feature; with
   `--no-default-features` the graph is `sevenz-turbo → lzma-turbo → crc-fast`
   and nothing else.
-- The writer sizes each folder's LZMA or LZMA2 coder to the folder, the way
-  7-Zip reduces its dictionary: a folder known to be smaller than the
-  dictionary is coded with one its size (never below 4 KiB), and one that fits
-  a single LZMA2 block is coded on one thread. `ArchiveEntry::from_path`
-  records the file's length so the size is known before the push.
-- The BCJ and delta filters are `lzma-turbo`'s, and BCJ2 is vendored into
-  `src/codec/filter/` from `lzma-rust2` 0.20.1 (Apache-2.0, same licence),
-  which together are what let `lzma-rust2` leave the decode graph rather than
-  be carried for three filters. `src/codec/filter/mod.rs` documents what is
-  still vendored and the mechanical changes made to it.
+- The branch converters, the delta filter and BCJ2 are all `lzma-turbo`'s
+  (`lzma_turbo::filters`). The `Read` and `Write` wrappers around the BCJ and
+  delta converters are vendored from `lzma-rust2` 0.20.1 (Apache-2.0, same
+  licence) in `src/codec/filter/`; the BCJ2 reader and writer are this crate's
+  own. Together that is what let `lzma-rust2` leave the decode graph rather
+  than be carried for three filters. `src/codec/filter/mod.rs` documents what
+  is still vendored and the mechanical changes made to it.
+- PPMd decodes and encodes through
+  [`ppmd-turbo`](https://github.com/scryer-media/ppmd-turbo) instead of
+  `ppmd-rust` (0.27.0). The decoder is given the folder's unpacked size, a
+  stream cut short is `UnexpectedEof`, a corrupt one `InvalidData`, and a
+  model larger than the memory limit is refused before it is allocated.
 - LZMA2 decodes on several threads through `lzma-turbo`'s `Lzma2AdaptiveDecoder`
   — a stream is cut at the dictionary resets that make a *run* independently
   decodable, and runs are decoded on workers while output stays in order.
@@ -128,6 +132,13 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   there is nothing to cut, and a block whose memory budget has no room to hold
   runs in flight **degrades to single-threaded rather than failing** — a limit
   states what the caller can afford, not that the archive must be refused.
+- The folders of a non-solid archive decode several at a time (0.27.0): with
+  a positional source (`ReadAt`) and more than one thread, runs of folders of
+  at most 8 MiB decode on workers and reach the callback in archive order,
+  inside the thread count and the memory limit. A block whose heavy coders
+  would share one thread decodes as a pipeline of stages on threads of their
+  own. Upstream decodes every folder and every coder chain on the calling
+  thread.
 - LZMA1 is now subject to the same dictionary memory limit as LZMA2. Upstream
   bounded only LZMA2, so an archive declaring a 4 GiB LZMA1 dictionary would
   try to allocate it.
@@ -237,7 +248,9 @@ Everything here is new surface; no upstream signature changed meaning.
   `ArchiveReader::lzma2_progress()` report an `Lzma2Progress { block_index,
   threads, spawned_threads, pending_runs, runs_claimed, in_flight_bytes }` —
   `pending_runs` is the backlog of complete runs an adaptive caller widens on,
-  and `runs_claimed` is the run index of the block being decoded.
+  and `runs_claimed` is the run index of the block being decoded. While a run
+  of small folders decodes several at a time (0.27.0), `set_threads` bounds
+  how many of them decode at once and `progress()` is `None`.
 - `ArchiveReader::set_sub_stream_complete_hook` / `clear_…`, called with a
   `SubStreamCompletion { block_index, sub_stream_index, file_index,
   unpacked_offset, len, crc32 }` as each file's checksum becomes final. The
@@ -271,8 +284,10 @@ Everything here is new surface; no upstream signature changed meaning.
   `lzma-turbo`, with the exact signatures and the local work-around for each.
   The parallel-decoder request landed and is recorded as such; the AES and
   key-derivation requests were withdrawn when that crate removed both on
-  purpose; what is outstanding is worker-side checksums on the adaptive
-  decoder and a run index over a stream not yet being decoded.
+  purpose; worker-side checksums landed and this fork folds them; what is
+  outstanding is a memory limit the parallel decoder holds to, or an account
+  of what it does not hold to, and a run index over a stream not yet being
+  decoded.
 - `AGENTS.md` gained the rule this fork is now held to: no CRC-32 is computed
   in a serialised section of the multi-threaded path, and thread counts
   default to one.
@@ -281,18 +296,38 @@ Everything here is new surface; no upstream signature changed meaning.
 
 - BCJ2 is written as well as read (0.27.0). Upstream reads BCJ2 folders but
   cannot write one.
+- `ArchiveWriter::push_archive_entries_non_solid` codes a non-solid archive's
+  folders on several workers and writes them in order (0.27.0), the bytes a
+  loop of `push_archive_entry` writes.
+- An LZMA2 thread count is divided between block threads and each block
+  coder's match-finder thread, as 7-Zip's `Lzma2EncProps_Normalize` divides it
+  (0.27.0): where a level runs the match finder on a thread of its own,
+  `threads` buys `threads / 2` block coders.
+- The writer sizes each folder's LZMA or LZMA2 coder to the folder, the way
+  7-Zip reduces its dictionary: a folder known to be smaller than the
+  dictionary is coded with one its size (never below 4 KiB), and one that fits
+  a single LZMA2 block is coded on one thread. `ArchiveEntry::from_path`
+  records the file's length so the size is known before the push.
 
 ### Cryptography
+
+- Archives are encrypted with 7-Zip's key-derivation work factor, 2^19
+  SHA-256 rounds (0.27.0); upstream writes 2^8. A derived key is shared by
+  the clones of its `Password`, so it is derived once per archive rather than
+  once per folder.
 
 - **The AES decoder decrypts in the caller's buffer.** It used to read the
   packed stream 512 bytes at a time into a fixed array, decrypt into a `Vec`
   and copy that into the caller's buffer — two million reads and two full
   copies of the payload for a 1 GiB store-mode archive. It now fills the
   caller's buffer with ciphertext and decrypts it in place, so reads are the
-  caller's size and the payload is copied zero extra times. The only state kept
-  is the ≤15 ciphertext bytes that did not complete a block, plus one block of
-  plaintext for callers that read less than 16 bytes at a time; neither grows
-  with the stream, so the memory estimate is unchanged. On the Linux bench box
+  caller's size and the payload is copied zero extra times. The state kept is
+  the ≤15 ciphertext bytes that did not complete a block and, only for a caller
+  that reads less than 64 KiB at a time (PPMd's range decoder, BCJ2's side
+  streams), a 64 KiB plaintext buffer filled a chunk at a time so the cipher
+  is never driven a block per call. Neither grows with the stream, and the
+  buffer is within the megabyte the memory estimate charges a filter, so the
+  estimate is unchanged. On the Linux bench box
   a 1 GiB store-mode AES archive went from 0.862 s to 0.282 s, which is under
   half of `7zz t -p` on the same fixture and the sum of what the cipher, the
   read and the CRC cost on their own.
@@ -342,14 +377,8 @@ Everything here is new surface; no upstream signature changed meaning.
   `compress` carries no in-guest block cipher — and the seam mirrors
   `rarpar`'s `unrar-rs` hooks module deliberately, so an embedder wires both
   crates the same way.
-  FOLLOW-UP, deliberately not wired here: `lzma-turbo` is growing `crc-host` /
-  `crypto-host` hooks of its own on an unpublished branch. Once 0.3.6 is
-  released this crate gains `crc-host = ["lzma-turbo/crc-host"]` and
-  `crypto-host` forwards `lzma-turbo/crypto-host`, so the member CRC-32 and the
-  KDF's SHA-256 are delegated too. Until then `crypto-host` forwards
-  `lzma-turbo/native-crypto`, which is what gives a delegating wasm guest a
-  SHA-256 without a C toolchain and without dragging in `native-crypto`'s
-  `aes`/`cbc`.
+  Since 0.27.0 `crypto-host` also delegates the KDF's SHA-256, and
+  `crc-host` the CRC-32, through `lzma-turbo`'s own hooks (see that release).
 - New `sevenz_turbo::crypto_backend() -> &'static str`, reporting which backend
   a build selected (`"aws-lc"`, `"rustcrypto"`, or `"host"` on a delegating
   wasm build), for consumers who want to assert on it.
@@ -399,10 +428,320 @@ Everything here is new surface; no upstream signature changed meaning.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
-## 0.27.0 - 2026-10-07
+## 0.27.0 - 2026-10-09
 
+- Removed: the `lzma-rust2-encoder` feature and the `lzma-rust2` dependency
+  are gone; archives are written by `lzma-turbo`'s encoder only, and
+  `lzma_encoder()` always returns `"lzma-turbo"`. The BCJ and delta filter
+  modules no longer reference `lzma-rust2`.
+- Security fix: every AES-256 folder, and the encrypted header, is now
+  encrypted under its own random IV, as 7-Zip's writer does.
+  `AesEncoderOptions::new` drew one IV, and every folder written with those
+  options - and the header - reused it under the same key, so two folders that
+  began with the same bytes began with the same ciphertext. The IV is drawn
+  per folder and written into that folder's coder properties; the salt and
+  cycle count stay the configured ones, so every folder's key is the same
+  one, derived as before.
+  `ArchiveWriter` no longer uses the `iv` field of `AesEncoderOptions` as any
+  folder's IV.
+  Two writes of the same encrypted input therefore no longer produce the same
+  bytes; the archives decode the same, and 7-Zip extracts them.
+- **Security fix: archives this crate encrypts use 7-Zip's key-derivation
+  work factor.** `AesEncoderOptions::new` defaulted `num_cycles_power` to 8
+  (2^8 = 256 SHA-256 rounds per key), against the 19 (2^19 = 524,288 rounds)
+  that 7-Zip writes, so a password guess against an archive written here was
+  2048 times cheaper than against one 7-Zip wrote. The default is now 19,
+  `AesEncoderOptions::DEFAULT_NUM_CYCLES_POWER`; archives written before
+  0.27.0 are as weak as they were and should be re-encrypted if the password
+  matters. A lower work factor can still be chosen deliberately, with
+  `with_num_cycles_power` or the public field. Both directions are held to
+  7-Zip: `7zz t` passes what is written at 19 and at a lowered power and `7zz
+  l` reports `7zAES:19`, and archives 7-Zip writes (at 19) decode here. The
+  coder properties hold six bits of the value, and a work factor they cannot
+  say - anything above 24 other than 63, the format's value for a key used
+  as it stands - is refused with `Limit::AesCyclesPower` when the archive is
+  written, before those bits are taken: cut down to them, 64 would have been
+  written as one round and 127 as no derivation at all.
+- A derived AES key travels with every clone of its `Password`. The cache
+  was per `Password` value and a clone started empty, so the encoder, which
+  clones its options for each folder it sizes and for the encrypted header,
+  derived the key once per folder; that is why the default could not be
+  raised on its own. Clones now share the cache (an `Arc`, keyed by salt and
+  work factor, up to four keys; the bytes of a password never change, so the
+  password is the cache's owner), and the derivation runs under its lock, so
+  copies asking at once derive once. The `max_aes_kdf_rounds` budget stays
+  each copy's own, as before; a key a clone already derived costs a copy
+  nothing. On Apple M5 Max, encoding 64 one-folder members with AES at 2^19
+  takes 30 ms instead of the 691 ms per-folder derivation would have cost, and
+  the 2049-folder bench tree 451 ms instead of 21.7 s: the work factor is a
+  one-off 8.5 ms per archive.
+- The key derivation hands the hash 64 rounds at a time (`7zAes.cpp`'s
+  unrolled buffer) instead of three calls a round; the bytes hashed are the
+  same. One 2^19 derivation is about 2 ms faster with AWS-LC on Apple M5 Max.
+  The buffer is at most 64 KiB whatever the password's length: a password
+  past about a kilobyte gets fewer rounds to a call, and one past 64 KiB is
+  hashed where it lies, three calls a round as before, with no copy made.
+- An entry can be written on straight from the decoder's output. A new
+  `EntryRead` trait (a `Read` with `write_rest`) is what
+  `ArchiveReader::for_each_entries_direct` and
+  `BlockDecoder::for_each_entries_direct` hand each entry over as; `write_rest`
+  passes the bytes to the sink in the pieces the decoder made them in, so a
+  consumer that only writes an entry to a file needs no buffer of its own and
+  copies nothing. `for_each_entries` is unchanged and is now built on it. The
+  multi-threaded LZMA2 reader reads its input 256 KiB at a time, the size
+  7-Zip reads a parallel block's input in, with one piece of slack, and a run
+  is dispatched as soon as the feed completes it, so every thread starts on
+  its own block instead of waiting for a wave to be read whole; the first wave
+  of a 2 GiB archive used to be read whole, up to half a gibibyte, before any
+  worker started. Verified, medians of three on an x86-64 Linux host against
+  7-Zip (time s / peak RSS MiB, ours vs 7-Zip): LZMA2 mx1 AES two threads
+  11.41 / 10.7 vs 11.43 / 11.4, eight threads 3.78 / 23.4 vs 3.95 / 25.0;
+  mx1 two threads 11.85 / 10.2 vs 11.82 / 10.6, eight threads 3.91 / 23.3 vs
+  4.08 / 23.8; stored AES two threads 0.23 / 6.4 vs 0.48 / 8.5; a 2 GiB mx5
+  archive on four threads 14.15 / 1035.8 vs 14.12 / 1035.7.
+- The folders of a non-solid archive decode in parallel. A new `ReadAt` trait
+  reads archive bytes at an offset with no shared cursor; it is implemented
+  for `std::fs::File` (`pread` on Unix, `seek_read` on Windows), for bytes in
+  memory (`[u8]`, `Vec<u8>`, and through `&`, `Box` and `Arc`), and by
+  `SerialReadAt`, which serialises the reads of any `Read + Seek`.
+  `ArchiveReader::open` sets one up from the file it opens;
+  `ArchiveReader::from_read_at` builds a reader over any `ReadAt` (its source
+  type is the new `ReadAtCursor`); `set_positional_source`,
+  `with_positional_source` and `clear_positional_source` attach or remove one
+  on a reader built any other way. With a positional source and more than one
+  thread, `for_each_entries` decodes runs of folders of at most 8 MiB
+  unpacked on parallel workers, each from its own cursor.
+- The callback still sees every entry, its bytes, the sub-stream and block
+  completion hooks, and any error in archive order, exactly as the
+  sequential walk would show them: a worker's output is staged and replayed on
+  the calling thread. A checksum mismatch or a damaged stream is still
+  reported as `Error::BlockDecode` naming the folder it is in and its packed
+  offset; a folder past it is never shown to the callback. The one visible
+  difference is that a worker reads each member to its end, so a member the
+  callback skipped is still checked. A callback that reads a member to its
+  end and then answers `false` still has that member's sub-stream hook called
+  first. A callback that panics unwinds out of `for_each_entries` once the
+  workers have been stopped, and likewise the writer of
+  `push_archive_entries_non_solid`.
+- The thread count is a budget, not a per-folder count: workers x threads
+  per folder never exceeds it. A folder larger than 8 MiB is decoded alone on
+  the calling thread with the whole thread count, so a media-sized archive
+  takes the multi-threaded LZMA2 path as before. What is staged between the
+  workers and the caller is bounded: two folders per worker, at most 8 MiB
+  each, so at most 16 MiB per worker, whatever the archive says. Without a
+  positional source, with one thread, or on `wasm32`, every folder decodes on
+  the calling thread as before.
+- Under a memory limit each folder of a run gets one thread, and the run gets
+  as many workers as fit the limit together. A worker is charged the largest
+  decoder of its run, the 64 KiB input buffer under it, its two 8 MiB stages
+  and the 1 MiB piece it is filling for them; the calling thread is charged
+  the 1 MiB piece its callback is reading. A run the limit leaves one worker
+  for is decoded on the calling thread, a folder at a time.
+- `Lzma2Handle::set_threads` is followed while a run of small folders
+  decodes. A run starts at the reader's thread count, as a block's coder
+  does; from there the ceiling bounds how many of the run's folders decode
+  at once and the threads of each one's own coder, from the next folder to
+  start. A run never has more workers than it was planned with.
+  `Lzma2Handle::progress` and `ArchiveReader::lzma2_progress` are `None` for
+  as long as such a run lasts, since no one coder is decoding for the reader
+  then.
+- `ArchiveWriter::push_archive_entries_non_solid(entries, open, threads)`
+  codes each entry as a folder of its own on up to `threads` workers and
+  writes them in the order given: the archive a loop of
+  `push_archive_entry` writes, byte for byte apart from the encrypted
+  folders' IVs. `open(index, entry)` is called on the coding thread, so no
+  more files are open than folders in flight. Each worker stages at most two
+  folders of at most 8 MiB of compressed bytes before it waits for the
+  writer, so memory is bounded by threads x (one coder + 16 MiB), however
+  large the inputs. A folder whose coder would start block threads of its
+  own is coded alone on the calling thread, after the folders before it. A
+  worker and its folder's coder thread count as one of `threads`; a chain
+  with more than one LZMA or LZMA2 coder has a coder thread for each, and
+  that many fewer folders in flight (`threads / 2` for two), so the threads
+  at work stay within `threads`. A compressor that is not LZMA or LZMA2
+  (PPMd, BZip2 and the rest) codes on the worker itself, so beside an LZMA
+  or LZMA2 coder it counts as a thread too: eight folders of PPMd or BZip2
+  with LZMA2 kept up to 12.7 cores busy at `threads = 8` on Apple M5 Max
+  when it did not. A filter or AES-256 in the chain is not counted, since
+  the worker runs it between its waits for the coder: eight folders of
+  LZMA2 kept 7.7 to 7.9 cores busy with AES-256 over it and 7.7 to 8.0
+  without. A BCJ2 folder coded on a worker runs its
+  call and jump coders on that worker rather than on two threads of their
+  own, and writes the same bytes. Its
+  three other pack streams, held whole by the worker until the folder ends as
+  on every path, then go through the worker's stage after the main stream, in
+  pieces of at most 256 KiB, each counted against the stage like the main
+  stream's bytes: a worker whose stage has no room for them waits for the
+  writer instead of starting another folder. They used to follow as one
+  message holding all three, which a stage the writer had already emptied took
+  at once whatever its size, so each folder in the window could leave its
+  whole tail parked beside the next.
+- On Apple M5 Max (18 threads), the 8192-member non-solid tree (256 MiB
+  unpacked, 32 KiB average, written by `7zz -mx=5 -ms=off`) decodes in
+  0.30 s at all threads, from 3.35 s (11.2x; `7zz t` takes 3.43 s, as it
+  decodes non-solid folders one at a time), with peak RSS 18.5 MiB from
+  9.1 MiB. Writing it non-solid at all threads takes 1.72 s, from 20.2 s
+  (11.7x; `7zz a -mmt=18` takes 16.8 s), at the same archive size, with peak
+  RSS 186 MiB from 32 MiB. Single-threaded decode and encode, solid and
+  single-folder archives, and the media rows are unchanged.
+- A block whose CPU-heavy coders would share the caller's thread decodes as
+  a pipeline when more than one thread is allowed: each coder below the top
+  with at least 1 MiB of output gets a thread of its own (at most one fewer
+  than the threads allowed, largest first), and the stages are joined by
+  bounded pipes of four 256 KiB pieces. An LZMA2 coder that decodes in
+  parallel already has its own workers and does not count, so AES over
+  parallel LZMA2 stays sequential: a thread for the cipher measured as a
+  wash. Beside such a coder the stages are threads on top of its workers,
+  not out of them: for a BCJ2 chain as 7-Zip writes it, two, decoding the
+  call and jump streams the calling thread decoded before. The work is the
+  same and now overlaps the main stream's; `Lzma2Handle::set_threads`
+  narrows the main coder's workers and not the stages. A coder's error
+  arrives after the bytes it produced and unchanged, so the block it is
+  reported against is the same as before. A pipe holds up to 1.25 MiB, and
+  a block's pipes are charged to the memory limit with its coders before
+  any of them is built: every coder, the filters and the fixed-size codecs
+  at the figures `Archive::decoder_memory_estimate` gives them. A block
+  whose pipes do not fit beside them keeps the sequential chain; nothing is
+  refused for it. The parallel LZMA2 plan's run buffers are sized against
+  the same remainder: the limit less every other coder of the chain, the
+  fixed-size ones at those figures too, where they were sized against the
+  limit less the sized coders alone. So does the rest of a chain from the first coder whose thread
+  cannot be started: it decodes on the caller's thread, reading the stages
+  already running. One thread, and wasm32, keep the sequential chain. A
+  BCJ2 archive written by 7-Zip (LZMA2 main stream, LZMA call and jump
+  streams) decodes 1.07-1.08x faster at 2-18 threads on Apple M5 Max and
+  1.08-1.11x at 2-8 threads on x86.
+- A chain has one parallel LZMA2 reader. Each LZMA2 coder of a block planned
+  for itself, so a chain of two with enough to decode started twice the
+  workers the block was given threads for, each sized to the whole of what
+  the memory limit leaves. The coder with the most to decode keeps the plan,
+  the first of several that tie; every other LZMA2 coder of the chain decodes
+  on one thread, and counts for the pipeline as any other CPU-heavy coder.
+- A reader no longer builds its name index when it is opened.
+  `ArchiveReader::read_file` and `file_compression_methods` build it on the
+  first lookup by name; a consumer that walks the entries never does, and no
+  longer holds a second copy of every name. Over a parsed archive of 100,000
+  entries, making the reader took 3.7 ms on Apple M5 Max and now takes under
+  a microsecond; the first lookup by name then takes 2.2 ms, the index being
+  sized for the entry count where it used to grow as it filled. Of two
+  entries with one name a lookup finds the later, as before.
+- An adaptive LZMA2 decode reaches the fixed plan's width. It started at one
+  thread with the first run decoded on the calling thread, which held the
+  stream's cursor; a widening was only heard once a whole run had landed;
+  and the backlog it reported left out runs already claimed, so a governor
+  narrowed it again straight after widening it. It now hands the first run
+  to a worker, listens for a widening while that worker runs, counts every
+  run in hand behind the front of the output, and reads ahead for the width
+  it is offered. On a 1 GiB mx5 stream at 18 threads on Apple M5 Max, an
+  adaptive decode went from 4.45 s to 2.46 s (the fixed plan: 2.37 s) at
+  the fixed plan's 2.07 GB peak RSS, and from 7.56 s to 4.77 s at 8 threads
+  on x86 (fixed: 4.74 s). Incompressible data stays narrow.
+- A parallel LZMA2 decode of more runs than it has threads keeps every
+  thread it can afford busy. The reader hands over whole runs and stops at a
+  run's end; the decoder closes a run only on the control byte after it,
+  which is the first byte of the next piece; and once the input budget was
+  spent on the run in hand and the runs out with workers, that piece was
+  refused for its size while the run it would have closed sat undispatched
+  with a worker idle. Nothing moved it: a drain had no declared run to give,
+  and the room a landing worker freed went on the next whole piece, so after
+  the first wave the decode ran one run short of its width. A piece refused
+  at a run boundary now has its first page fed on its own, the decoder
+  closes the run on the next drain and gives it out, and the rest of the
+  piece is still the next thing offered whole. On an Apple M5 Max a 2 GiB
+  `-mx=5` archive of sixteen 128 MiB runs decodes at 4 threads in 9.0 s
+  instead of 17.3 s and at 8 threads in 4.7 s instead of 6.8 s (medians of
+  three over two alternating passes on a loaded machine; 7-Zip with every
+  core: 3.0 s). Under a memory limit that pays for four runs the 4-thread
+  decode went from 15.4 s to 13.1 s; the remaining gap under a tight limit
+  is the decoder's budgeting, not the reader's. At one thread the page stops
+  short of the end of the run after the one it closes: on runs smaller than
+  a page it otherwise handed the decoder many runs at once, and a second
+  worker decoded the next run while the first was still undelivered.
+- A block of exactly one LZMA2 run (1 MiB) decodes single-threaded. The
+  parallel path wins only from the second run, and one run decoded in
+  parallel was 4.5% slower; the threshold is the encoder's minimum run size,
+  measured the same on x86 and arm64.
+- A multi-threaded LZMA2 decode of a stream that is a single run no longer
+  holds its input. The reader looked ahead for a run boundary to hand whole
+  runs to its workers, and a stream written as one run has none: it read up
+  to 192 MiB ahead and then went on feeding the decoder in 1 MiB slices
+  copied out of that hold, and a stream smaller than its 256 MiB give-up was
+  read whole first. Once a first run has decoded past the longest run an
+  encoder writes for that dictionary (7-Zip's block size: four dictionaries,
+  kept to 1..=256 MiB and never under one dictionary), the reader takes the
+  stream as one run and streams it, reading a few MiB ahead of the decoder.
+  On Apple M5 Max at 18 threads, peak RSS went from 398 to 148 MiB on a
+  900 MiB single-run archive with a 16 MiB dictionary (7-Zip: 156 MiB) and
+  from 424 to 116 MiB on a 160 MiB delta-filtered one (7-Zip: 122 MiB), at
+  the same wall time; multi-run archives decode as before.
+- Which runs decode on fewer threads is decided from the chunk headers, not
+  from the ratio. A run whose packed size was no smaller than its unpacked
+  size was taken for stored data, and decoded narrow because a copy has
+  nothing to gain from more threads; but LZMA-coded data that barely
+  compresses has the same ratio and decodes about as slowly as anything. A
+  run is now narrowed when under one part in 64 of its output comes from
+  LZMA-coded chunks, by the counts `lzma-turbo` 0.7.0 records for each run;
+  stored data still goes narrow, and an LZMA-coded run stays as wide as it
+  was asked to be whatever its ratio.
+- `lzma-turbo` 0.7.0.
+- An LZMA2 encode on more than one thread gives the binary-tree match finder
+  a thread of its own, as 7-Zip does (`numThreads = 2` for the normal
+  algorithm with a binary-tree finder; one for the fast algorithm and hash
+  chains). A single-threaded encode and the LZMA coder are unchanged. As in
+  7-Zip, the block threads are the thread count divided by the match
+  finder's two, so an LZMA2 encode on 8 threads codes 4 blocks at once
+  rather than 8 blocks each with a finder thread (16 busy threads); the
+  bytes are the same. A folder coded on a worker of
+  `push_archive_entries_non_solid` keeps its match finder on the worker's
+  thread, so the workers stay within the thread count.
+- Bench tooling: `decode-bench op version` reports `ppmd_crates`, every
+  `ppmd-*` crate in the `Cargo.lock` the binary embeds with its version, and
+  `ppmd_turbo` (its version, or `absent`), in place of `ppmd_rust`; the
+  harness report's toolchain line prints the PPMd crates and still reads a
+  binary that reports only `ppmd_rust`. Nothing names the PPMd engine by
+  crate any more, so the record survives a change of engine.
+- PPMd decodes and encodes through `ppmd-turbo` instead of `ppmd-rust`, in
+  both directions: its reader reads straight out of the coder's 64 KiB
+  input buffer, and its writer settles 64 KiB of output at a time and ends
+  the stream once, with no end marker, as 7-Zip does. The decoder is built
+  with the folder's unpacked size, which ends the stream. A stream cut short
+  fails its read as an I/O error of kind `UnexpectedEof` and a corrupt one
+  as `InvalidData`, located in its block, the same errors the LZMA decoders
+  give. A model larger than the memory limit is refused with
+  `MaxMemLimited` before it is allocated. The encoder writes the same bytes
+  as before, which are the bytes `7zz a` writes for the same order and
+  memory size. On Apple M5 Max, 7 interleaved runs each, a 15 MB PPMd
+  block written by 7-Zip decoded in 1.98 s instead of 2.92 s (7zz:
+  2.63 s), and the same data under AES-256 in 2.00 s instead of 2.93 s
+  (7zz: 2.64 s). Encoding runs within 3% of before: 16 MiB of data that
+  barely compresses at order 8 took 2.52 s instead of 2.45 s (7zz:
+  2.44 s), and 4 MiB of x86 code 0.43 s instead of 0.42 s. Text encodes as
+  fast as before.
+- Writing LZMA or LZMA2 where no thread can be started (`wasm32`) no longer
+  holds the folder's whole input. The thread-less path collected every byte
+  and encoded on `finish`, so its memory grew with the input; it now pushes
+  each write into `lzma-turbo`'s push encoders on the caller's thread, which
+  run the encoder as far as a queue of about one 2 MiB LZMA2 chunk allows.
+  The packed bytes are unchanged, byte for byte, and the threaded path is
+  untouched. Forced onto that path on Apple silicon (level 1, 8 MiB
+  dictionary, one thread), peak RSS went from 395 to 67 MiB for a 256 MiB
+  input and from 1382 to 67 MiB for 1 GiB, with wall and CPU time no worse.
+  Building with `--cfg sevenz_turbo_unthreaded` sends every writer down that
+  path, for tests and measurement on a host with threads, and CI runs clippy
+  and the default-feature tests built that way (the `unthreaded` job).
+- The `wasm32-unknown-unknown` clippy gate (`--no-default-features --features
+  default_wasm`, `-D warnings`) passes: `Decoder::Delta` boxes its reader,
+  whose filter history would otherwise size every variant, and two closures
+  in `util::wasm` became the functions they wrapped. No behaviour changed.
 - Bench harness: `run` refuses an `--out` whose `scratch` directory already
-  exists instead of deleting it at the end of the run.
+  exists instead of deleting it at the end of the run, and removes the one
+  it made however the run ends, so a planning failure no longer leaves a
+  directory that refuses the next run.
+- Under a memory limit, a block's parallel LZMA2 decoder is sized against
+  what the limit leaves after the rest of the chain: the pack-stream buffer
+  and the other coders' memory the chain check reserved. The plan was handed
+  the whole limit and subtracted only its own dictionary and state, so its
+  in-flight runs could take the chain past the limit by the reserved amount.
 - `sevenz_turbo::sha256` digests with the backend `crypto_backend` names.
   decode-bench takes its `Cargo.lock` digest through it, so the
   `native-crypto` candidate no longer links AWS-LC's SHA-256 beside
@@ -517,6 +856,71 @@ Everything here is new surface; no upstream signature changed meaning.
   one-file block read through `for_each_entries` or `read_file` is now
   checked once, against the file's CRC, instead of twice over the same
   bytes; the block check stays wherever it is the only one.
+- Fixed: the files of an LZMA2 folder decoded as one long run are compared
+  with their CRCs at every thread count. Above one thread the parallel
+  reader's workers take the checksums and the reader asks for each file's.
+  A stream the reader cannot split - one run longer than the reader holds
+  for a split, which is what 7-Zip writes when it has no block threading
+  (`-mmt=1`, `-mmt=2`), at any size past a few megabytes packed - is
+  checksummed as one open piece, and the decoder gives that piece up only
+  when it reaches the stream's end marker. A reader that stopped at a file's
+  last byte never got there: it found no checksum for the file, took that as
+  bytes the callback had left unread, and compared nothing. Such a file was
+  delivered with a wrong CRC unnoticed, its sub-stream hook was never
+  called, and the block's own CRC was passed over the same way, while the
+  block hook still reported it verified. One thread compared them, as
+  0.26.1 did at every count; this was never in a published version.
+  The reader now keeps such a file owed. Once the stream has been read to
+  its end it makes the one read that reaches the end marker, then compares
+  every owed file in archive order and calls its hook; a folder worker does
+  the same, and so does the block's own check. A file with a CRC for which
+  the decoder still has no checksum after the end of the stream is an
+  error, never a pass. Known limit: files that share one such run and are
+  not the last of their block are compared, and their hooks called, when
+  the block ends and not as each file ends, and a callback that stops after
+  one of them has the rest of the block decoded and thrown away to get its
+  checksum. Comparing at each file's end needs the decoder to give up the
+  open piece at a file boundary, which is a later lzma-turbo version.
+- Fixed: a block whose only checksum is its own is compared once every byte
+  of it has been handed over, whether or not the callback handed the last
+  byte then stops. Above one thread that checksum is folded from the
+  workers' after the last callback returns, and a callback that answered
+  `false` was taken at its word first: a damaged block whose files carry no
+  CRCs of their own passed unnoticed, whether its stream was one run or
+  many. A folder decoded on a worker had its verdict left unread the same
+  way. One thread compares on the read that hands the last byte over, as
+  0.26.1 did at every count; this was never in a published version. The
+  comparison now comes first, and the stop is honoured after it.
+- Fixed: damage in a block that does not decrypt is reported as damage
+  whatever password the caller holds. Whether a failure might be a wrong
+  password was decided by whether a password had been supplied, not by
+  whether the block has an AES coder. A consumer that hands every archive of
+  a job the job's password was therefore told `BlockErrorKind::Password`, or
+  `Error::MaybeBadPassword`, for a checksum mismatch or a broken stream in a
+  plain block, and was asked for a password where it could have repaired.
+  0.26.1 answers `Password` for a flipped byte of a store-mode block read
+  under such a password. The answer is now read from the block's own coders
+  on every path: `for_each_entries` on one thread and on folder workers,
+  `read_file`, the construction of a coder from its properties, and the
+  compressed header, which is damage under any password unless it is itself
+  encrypted. A block that does decrypt is unchanged: a wrong key and damaged
+  ciphertext cannot be told apart, and both stay `Password`.
+- Fixed: a store-mode block whose source ends before the bytes its header
+  declares is an error. Copy keeps no count of its own, and neither does a
+  filter over it, so an archive cut short, or a header declaring more than
+  was packed, ended the stream with a clean end of input: each file came out
+  short and the decode returned `Ok`. A CRC did not catch it, because a
+  file's CRC is compared once every byte it declares has been read. 0.26.1
+  does the same: of a two-file store archive cut inside the first file it
+  delivers 60,000 of 100,000 bytes, none of the second file, and `Ok`, with
+  verification on or off. A block's packed stream, each packed stream of a
+  BCJ2 block and the block's decoded output now fail the read that finds the
+  stream ended with bytes still owed, with `io::ErrorKind::UnexpectedEof`,
+  the kind a truncated LZMA stream gives. `for_each_entries` reports it as
+  `Error::BlockDecode` of kind `Io` located in the block, on one thread and
+  on folder workers, and `read_file` as `Error::Io` of that kind. A read of
+  no bytes is still answered with none, and a read past a block's declared
+  length is passed on, so an LZMA2 coder is still brought to its end marker.
 - Fixed: a PPMd block this crate wrote failed `7zz t` with "Data Error",
   although `7zz x` and this crate's reader both gave the right bytes back.
   The writer flushes a block's coder chain before finishing it, and
@@ -592,6 +996,221 @@ Everything here is new surface; no upstream signature changed meaning.
   message per mebibyte. The output is byte-identical (LZMA2 level 5, BCJ2
   and PPMd checked), and `ArchiveWriter::create` still returns
   `ArchiveWriter<File>`.
+- Bench harness: the full corpus gains `media_mx5_2g.7z` and
+  `media_mx5_3g.7z`, the near-incompressible recipe at 2 and 3 GiB written at
+  `-mx=5 -mmt=8` with 7-Zip's own run size: 16 and 24 LZMA2 runs of 128 MiB.
+  The larger has more runs than the widest host measured has threads (18), so
+  a parallel decoder that cannot keep every thread supplied from a backlog
+  shows it at any thread count; the 1 GiB archives have eight runs and hide
+  it from eight threads up. `fixtures` counts the runs of these, of `mt.7z`
+  and of the other media archives from each archive's own stream, by walking
+  its LZMA2 chunk headers, records the count and the run sizes in
+  `fixtures.json`, and refuses an archive with fewer runs than its recipe
+  needs. The quick corpus is unchanged.
+- `Lzma2Handle::keep_ledger` asks a reader to account for its parallel LZMA2
+  decodes, and `Lzma2Handle::ledger` returns the account as an `Lzma2Ledger`:
+  the most the decoder held, the most packed input queued for it and decoded
+  output held behind it, and the most the three came to at one moment; the
+  runs handed out, in waves, where a wave is the runs the decoder claimed
+  between two sleeps of the delivering thread, each with the runs out as that
+  thread went to sleep; how often the decoder handed a
+  piece of input back for want of room, split by where in a run the piece was
+  offered; how often the reader stopped reading ahead for room and how often
+  because the decoder had its backlog; and how long the delivering thread
+  slept, by the runs out as it went to sleep. A ledger steers nothing: it
+  reads the gauges a decode already keeps at the points where it already
+  looks at them. A reader not asked for one carries an empty `Option` and
+  every hook returns at its first branch. `decode-bench op decode --ledger`
+  keeps one and reports it as `ledger_*` fields. Three figures are not in it,
+  because lzma-turbo 0.7.0 does not expose them: how many times the decoder
+  declined to give a complete run to a worker for want of room (it reports
+  the bytes, behind a feature, not the count), how its held bytes divide
+  between input, runs out, runs waiting and parked buffers, and how many runs
+  are being decoded at a moment, as opposed to claimed and not yet delivered.
+- Bench harness: a `decode ledger` group in the `full` and `fleet` profiles
+  decodes `media_mx5_3g.7z`, `media_mx5_2g.7z` and `mt.7z` at 2, 4, 8 and all
+  threads, with no memory limit and with limits of 512, 553, 1024, 1065 and
+  2089 MiB, against 7zz at the same thread count, and `media_mx1.7z` and
+  `aes_mx1.7z` at 2, 4 and 8 threads as rows that a change to the run
+  hand-over must not move. The candidate keeps a ledger; each row without a
+  memory limit also runs it without one, as `sevenz-turbo no-ledger`, so the
+  cost of keeping it is measured rather than assumed. The report gains two
+  tables: memory (peak RSS, what the decoder held, the reader's queue, the
+  output behind it, the three together, the dictionary the decode allocated
+  beside dictionary size times the decoders that ran, and the remainder) and
+  dispatch (runs, waves, the runs claimed in each wave and the runs out at
+  its end, the mean runs out while the delivering thread slept, refusals by
+  where in a run the piece was offered, the reader's stops for room, and the
+  time the delivering thread slept and the worker time that stood idle with
+  it). The quick profile plans none of these rows.
+- Bench harness: report.md gives throughput to three significant figures, so
+  a row under 0.5 MiB/s no longer reads as 0.
+- Bench harness: raw.json and the reports built from it name the corpus, the
+  run's scratch and output directories, the checkout and the home directory
+  as `<fixtures>`, `<scratch>`, `<out>`, `<repo>` and `~`, not by their
+  absolute paths.
+- Bench harness: the Cargo.lock digest that ties a candidate to its checkout
+  reads CRLF line endings as LF, in decode-bench and in the harness, so
+  `merge` no longer refuses a report from a CRLF checkout over line endings
+  alone.
+- Bench harness: BCJ2 encode rows, `encode/bcj2/L5/{T1,T4,Tall}`, in the full
+  and fleet profiles. They write the x86-shaped `code-x86` source with
+  `decode-bench op encode --filter bcj2`, a new flag that writes the BCJ2 chain
+  7zz writes for `-mf=BCJ2`: BCJ2 first, LZMA2 for its main stream, LZMA for
+  its call and jump streams. The reference is `7zz a -mf=BCJ2 -mx5 -mmt<T>`.
+  7zz refuses `-mmtf=off` with a filter when it writes, so the one-thread
+  encode row has only the plain `7zz -mmt=1` reference.
+- Bench harness: the one-thread BCJ2 row, `decode/bcj2/T1`, judges parity
+  against `7zz -mmt=1 -mmtf=off`, the 7zz that also decodes on one thread;
+  plain `7zz -mmt=1` still runs the BCJ2 stage on a second thread, and its
+  ratio is reported beside for a user's view. Every ratio in report.json
+  names the reference it is against (`reference`) and whether that is the
+  row's parity reference (`parity_reference`). The scenario names a parity
+  reference other than 7zz in `parity_reference`, and both reports mark the
+  parity ratio `(parity reference)`.
+- `crypto-host` now delegates the 7z key derivation's SHA-256 as well as the
+  AES-256-CBC decrypt, and a new `crc-host` feature delegates every CRC-32 the
+  archive carries (start header, header, members); both on `wasm32` only,
+  inert on native targets. They forward `lzma-turbo/crypto-host` and
+  `lzma-turbo/crc-host`: until now `crypto-host` forwarded
+  `lzma-turbo/native-crypto` and kept SHA-256 in the guest, and `crc-host` did
+  not exist. `sevenz_turbo::hooks` re-exports `lzma-turbo`'s hook API
+  (`HostHashHooks`, `install_host_hash_hooks`, …), so an embedder installs both
+  seams without depending on `lzma-turbo` directly; the module is present with
+  either feature. A wasm embedder that enables `crypto-host` must now install
+  the hash hooks too, or the key derivation panics naming
+  `install_host_hash_hooks`. The conformance guest builds with
+  `aes256,crc-host,crypto-host`, and the `wasmtime` harness serves a reference
+  SHA-256 and CRC-32 beside its AES, asserts that each import was called and
+  every SHA-256 handle closed, and checks that a guest missing either set of
+  hooks panics with that set's message.
+- CI's package job builds the crate from its own archive (`cargo package
+  --locked`) as well as listing it, so a file the build needs that the
+  archive leaves out fails on the pull request rather than at publish.
+- `ArchiveEntry::from_path` reads the path's metadata once, where it read
+  it three times (`is_file`, `is_dir`, then the metadata itself). What it
+  returns is unchanged: a link is what it points to, and a path whose
+  metadata cannot be read is neither a file nor a directory.
+- A non-solid folder whose LZMA or LZMA2 coder runs on one thread is now
+  encoded on the thread that adds it, by an encoder that is kept and reused
+  for the next such folder, where each folder started an encoder thread and
+  built a new encoder (window, tables and a 1 MiB read buffer) of its own.
+  `push_archive_entries_non_solid` keeps one encoder per worker for the
+  length of the call; `push_archive_entry` also codes on the calling thread
+  but still builds an encoder per entry. Folders under 4 KiB now share one set of encoder settings: the
+  size hint given to the encoder is at least 4 KiB, below which the
+  encoder's dictionary does not shrink further anyway. The archive is the
+  same bytes, also built with `--cfg sevenz_turbo_unthreaded`, where the
+  writer ignores an LZMA2 block plan and so does this coder; on wasm an
+  LZMA2 coder with a block plan is left to the writer.
+- New `ArchiveEntry::from_metadata` builds an entry from metadata the caller
+  already holds, such as a directory walk's `DirEntry::metadata`, where
+  `from_path` looks the path up again. On Windows that lookup opens the
+  file, so a tree walked and added with `from_path` opened every file twice.
+  `from_path` is now `from_metadata` over the path's metadata.
+- `push_archive_entries` (a solid folder) also codes a one-thread LZMA or
+  LZMA2 coder on the calling thread, pulling the members itself, where it
+  read them through a 1 MiB buffer and handed them to an encoder thread in
+  1 MiB chunks, up to four in flight. At level 1 on one thread that was
+  half the writer's peak memory. The archive is the same bytes.
+- The `SEVENZ_TURBO_MT_TRACE` line of the parallel LZMA2 reader also gives
+  the most the decoder held (`peak_held`, what a memory limit governs), the
+  most the reader had queued for it (`peak_queue`, outside the limit), the
+  most the two came to at one moment (`peak_sum`), and the waves of the
+  decode (`waves`): for each time the delivering thread went to wait, the
+  runs claimed since the last wait and the runs out with workers. Nothing
+  is sampled when the variable is unset. `peak_held` and the decoder's
+  reasons for holding a run back (`dispatch_held_back`, `input_refused`,
+  `sheds`) come from `lzma-turbo`'s `AdaptiveLedger`. `wait` splits the
+  delivering thread's waits on a worker by why fewer runs were being
+  decoded than there are threads: none (`full`), finished blocks queued
+  behind the one waited on (`ordered`), no complete run at the cursor
+  (`input`), or a complete run held back (`held`).
+- A parallel LZMA2 decode under a memory limit keeps the decoder and the
+  reader's queue inside it together. The memory contract: the limit governs
+  the decoder's held bytes (`AdaptiveLedger`'s `input_bytes`,
+  `runs_out_bytes`, `runs_waiting_bytes` and `parked_bytes`) plus the
+  reader's queue (pieces read and not yet handed over, at their capacity).
+  Dictionaries, coder state and allocator slack are documented additions,
+  not bounded by it. The queue used to sit outside the limit, and a decode
+  could hold a read more than it allowed. The reader now does four things.
+  It sets the decoder's limit to what is left after its queue before every
+  feed and drain. It reads again only when a read fits beside both. It asks
+  the decoder's own `dispatch_cost` whether another run fits, so a parked
+  output buffer is not charged twice. And it cuts a small head off a read
+  as an exact-size copy, so a few kilobytes are not charged, or kept, as
+  the whole 4 MiB read. Requires `lzma-turbo` 0.8.0.
+- A parallel LZMA2 decode gives every thread a run in the first wave. The
+  decoder holds one run pair (input and output) per thread under any larger
+  limit, but it learns the pair's size only when it scans, which it does in
+  a drain. The reader used to feed its whole read-ahead before the first
+  drain, so that drain found no room for some of the outputs. On 128 MiB
+  runs at four threads, two workers started a run late, and every later
+  wave waited on that offset. Until the decoder has scanned a run, the
+  read-ahead now reserves an output for every run fed, and works to the
+  pair bound itself.
+  It also declares the last run of that first wave, by handing over the
+  next run's header, so that run's worker is not left idle until a run is
+  handed back. After the first scan the decoder's own bound governs, as
+  before: reserving there as well held back the run a finishing worker
+  would have taken next and lost a thread for the rest of the decode.
+- A parallel LZMA2 decode no longer holds a run's input queued in the
+  reader while the decoder refuses it. The reader used to hand a run over
+  only once it had read the run's end, so on 128 MiB runs a whole run sat in
+  its queue (130 MiB at peak) while the decoder, holding one run pair per
+  thread, refused it. Past the first wave the reader now hands each read over
+  as it is read, and lets the decoder's refusal stop the feed. While the
+  decoder refuses, the reader reads no more than two pieces ahead. The queue
+  now peaks at one 4 MiB read.
+- A parallel LZMA2 decode of small runs stops reading ahead where it means
+  to. Past the first wave each read goes over whole, and the feed stopped
+  only if it happened to end at a run boundary, which it seldom did; and it
+  counted only the runs the decoder had scanned, which it does in a drain,
+  so the runs just fed were invisible to it. So it fed on until the decoder
+  refused input at its pair bound: on the 1 MiB runs `7zz -mx1` writes, at
+  eight threads, about seventy runs held where the read-ahead asks for
+  sixteen. The feed now counts every run fed that no worker has taken, and
+  once the read-ahead is full it hands over the run in hand to its end and
+  stops there, declaring it with the next header. Linux x86-64, 1 GiB,
+  median of 3, peak RSS: `aes_mx1` 33 to 28 MiB at two threads and 81 to 63
+  MiB at eight; `media_mx1` 33 to 29 MiB and 81 to 69 MiB. Wall time is
+  unchanged within 1.5%.
+- A parallel LZMA2 decode of runs of at most 4 MiB, which is what `7zz` writes
+  at `-mx1` and for dictionaries up to 1 MiB, reads its input in 1 MiB pieces
+  and keeps one run per thread waiting instead of two. A piece is let go
+  only once every run in it is done, so a 4 MiB read held four small runs for
+  each one being decoded. The run size comes from the runs already scanned,
+  and before the first has closed from the dictionary, so the first reads
+  are already the right size. Larger runs are read as before: on 128 MiB
+  runs either change alone cost a sixth of the wall time at four threads.
+  Linux x86-64, 1 GiB, median of 3, peak RSS: `aes_mx1` 28 to 19 MiB at two
+  threads and 63 to 48 MiB at eight; `media_mx1` 28 to 18 MiB and 66 to 52
+  MiB; 4 MiB runs at two threads 50 to 33 MiB. Wall time is unchanged within
+  the run-to-run spread, and the 2 GiB, 128 MiB-run decode at four threads is
+  unchanged.
+- A parallel LZMA2 decode of those small runs keeps no more of them waiting
+  than its idle workers can take plus two, so with every thread busy two
+  runs wait instead of one per thread. Linux x86-64, 1 GiB, median of 3,
+  peak RSS at eight threads: `aes_mx1` 46 to 39-41 MiB and `media_mx1` 50
+  to 40-43 MiB; at two threads within 1 MiB of before. Wall time is
+  unchanged within the run-to-run spread.
+- An LZMA or LZMA2 folder coded on an encoder thread reuses the buffers that
+  carry its input to that thread and its output back, where it allocated a
+  new one for every 1 MiB of input and for every piece of output, each freed
+  on the other thread. That churn left the allocator holding several
+  megabytes it could not hand back. The input now travels in 256 KiB pieces,
+  and at most five are allocated for a folder of any length. A folder coded
+  in parallel blocks hands each finished block to the writer as the buffer
+  it was coded into, where it copied it, so a block is no longer held twice
+  (about 56 MiB less at level 5 on four threads). The archive is the same
+  bytes.
+- The compressed output of an LZMA or LZMA2 folder coded on an encoder
+  thread no longer queues without bound while it waits for the writer. A
+  block-parallel coder whose output outran the sink held every finished
+  block until the writer drained them. The encoder now waits once 4 MiB of
+  output is queued (a single larger block waits alone), and the writer takes
+  output while it waits for room to queue input, so neither side stalls the
+  other. The archive is the same bytes.
 
 ## 0.26.1 - 2026-09-29
 

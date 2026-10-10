@@ -54,19 +54,21 @@
 //! A third choice exists for wasm embeddings: with `crypto-host` enabled on a
 //! `wasm32` target, the bulk AES-256-CBC **decrypt** leaves the guest and runs
 //! on the embedder's AES through a plain `fn` pointer hook (see
-//! [`crate::hooks`]). A wasm guest has neither AES-NI nor the ARMv8
-//! cryptography extensions, so the block cipher is the one part of 7z decoding
-//! a host can do several times faster; everything else — the key derivation,
-//! the LZMA/LZMA2 decode, the CRCs — stays in the guest where it belongs.
+//! [`crate::hooks`]), and the key derivation's SHA-256 runs on the embedder's
+//! hash through `lzma-turbo`'s own `crypto-host` hooks, which the feature
+//! forwards to. A wasm guest has neither AES-NI, the SHA extensions nor their
+//! ARMv8 counterparts, so these are the parts of 7z decoding a host can do
+//! several times faster; the LZMA/LZMA2 decode stays in the guest where it
+//! belongs, and the CRCs follow `crc-host`, not this feature.
 //!
 //! Precedence is **host (wasm + `crypto-host`) > `native-crypto` > AWS-LC**.
 //! On a native target `crypto-host` is accepted but inert: the in-process
 //! backend stays selected and no hook is ever called, so feature unification
 //! in a mixed workspace cannot silently turn a native build into a delegating
 //! one. `crypto-host` pulls in neither `aes` nor `cbc` — a delegating wasm
-//! build carries no in-guest AES at all — but it does forward
-//! `lzma-turbo/native-crypto`, because SHA-256 for the 7z key derivation is
-//! still computed in the guest (see the feature comment in `Cargo.toml`).
+//! build carries no in-guest AES at all. `lzma-turbo/crypto-host` implies
+//! `lzma-turbo/native-crypto`, so the RustCrypto SHA-256 is compiled beside
+//! the host one (see the feature comment in `Cargo.toml`).
 //!
 //! The hook is stateless per call, so [`HostAes256Cbc`] threads the CBC IV
 //! across chunks itself: before each in-place decrypt it copies out the
@@ -87,20 +89,20 @@ use aws_lc_rs::cipher::{EncryptingKey, EncryptionContext};
 #[cfg(feature = "aws-lc-crypto")]
 use aws_lc_rs::iv::FixedLength;
 
-// SHA-256 stays in-process on every lane, including the host-delegated one:
-// `crypto-host` forwards `lzma-turbo/native-crypto`, so a delegating wasm
-// guest has RustCrypto's SHA-256 without needing this crate's `native-crypto`
-// (which would also drag `aes`/`cbc` in). Delegating SHA-256 as well is a
-// follow-up that waits on `lzma-turbo`'s own host hooks.
+// SHA-256 follows the same precedence as the cipher. On the host-delegated
+// lane it is `lzma-turbo`'s host type, which hashes through the hooks an
+// embedder installs with `hooks::install_host_hash_hooks`.
 #[cfg(all(
     feature = "aws-lc-crypto",
     not(feature = "native-crypto"),
     not(all(target_arch = "wasm32", feature = "crypto-host"))
 ))]
 pub(crate) use lzma_turbo::crypto::awslc::Sha256;
-#[cfg(any(
+#[cfg(all(target_arch = "wasm32", feature = "crypto-host"))]
+pub(crate) use lzma_turbo::crypto::host::Sha256;
+#[cfg(all(
     feature = "native-crypto",
-    all(target_arch = "wasm32", feature = "crypto-host")
+    not(all(target_arch = "wasm32", feature = "crypto-host"))
 ))]
 pub(crate) use lzma_turbo::crypto::rustcrypto::Sha256;
 
@@ -112,8 +114,8 @@ pub(crate) use lzma_turbo::crypto::rustcrypto::Sha256;
 compile_error!(
     "the `aes256` feature needs a SHA-256 backend: enable `aws-lc-crypto` \
      (the default, AWS-LC) or `native-crypto` (RustCrypto, no C toolchain). \
-     On wasm32, `crypto-host` also satisfies this: it delegates AES to the \
-     embedder and keeps RustCrypto's SHA-256 in the guest"
+     On wasm32, `crypto-host` also satisfies this: it delegates AES and \
+     SHA-256 to the embedder"
 );
 
 /// Which cryptography backend this build selected, for SHA-256 and for
@@ -508,14 +510,10 @@ macro_rules! impl_sha256_like {
     not(all(target_arch = "wasm32", feature = "crypto-host"))
 ))]
 impl_sha256_like!(lzma_turbo::crypto::awslc::Sha256);
-// `crypto-host` forwards `lzma-turbo/native-crypto`, so the RustCrypto hash is
-// present on a delegating wasm build even without this crate's own
-// `native-crypto`.
-#[cfg(any(
-    feature = "native-crypto",
-    all(target_arch = "wasm32", feature = "crypto-host")
-))]
+#[cfg(feature = "native-crypto")]
 impl_sha256_like!(lzma_turbo::crypto::rustcrypto::Sha256);
+#[cfg(all(target_arch = "wasm32", feature = "crypto-host"))]
+impl_sha256_like!(lzma_turbo::crypto::host::Sha256);
 
 #[cfg(test)]
 mod tests {

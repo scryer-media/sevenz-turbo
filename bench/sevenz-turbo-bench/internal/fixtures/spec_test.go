@@ -2,20 +2,22 @@ package fixtures
 
 import (
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
 
 func TestProfilesShareOneRecipe(t *testing.T) {
 	full, quick := Full(), Quick()
-	if len(full.Archives) != len(quick.Archives) || len(full.Sources) != len(quick.Sources) {
-		t.Fatal("full and quick profiles list different fixtures")
+	only := len(FullOnlyArchives)
+	if len(full.Archives) != len(quick.Archives)+only || len(full.Sources) != len(quick.Sources)+only {
+		t.Fatal("full and quick profiles list different fixtures beyond the full-only ones")
 	}
 	for _, archive := range full.Archives {
 		if _, ok := full.Source(archive.Source); !ok {
 			t.Errorf("%s: unknown source %s", archive.Name, archive.Source)
 		}
-		if _, ok := quick.Archive(archive.Name); !ok {
+		if _, ok := quick.Archive(archive.Name); !ok && !slices.Contains(FullOnlyArchives, archive.Name) {
 			t.Errorf("%s missing from quick", archive.Name)
 		}
 		hasPassword := false
@@ -30,7 +32,7 @@ func TestProfilesShareOneRecipe(t *testing.T) {
 
 // readmePending are archives whose README row awaits the operator's approval
 // of the Markdown edit. Remove a name once bench/fixtures/README.md lists it.
-var readmePending = map[string]bool{"media_mx1.7z": true, "media_mx5.7z": true}
+var readmePending = map[string]bool{}
 
 // The fixtures README lists every archive the recipe writes.
 func TestReadmeListsEveryArchive(t *testing.T) {

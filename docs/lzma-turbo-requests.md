@@ -248,6 +248,17 @@ lane, while peak resident memory rose 8-21%. The refill now starts from
 whatever piece is handed back, and on an incompressible archive at four threads
 that took peak resident memory from 1.75 GB to 1.40 GB for the same wall time.
 
+### What a run's chunks are, by kind — landed, and this fork is on it
+
+`Lzma2Run::chunks` (`Lzma2RunChunks`, lzma-turbo 0.7.0) reports, from the
+chunk headers alone, how much of a run's output comes from stored chunks and
+how much from LZMA-coded ones. Before it, the reader could only tell an
+incompressible stream — a run that is nearly all stored chunks, which a
+worker thread decodes as fast as it copies — by its packed-to-unpacked
+ratio, which an archive written at `-mx1` over already-compressed media
+defeats. `RunShape` in `src/codec/lzma_turbo.rs` now reads the LZMA-coded
+share straight off the run and holds a stored run to one thread.
+
 ## Outstanding
 
 ### A limit the decoder holds to, or an account of what it does not — outstanding

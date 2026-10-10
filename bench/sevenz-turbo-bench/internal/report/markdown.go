@@ -23,6 +23,54 @@ func ratioText(value *float64) string {
 	return fmt.Sprintf("%.3f", *value)
 }
 
+// primaryReference reports whether a ratio is against 7zz as every row runs
+// it; a report written before ratios named their reference has only those.
+func primaryReference(ratio Ratio) bool {
+	return ratio.Reference == "" || ratio.Reference == suite.VariantOracle
+}
+
+// ratioLabel names a ratio's candidate, and its reference when that is not
+// the primary one.
+func ratioLabel(ratio Ratio) string {
+	if primaryReference(ratio) {
+		return ratio.Variant
+	}
+	return ratio.Variant + " vs " + ratio.Reference
+}
+
+// hasParityOther reports whether one of a candidate's ratios against a second
+// reference is the one parity is judged by.
+func hasParityOther(others []Ratio) bool {
+	for _, other := range others {
+		if other.Parity {
+			return true
+		}
+	}
+	return false
+}
+
+// parityText is the note a host report gives a scenario judged against a
+// reference other than plain 7zz.
+func parityText(scenario suite.Scenario) string {
+	return fmt.Sprintf("`%s`: parity is judged against `%s` (7zz -mmt=1 -mmtf=off). sevenz-turbo runs on exactly one thread when asked for one, and so does 7-Zip with -mmtf=off; at -mmt=1 alone 7-Zip still runs the BCJ2 stage on a second thread. The ratio against plain `7zz` (-mmt=1) is reported beside it for a user's view, and is not the parity figure.",
+		scenario.ID, scenario.ParityReference)
+}
+
+// throughputText gives a throughput in MiB/s to three significant figures, so
+// a slow row reads as what it is rather than rounding to 0.
+func throughputText(mibs float64) string {
+	switch {
+	case mibs >= 100:
+		return fmt.Sprintf("%.0f", mibs)
+	case mibs >= 10:
+		return fmt.Sprintf("%.1f", mibs)
+	case mibs >= 1:
+		return fmt.Sprintf("%.2f", mibs)
+	default:
+		return fmt.Sprintf("%.3g", mibs)
+	}
+}
+
 func mib(bytes int64) string {
 	if bytes <= 0 {
 		return "-"
@@ -36,6 +84,11 @@ func Markdown(report *Report) string {
 	m := report.Machine
 	fmt.Fprintf(&b, "# sevenz-turbo bench: %s\n\n", m.Label)
 	fmt.Fprintf(&b, "%s\n\n", Orientation)
+	for _, scenario := range report.Scenarios {
+		if scenario.ParityReference != "" {
+			fmt.Fprintf(&b, "Parity reference: %s\n\n", parityText(scenario))
+		}
+	}
 	fmt.Fprintf(&b, "Each cell is the median [min–max] over %d measured runs (%d warmups discarded); variants are interleaved, their order reversed every repeat. Every run is its own process: wall time from the harness's clock, CPU (user+sys) and peak RSS from the kernel's accounting of the exited child.\n\n", report.Repeats, report.Warmups)
 	fmt.Fprintln(&b, "## Host")
 	fmt.Fprintln(&b)
@@ -67,9 +120,9 @@ func Markdown(report *Report) string {
 	fmt.Fprintln(&b)
 	fmt.Fprintf(&b, "- linked lzma-turbo: %s\n", t.LinkedLzmaTurbo)
 	for _, candidate := range t.Candidates {
-		fmt.Fprintf(&b, "- %s: crypto %s, sevenz-rust2 %s, aws-lc-rs %s, crc-fast %s, ppmd-rust %s (sha256 %s)\n", candidate.Label,
+		fmt.Fprintf(&b, "- %s: crypto %s, sevenz-rust2 %s, aws-lc-rs %s, crc-fast %s, PPMd crates %s (sha256 %s)\n", candidate.Label,
 			candidate.Field("crypto_backend"), candidate.Field("sevenz_rust2"), candidate.Field("aws_lc_rs"),
-			candidate.Field("crc_fast"), candidate.Field("ppmd_rust"), short(candidate.SHA256))
+			candidate.Field("crc_fast"), candidate.PPMdCrates(), short(candidate.SHA256))
 	}
 	fmt.Fprintf(&b, "- 7zz: %s (sha256 %s); provenance: %s; official: %t\n", t.Oracle.Banner, short(t.Oracle.SHA256), t.Oracle.Provenance, t.Oracle.Official)
 	dirty := ""
@@ -91,8 +144,18 @@ func Markdown(report *Report) string {
 		fmt.Fprintln(&b)
 	}
 
+	// ratios holds each candidate's ratio against 7zz; others its ratios
+	// against a second reference, printed on lines of their own that name it.
 	ratios := map[string]map[string]Ratio{}
+	others := map[string]map[string][]Ratio{}
 	for _, ratio := range report.Ratios {
+		if !primaryReference(ratio) {
+			if others[ratio.Scenario] == nil {
+				others[ratio.Scenario] = map[string][]Ratio{}
+			}
+			others[ratio.Scenario][ratio.Variant] = append(others[ratio.Scenario][ratio.Variant], ratio)
+			continue
+		}
 		if ratios[ratio.Scenario] == nil {
 			ratios[ratio.Scenario] = map[string]Ratio{}
 		}
@@ -136,7 +199,7 @@ func Markdown(report *Report) string {
 			}
 			throughput := "-"
 			if row.ThroughputMiBs > 0 {
-				throughput = fmt.Sprintf("%.0f", row.ThroughputMiBs)
+				throughput = throughputText(row.ThroughputMiBs)
 			}
 			line := fmt.Sprintf("| %s | %s | %s | %s | %s | %s |", name, variantLabel(row), seconds(row.Wall), seconds(row.CPU),
 				procmeasure.MiBRange(int64(row.RSS.Median), int64(row.RSS.Min), int64(row.RSS.Max)), throughput)
@@ -156,11 +219,26 @@ func Markdown(report *Report) string {
 				load = fmt.Sprintf("%.2f", row.Load.Median)
 			}
 			extra := row.Extra
+			if hasRatio && !ratio.Parity && hasParityOther(others[row.Scenario][row.Variant]) {
+				extra = strings.TrimSpace("ratios vs 7zz -mmt=1, a user's view; the parity ratio is on the next line. " + extra)
+			}
 			if row.Failed > 0 {
 				extra = strings.TrimSpace(fmt.Sprintf("%s FAILED %d/%d: %s", extra, row.Failed, row.Failed+row.OK, strings.Join(dedupe(row.Failures), ",")))
 			}
 			line += fmt.Sprintf(" %s | %s | %s | %s | %s |", wall, cpu, rss, load, dash(extra))
 			fmt.Fprintln(&b, line)
+			for _, other := range others[row.Scenario][row.Variant] {
+				label := ratioLabel(other)
+				if other.Parity {
+					label += " (parity reference)"
+				}
+				line := fmt.Sprintf("| | %s | - | - | - | - |", label)
+				if encode {
+					line += fmt.Sprintf(" - | %s |", ratioText(other.Size))
+				}
+				line += fmt.Sprintf(" %s | %s | %s | - | - |", ratioText(other.Wall), ratioText(other.CPU), ratioText(other.RSS))
+				fmt.Fprintln(&b, line)
+			}
 		}
 		fmt.Fprintln(&b)
 		for _, note := range groupNotes {
@@ -170,6 +248,7 @@ func Markdown(report *Report) string {
 			fmt.Fprintln(&b)
 		}
 	}
+	renderLedgers(&b, report.Ledgers)
 	procmeasure.RenderRSSSummary(&b, report.RSS)
 	if len(report.SecondaryFailures) > 0 {
 		fmt.Fprintln(&b, "## Secondary reference failures")
@@ -248,6 +327,9 @@ func Merge(reports []*Report) (string, error) {
 	}
 	cells := map[cellKey]string{}
 	groupOf := map[string]string{}
+	// shown is a ratio line's variant cell: its label, marked when the
+	// scenario's parity is judged against a reference other than plain 7zz.
+	shown := map[string]string{}
 	var order []string
 	seen := map[string]bool{}
 	for index, r := range reports {
@@ -255,18 +337,29 @@ func Merge(reports []*Report) (string, error) {
 		for _, row := range r.Rows {
 			walls[row.Scenario+"\x00"+row.Variant] = row.Wall
 		}
+		judged := map[string]bool{}
+		for _, scenario := range r.Scenarios {
+			judged[scenario.ID] = scenario.ParityReference != ""
+		}
 		for _, ratio := range r.Ratios {
-			key := ratio.Scenario + "\x00" + ratio.Variant
+			key := ratio.Scenario + "\x00" + ratioLabel(ratio)
 			if !seen[key] {
 				seen[key] = true
 				order = append(order, key)
 				groupOf[key] = ratio.Group
+				shown[key] = ratioLabel(ratio)
 			}
-			cell := fmt.Sprintf("%.3f / %s / %s", walls[key].Median, ratioText(ratio.Wall), ratioText(ratio.RSS))
+			switch {
+			case ratio.Parity && !primaryReference(ratio):
+				shown[key] = ratioLabel(ratio) + " (parity reference)"
+			case judged[ratio.Scenario] && !ratio.Parity && primaryReference(ratio):
+				shown[key] = ratioLabel(ratio) + " (vs 7zz -mmt=1, a user's view)"
+			}
+			cell := fmt.Sprintf("%.3f / %s / %s", walls[ratio.Scenario+"\x00"+ratio.Variant].Median, ratioText(ratio.Wall), ratioText(ratio.RSS))
 			if ratio.Size != nil {
 				cell += " / " + ratioText(ratio.Size)
 			}
-			cells[cellKey{index, ratio.Scenario, ratio.Variant}] = cell
+			cells[cellKey{index, ratio.Scenario, ratioLabel(ratio)}] = cell
 		}
 	}
 	groupIndex := map[string]int{}
@@ -289,7 +382,7 @@ func Merge(reports []*Report) (string, error) {
 			fmt.Fprintln(&b, rule)
 		}
 		scenario, variant, _ := strings.Cut(key, "\x00")
-		line := fmt.Sprintf("| %s | %s |", scenario, variant)
+		line := fmt.Sprintf("| %s | %s |", scenario, shown[key])
 		for index := range reports {
 			line += " " + dash(cells[cellKey{index, scenario, variant}]) + " |"
 		}

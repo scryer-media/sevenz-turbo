@@ -533,7 +533,8 @@ fn extract_fork_with(
 }
 
 /// Upstream at a given thread count. Above one this is its `Lzma2ReaderMt`,
-/// the multi-threaded LZMA2 reader in `lzma-rust2` that this fork replaced.
+/// the multi-threaded LZMA2 reader of its LZMA dependency, which this fork
+/// replaced.
 fn extract_upstream(path: &Path, threads: u32, password: Option<&str>) -> Sink {
     let file = std::fs::File::open(path).expect("open archive");
     let upstream_password =
@@ -647,7 +648,7 @@ fn bench_one(
     }
 
     if wanted("upstream") {
-        // Upstream's own multi-threaded path, which is `lzma-rust2`'s
+        // Upstream's own multi-threaded path, its LZMA dependency's
         // `Lzma2ReaderMt`. Sixteen threads: it is what weaver would be asking
         // for today, and the crate does not scale past it on these fixtures.
         rows.push(time_it(

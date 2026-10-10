@@ -98,6 +98,9 @@ fn shared_key_non_solid_archive_only_spends_one_derivation() {
             .unwrap();
     }
     let encoded = writer.finish().unwrap().into_inner();
+    // The reader's password is made afresh: a clone of the writer's would
+    // carry the key the writer derived, and the budget would never be asked.
+    let password = Password::new("fixture-pass");
     for limits in [
         ArchiveLimits::default(),
         ArchiveLimits {
@@ -123,9 +126,10 @@ fn shared_key_non_solid_archive_only_spends_one_derivation() {
         max_aes_kdf_rounds: (1 << 19) - 1,
         ..ArchiveLimits::default()
     };
-    let err = ArchiveReader::with_limits(Cursor::new(&encoded), password, limits)
-        .err()
-        .expect("encrypted header exceeds budget");
+    let err =
+        ArchiveReader::with_limits(Cursor::new(&encoded), Password::new("fixture-pass"), limits)
+            .err()
+            .expect("encrypted header exceeds budget");
     assert_eq!(err.limit_hit(), Some(Limit::AesKdfRounds));
 }
 

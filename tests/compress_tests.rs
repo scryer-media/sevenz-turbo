@@ -934,3 +934,53 @@ fn an_undeclared_entry_is_sized_by_reading_ahead() {
         assert!(reader.read_file("undeclared.txt").unwrap() == content);
     }
 }
+
+/// `from_path` reads one metadata record for a file, a directory, a link and a
+/// path that is not there, and says what `Path::is_file` and `Path::is_dir`
+/// say about each: a link is what it points to, and a missing path is neither.
+#[cfg(feature = "util")]
+#[test]
+fn from_path_classifies_from_one_metadata_lookup() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("member.txt");
+    std::fs::write(&file, b"twelve bytes").unwrap();
+    let sub = dir.path().join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let missing = dir.path().join("missing");
+
+    let mut paths = vec![file.clone(), sub.clone(), missing];
+    #[cfg(unix)]
+    {
+        let to_file = dir.path().join("to-file");
+        std::os::unix::fs::symlink(&file, &to_file).unwrap();
+        let to_dir = dir.path().join("to-dir");
+        std::os::unix::fs::symlink(&sub, &to_dir).unwrap();
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        paths.extend([to_file, to_dir, dangling]);
+    }
+    for path in paths {
+        let entry = sevenz_turbo::ArchiveEntry::from_path(&path, "name".into());
+        assert_eq!(entry.has_stream(), path.is_file(), "{}", path.display());
+        assert_eq!(entry.is_directory(), path.is_dir(), "{}", path.display());
+        let size = if path.is_file() { 12 } else { 0 };
+        assert_eq!(entry.size, size, "{}", path.display());
+        assert_eq!(
+            entry.has_last_modified_date,
+            path.exists(),
+            "{}",
+            path.display()
+        );
+        // The same entry from metadata the caller already holds.
+        if let Ok(meta) = path.metadata() {
+            let held = sevenz_turbo::ArchiveEntry::from_metadata(&meta, "name".into());
+            assert_eq!(held.name(), entry.name());
+            assert_eq!(held.has_stream(), entry.has_stream());
+            assert_eq!(held.is_directory(), entry.is_directory());
+            assert_eq!(held.size, entry.size);
+            assert_eq!(held.last_modified_date, entry.last_modified_date);
+            assert_eq!(held.creation_date, entry.creation_date);
+            assert_eq!(held.has_access_date, entry.has_access_date);
+        }
+    }
+}

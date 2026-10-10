@@ -7,7 +7,7 @@ outside `tests/resources` and `examples/data`.
 
 ```sh
 cd bench/sevenz-turbo-bench
-go run . fixtures --profile full  --dir ../fixtures/full    # fleet corpus, a few GiB
+go run . fixtures --profile full  --dir ../fixtures/full    # fleet corpus, about 20 GiB (see below)
 go run . fixtures --profile quick --dir ../fixtures/quick   # smoke corpus, ~250 MiB
 ```
 
@@ -33,6 +33,9 @@ corpus that has changed since.
 | `audio` | 256 MiB | 8 MiB | synthetic 16-bit stereo PCM: two tones plus noise |
 | `tree` | 8192 x ~32 KiB | 512 x ~16 KiB | many small text members under invented directories |
 | `kdf-tree` | 2048 x ~2 KiB | 128 x ~2 KiB | many tiny members |
+| `media` | 1 GiB | 16 MiB | near-incompressible pages (4016 random bytes, 80 zeros): the already-compressed video and audio of a usenet download |
+| `media-2g` | 2 GiB | - | the same recipe at 2 GiB |
+| `media-3g` | 3 GiB | - | the same recipe at 3 GiB |
 
 ## Archives
 
@@ -53,11 +56,31 @@ benchmark passphrase `bench-passphrase`, a public constant):
 | `bcj_arm64.7z` | code-arm64 | `-mx=5 -mmt=1 -mf=ARM64` | BCJ ARM64 filter |
 | `bcj2.7z` | code-x86 | `-mx=5 -mmt=1 -mf=BCJ2` | BCJ2 (four streams, LZMA2 + LZMA) |
 | `delta.7z` | audio | `-mx=5 -mmt=1 -mf=Delta:4` | delta filter, distance 4 |
-| `ppmd.7z` | payload-sub | `-mx=5 -m0=PPMd -mmt=1` | PPMd (decoded by the external `ppmd-rust` crate): a secondary row |
+| `ppmd.7z` | payload-sub | `-mx=5 -m0=PPMd -mmt=1` | PPMd (decoded by the external `ppmd-turbo` crate): a secondary row |
+| `media_mx1.7z` | media | `-mx=1 -m0=lzma2 -mmt=8` | near-incompressible LZMA2 at `-mx1` in parallel blocks, the download-shaped decode: 1024 runs of 1 MiB. 7zz codes every chunk as LZMA, even pages it cannot shrink, so the archive holds no stored chunk |
+| `media_mx5.7z` | media | `-mx=5 -m0=lzma2 -mmt=8` | the same at `-mx5`: 8 runs of 128 MiB, so the parallel decoder holds fewer, larger runs at once |
+| `media_mx5_2g.7z` | media-2g | `-mx=5 -m0=lzma2 -mmt=8` | full only. 16 runs of 128 MiB: more than eight threads take at once |
+| `media_mx5_3g.7z` | media-3g | `-mx=5 -m0=lzma2 -mmt=8` | full only. 24 runs of 128 MiB: more runs than the widest host measured has threads (18), so a decoder that cannot keep every thread supplied from a backlog shows it at any thread count |
 
 `-mmt=8` rather than `-mmt=on` keeps the block layout the same on every host
 whatever its core count. The quick corpus sets a 4 MiB LZMA2 block because at
-32 MiB the default block (four dictionaries, 64 MiB at `-mx=5`) would leave
+32 MiB the default block (four dictionaries, 128 MiB at `-mx=5`) would leave
 the archive a single block.
+
+A run is the stretch of an LZMA2 stream from one dictionary reset to the next:
+what a parallel decoder can give to one thread. 7zz cuts a multi-threaded
+encode into runs of its own size, 128 MiB at `-mx=5` and 1 MiB at `-mx=1`.
+`fixtures` counts the runs of `mt.7z` and of every media archive from the
+archive's own stream, by walking its LZMA2 chunk headers, and records the
+count and the run sizes in `fixtures.json` (`lzma2`). The counts above are
+those. An archive with fewer runs than its recipe needs (`min_runs`: two for
+the parallel fixtures, nine for `media_mx5_2g.7z`, nineteen for
+`media_mx5_3g.7z`) is refused, so a 7zz that cuts differently cannot pass for
+the fixture.
+
+The full corpus is about 20 GiB on every host: about 19.5 GiB of sources and
+archives as measured, and about 10 GiB of that is `media-2g`, `media-3g` and
+their two archives. Leave room for it before generating; the quick corpus is
+about 250 MiB.
 
 Encode rows read `payload-sub`, `tree` and `kdf-tree` directly.

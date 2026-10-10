@@ -166,6 +166,83 @@ fn the_parallel_path_is_engaged_and_reports_its_backlog() {
     assert!(spawned > 0, "no worker thread was ever created");
 }
 
+/// Runs in the LZMA2 stream of a one-folder archive `7zz` wrote, counted from
+/// the stream itself: a run begins at every chunk that resets the dictionary.
+/// The packed stream starts straight after the 32-byte signature header and
+/// ends at the chunk header that is a single zero.
+fn runs_in_stream(archive: &Path) -> u64 {
+    let bytes = std::fs::read(archive).expect("read archive");
+    let mut at = 32;
+    let mut runs = 0;
+    loop {
+        let control = bytes[at];
+        let size =
+            |offset: usize| usize::from(u16::from_be_bytes([bytes[offset], bytes[offset + 1]])) + 1;
+        match control {
+            0x00 => return runs,
+            0x01 | 0x02 => {
+                runs += u64::from(control == 0x01);
+                at += 3 + size(at + 1);
+            }
+            0x80.. => {
+                runs += u64::from(control >= 0xE0);
+                at += 5 + usize::from(control >= 0xC0) + size(at + 3);
+            }
+            _ => panic!("not an LZMA2 chunk header at {at}: {control:#04x}"),
+        }
+    }
+}
+
+/// A ledger is kept only for a handle that asked, and what it says of the runs
+/// is what the stream says: every run is handed to a decoder exactly once, and
+/// the waves it records are those runs and no others.
+#[test]
+fn a_kept_ledger_accounts_for_every_run_in_the_stream() {
+    if !have_7zz() {
+        eprintln!("skipping: 7zz is not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let archive = multi_run_archive(tmp.path());
+    let expected = oracle(&archive);
+    let in_stream = runs_in_stream(&archive);
+    assert!(in_stream > 1, "the archive is one run: {in_stream}");
+
+    let mut unasked = open(&archive, 8);
+    let handle = unasked.lzma2_handle();
+    assert!(extract(&mut unasked) == expected);
+    assert_eq!(handle.ledger(), None, "a ledger nobody asked for was kept");
+
+    for threads in [2, 8] {
+        let mut reader = open(&archive, threads);
+        let handle = reader.lzma2_handle();
+        handle.keep_ledger();
+        assert!(
+            extract(&mut reader) == expected,
+            "bytes differ at {threads}"
+        );
+
+        let ledger = handle.ledger().expect("a ledger was asked for");
+        assert_eq!(ledger.blocks, 1);
+        assert_eq!(ledger.dictionary_bytes, 256 * 1024);
+        assert_eq!(ledger.threads, u64::from(threads));
+        assert_eq!(ledger.runs, in_stream, "runs at {threads} threads");
+        assert!(ledger.wave_count >= 1);
+        if ledger.wave_count as usize == ledger.wave_runs.len() {
+            assert_eq!(ledger.wave_runs.iter().sum::<u64>(), in_stream);
+        }
+        assert_eq!(ledger.wave_runs.len(), ledger.wave_runs_out.len());
+        assert!(ledger.peak_runs_out >= 1);
+        assert!(ledger.peak_held_bytes > 0);
+        assert!(ledger.peak_total_bytes >= ledger.peak_held_bytes);
+        assert!(ledger.peak_queue_capacity_bytes >= ledger.peak_queue_bytes);
+        assert_eq!(
+            ledger.refused_feeds,
+            ledger.refused_at_boundary + ledger.refused_mid_run + ledger.refused_run_pending,
+        );
+    }
+}
+
 /// Moving the thread count while the archive is decoding changes nothing about
 /// the bytes. The switch lands at the next run boundary, which is a dictionary
 /// reset, so a run decoded inline and the same run decoded on a worker are the
@@ -516,4 +593,77 @@ fn a_corrupt_block_is_still_refused_when_the_workers_checksum() {
         outcome.is_err(),
         "a corrupt block decoded without complaint"
     );
+}
+
+/// Each entry written on with `write_rest`, from the decoder's own output.
+fn extract_direct(reader: &mut ArchiveReader<std::fs::File>) -> Vec<u8> {
+    let mut out = Vec::new();
+    reader
+        .for_each_entries_direct(|entry, rd| {
+            if entry.is_directory() {
+                return Ok(true);
+            }
+            rd.write_rest(&mut out)?;
+            Ok(true)
+        })
+        .expect("extract");
+    out
+}
+
+/// Writing an entry on from the decoder's blocks gives the bytes reading it
+/// does, at every thread count.
+#[test]
+fn writing_entries_from_the_decoder_gives_what_7zz_decodes() {
+    if !have_7zz() {
+        eprintln!("skipping: 7zz is not on PATH");
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let archive = multi_run_archive(tmp.path());
+    let expected = oracle(&archive);
+
+    let all = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    for threads in [1, 2, 8, all] {
+        let mut reader = open(&archive, threads);
+        let got = extract_direct(&mut reader);
+        assert_eq!(got.len(), expected.len(), "length differs at {threads}");
+        assert!(got == expected, "bytes differ at {threads} threads");
+    }
+}
+
+/// A sink that fails is the caller's failure, passed through as it was
+/// raised, and never reported as damage to the block being written from.
+#[test]
+fn a_failing_sink_is_not_a_damaged_block() {
+    if !have_7zz() {
+        eprintln!("skipping: 7zz is not on PATH");
+        return;
+    }
+    struct FailsAfter(usize);
+    impl std::io::Write for FailsAfter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.0 < bytes.len() {
+                return Err(std::io::Error::other("the sink is full"));
+            }
+            self.0 -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let archive = multi_run_archive(tmp.path());
+    let mut reader = open(&archive, 4);
+    let err = reader
+        .for_each_entries_direct(|_entry, rd| {
+            rd.write_rest(&mut FailsAfter(3 << 20))?;
+            Ok(true)
+        })
+        .expect_err("the sink fails");
+    assert!(
+        !matches!(err, sevenz_turbo::Error::BlockDecode { .. }),
+        "the sink's failure was blamed on the block: {err:?}"
+    );
+    assert!(err.to_string().contains("the sink is full"), "{err}");
 }

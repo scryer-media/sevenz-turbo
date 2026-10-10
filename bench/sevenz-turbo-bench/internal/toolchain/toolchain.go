@@ -34,7 +34,8 @@ type Candidate struct {
 	Label string `json:"label"`
 	// Version is the `op version` object: crypto_backend, lzma_encoder,
 	// build_profile, git_commit, git_dirty, cargo_lock_sha256, lzma_turbo,
-	// sevenz_rust2, aws_lc_rs, crc_fast, ppmd_rust, available_parallelism.
+	// sevenz_rust2, aws_lc_rs, crc_fast, ppmd_crates, ppmd_turbo,
+	// available_parallelism.
 	Version map[string]any `json:"version"`
 }
 
@@ -44,6 +45,20 @@ func (c Candidate) Field(name string) string {
 		return value
 	}
 	return ""
+}
+
+// PPMdCrates is every `ppmd-*` crate the candidate's Cargo.lock carries, as
+// "name version" joined by ", " (ppmd_crates). A binary built before that
+// field reported only ppmd-rust's version (ppmd_rust), and is read the same
+// way; one that reports neither gives "unknown".
+func (c Candidate) PPMdCrates() string {
+	if crates := c.Field("ppmd_crates"); crates != "" {
+		return crates
+	}
+	if version := c.Field("ppmd_rust"); version != "" {
+		return "ppmd-rust " + version
+	}
+	return "unknown"
 }
 
 // Oracle is the 7-Zip the candidate is measured against.
@@ -206,8 +221,8 @@ const (
 	BackendNative  = "rustcrypto"
 )
 
-// LzmaEncoder is the encoder every candidate must report: a build with
-// sevenz-turbo's lzma-rust2-encoder feature measures another encoder.
+// LzmaEncoder is the encoder every candidate must report: a build that
+// reports another measures another encoder.
 const LzmaEncoder = "lzma-turbo"
 
 // BuildPaths are the checkout paths compiled into decode-bench; its build
@@ -229,7 +244,7 @@ func CheckProfile(candidate Candidate, flag string) error {
 // CheckEncoder fails unless the candidate reports the default LZMA encoder.
 func CheckEncoder(candidate Candidate, flag string) error {
 	if got := candidate.Field("lzma_encoder"); got != LzmaEncoder {
-		return fmt.Errorf("%s %s reports LZMA encoder %q, want %q (build without sevenz-turbo/lzma-rust2-encoder; an older decode-bench reports none)", flag, candidate.Path, got, LzmaEncoder)
+		return fmt.Errorf("%s %s reports LZMA encoder %q, want %q (an older decode-bench reports none)", flag, candidate.Path, got, LzmaEncoder)
 	}
 	return nil
 }
@@ -402,12 +417,20 @@ func ProbeRust(ctx context.Context, repo string) Rust {
 		rust.BuildDirty = run(repo, "git", append([]string{"status", "--porcelain", "--untracked-files=no", "--"}, BuildPaths...)...) != ""
 	}
 	if lock, err := os.ReadFile(filepath.Join(repo, "Cargo.lock")); err == nil {
-		sum := sha256.Sum256(lock)
-		rust.CargoLock = hex.EncodeToString(sum[:])
+		rust.CargoLock = LockDigest(lock)
 		rust.LockedTurbo = LockedVersion(string(lock), "lzma-turbo")
 		rust.LockedVersion = LockedVersion(string(lock), "sevenz-turbo")
 	}
 	return rust
+}
+
+// LockDigest is the SHA-256 of a Cargo.lock with CRLF line endings read as
+// LF, lower-case hex, so a checkout made with CRLF endings carries the digest
+// of the same lock checked out with LF. decode-bench takes its own digest the
+// same way.
+func LockDigest(lock []byte) string {
+	sum := sha256.Sum256(bytes.ReplaceAll(lock, []byte("\r\n"), []byte("\n")))
+	return hex.EncodeToString(sum[:])
 }
 
 // DefaultCandidate is where `cargo build --release -p decode-bench` puts the

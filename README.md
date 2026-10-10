@@ -23,22 +23,15 @@ want; an API the container work needs to change will change, with a version
 bump and a changelog entry.
 
 Two things are the reason the fork exists; the default thread count, the
-cryptography backends and the limits on hostile archives below also differ
-from upstream.
+cryptography backends, the PPMd engine (`ppmd-turbo`) and the limits on
+hostile archives below also differ from upstream.
 
 ### 1. LZMA and LZMA2 decode and encode with `lzma-turbo`
 
-Upstream decodes LZMA/LZMA2 with
-[`lzma-rust2`](https://github.com/hasenbanck/lzma-rust2), which is the fastest
-pure-Rust LZMA decoder published but still well behind 7-Zip single-threaded
-(28.7 s against 20.2 s through `sevenz-rust2` in the [Speed](#speed) table).
-This fork routes those two coders to
-[`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a port of Igor
-Pavlov's reference decoder (including the LZMA SDK's assembly loops) that is at
-parity with `7zz` single-threaded. Archives are written with `lzma-turbo`'s
-encoder too, a port of the SDK's, so `lzma-rust2` is not in the dependency
-graph at all unless the `lzma-rust2-encoder` feature asks for its encoders
-instead.
+Upstream decodes LZMA/LZMA2 with a pure-Rust decoder. This fork routes those
+two coders to [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a
+port of Igor Pavlov's reference decoder (including the LZMA SDK's assembly
+loops). Archives are written with `lzma-turbo`'s port of the SDK encoder.
 
 LZMA2 also decodes on several threads, by cutting the stream at the dictionary
 resets that make a run independently decodable. **The default is one thread**,
@@ -49,11 +42,11 @@ not decide on its own to occupy every core, or to hold the memory that costs.
 let mut reader = ArchiveReader::new(file, Password::empty())?.with_threads(8);
 ```
 
-An archive written that way decodes about four times faster on eight threads
-than on one (19.9 s to 4.59 s in the [Speed](#speed) table), and within a fifth
-of what `7zz t` takes with every thread on the same machine. An archive written `-mmt=1` is one run from beginning to end and
-cannot be split at all, so a thread count above one neither helps it nor — as
-of the read-ahead rule — hurts it: see [docs/benchmarking.md](docs/benchmarking.md).
+Decoding is at parity with `7zz t` in time and peak memory on the measured
+rows, at two to eight threads (see [Speed](#speed)). An archive written
+`-mmt=1` is one run from beginning to end and cannot be split at all, so a
+thread count above one neither helps it nor — as of the read-ahead rule —
+hurts it: see [docs/benchmarking.md](docs/benchmarking.md).
 
 The count can also be changed *while* a block is decoding, from the decoding
 thread or from another one, through a handle taken before the decode starts:
@@ -82,16 +75,12 @@ for runs in flight: a limit says what the caller can afford, not that the
 archive must be refused. Measured numbers live in
 [docs/benchmarking.md](docs/benchmarking.md).
 
-Parallel decoding buys its speed with memory, and this crate spends more of it
-than the runs in flight alone would need: reading a long way ahead is what
-keeps the decoder from finishing a run on the delivering thread, which is worth
-about 1.5x at low thread counts and is explained in
-[docs/lzma-turbo-requests.md](docs/lzma-turbo-requests.md). Decoding a 900 MiB
-block peaked at about 2.6 GiB at two threads and 4.1 GiB at eight, against
-376 MiB single-threaded, when it was measured (linux-x86_64, 2026-09-16,
-sevenz-turbo 0.23.0; see [docs/benchmarking.md](docs/benchmarking.md)). A caller who would rather have the memory than the
-speed says so with `ArchiveLimits::memory`, which bounds the read-ahead along
-with everything else; a caller who wants neither leaves the thread count at
+Parallel decoding buys its speed with memory: each thread holds a run's input
+and output. It holds what `7zz` holds; the 2 GiB `-mx5` archive at four
+threads peaks at 1035.8 MiB against 1035.7 MiB (see [Speed](#speed)). A
+caller who would rather have the memory than the speed says so with
+`ArchiveLimits::memory`, which bounds the read-ahead along with everything
+else; a caller who wants neither leaves the thread count at
 one, where a block costs its dictionary and nothing else.
 
 ### 2. Container API a streaming consumer needs
@@ -148,11 +137,8 @@ left its origin behind.
 ### Encoders
 
 Writing archives (`compress`) encodes LZMA and LZMA2 with `lzma-turbo`'s port
-of the SDK encoder. The alternative is `lzma-rust2`'s pure-Rust encoders,
-behind the `lzma-rust2-encoder` feature (off by default), which is what every
-version before 0.25.0 used; the option types and the archives are the same
-either way, only the compressed bytes differ. A compression level means the
-same dictionary under both: 256 KiB at level 0, rising to 64 MiB at level 9.
+of the SDK encoder. A compression level means the same dictionary as in
+every earlier version: 256 KiB at level 0, rising to 64 MiB at level 9.
 
 ### Crypto backends
 
@@ -165,8 +151,10 @@ cannot build C can use `default-features = false` with `aes256, native-crypto`;
 that lane compiles to AES-NI on x86-64 and to the ARMv8 cryptography extensions
 on aarch64. Decrypting a 7z stream in pieces needs no streaming API on either
 lane: each chunk is decrypted with the current IV and its last ciphertext block
-becomes the next chunk's. Writing archives (`compress`) keeps RustCrypto's
-`cbc::Encryptor`. CRC-32 is `crc-fast`.
+becomes the next chunk's. Writing archives (`compress`) encrypts through the
+same backend switch. CRC-32 is `crc-fast`. On wasm, `crypto-host` and
+`crc-host` hand both to the embedding host instead (see
+[WASM support](#wasm-support)).
 
 Because Cargo features are additive, `native-crypto` cannot mean "turn AWS-LC
 off"; it means "win when both are compiled". So `aes256` does not pull a
@@ -177,47 +165,29 @@ reports which one a build selected.
 
 ## Speed
 
-Measured 2026-09-16/17 at sevenz-turbo 0.23.0 (on `lzma-fast` 0.2.0-0.3.0,
-since renamed `lzma-turbo`), on the
-hosts described in [docs/benchmarking.md](docs/benchmarking.md); the crate has
-changed since, and current numbers for any host come from
-[`bench/sevenz-turbo-bench`](bench/sevenz-turbo-bench/README.md), which runs the
-whole matrix against `7zz` with peak RSS on every row.
+Measured at 0.27.0 (2026-10-09) against 7-Zip 26.03, median of three runs,
+peak RSS alongside time, on an x86-64 Linux host and on Apple M5 Max.
 
-Two 7z archives of the same 1 GiB, decoded and CRC-checked in full, on the
-16-thread linux-x86_64 host, median of three runs. `mt.7z` was written by
-`7zz -mmt=on`, so its LZMA2 stream can be decoded in parallel; `st.7z` by
-`7zz -mmt=1`, so it cannot, by anyone.
+Decoding and CRC-checking in full on x86-64 Linux:
 
-| decoder | `mt.7z` | `st.7z` |
-| --- | --- | --- |
-| `7zz t`, all threads | 3.86 s | 20.1 s |
-| `7zz t -mmt=1` | 20.2 s | 20.2 s |
-| `sevenz-rust2` 0.22.2 | 25.6 s | 28.7 s |
-| `sevenz-turbo`, 1 thread | 19.9 s | 20.0 s |
-| `sevenz-turbo`, 8 threads | 4.59 s | 20.0 s (\*) |
-
-(\*) [docs/benchmarking.md](docs/benchmarking.md) records 21.16 s for this
-cell from its own run on the same host; 20.0 s is not recorded there.
-
-On an Apple M5 Max the same `mt.7z` takes 2.28 s at 8 threads against
-2.13 s for `7zz`.
-
-Encrypted archives are where the fork is clearly ahead. The same 1 GiB,
-stored (`-mx0`) and AES-256 encrypted, so that decrypting it is nearly all
-of the work (same date and version):
-
-| `aes_store.7z` | `sevenz-turbo` | `7zz t` | `sevenz-rust2` |
+| archive | threads | `sevenz-turbo` | `7zz t` |
 | --- | --- | --- | --- |
-| Linux x86_64 | 0.28 s | 0.63 s | 0.94 s |
-| Windows x86_64 | 0.48 s | 0.65 s | 3.46 s |
-| macOS arm64 | 0.18 s | 0.23 s | 0.97 s |
+| LZMA2 `-mx1`, AES | 2 | 11.41 s, 10.7 MiB | 11.43 s, 11.4 MiB |
+| LZMA2 `-mx1`, AES | 8 | 3.78 s, 23.4 MiB | 3.95 s, 25.0 MiB |
+| LZMA2 `-mx1` | 2 | 11.85 s, 10.2 MiB | 11.82 s, 10.6 MiB |
+| LZMA2 `-mx1` | 8 | 3.91 s, 23.3 MiB | 4.08 s, 23.8 MiB |
+| stored, AES | 2 | 0.23 s, 6.4 MiB | 0.48 s, 8.5 MiB |
+| LZMA2 `-mx5`, 2 GiB | 4 | 14.15 s, 1035.8 MiB | 14.12 s, 1035.7 MiB |
 
-The AES decoder reads the packed stream a megabyte at a time and decrypts
-it in the caller's buffer; measured layer by layer, the cipher, the file read
-and the CRC add up to the whole decode, with nothing left in the plumbing.
-What each phase of a decode costs, and the rest of the fixtures, are in
-[docs/benchmarking.md](docs/benchmarking.md).
+The folders of a non-solid archive decode in parallel, where `7zz` decodes
+them one at a time: on Apple M5 Max (18 threads) an 8192-member tree of
+256 MiB decodes in 0.30 s against 3.43 s for `7zz t`, and writing it
+non-solid takes 1.72 s against 16.8 s for `7zz a -mmt=18`. An encrypted
+store, where decrypting is nearly all of the work, decodes in half the time
+`7zz` takes (the stored AES row above).
+
+The full matrix, every row against `7zz` with peak RSS, comes from
+[`bench/sevenz-turbo-bench`](bench/sevenz-turbo-bench/README.md).
 
 ## Usage
 
@@ -311,12 +281,12 @@ writer.finish().expect("compress ok");
 | Codec       | Decompression | Compression | Implemented by |
 |-------------|---------------|-------------|----------------|
 | COPY        | ✓            | ✓          | this crate |
-| LZMA        | ✓            | ✓          | `lzma-turbo` (encode: `lzma-rust2` with `lzma-rust2-encoder`) |
-| LZMA2       | ✓            | ✓          | `lzma-turbo`, including the parallel decoder (encode: `lzma-rust2` with `lzma-rust2-encoder`) |
+| LZMA        | ✓            | ✓          | `lzma-turbo`, decoder and encoder |
+| LZMA2       | ✓            | ✓          | `lzma-turbo`, decoder, parallel decoder and encoder |
 | BROTLI (*)  | ✓            | ✓          | `brotli` crate |
 | BZIP2       | ✓            | ✓          | `bzip2` crate |
 | DEFLATE (*) | ✓            | ✓          | `flate2` crate (`zlib-rs`) |
-| PPMD        | ✓            | ✓          | `ppmd-rust` crate |
+| PPMD        | ✓            | ✓          | `ppmd-turbo` crate |
 | LZ4 (*)     | ✓            | ✓          | `lz4_flex` crate |
 | ZSTD (*)    | ✓            | ✓          | `zstd` crate |
 
@@ -337,9 +307,9 @@ writer.finish().expect("compress ok");
 
 Every branch converter, BCJ2 and the delta filter are `lzma-turbo`'s
 (`lzma_turbo::filters`). The `Read`/`Write` wrappers around the BCJ and delta
-converters were vendored from `lzma-rust2` 0.20.1 (`src/codec/filter/`); the
-BCJ2 reader is this crate's own. CRC-32 everywhere is `crc-fast`, through
-`lzma-turbo`'s `crc` module.
+converters are this crate's, ported from the SDK's (`src/codec/filter/`), as
+is the BCJ2 reader. CRC-32 everywhere is `crc-fast`, through
+`lzma-turbo`'s `crc` module (the host's, on a wasm build with `crc-host`).
 
 ### WASM support
 
@@ -354,27 +324,40 @@ The `util` feature's `wasm-bindgen` exports follow the feature set: `decompress`
 is there whenever `util` is, and `compress` only when the `compress` feature is
 on as well, so a decode-only guest builds without the writer half of the crate.
 
-#### Letting the host do the AES (`crypto-host`)
+#### Letting the host do the cryptography and checksums (`crypto-host`, `crc-host`)
 
-A wasm guest has neither AES-NI nor the ARMv8 cryptography extensions, so the
-block cipher is the one part of decoding an encrypted 7z archive that the
-embedding program can do several times faster than the guest. The `crypto-host`
-feature moves it there: on a `wasm32` target the bulk AES-256-CBC **decrypt**
-leaves the guest through a plain `fn` pointer the embedder installs.
+A wasm guest has neither AES-NI, the SHA extensions, carry-less multiply nor
+their ARMv8 counterparts, so the block cipher, the key derivation's SHA-256 and
+the CRC-32 are the parts of decoding a 7z archive that the embedding program
+can do several times faster than the guest. Two features move them there, on a
+`wasm32` target only:
+
+- `crypto-host`: the bulk AES-256-CBC **decrypt** leaves the guest through this
+  crate's own hook, and the 7z key derivation's SHA-256 through `lzma-turbo`'s
+  (the feature forwards `lzma-turbo/crypto-host`).
+- `crc-host`: every CRC-32 the archive carries — start header, header, members
+  — leaves the guest through `lzma-turbo`'s hooks (the feature forwards
+  `lzma-turbo/crc-host`).
 
 ```bash
-RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --target wasm32-unknown-unknown --no-default-features --features=aes256_wasm,crypto-host,bzip2,ppmd
+RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --target wasm32-unknown-unknown --no-default-features --features=aes256_wasm,crc-host,crypto-host,bzip2,ppmd
 ```
 
-Nothing else changes: the SHA-256 key derivation, the LZMA/LZMA2 decode and the
-CRCs stay in the guest, the public API is untouched, and the encoder keeps its
-own in-guest AES. The feature adds no AES dependency at all — a delegating build
-that does not also ask for `compress` carries no block cipher of its own.
+Nothing else changes: the LZMA/LZMA2 decode stays in the guest, the public API
+is untouched, and the encoder keeps its own in-guest AES. Checksums inside a
+bzip2 or zstd stream are those codecs' own and stay in the guest too.
+`crypto-host` adds no AES dependency at all — a delegating build that does not
+also ask for `compress` carries no block cipher of its own.
 
-The embedder installs one hook before opening an encrypted archive:
+The embedder installs the hooks before opening an archive. Both seams are
+reachable from `sevenz_turbo::hooks`, so no direct dependency on `lzma-turbo`
+is needed:
 
 ```rust,ignore
-use sevenz_turbo::hooks::{HostAesError, HostCryptoHooks, install_host_crypto_hooks};
+use sevenz_turbo::hooks::{
+    HostAesError, HostCryptoHooks, HostHashHooks, install_host_crypto_hooks,
+    install_host_hash_hooks,
+};
 
 fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, HostAesError> {
     // forward to the embedder's AES-256-CBC (a raw wasm import, a component
@@ -382,9 +365,12 @@ fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, HostAe
 }
 
 install_host_crypto_hooks(HostCryptoHooks { aes_cbc_decrypt });
+install_host_hash_hooks(HostHashHooks::new(
+    crc32, crc64_xz, sha256_init, sha256_clone, sha256_update, sha256_finalize, sha256_drop,
+));
 ```
 
-The contract the hook must satisfy:
+The contract the AES hook must satisfy:
 
 - It returns the AES-256-CBC decryption of `data` under `key`/`iv`, **no
   padding**, as a fresh buffer of exactly `data.len()` bytes.
@@ -392,21 +378,31 @@ The contract the hook must satisfy:
   may be empty.
 - It is **stateless per call**: this crate threads the CBC IV across chunks
   itself, so a host never carries cipher state between calls.
-- A hook that errors, answers with the wrong length, or was never installed is
-  an embedder contract violation and panics. There is no silent in-guest
-  fallback, because a fallback would quietly undo the delegation.
+
+The hash hooks are `lzma-turbo`'s, and so is their contract (see
+`lzma_turbo::hooks`): the CRCs resume from a seed in the finalized domain,
+SHA-256 is a streaming state behind an opaque handle, and every handle is
+finalized or dropped exactly once. `HostHashHooks` takes every hook whichever
+feature is on, and only the ones a feature consumes are called; 7z has no
+CRC-64, so `crc64_xz` is never called by this crate.
+
+A hook that errors, answers with the wrong length, or was never installed is an
+embedder contract violation and panics. There is no silent in-guest fallback,
+because a fallback would quietly undo the delegation.
 
 `examples/wasm_host_extract_conformance.rs` is a complete reference embedding —
-a `wasm32-wasip1` guest that declares one raw import in a `host` namespace and
-forwards the hook to it — and `tools/wasm-conformance` is the native `wasmtime`
-harness that runs it: it writes an encrypted fixture archive,
-extracts it inside the guest through a reference host AES, and asserts the
-guest's bytes equal the native decoder's. `wasmtime` is a dev-dependency of that
-harness only and never enters the crate's dependency graph.
+a `wasm32-wasip1` guest that declares its raw imports in a `host` namespace and
+forwards the hooks to them — and `tools/wasm-conformance` is the native
+`wasmtime` harness that runs it: it writes an encrypted fixture archive,
+extracts it inside the guest through a reference host AES, SHA-256 and CRC-32,
+asserts the guest's bytes equal the native decoder's and that each import was
+actually called, and checks that a guest missing either set of hooks panics
+with that set's message. `wasmtime` is a dev-dependency of that harness only and
+never enters the crate's dependency graph.
 
-On native targets `crypto-host` is accepted but inert: AWS-LC or RustCrypto
-stays selected and no hook is ever called, so feature unification in a mixed
-workspace cannot turn a native build into a delegating one.
+On native targets both features are accepted but inert: AWS-LC or RustCrypto
+and `crc-fast` stay selected and no hook is ever called, so feature unification
+in a mixed workspace cannot turn a native build into a delegating one.
 
 ## Acknowledgements
 
@@ -417,11 +413,8 @@ named before the licence is.
   [`sevenz-rust2`](https://github.com/hasenbanck/sevenz-rust2), which is
   where the code in this repository comes from: the archive reader and
   writer, the coders, the encryption, the tests and the examples all started
-  as his. He also wrote
-  [`lzma-rust2`](https://github.com/hasenbanck/lzma-rust2), whose encoders
-  are the `lzma-rust2-encoder` alternative and whose filter readers and
-  writers are vendored here. This fork is built on his work, and if you are
-  not sure you need what it changes, his crate is the one to use.
+  as his. This fork is built on his work, and if you are not sure you need
+  what it changes, his crate is the one to use.
 - **dyz1990** wrote the original
   [`sevenz-rust`](https://github.com/dyz1990/sevenz-rust) that `sevenz-rust2`
   continued, and with it the first 7z implementation in pure Rust.
@@ -439,9 +432,7 @@ This crate is licensed under the
 [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0),
 the same as upstream, and upstream's copyright notices are unchanged.
 
-Note that `lzma-turbo`, which this crate depends on for LZMA/LZMA2 decoding
-and encoding, the BCJ/BCJ2/delta filters and CRC-32, is licensed
-GPL-3.0-or-later. This crate's own source stays Apache-2.0, but a
-binary that links it together with `lzma-turbo` is a combined work under the
-GPL. If that is a problem for you, upstream `sevenz-rust2` is the crate you
-want.
+`lzma-turbo`, which this crate depends on for LZMA/LZMA2 decoding and
+encoding, the BCJ/BCJ2/delta filters and CRC-32, is licensed under Apache-2.0
+as well, from its 0.7.0 release, which is the version this crate requires.
+Its releases before 0.7.0 were published under GPL-3.0-or-later.
