@@ -28,14 +28,10 @@ hostile archives below also differ from upstream.
 
 ### 1. LZMA and LZMA2 decode and encode with `lzma-turbo`
 
-Upstream decodes LZMA/LZMA2 with a pure-Rust decoder, the fastest published
-but still well behind 7-Zip single-threaded
-(28.7 s against 20.2 s through `sevenz-rust2` in the [Speed](#speed) table).
-This fork routes those two coders to
-[`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a port of Igor
-Pavlov's reference decoder (including the LZMA SDK's assembly loops) that is at
-parity with `7zz` single-threaded. Archives are written with `lzma-turbo`'s
-encoder too, a port of the SDK's.
+Upstream decodes LZMA/LZMA2 with a pure-Rust decoder. This fork routes those
+two coders to [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a
+port of Igor Pavlov's reference decoder (including the LZMA SDK's assembly
+loops). Archives are written with `lzma-turbo`'s port of the SDK encoder.
 
 LZMA2 also decodes on several threads, by cutting the stream at the dictionary
 resets that make a run independently decodable. **The default is one thread**,
@@ -46,11 +42,11 @@ not decide on its own to occupy every core, or to hold the memory that costs.
 let mut reader = ArchiveReader::new(file, Password::empty())?.with_threads(8);
 ```
 
-An archive written that way decodes about four times faster on eight threads
-than on one (19.9 s to 4.59 s in the [Speed](#speed) table), and within a fifth
-of what `7zz t` takes with every thread on the same machine. An archive written `-mmt=1` is one run from beginning to end and
-cannot be split at all, so a thread count above one neither helps it nor — as
-of the read-ahead rule — hurts it: see [docs/benchmarking.md](docs/benchmarking.md).
+Decoding is at parity with `7zz t` in time and peak memory on the measured
+rows, at two to eight threads (see [Speed](#speed)). An archive written
+`-mmt=1` is one run from beginning to end and cannot be split at all, so a
+thread count above one neither helps it nor — as of the read-ahead rule —
+hurts it: see [docs/benchmarking.md](docs/benchmarking.md).
 
 The count can also be changed *while* a block is decoding, from the decoding
 thread or from another one, through a handle taken before the decode starts:
@@ -79,16 +75,12 @@ for runs in flight: a limit says what the caller can afford, not that the
 archive must be refused. Measured numbers live in
 [docs/benchmarking.md](docs/benchmarking.md).
 
-Parallel decoding buys its speed with memory, and this crate spends more of it
-than the runs in flight alone would need: reading a long way ahead is what
-keeps the decoder from finishing a run on the delivering thread, which is worth
-about 1.5x at low thread counts and is explained in
-[docs/lzma-turbo-requests.md](docs/lzma-turbo-requests.md). Decoding a 900 MiB
-block peaked at about 2.6 GiB at two threads and 4.1 GiB at eight, against
-376 MiB single-threaded, when it was measured (linux-x86_64, 2026-09-16,
-sevenz-turbo 0.23.0; see [docs/benchmarking.md](docs/benchmarking.md)). A caller who would rather have the memory than the
-speed says so with `ArchiveLimits::memory`, which bounds the read-ahead along
-with everything else; a caller who wants neither leaves the thread count at
+Parallel decoding buys its speed with memory: each thread holds a run's input
+and output. It holds what `7zz` holds; the 2 GiB `-mx5` archive at four
+threads peaks at 1035.8 MiB against 1035.7 MiB (see [Speed](#speed)). A
+caller who would rather have the memory than the speed says so with
+`ArchiveLimits::memory`, which bounds the read-ahead along with everything
+else; a caller who wants neither leaves the thread count at
 one, where a block costs its dictionary and nothing else.
 
 ### 2. Container API a streaming consumer needs
@@ -173,47 +165,29 @@ reports which one a build selected.
 
 ## Speed
 
-Measured 2026-09-16/17 at sevenz-turbo 0.23.0 (on `lzma-fast` 0.2.0-0.3.0,
-since renamed `lzma-turbo`), on the
-hosts described in [docs/benchmarking.md](docs/benchmarking.md); the crate has
-changed since, and current numbers for any host come from
-[`bench/sevenz-turbo-bench`](bench/sevenz-turbo-bench/README.md), which runs the
-whole matrix against `7zz` with peak RSS on every row.
+Measured at 0.27.0 (2026-10-09) against 7-Zip 26.03, median of three runs,
+peak RSS alongside time, on an x86-64 Linux host and on Apple M5 Max.
 
-Two 7z archives of the same 1 GiB, decoded and CRC-checked in full, on the
-16-thread linux-x86_64 host, median of three runs. `mt.7z` was written by
-`7zz -mmt=on`, so its LZMA2 stream can be decoded in parallel; `st.7z` by
-`7zz -mmt=1`, so it cannot, by anyone.
+Decoding and CRC-checking in full on x86-64 Linux:
 
-| decoder | `mt.7z` | `st.7z` |
-| --- | --- | --- |
-| `7zz t`, all threads | 3.86 s | 20.1 s |
-| `7zz t -mmt=1` | 20.2 s | 20.2 s |
-| `sevenz-rust2` 0.22.2 | 25.6 s | 28.7 s |
-| `sevenz-turbo`, 1 thread | 19.9 s | 20.0 s |
-| `sevenz-turbo`, 8 threads | 4.59 s | 20.0 s (\*) |
-
-(\*) [docs/benchmarking.md](docs/benchmarking.md) records 21.16 s for this
-cell from its own run on the same host; 20.0 s is not recorded there.
-
-On an Apple M5 Max the same `mt.7z` takes 2.28 s at 8 threads against
-2.13 s for `7zz`.
-
-Encrypted archives are where the fork is clearly ahead. The same 1 GiB,
-stored (`-mx0`) and AES-256 encrypted, so that decrypting it is nearly all
-of the work (same date and version):
-
-| `aes_store.7z` | `sevenz-turbo` | `7zz t` | `sevenz-rust2` |
+| archive | threads | `sevenz-turbo` | `7zz t` |
 | --- | --- | --- | --- |
-| Linux x86_64 | 0.28 s | 0.63 s | 0.94 s |
-| Windows x86_64 | 0.48 s | 0.65 s | 3.46 s |
-| macOS arm64 | 0.18 s | 0.23 s | 0.97 s |
+| LZMA2 `-mx1`, AES | 2 | 11.41 s, 10.7 MiB | 11.43 s, 11.4 MiB |
+| LZMA2 `-mx1`, AES | 8 | 3.78 s, 23.4 MiB | 3.95 s, 25.0 MiB |
+| LZMA2 `-mx1` | 2 | 11.85 s, 10.2 MiB | 11.82 s, 10.6 MiB |
+| LZMA2 `-mx1` | 8 | 3.91 s, 23.3 MiB | 4.08 s, 23.8 MiB |
+| stored, AES | 2 | 0.23 s, 6.4 MiB | 0.48 s, 8.5 MiB |
+| LZMA2 `-mx5`, 2 GiB | 4 | 14.15 s, 1035.8 MiB | 14.12 s, 1035.7 MiB |
 
-The AES decoder reads the packed stream a megabyte at a time and decrypts
-it in the caller's buffer; measured layer by layer, the cipher, the file read
-and the CRC add up to the whole decode, with nothing left in the plumbing.
-What each phase of a decode costs, and the rest of the fixtures, are in
-[docs/benchmarking.md](docs/benchmarking.md).
+The folders of a non-solid archive decode in parallel, where `7zz` decodes
+them one at a time: on Apple M5 Max (18 threads) an 8192-member tree of
+256 MiB decodes in 0.30 s against 3.43 s for `7zz t`, and writing it
+non-solid takes 1.72 s against 16.8 s for `7zz a -mmt=18`. An encrypted
+store, where decrypting is nearly all of the work, decodes in half the time
+`7zz` takes (the stored AES row above).
+
+The full matrix, every row against `7zz` with peak RSS, comes from
+[`bench/sevenz-turbo-bench`](bench/sevenz-turbo-bench/README.md).
 
 ## Usage
 
