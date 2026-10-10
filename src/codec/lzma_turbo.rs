@@ -3702,6 +3702,13 @@ mod stall_tests {
     /// widening takes it away again, at whatever run boundary comes next, so
     /// this is where a feed that stopped in the wrong place or a chase left
     /// switched off would show up as a decode that stops.
+    ///
+    /// What is asserted of the widened stretches is what this reader
+    /// decided: a width above one applied, and more than one run handed out
+    /// at once under it. Not how many workers came to exist: the decoder
+    /// spawns one only when every worker it has still holds a run, so a
+    /// worker that lands its run before the next is handed out is given
+    /// that one too, and the count depends on how fast it ran.
     #[test]
     fn widening_and_narrowing_repeatedly_mid_stream_keeps_producing() {
         let (packed, plain) = stream(24, 4);
@@ -3714,16 +3721,19 @@ mod stall_tests {
         );
         let mut out = Vec::new();
         let mut buf = vec![0u8; 16 << 10];
-        let mut widest = 0;
+        let mut widest_applied = 0;
+        let mut most_out_widened = 0;
         loop {
             // One thread either side of a widened middle, and widened again
             // for the tail: four crossings in one block.
             let megabytes = out.len() >> 20;
             control.set_threads(if matches!(megabytes, 0 | 3) { 1 } else { 4 });
-            if let Some(p) = control.progress() {
-                widest = widest.max(p.spawned_threads);
-            }
             let n = rd.read(&mut buf).expect("decode");
+            widest_applied = widest_applied.max(rd.applied_threads);
+            if rd.applied_threads > 1 {
+                most_out_widened = most_out_widened
+                    .max(rd.decoder.runs_claimed().saturating_sub(rd.runs_delivered));
+            }
             if n == 0 {
                 break;
             }
@@ -3731,8 +3741,12 @@ mod stall_tests {
         }
         assert_eq!(out, plain);
         assert!(
-            widest > 1,
-            "the widened stretches decoded on more than one thread"
+            widest_applied > 1,
+            "the widened stretches were decoded at a width of one"
+        );
+        assert!(
+            most_out_widened > 1,
+            "the widened stretches handed out one run at a time"
         );
     }
 
