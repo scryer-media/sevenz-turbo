@@ -1,4 +1,5 @@
 mod counting_writer;
+mod input_buffer;
 #[cfg(all(feature = "util", not(target_arch = "wasm32")))]
 mod lazy_file_reader;
 mod pack_info;
@@ -178,10 +179,10 @@ fn declared_size<'a>(entries: impl IntoIterator<Item = &'a ArchiveEntry>) -> Opt
 /// where a dictionary-sized setup costs more than coding the bytes.
 const READ_AHEAD: u64 = 1 << 20;
 
-/// How much of an entry's source is read in one go and handed to the coder chain.
+/// Ordinary source-read size; large Linux LZMA folders use InputBuffer's aligned buffer.
 ///
-/// Large enough that a chain whose first coder hands its input to another thread pays one
-/// message per mebibyte rather than one per page.
+/// Amortizes source reads and writes into the coder chain. A threaded coder
+/// can split a write into smaller, bounded messages of its own.
 const SOURCE_READ_LEN: usize = 1 << 20;
 
 /// What a folder's compressed bytes are gathered into before they reach the archive's writer.
@@ -759,7 +760,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries)))
             })?;
             drop(head);
-            let mut buf = vec![0u8; SOURCE_READ_LEN];
+            let mut buf = input_buffer::InputBuffer::new(folder, content_methods);
 
             loop {
                 match r.read(&mut buf) {
@@ -1326,7 +1327,7 @@ fn encode_entry<R: Read, O: Write>(
         w.write_all(&head)
             .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
         drop(head);
-        let mut buf = vec![0u8; SOURCE_READ_LEN];
+        let mut buf = input_buffer::InputBuffer::new(folder, &methods);
         loop {
             match r.read(&mut buf) {
                 Ok(n) => {
@@ -1669,7 +1670,7 @@ pub fn prepare_block<R: Read>(
                 )
             })?;
             drop(head);
-            let mut buf = vec![0u8; SOURCE_READ_LEN];
+            let mut buf = input_buffer::InputBuffer::new(folder, &methods);
             loop {
                 let n = r.read(&mut buf).map_err(|e| {
                     Error::io_msg(

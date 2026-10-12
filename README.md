@@ -165,8 +165,15 @@ reports which one a build selected.
 
 ## Speed
 
-Measured at 0.27.0 (2026-10-09) against 7-Zip 26.03, median of three runs,
+The figures below were measured at 0.27.0 (2026-10-09) against 7-Zip 26.03, median of three runs,
 peak RSS alongside time, on an x86-64 Linux host and on Apple M5 Max.
+They were not rerun by the current encoder-input audit. That audit measures
+the actual archive writer with the optimized encoder targeted for
+lzma-turbo 0.9.0; this package still pins 0.8.0. On Zen 4 and Sapphire Rapids,
+level 5 at T2/T4, its 256 MiB zeros and 64 MiB repeated-pattern cases use
+12.3–38.2% less wall time and 9.2–32.8% less CPU than matched 7zz, with RSS
+1.1–2.8% higher. These integration results require the optimized encoder;
+see [the input-path audit](docs/input-buffer-perf.md) for settings and samples.
 
 Decoding and CRC-checking in full on x86-64 Linux:
 

@@ -294,6 +294,10 @@ Everything here is new surface; no upstream signature changed meaning.
 
 ### Encoding
 
+- Large Linux LZMA/LZMA2 folders use a bounded, aligned source buffer with
+  huge-page advice applied before initialization (0.27.1).
+- The encoder bridge returns consumed input chunks immediately, while
+  retaining overlapped preparation of the next chunk (0.27.1).
 - BCJ2 is written as well as read (0.27.0). Upstream reads BCJ2 folders but
   cannot write one.
 - `ArchiveWriter::push_archive_entries_non_solid` codes a non-solid archive's
@@ -427,6 +431,22 @@ Everything here is new surface; no upstream signature changed meaning.
 - The vendored BCJ round-trip tests generate their sample data instead of
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
+
+## 0.27.1 - 2026-10-11
+
+- Apply best-effort Linux huge-page advice before touching the archive
+  writer's source buffer for large LZMA/LZMA2 folders. Source storage stays
+  bounded at 2 MiB; small, unknown-size and other-codec folders retain the
+  existing 1 MiB buffer. Covers single-entry, solid and prepared-block input.
+- Recycle a bridge input chunk as soon as its bytes have been consumed.
+  Keeps the existing queue depth and overlapped input preparation while
+  reducing retained input storage.
+- With the optimized encoder targeted for lzma-turbo 0.9.0, the input change
+  reduces Zen 4 zeros T4 wall time by 3.7% against the unchanged writer.
+  The measured T2/T4 zeros and repeated-pattern cases on Zen 4 and Sapphire
+  Rapids all meet the 3% wall, CPU and RSS gates against matched 7zz.
+  This package still pins lzma-turbo 0.8.0; the integration measurements and
+  complete candidate history are in `docs/input-buffer-perf.md`.
 
 ## 0.27.0 - 2026-10-09
 

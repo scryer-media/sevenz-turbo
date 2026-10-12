@@ -283,6 +283,14 @@ impl SeqInStream for ChannelSource {
                 let n = buf.len().min(left.len());
                 buf[..n].copy_from_slice(&left[..n]);
                 self.pos += n;
+                if self.pos == self.pending.len() {
+                    // The caller owns the copied bytes now. Return the chunk
+                    // before it starts encoding, rather than retaining it
+                    // until the next read asks for another chunk.
+                    let spent = core::mem::take(&mut self.pending);
+                    self.pos = 0;
+                    let _ = self.spent.send(spent);
+                }
                 return Ok(n);
             }
             let mut q = self.bridge.lock();
@@ -298,13 +306,8 @@ impl SeqInStream for ChannelSource {
             };
             drop(q);
             self.bridge.changed.notify_all();
-            let spent = core::mem::replace(&mut self.pending, chunk);
+            self.pending = chunk;
             self.pos = 0;
-            // The writer has gone only if it is being dropped; the buffer is
-            // then freed here.
-            if spent.capacity() != 0 {
-                let _ = self.spent.send(spent);
-            }
         }
     }
 }
@@ -585,9 +588,8 @@ impl<W: Write> Write for LzmaTurboWriter<W> {
                     });
                     buf.clear();
                     buf.extend_from_slice(chunk);
-                    // Queue the chunk, writing out what the encoder produces
-                    // while the queue is full: the encoder may be waiting for
-                    // exactly that before it reads again.
+                    // Prepare the next chunk while the encoder is busy, then
+                    // queue it, draining output while waiting for input space.
                     let mut buf = Some(buf);
                     while let Some(chunk) = buf.take() {
                         let mut q = bridge.0.lock();
@@ -885,11 +887,9 @@ mod tests {
 
     /// A stream of many chunks allocates its input chunks a few times, not
     /// once a chunk: the encoder hands each one back once it has read it.
-    /// What can be out at once when the writer finds none to take back is
-    /// the channel's `INPUT_DEPTH`, the chunk the encoder is reading and the
-    /// one it has just replaced, so the writer has allocated at most one more
-    /// than that; the bound holds on any schedule. The bytes are the
-    /// unthreaded path's.
+    /// Storage is bounded by the channel's `INPUT_DEPTH`, the chunk the
+    /// encoder is reading, and the next chunk the writer has prepared.
+    /// Consumed chunks return immediately. The bytes are the unthreaded path's.
     #[cfg(not(any(sevenz_turbo_unthreaded, target_family = "wasm")))]
     #[test]
     fn a_long_stream_reuses_its_input_chunks() {
@@ -908,13 +908,43 @@ mod tests {
         };
         let allocs = *input_allocs;
         assert!(
-            allocs <= INPUT_DEPTH + 3,
+            allocs <= INPUT_DEPTH + 2,
             "{allocs} input chunks allocated for {chunks} chunks of input"
         );
         let packed = w.finish().expect("finish");
         let mut inline = unthreaded(coder);
         inline.write_all(&data).expect("write");
         assert_eq!(inline.finish().expect("finish"), packed);
+    }
+
+    #[test]
+    fn a_consumed_input_chunk_returns_before_the_next_read() {
+        use std::sync::{Arc, Condvar, Mutex, mpsc};
+
+        use lzma_turbo::SeqInStream;
+
+        use super::{Bridge, ChannelSource, Queues};
+
+        let bridge = Arc::new(Bridge {
+            queues: Mutex::new(Queues::default()),
+            changed: Condvar::new(),
+        });
+        let (spent, returned) = mpsc::channel();
+        let mut source = ChannelSource {
+            bridge,
+            spent,
+            pending: vec![1, 2, 3, 4],
+            pos: 0,
+        };
+        let mut first = [0; 1];
+        assert_eq!(source.read(&mut first).unwrap(), 1);
+        assert_eq!(first, [1]);
+        assert!(returned.try_recv().is_err());
+        let mut rest = [0; 8];
+        assert_eq!(source.read(&mut rest).unwrap(), 3);
+        assert_eq!(&rest[..3], &[2, 3, 4]);
+        assert_eq!(returned.try_recv().unwrap(), [1, 2, 3, 4]);
+        assert!(source.pending.is_empty());
     }
 
     /// Output the encoder cannot compress, so that what it queues is as large

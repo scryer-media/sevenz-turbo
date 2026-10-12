@@ -197,7 +197,7 @@ $B/sevenz-turbo-bench toolchain --candidate $B/decode-bench --candidate-native $
     --oracle /opt/7zip/7zz > results/toolchain.json
 $B/sevenz-turbo-bench run --profile fleet --dir work/fixtures --out results \
     --candidate $B/decode-bench --candidate-native $B/decode-bench-native \
-    --oracle /opt/7zip/7zz --machine c7i.4xlarge-us-east-1
+    --oracle /opt/7zip/7zz --machine intel-benchmark-host
 echo "rc=$?"
 # collect results/report.json from every host, then:
 $B/sevenz-turbo-bench merge --out cross-arch.md host-*/report.json
