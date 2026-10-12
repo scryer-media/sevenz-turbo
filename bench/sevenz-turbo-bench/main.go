@@ -276,7 +276,7 @@ func cmdRun(ctx context.Context, args []string) int {
 		"fleet (every scenario over the full corpus, 3 repeats, 1 warmup)")
 	quick := set.Bool("quick", false, "the same as --profile quick")
 	list := set.Bool("list", false, "print the planned scenarios and the plan's size, then exit without running")
-	machine := set.String("machine", env("SEVENZ_BENCH_MACHINE", hostname()), "host label in the report (e.g. c7i.4xlarge-us-east-1)")
+	machine := set.String("machine", env("SEVENZ_BENCH_MACHINE", hostname()), "host label in the report (e.g. intel-benchmark-host)")
 	repeats := set.Int("repeats", -1, "measured runs per variant (default: the profile's, full 5, fleet 3, quick 2)")
 	warmups := set.Int("warmups", -1, "discarded runs per variant before the measured ones (default: the profile's, full and fleet 1, quick 0)")
 	only := set.String("only", "", "comma-separated substrings; run only scenarios whose id contains one")
