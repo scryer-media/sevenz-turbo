@@ -434,8 +434,10 @@ Everything here is new surface; no upstream signature changed meaning.
 
 ## 0.27.0 - 2026-10-11
 
-- Require lzma-turbo 0.9.0, matching the optimized encoder used by the
-  retained archive-input benchmarks.
+- Require lzma-turbo 0.9.0, published to crates.io on 2026-10-12. Its
+  encoder is the one the retained archive-input benchmarks measured plus one
+  review-fix commit (allocation-failure, reuse and memory-accounting
+  corrections) that was not rebenchmarked; see `docs/input-buffer-perf.md`.
 - Apply best-effort Linux huge-page advice before touching the archive
   writer's source buffer for large LZMA/LZMA2 folders. Source storage stays
   bounded at 2 MiB; small, unknown-size and other-codec folders retain the

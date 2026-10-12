@@ -40,17 +40,22 @@ The original package pinned lzma-turbo 0.8.0. Integration builds used the first-
 source at `25df1bea056ba07b170bb38bbe607eb76706810b` in both the
 baseline and candidate. It carried a provisional 0.9.1 build label; the
 maintainer has since retargeted the encoder work to 0.9.0. Historical labels
-remain in the raw evidence. The 0.27.0 candidate now requires exactly
-lzma-turbo 0.9.0. Its encoder source at `fecf6b3` is byte-identical to the
-measured encoder source above (`src/enc` and `src/kernel_ab.rs`); archive
-source hashes also match the retained measurements. No benchmark rerun is
-needed for this dependency/version alignment.
+remain in the raw evidence. The 0.27.0 release requires exactly
+lzma-turbo 0.9.0. The encoder source at lzma-turbo `fecf6b3` is byte-identical
+to the measured encoder source above (`src/enc` and `src/kernel_ab.rs`);
+archive source hashes also match the retained measurements.
 
-At PR preparation, lzma-turbo 0.9.0 is not yet on crates.io. Local dependency
-checks use an explicit command-line override to that exact signed source.
-The manifest contains no local path. Registry-only resolution and its final
-lockfile checksum require lzma-turbo 0.9.0 to be published first; this is an
-outstanding release prerequisite, not a passing registry packaging check.
+lzma-turbo 0.9.0 was published to crates.io on 2026-10-12 from its tag
+`v0.9.0` (`170ec8b`), which is `fecf6b3` plus one review-fix commit
+(`80909a6`: encoder state preserved after a failed buffer replacement, stale
+size hints cleared before unsized encoding, fallible hash-chain head
+allocation, retained streamed windows counted in the block-thread memory
+estimate). lzma-turbo's own `docs/encoder-perf-0.9.0.md` records that those
+corrections were not rebenchmarked there, and they were not rebenchmarked
+here either: the measurements in this document describe the `fecf6b3`
+encoder. `Cargo.lock` records the registry entry and checksum of the
+published crate; there is no path, Git or command-line override anywhere in
+the dependency resolution.
 
 The measured program is `tools/decode-bench`'s existing `op encode` command:
 filesystem enumeration, lazy file opens, actual `ArchiveWriter` calls,
