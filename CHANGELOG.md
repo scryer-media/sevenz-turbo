@@ -295,9 +295,9 @@ Everything here is new surface; no upstream signature changed meaning.
 ### Encoding
 
 - Large Linux LZMA/LZMA2 folders use a bounded, aligned source buffer with
-  huge-page advice applied before initialization (0.27.1).
+  huge-page advice applied before initialization (0.27.0).
 - The encoder bridge returns consumed input chunks immediately, while
-  retaining overlapped preparation of the next chunk (0.27.1).
+  retaining overlapped preparation of the next chunk (0.27.0).
 - BCJ2 is written as well as read (0.27.0). Upstream reads BCJ2 folders but
   cannot write one.
 - `ArchiveWriter::push_archive_entries_non_solid` codes a non-solid archive's
@@ -432,8 +432,10 @@ Everything here is new surface; no upstream signature changed meaning.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
-## 0.27.1 - 2026-10-11
+## 0.27.0 - 2026-10-11
 
+- Require lzma-turbo 0.9.0, matching the optimized encoder used by the
+  retained archive-input benchmarks.
 - Apply best-effort Linux huge-page advice before touching the archive
   writer's source buffer for large LZMA/LZMA2 folders. Source storage stays
   bounded at 2 MiB; small, unknown-size and other-codec folders retain the
@@ -445,10 +447,8 @@ Everything here is new surface; no upstream signature changed meaning.
   reduces Zen 4 zeros T4 wall time by 3.7% against the unchanged writer.
   The measured T2/T4 zeros and repeated-pattern cases on Zen 4 and Sapphire
   Rapids all meet the 3% wall, CPU and RSS gates against matched 7zz.
-  This package still pins lzma-turbo 0.8.0; the integration measurements and
+  The dependency now pins lzma-turbo 0.9.0; the integration measurements and
   complete candidate history are in `docs/input-buffer-perf.md`.
-
-## 0.27.0 - 2026-10-09
 
 - Removed: the `lzma-rust2-encoder` feature and the `lzma-rust2` dependency
   are gone; archives are written by `lzma-turbo`'s encoder only, and

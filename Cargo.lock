@@ -1317,9 +1317,7 @@ checksum = "5e2a88783b84d2d67ef2791778a9e76bfb68b8017aaf6c9d7d5f2626a478b16c"
 
 [[package]]
 name = "lzma-turbo"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1e732b8cd010eb60ed9768d596a9215d40a5358bd1dc6836fc59eba8ad62c2b"
+version = "0.9.0"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",
@@ -1751,7 +1749,7 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.27.1"
+version = "0.27.0"
 dependencies = [
  "aes",
  "aws-lc-rs",

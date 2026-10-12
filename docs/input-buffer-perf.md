@@ -36,12 +36,21 @@ probe's saving therefore cannot be credited to this archive-writer change.
 ## Measurement scope
 
 The base is sevenz-turbo `a1731cca4a810d91940f45077a849763ff9f7af0`.
-The package still pins lzma-turbo 0.8.0; this change does not update any
-dependency. Separate integration builds use the first-party lzma-turbo
+The original package pinned lzma-turbo 0.8.0. Integration builds used the first-party lzma-turbo
 source at `25df1bea056ba07b170bb38bbe607eb76706810b` in both the
 baseline and candidate. It carried a provisional 0.9.1 build label; the
 maintainer has since retargeted the encoder work to 0.9.0. Historical labels
-remain in the raw evidence. These results require that optimized encoder.
+remain in the raw evidence. The 0.27.0 candidate now requires exactly
+lzma-turbo 0.9.0. Its encoder source at `fecf6b3` is byte-identical to the
+measured encoder source above (`src/enc` and `src/kernel_ab.rs`); archive
+source hashes also match the retained measurements. No benchmark rerun is
+needed for this dependency/version alignment.
+
+At PR preparation, lzma-turbo 0.9.0 is not yet on crates.io. Local dependency
+checks use an explicit command-line override to that exact signed source.
+The manifest contains no local path. Registry-only resolution and its final
+lockfile checksum require lzma-turbo 0.9.0 to be published first; this is an
+outstanding release prerequisite, not a passing registry packaging check.
 
 The measured program is `tools/decode-bench`'s existing `op encode` command:
 filesystem enumeration, lazy file opens, actual `ArchiveWriter` calls,
