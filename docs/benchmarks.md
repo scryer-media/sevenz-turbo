@@ -340,3 +340,11 @@ skips the per-block accounting the default build keeps. Both are against
 | `decode/aes_mx1/T2/ledger` | 1.001 | 1.003 | 1.000 | 1.001 | 1.003 | 1.000 | 1.034 | 1.038 | 1.000 | 0.996 | 0.994 | 1.250 | 1.003 | 1.006 | 1.005 |
 | `decode/aes_mx1/T4/ledger` | 0.998 | 1.006 | 1.011 | 1.002 | 1.003 | 1.000 | 1.010 | 1.010 | 1.023 | 1.001 | 1.021 | 1.229 | 1.003 | 1.005 | 1.031 |
 | `decode/aes_mx1/T8/ledger` | 0.998 | 1.006 | 1.140 | 1.002 | 1.003 | 1.168 | 1.049 | 1.003 | 1.044 | 1.005 | 1.012 | 1.196 | 1.000 | 1.005 | **0.917** |
+
+## Lane view
+
+The same run grouped by the rows that are still behind parity, one lane per gap. Click an image for the full-size version.
+
+[![sevenz-turbo 0.27.0 vs 7-Zip 26.03, lane view](images/fleet-lanes-vs-7zip.webp)](images/fleet-lanes-vs-7zip.webp)
+
+[![sevenz-turbo 0.27.0 vs sevenz-rust2 0.22.2, lane view](images/fleet-lanes-vs-sevenz-rust2.webp)](images/fleet-lanes-vs-sevenz-rust2.webp)
