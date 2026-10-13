@@ -165,38 +165,34 @@ reports which one a build selected.
 
 ## Speed
 
-The decode figures below were measured on the earlier 0.27.0 candidate
-(2026-10-09) against 7-Zip 26.03, median of three runs,
-peak RSS alongside time, on an x86-64 Linux host and on Apple M5 Max.
-They were not rerun by the current encoder-input audit. That audit measures
-the actual archive writer with the optimized encoder pinned as
-lzma-turbo 0.9.0. On Zen 4 and Sapphire Rapids,
-level 5 at T2/T4, its 256 MiB zeros and 64 MiB repeated-pattern cases use
-12.3–38.2% less wall time and 9.2–32.8% less CPU than matched 7zz, with RSS
-1.1–2.8% higher. The published 0.9.0 adds one unbenchmarked review-fix
-commit on top of the measured encoder source;
-see [the input-path audit](docs/input-buffer-perf.md) for settings and samples.
+Fleet measurements of 0.27.0 against 7-Zip 26.03 and sevenz-rust2 0.22.2 on
+five CPUs, 2026-10-13. Each cell is the geometric mean over the default-build
+rows of reference / sevenz-turbo, so above 1.00 means sevenz-turbo took less
+wall time or less peak memory. Decode covers 1 to every thread, solid and
+non-solid, encrypted and filtered archives; encode covers levels 1 to 9 at
+1 to every thread.
 
-Decoding and CRC-checking in full on x86-64 Linux:
+| CPU | threads | vs 7-Zip: decode wall | encode wall | peak RSS | vs sevenz-rust2: decode wall | peak RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Zen 4 | 16 | 1.16 | 1.54 | 0.97 | 2.42 | 1.16 |
+| Graviton4 | 16 | 1.12 | 1.45 | 0.97 | 1.95 | 1.16 |
+| Alder Lake | 16 | 1.13 | 1.42 | 0.96 | 1.88 | 1.11 |
+| Zen 2 | 12 | 1.10 | 1.33 | 0.98 | 2.51 | 1.19 |
+| M5 Max | 18 | 1.13 | 1.38 | 0.93 | 2.44 | 1.24 |
 
-| archive | threads | `sevenz-turbo` | `7zz t` |
-| --- | --- | --- | --- |
-| LZMA2 `-mx1`, AES | 2 | 11.41 s, 10.7 MiB | 11.43 s, 11.4 MiB |
-| LZMA2 `-mx1`, AES | 8 | 3.78 s, 23.4 MiB | 3.95 s, 25.0 MiB |
-| LZMA2 `-mx1` | 2 | 11.85 s, 10.2 MiB | 11.82 s, 10.6 MiB |
-| LZMA2 `-mx1` | 8 | 3.91 s, 23.3 MiB | 4.08 s, 23.8 MiB |
-| stored, AES | 2 | 0.23 s, 6.4 MiB | 0.48 s, 8.5 MiB |
-| LZMA2 `-mx5`, 2 GiB | 4 | 14.15 s, 1035.8 MiB | 14.12 s, 1035.7 MiB |
-
-The folders of a non-solid archive decode in parallel, where `7zz` decodes
-them one at a time: on Apple M5 Max (18 threads) an 8192-member tree of
-256 MiB decodes in 0.30 s against 3.43 s for `7zz t`, and writing it
-non-solid takes 1.72 s against 16.8 s for `7zz a -mmt=18`. An encrypted
-store, where decrypting is nearly all of the work, decodes in half the time
-`7zz` takes (the stored AES row above).
-
-The full matrix, every row against `7zz` with peak RSS, comes from
-[`bench/sevenz-turbo-bench`](bench/sevenz-turbo-bench/README.md).
+Single-threaded LZMA2 decode is at parity with `7zz -mmt=1` on every CPU,
+and parallel decode is at parity with `7zz` at every thread count on every
+CPU; the decode average covers the `decode/*` rows only and is above 1.0
+because of AES, PPMd and non-solid extract. The largest gaps are
+near-incompressible archives decoded on every hardware thread (0.88 to
+0.99, plain and AES), single-thread `bcj_arm64` filter decode on Zen 4,
+Graviton4 and M5 Max (0.91 to 0.94), the peak memory of single-thread
+decode with a tall window, and the encoder's peak memory; every cell below
+0.970 is in bold on the benchmarks page. Every row on every host, with CPU
+time, the memory-budget and adaptive rows, the `native-crypto` build and
+the runs without the decode ledger, is in
+[docs/benchmarks.md](docs/benchmarks.md). How to reproduce a measurement is
+in [docs/benchmarking.md](docs/benchmarking.md).
 
 ## Usage
 
