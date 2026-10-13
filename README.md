@@ -182,11 +182,15 @@ non-solid, encrypted and filtered archives; encode covers levels 1 to 9 at
 
 Single-threaded LZMA2 decode is at parity with `7zz -mmt=1` on every CPU,
 and parallel decode is at parity with `7zz` at every thread count on every
-CPU; the decode average is above 1.0 because of AES, PPMd, container parse
-and non-solid extract. The rows that are not wins are near-incompressible
-archives decoded on every hardware thread (0.88 to 0.99), the peak memory of
-single-thread decode with a tall window, and the encoder's peak memory. Every row on every host, with CPU time, the
-memory-budget and adaptive rows, and the non-default builds, is in
+CPU; the decode average covers the `decode/*` rows only and is above 1.0
+because of AES, PPMd and non-solid extract. The largest gaps are
+near-incompressible archives decoded on every hardware thread (0.88 to
+0.99, plain and AES), single-thread `bcj_arm64` filter decode on Zen 4,
+Graviton4 and M5 Max (0.91 to 0.94), the peak memory of single-thread
+decode with a tall window, and the encoder's peak memory; every cell below
+0.970 is in bold on the benchmarks page. Every row on every host, with CPU
+time, the memory-budget and adaptive rows, the `native-crypto` build and
+the runs without the decode ledger, is in
 [docs/benchmarks.md](docs/benchmarks.md). How to reproduce a measurement is
 in [docs/benchmarking.md](docs/benchmarking.md).
 

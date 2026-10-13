@@ -194,7 +194,9 @@ walk every entry; 7-Zip's `l -slt` also formats every property.
 | `encode/kdf-tree/L5/T1/non-solid/aes` | 1.513 | 1.534 | 1.000 | 1.287 | 1.310 | 1.000 | 1.314 | 1.298 | 1.000 | 1.110 | **0.257** | **0.837** | 1.109 | 1.139 | **0.873** |
 
 Archive size ratio is 1.000 on every encode row on every host: the encoder
-writes the same bytes as 7-Zip at the same settings.
+produces an archive of the same size as 7-Zip at the same settings. The
+harness compares sizes, not bytes; salts, IVs and file attributes make equal
+recipes differ byte for byte.
 
 ## By design: memory budget and adaptive rows
 
@@ -275,8 +277,8 @@ targets.
 ## sevenz-turbo vs sevenz-rust2
 
 Ratios are sevenz-rust2 / sevenz-turbo. sevenz-rust2 decodes on at most a
-few threads, so on `Tall` rows it holds less memory and takes several times
-the wall time.
+few threads, so on `decode/mt/Tall` it holds less memory and takes several
+times the wall time; on `decode/st/Tall` it holds 16 to 23 times more.
 
 | scenario | Zen 4 wall | Zen 4 CPU | Zen 4 RSS | Graviton4 wall | Graviton4 CPU | Graviton4 RSS | Alder Lake wall | Alder Lake CPU | Alder Lake RSS | Zen 2 wall | Zen 2 CPU | Zen 2 RSS | M5 Max wall | M5 Max CPU | M5 Max RSS |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -298,11 +300,14 @@ the wall time.
 | `decode/delta/T1` | 1.355 | 1.355 | 1.012 | 1.322 | 1.322 | 1.021 | 1.308 | 1.308 | 1.015 | 1.464 | 1.528 | 1.023 | 1.353 | 1.354 | 1.022 |
 | `decode/ppmd/T1` | 5.203 | 5.203 | 1.018 | 2.123 | 2.123 | 1.026 | 1.915 | 1.915 | 1.026 | 6.302 | 6.340 | 1.039 | 3.557 | 3.558 | 1.042 |
 
-## Non-default builds
+## Other variants
 
-`native-crypto` is the RustCrypto backend instead of `aws-lc-rs`; `no-ledger`
-skips the per-block accounting the default build keeps. Both are against
-7-Zip on the same rows.
+`native-crypto` is a non-default build with the RustCrypto backend instead
+of `aws-lc-rs`. `no-ledger` is the default build run without `--ledger`:
+the `ledger` rows above ask the reader to keep an accounting of its parallel
+LZMA2 decode (`Lzma2Handle::keep_ledger`) and report it, which no consumer
+does unless it asks; `no-ledger` is the same decode as a consumer runs it.
+Both are against 7-Zip on the same rows.
 
 ### native-crypto
 
