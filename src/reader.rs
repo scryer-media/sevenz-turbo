@@ -5912,12 +5912,17 @@ mod header_damage_tests {
         archive.files[0].has_crc = false;
         for verify in [true, false] {
             match read_all(&archive, &Password::empty(), &mut source, verify) {
-                Err(Error::BlockDecode {
-                    block_index: 0,
-                    kind: BlockErrorKind::Io,
-                    message,
-                    ..
-                }) => assert!(message.contains("UnexpectedEof"), "{message}"),
+                Err(
+                    error @ Error::BlockDecode {
+                        block_index: 0,
+                        kind: BlockErrorKind::Io,
+                        ..
+                    },
+                ) => assert_eq!(
+                    error.io_error().map(std::io::Error::kind),
+                    Some(std::io::ErrorKind::UnexpectedEof),
+                    "{error}"
+                ),
                 other => panic!("verify {verify}: expected an early end, got {other:?}"),
             }
         }

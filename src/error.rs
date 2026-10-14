@@ -128,6 +128,13 @@ pub enum Error {
         kind: BlockErrorKind,
         /// The underlying error, already rendered.
         message: String,
+        /// The underlying error itself, so a caller can ask what it was —
+        /// [`Error::io_error`], [`Error::is_password_required`],
+        /// [`Error::has_checksum_mismatch`] — without reading `message`.
+        ///
+        /// Not part of the [`Display`] rendering, which stays the four fields
+        /// above.
+        cause: Box<Error>,
     },
     /// An earlier push on this `ArchiveWriter` failed after it had put bytes
     /// in the output that the archive's header does not account for, so no
@@ -357,14 +364,196 @@ impl Error {
             packed_offset,
             kind,
             message: error.to_string(),
+            cause: Box::new(error),
+        }
+    }
+
+    /// The I/O error this one reports, if an I/O error is what it reports:
+    /// the source's own, one a coder raised inside the `Read` chain, or the
+    /// one behind a block error or a possibly wrong password.
+    ///
+    /// Its [`kind`](std::io::Error::kind), OS code and payload are the
+    /// reader's, untouched.
+    #[must_use]
+    pub fn io_error(&self) -> Option<&std::io::Error> {
+        match self {
+            Self::Io(error, _) | Self::FileOpen(error, _) | Self::MaybeBadPassword(error) => {
+                Some(error)
+            }
+            Self::BlockDecode { cause, .. } => cause.io_error(),
+            _ => None,
+        }
+    }
+
+    /// Whether the archive is encrypted and no password was given, here or as
+    /// the cause of a block error.
+    ///
+    /// A password that was given and may be wrong is
+    /// [`Error::MaybeBadPassword`], which is not this: its bytes failed to
+    /// decode or verify, and damage fails the same way.
+    #[must_use]
+    pub fn is_password_required(&self) -> bool {
+        match self {
+            Self::PasswordRequired => true,
+            Self::BlockDecode { cause, .. } => cause.is_password_required(),
+            _ => false,
+        }
+    }
+
+    /// Whether a checksum the archive carries disagreed with its bytes,
+    /// wherever that verdict travelled: raised here, carried inside an I/O
+    /// error from a `Read` chain, behind a possibly wrong password, or as the
+    /// cause of a block error. A CRC-32 of a block or file, the next header's
+    /// CRC, and an LZ4 frame's own header, block or content checksum all
+    /// count.
+    #[must_use]
+    pub fn has_checksum_mismatch(&self) -> bool {
+        match self {
+            Self::ChecksumVerificationFailed | Self::NextHeaderCrcMismatch => true,
+            Self::BlockDecode {
+                kind: BlockErrorKind::ChecksumMismatch,
+                ..
+            } => true,
+            Self::BlockDecode { cause, .. } => cause.has_checksum_mismatch(),
+            Self::Io(error, _) | Self::FileOpen(error, _) | Self::MaybeBadPassword(error) => {
+                io_error_has_checksum_mismatch(error)
+            }
+            _ => false,
         }
     }
 }
 
+fn io_error_has_checksum_mismatch(error: &std::io::Error) -> bool {
+    let Some(inner) = error.get_ref() else {
+        return false;
+    };
+    if let Some(inner) = inner.downcast_ref::<Error>() {
+        return inner.has_checksum_mismatch();
+    }
+    #[cfg(feature = "lz4")]
+    if let Some(inner) = inner.downcast_ref::<lz4_flex::frame::Error>() {
+        return matches!(
+            inner,
+            lz4_flex::frame::Error::HeaderChecksumError
+                | lz4_flex::frame::Error::BlockChecksumError
+                | lz4_flex::frame::Error::ContentChecksumError
+        );
+    }
+    false
+}
+
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&self, f)
+        match self {
+            // The cause is already rendered into `message`; leaving it out
+            // keeps the rendering what it was before the cause was kept.
+            Self::BlockDecode {
+                block_index,
+                packed_offset,
+                kind,
+                message,
+                cause: _,
+            } => f
+                .debug_struct("BlockDecode")
+                .field("block_index", block_index)
+                .field("packed_offset", packed_offset)
+                .field("kind", kind)
+                .field("message", message)
+                .finish(),
+            _ => std::fmt::Debug::fmt(&self, f),
+        }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::BlockDecode { cause, .. } => Some(cause.as_ref()),
+            Self::Io(error, _) | Self::FileOpen(error, _) | Self::MaybeBadPassword(error) => {
+                Some(error)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A block error keeps the error it locates, so its I/O kind, its OS code
+    /// and whether it was a password problem are answered from the error and
+    /// not from its wording; the rendering is the one it always had.
+    #[test]
+    fn a_block_error_keeps_its_cause() {
+        let short =
+            Error::from(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)).in_block(2, 32);
+        assert!(matches!(
+            short,
+            Error::BlockDecode {
+                kind: BlockErrorKind::Io,
+                ..
+            }
+        ));
+        assert_eq!(
+            short.io_error().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::UnexpectedEof)
+        );
+        assert_eq!(
+            short.to_string(),
+            "BlockDecode { block_index: 2, packed_offset: 32, kind: Io, message: \"Io(Kind(UnexpectedEof), \\\"\\\")\" }"
+        );
+
+        let os = Error::from(std::io::Error::from_raw_os_error(24)).in_block(0, 32);
+        assert_eq!(
+            os.io_error().and_then(std::io::Error::raw_os_error),
+            Some(24)
+        );
+        assert!(!os.has_checksum_mismatch());
+
+        let required = Error::PasswordRequired.in_block(0, 32);
+        assert!(required.is_password_required());
+        assert!(required.io_error().is_none());
+
+        let maybe =
+            Error::MaybeBadPassword(std::io::Error::other(Error::ChecksumVerificationFailed))
+                .in_block(0, 32);
+        assert!(matches!(
+            maybe,
+            Error::BlockDecode {
+                kind: BlockErrorKind::Password,
+                ..
+            }
+        ));
+        assert!(!maybe.is_password_required());
+        assert!(maybe.has_checksum_mismatch());
+
+        let crc =
+            Error::from(std::io::Error::other(Error::ChecksumVerificationFailed)).in_block(0, 32);
+        assert!(crc.has_checksum_mismatch());
+        assert!(Error::NextHeaderCrcMismatch.has_checksum_mismatch());
+        assert!(
+            !Error::other("damaged")
+                .in_block(0, 32)
+                .has_checksum_mismatch()
+        );
+    }
+
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn an_lz4_frame_checksum_is_a_checksum_mismatch() {
+        for frame in [
+            lz4_flex::frame::Error::HeaderChecksumError,
+            lz4_flex::frame::Error::BlockChecksumError,
+            lz4_flex::frame::Error::ContentChecksumError,
+        ] {
+            let error = Error::from(std::io::Error::from(frame)).in_block(0, 32);
+            assert!(error.has_checksum_mismatch(), "{error}");
+        }
+        let other = Error::from(std::io::Error::from(
+            lz4_flex::frame::Error::UnsupportedVersion(9),
+        ))
+        .in_block(0, 32);
+        assert!(!other.has_checksum_mismatch());
+    }
+}
