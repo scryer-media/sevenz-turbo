@@ -999,7 +999,7 @@ mod tests {
 
     fn coder(method: &[u8], inputs: u64) -> crate::block::Coder {
         let mut coder = crate::block::Coder::single_stream();
-        coder.id_size = u8::try_from(method.len()).expect("test method ID fits a byte");
+        coder.set_id_size(u8::try_from(method.len()).expect("test method ID fits a byte"));
         coder.set_stream_counts(inputs, 1);
         coder.decompression_method_id_mut().copy_from_slice(method);
         coder
@@ -1268,7 +1268,7 @@ mod tests {
         };
         let with_properties = |method: &[u8], properties: &[u8]| {
             let mut coder = coder(method, 1);
-            coder.properties = properties.to_vec().into();
+            coder.set_properties(properties.to_vec().into());
             coder
         };
         // Sized coders are the chain check's: an LZMA coder of a 1 MiB

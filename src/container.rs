@@ -429,7 +429,7 @@ pub(crate) fn check_aes_coders<'a>(
             continue;
         }
         let power = coder
-            .properties
+            .properties()
             .first()
             .ok_or_else(|| crate::Error::other("AES256 properties too short"))?
             & 63;
@@ -653,8 +653,9 @@ impl Archive {
 
     /// Every sub-stream of one block, in order.
     ///
-    /// Empty when `block_index` is out of range, or when the archive carries
-    /// no `SubStreamsInfo` at all (an archive of one entry per block need not).
+    /// Empty when `block_index` is out of range. When the archive omits
+    /// `SubStreamsInfo`, parsing infers one sub-stream per block with the
+    /// block's unpacked size and any defined block checksum.
     #[must_use]
     pub fn block_sub_streams(&self, block_index: usize) -> Vec<SubStream> {
         let Some(block) = self.blocks.get(block_index) else {
@@ -725,13 +726,13 @@ mod aes_budget_tests {
     #[test]
     fn raw_key_mode_is_allowed_but_the_hard_power_ceiling_remains() {
         let mut coder = Coder::default();
-        coder.id_size = 4;
+        coder.set_id_size(4);
         coder
             .decompression_method_id_mut()
             .copy_from_slice(EncoderMethod::ID_AES256_SHA256);
-        coder.properties = vec![63, 0].into();
+        coder.set_properties(vec![63, 0].into());
         check_aes_coders([&coder].into_iter(), &ArchiveLimits::unlimited()).unwrap();
-        coder.properties[0] = crate::encryption::MAX_AES_CYCLES_POWER + 1;
+        coder.properties_mut()[0] = crate::encryption::MAX_AES_CYCLES_POWER + 1;
         assert_eq!(
             check_aes_coders([&coder].into_iter(), &ArchiveLimits::unlimited())
                 .unwrap_err()

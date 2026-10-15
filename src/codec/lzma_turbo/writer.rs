@@ -360,6 +360,11 @@ struct ChannelSink {
 }
 
 impl SeqOutStream for ChannelSink {
+    fn supports_streamed_blocks(&self) -> bool {
+        // The bridge forwards an ordered byte stream, not block boundaries.
+        true
+    }
+
     fn write(&mut self, data: &[u8]) -> Result<(), LzmaError> {
         let mut buf = self.spare.try_recv().unwrap_or_default();
         buf.clear();
@@ -757,6 +762,10 @@ struct WriteSink<'a> {
 }
 
 impl SeqOutStream for WriteSink<'_> {
+    fn supports_streamed_blocks(&self) -> bool {
+        true
+    }
+
     fn write(&mut self, data: &[u8]) -> Result<(), LzmaError> {
         self.inner.write_all(data).map_err(|err| {
             self.error = Some(err);

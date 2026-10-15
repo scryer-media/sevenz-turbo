@@ -581,17 +581,16 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     {
         let methods = Arc::new(encoder::one_thread_each(&self.content_methods));
         let workers = (workers as usize).min(run.len());
-        // A coder per worker, kept from one of its folders to the next: a
-        // worker takes one at the start of a folder and puts it back at the
-        // end, so there are never more than there are workers.
-        let coders = std::sync::Mutex::new(Vec::<encoder::FolderCoder>::new());
+        // Keep a coder on its worker between folders, without exchanging it
+        // through a shared pool for every file. There is at most one per worker.
         let first = run.start;
-        let outcome = crate::ordered::run(
+        let outcome = crate::ordered::run_with_state(
             run.len(),
             workers,
             ENCODE_WINDOW_PER_WORKER * workers,
             ENCODE_STAGE_BYTES,
-            |job, tx| {
+            encoder::FolderCoder::default,
+            |job, coder, tx| {
                 let index = first + job;
                 let entry = entries[index].clone();
                 let result = if entry.is_directory {
@@ -605,11 +604,6 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                                 tx: &mut *tx,
                                 cancelled: false,
                             };
-                            let mut coder = coders
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .pop()
-                                .unwrap_or_default();
                             // The worker is the folder's thread: a BCJ2 chain's
                             // call and jump coders run on it, not beside it.
                             let encoded = encode_entry(
@@ -618,12 +612,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                                 &mut reader,
                                 &mut sink,
                                 encoder::Bcj2Sides::Inline,
-                                &mut coder,
+                                coder,
                             );
-                            coders
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .push(coder);
                             if sink.cancelled {
                                 return;
                             }

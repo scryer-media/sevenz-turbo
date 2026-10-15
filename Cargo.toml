@@ -24,6 +24,8 @@ resolver = "3"
 crate-type = ["cdylib", "rlib"]
 
 [features]
+# Diagnostic kernel comparisons; never enabled by default.
+kernel-ab = ["lzma-turbo/kernel-ab"]
 default = ["aes256", "aws-lc-crypto", "bzip2", "compress", "ppmd", "util"]
 # wasm has no C toolchain, so it takes the RustCrypto backend.
 default_wasm = ["aes256_wasm", "native-crypto", "bzip2", "compress", "ppmd", "util"]
@@ -84,7 +86,7 @@ flate2 = { version = "1", optional = true, features = ["zlib-rs"] }
 getrandom = { version = "0.4", optional = true }
 # Pin the reviewed library checkpoint while both performance PRs are open.
 # Registry packaging awaits the corresponding library publication.
-lzma-turbo = { version = "=0.9.1", git = "https://github.com/scryer-media/lzma-turbo", rev = "39b275c71dc958f84c4287d8abcaa187c759c9f2", default-features = false, features = ["std", "asm", "crc", "filters"] }
+lzma-turbo = { version = "=0.9.1", git = "https://github.com/scryer-media/lzma-turbo", rev = "8f436d76b3ae4c8b51fc5a54dc23c9aea5531679", default-features = false, features = ["std", "asm", "crc", "filters"] }
 ppmd-turbo = { version = "0.1.1", optional = true }
 lz4_flex = { version = "0.14", optional = true }
 nt-time = { version = "0.15", optional = true }

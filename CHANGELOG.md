@@ -310,12 +310,17 @@ Everything here is new surface; no upstream signature changed meaning.
 
 ### Encoding
 
+- The LZMA2 byte-stream bridges opt into ordered subblock delivery, reducing
+  staging memory on macOS ARM64 while retaining backpressure and I/O errors.
 - Large Linux LZMA/LZMA2 folders use a bounded, aligned source buffer with
   huge-page advice applied before initialization (0.27.0).
 - The encoder bridge returns consumed input chunks immediately, while
   retaining overlapped preparation of the next chunk (0.27.0).
 - BCJ2 is written as well as read (0.27.0). Upstream reads BCJ2 folders but
   cannot write one.
+- Non-solid encoder workers retain their own coders and wake only the relevant
+  ordered-output, capacity or admission waiters, reducing tiny-file scheduling
+  overhead while preserving cancellation and dynamic decoder thread limits.
 - `ArchiveWriter::push_archive_entries_non_solid` codes a non-solid archive's
   folders on several workers and writes them in order (0.27.0), the bytes a
   loop of `push_archive_entry` writes.

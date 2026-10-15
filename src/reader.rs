@@ -1533,12 +1533,34 @@ impl Archive {
         } else {
             archive.blocks.clear();
         }
-        if nid == K_SUB_STREAMS_INFO {
+        let explicit_sub_streams = nid == K_SUB_STREAMS_INFO;
+        if explicit_sub_streams {
             Self::read_sub_streams_info(header, archive, bounds)?;
             nid = header.read_u8()?;
         }
         if nid != K_END {
             return Err(Error::BadTerminatedStreamsInfo(nid));
+        }
+        if !explicit_sub_streams {
+            // C: SzReadStreamsInfo defaults to one sub-stream per folder;
+            // SzReadHeader2 derives its size and inherits its folder CRC.
+            let count = bounds.count(archive.blocks.len() as u64, Limit::Entries)?;
+            let mut info = SubStreamsInfo {
+                unpack_sizes: Vec::with_capacity(count),
+                has_crc: BitSet::with_capacity(count),
+                crcs: Vec::with_capacity(count),
+            };
+            for (index, block) in archive.blocks.iter_mut().enumerate() {
+                block.num_unpack_sub_streams = 1;
+                info.unpack_sizes.push(block.get_unpack_size());
+                if block.has_crc {
+                    info.has_crc.insert(index);
+                }
+                // The parser read the folder CRC from a 32-bit wire field.
+                info.crcs
+                    .push(if block.has_crc { block.crc as u32 } else { 0 });
+            }
+            archive.sub_streams_info = Some(info);
         }
 
         Ok(())
@@ -2052,9 +2074,6 @@ impl Archive {
             let mut next_missing_crc = 0;
             for block in archive.blocks.iter() {
                 if block.num_unpack_sub_streams == 1 && block.has_crc {
-                    sub_streams_info.has_crc.insert(next_crc);
-                    // The block CRC was read from the same 32-bit wire field.
-                    sub_streams_info.crcs[next_crc] = block.crc as u32;
                     next_crc += 1;
                 } else {
                     for _i in 0..block.num_unpack_sub_streams {
@@ -2077,6 +2096,18 @@ impl Archive {
             return Err(Error::BadTerminatedSubStreamsInfo);
         }
 
+        // C: SzReadHeader2 inherits the folder CRC independently of the
+        // optional sub-stream CRC property, for exactly one sub-stream.
+        let mut first_sub_stream = 0;
+        for block in &archive.blocks {
+            if block.num_unpack_sub_streams == 1 && block.has_crc {
+                sub_streams_info.has_crc.insert(first_sub_stream);
+                // Parsing established that this is a 32-bit wire CRC.
+                sub_streams_info.crcs[first_sub_stream] = block.crc as u32;
+            }
+            first_sub_stream += block.num_unpack_sub_streams;
+        }
+
         archive.sub_streams_info = Some(sub_streams_info);
         Ok(())
     }
@@ -2094,7 +2125,7 @@ impl Archive {
             let has_attributes = (bits & 0x20) != 0;
             let more_alternative_methods = (bits & 0x80) != 0;
 
-            coder.id_size = id_size;
+            coder.set_id_size(id_size);
 
             header.read_exact(coder.decompression_method_id_mut())?;
             let (input_streams, output_streams) = if is_simple {
@@ -2128,7 +2159,7 @@ impl Archive {
                 let properties_size = bounds.size(read_variable_u64(header)?)?;
                 let mut props = SmallSlice::with_len(properties_size);
                 header.read_exact(&mut props)?;
-                coder.properties = props;
+                coder.set_properties(props);
             }
             coders.push(coder);
             // would need to keep looping as above:
@@ -5077,6 +5108,230 @@ mod count_limit_tests {
 mod metadata_wire_tests {
     use super::*;
 
+    fn parse_substreams(archive: &mut Archive, mut wire: &[u8]) -> Result<(), Error> {
+        let len = wire.len();
+        Archive::read_sub_streams_info(
+            &mut wire,
+            archive,
+            HeaderBounds::new(len, &ArchiveLimits::default()),
+        )
+    }
+
+    #[test]
+    fn omitted_substream_crcs_inherit_only_single_stream_folders() {
+        for crc in [0, 0x8000_0000u32, u32::MAX] {
+            for defined in [false, true] {
+                let mut archive = Archive::default();
+                let mut block = Block::default();
+                block.has_crc = defined;
+                block.crc = u64::from(crc);
+                archive.blocks.push(block);
+                parse_substreams(&mut archive, &[K_END]).unwrap();
+                assert_eq!(archive.sub_stream(0).unwrap().crc, defined.then_some(crc));
+                archive.blocks[0].has_crc = !defined;
+                archive.blocks[0].crc ^= u64::MAX;
+                assert_eq!(archive.sub_stream(0).unwrap().crc, defined.then_some(crc));
+            }
+        }
+
+        for explicit in [false, true] {
+            let mut archive = Archive::default();
+            for crc in [7u32, 0x8000_0000, 9, u32::MAX] {
+                let mut block = Block::default();
+                block.has_crc = true;
+                block.crc = u64::from(crc);
+                archive.blocks.push(block);
+            }
+            let mut wire = vec![K_NUM_UNPACK_STREAM, 0, 1, 2, 1, K_SIZE, 0];
+            if explicit {
+                // Only the two-stream folder consumes digest bits/values.
+                wire.extend_from_slice(&[K_CRC, 0, 0x80]);
+                wire.extend_from_slice(&0xfedc_ba98u32.to_le_bytes());
+            }
+            wire.push(K_END);
+            parse_substreams(&mut archive, &wire).unwrap();
+            let crcs: Vec<_> = (0..4).map(|i| archive.sub_stream(i).unwrap().crc).collect();
+            assert_eq!(
+                crcs,
+                [
+                    Some(0x8000_0000),
+                    explicit.then_some(0xfedc_ba98),
+                    None,
+                    Some(u32::MAX)
+                ]
+            );
+            assert!(archive.sub_stream(4).is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_substream_crcs_do_not_publish_a_partial_snapshot() {
+        let mut archive = Archive::default();
+        let mut block = Block::default();
+        block.has_crc = true;
+        block.crc = 0x8000_0000;
+        archive.blocks.push(block);
+        parse_substreams(&mut archive, &[K_END]).unwrap();
+        for wire in [vec![], vec![K_CRC], vec![K_CRC, 1], vec![K_NAME]] {
+            let error = parse_substreams(&mut archive, &wire).unwrap_err();
+            if wire == [K_NAME] {
+                assert!(matches!(error, Error::BadTerminatedSubStreamsInfo));
+            } else {
+                assert!(
+                    matches!(error, Error::Io(ref e, _) if e.kind() == io::ErrorKind::UnexpectedEof)
+                );
+            }
+            assert_eq!(archive.sub_stream(0).unwrap().crc, Some(0x8000_0000));
+        }
+        // An explicitly required digest must still be fully present.
+        archive.blocks[0].has_crc = false;
+        let error = parse_substreams(&mut archive, &[K_CRC, 1, 0, 0, 0]).unwrap_err();
+        assert!(matches!(error, Error::Io(ref e, _) if e.kind() == io::ErrorKind::UnexpectedEof));
+        assert_eq!(archive.sub_stream(0).unwrap().crc, Some(0x8000_0000));
+    }
+
+    fn archive_with_inherited_crc(data: &[u8]) -> Vec<u8> {
+        assert!(!data.is_empty() && data.len() < 120);
+        // One uncompressed LZMA2 chunk, with a dictionary reset and end marker.
+        let mut packed = vec![1, 0, (data.len() - 1) as u8];
+        packed.extend_from_slice(data);
+        packed.push(0);
+        let mut header = vec![
+            K_HEADER,
+            K_MAIN_STREAMS_INFO,
+            K_PACK_INFO,
+            0,
+            1,
+            K_SIZE,
+            packed.len() as u8,
+            K_END,
+            K_UNPACK_INFO,
+            K_FOLDER,
+            1,
+            0,
+            1,
+            0x21,
+            0x21,
+            1,
+            0,
+            K_CODERS_UNPACK_SIZE,
+            data.len() as u8,
+            K_CRC,
+            1,
+        ];
+        header.extend_from_slice(&crc32(data).to_le_bytes());
+        header.extend_from_slice(&[
+            K_END,
+            K_SUB_STREAMS_INFO,
+            K_END,
+            K_END,
+            K_FILES_INFO,
+            1,
+            K_END,
+            K_END,
+        ]);
+        let mut start = Vec::new();
+        start.extend_from_slice(&(packed.len() as u64).to_le_bytes());
+        start.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        start.extend_from_slice(&crc32(&header).to_le_bytes());
+        let mut bytes = vec![0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c, 0, 4];
+        bytes.extend_from_slice(&crc32(&start).to_le_bytes());
+        bytes.extend_from_slice(&start);
+        bytes.extend_from_slice(&packed);
+        bytes.extend_from_slice(&header);
+        bytes
+    }
+
+    #[test]
+    fn inherited_crc_reaches_entry_and_positional_completion_paths() {
+        use std::sync::{Mutex, atomic::AtomicBool};
+        let data = b"folder checksum without a substream CRC property";
+        for damaged in [false, true] {
+            let mut bytes = archive_with_inherited_crc(data);
+            if damaged {
+                bytes[35] ^= 1;
+            }
+            for direct in [false, true] {
+                let mut reader =
+                    ArchiveReader::new(io::Cursor::new(bytes.clone()), Password::empty()).unwrap();
+                assert!(reader.archive().files[0].has_crc);
+                assert_eq!(reader.archive().files[0].crc, u64::from(crc32(data)));
+                assert_eq!(
+                    reader.archive().sub_stream(0).unwrap().crc,
+                    Some(crc32(data))
+                );
+                let reports = Arc::new(Mutex::new(Vec::new()));
+                let hook = reports.clone();
+                reader.set_sub_stream_complete_hook(move |event| {
+                    hook.lock().unwrap().push(event.crc32)
+                });
+                let mut output = Vec::new();
+                let result = if direct {
+                    reader.for_each_entries_direct(|_, input| {
+                        input.write_rest(&mut output)?;
+                        Ok(true)
+                    })
+                } else {
+                    reader.for_each_entries(|_, input| {
+                        io::copy(input, &mut output)?;
+                        Ok(true)
+                    })
+                };
+                if damaged {
+                    assert!(matches!(
+                        result,
+                        Err(Error::BlockDecode {
+                            kind: crate::BlockErrorKind::ChecksumMismatch,
+                            ..
+                        })
+                    ));
+                    assert!(reports.lock().unwrap().is_empty());
+                } else {
+                    result.unwrap();
+                    assert_eq!(output, data);
+                    assert_eq!(*reports.lock().unwrap(), [crc32(data)]);
+                }
+            }
+            let bytes = Arc::new(bytes);
+            let archive =
+                Archive::read(&mut io::Cursor::new(bytes.as_slice()), &Password::empty()).unwrap();
+            let folder = crate::PositionalLzma2Folder::new(
+                Arc::new(archive),
+                bytes.clone(),
+                0,
+                ArchiveLimits::default(),
+            )
+            .unwrap()
+            .unwrap();
+            let pack = folder.packed_range();
+            let mut scanner = folder.scanner();
+            scanner
+                .feed(&bytes[pack.offset as usize..pack.end() as usize])
+                .unwrap();
+            let run = scanner.next_run().unwrap();
+            scanner.finish().unwrap();
+            let completion = run
+                .decode(&AtomicBool::new(false), &mut |_, bytes: &[u8]| {
+                    Ok(bytes.len())
+                })
+                .unwrap();
+            let result = folder.verify_runs(&[completion]);
+            if damaged {
+                assert!(matches!(
+                    result,
+                    Err(Error::BlockDecode {
+                        kind: crate::BlockErrorKind::ChecksumMismatch,
+                        ..
+                    })
+                ));
+            } else {
+                let events = result.unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].crc32, crc32(data));
+            }
+        }
+    }
+
     #[test]
     fn substream_crc_keeps_all_wire_bits_for_explicit_and_inherited_values() {
         for crc in [0x8000_0000u32, u32::MAX] {
@@ -5317,7 +5572,7 @@ mod header_damage_tests {
     fn coder_properties_that_cannot_be_read_are_not_a_password_error() {
         let (mut source, mut archive) = one_file(EncoderMethod::LZMA);
         // No `lc`, `lp` and `pb` encode to this.
-        archive.blocks[0].coders[0].properties[0] = 0xFF;
+        archive.blocks[0].coders[0].properties_mut()[0] = 0xFF;
         for password in [Password::empty(), Password::from("the password of the job")] {
             match read_all(&archive, &password, &mut source, true) {
                 Err(Error::BlockDecode {

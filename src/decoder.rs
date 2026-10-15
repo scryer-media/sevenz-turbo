@@ -429,17 +429,17 @@ fn sized_coder_memory_kb(coder: &Coder, uncompressed_len: usize) -> Option<usize
     let method_id = coder.encoder_method_id();
     if method_id == EncoderMethod::ID_LZMA {
         let dict_size = crate::codec::lzma_turbo::clamp_dictionary(
-            crate::codec::lzma_turbo::lzma_dictionary_size(&coder.properties).ok()?,
+            crate::codec::lzma_turbo::lzma_dictionary_size(coder.properties()).ok()?,
             uncompressed_len as u64,
         );
         Some(lzma2_memory_usage_kb(dict_size))
     } else if method_id == EncoderMethod::ID_LZMA2 {
-        let dict_prop = lzma2_clamped_prop(*coder.properties.first()?, uncompressed_len as u64);
+        let dict_prop = lzma2_clamped_prop(*coder.properties().first()?, uncompressed_len as u64);
         Some(lzma2_memory_usage_kb(
             lzma2_dictionary_size(&[dict_prop]).ok()?,
         ))
     } else if cfg!(feature = "ppmd") && method_id == EncoderMethod::ID_PPMD {
-        let size = coder.properties.get(1..5)?;
+        let size = coder.properties().get(1..5)?;
         let memory_size = u32::from_le_bytes([size[0], size[1], size[2], size[3]]);
         Some(ppmd_memory_kb(memory_size))
     } else {
@@ -582,13 +582,13 @@ pub fn add_decoder<I: Read>(
         EncoderMethod::ID_LZMA => {
             // Validate the length before touching the properties: the decoder
             // slices `[1..5]`, which would panic on an attacker-supplied short field.
-            if coder.properties.len() < 5 {
+            if coder.properties().len() < 5 {
                 return Err(Error::Other("LZMA properties too short".into()));
             }
             // Clamp before the budget check, so a coder that declares a huge
             // dictionary for a small stream is decoded rather than refused.
             let dict_size = crate::codec::lzma_turbo::clamp_dictionary(
-                crate::codec::lzma_turbo::lzma_dictionary_size(&coder.properties)?,
+                crate::codec::lzma_turbo::lzma_dictionary_size(coder.properties())?,
                 uncompressed_len as u64,
             );
             let mem_size = lzma2_memory_usage_kb(dict_size);
@@ -601,7 +601,7 @@ pub fn add_decoder<I: Read>(
             let lz = crate::codec::lzma_turbo::lzma_decoder(
                 input,
                 uncompressed_len,
-                &coder.properties,
+                coder.properties(),
                 dict_size,
             )
             .map_err(|e| Error::bad_password(e, opts.encrypted))?;
@@ -611,7 +611,7 @@ pub fn add_decoder<I: Read>(
             // The dictionary is a table index rather than a number here, so the
             // clamp comes back as the property byte the decoders are built from.
             let dict_prop = coder
-                .properties
+                .properties()
                 .first()
                 .copied()
                 .ok_or_else(|| Error::other("LZMA2 properties too short"))?;
@@ -752,7 +752,7 @@ pub fn add_decoder<I: Read>(
             // The distance is `properties[0] + 1` in the range 1..=256. Widen to `usize`
             // before the `+1` so a property byte of `0xFF` yields 256, not 0 (a `u8`
             // `wrapping_add` would wrap to a zero distance and mis-decode / divide by zero).
-            let d = coder.properties.first().map_or(1, |b| *b as usize + 1);
+            let d = coder.properties().first().map_or(1, |b| *b as usize + 1);
             let de = DeltaReader::new(input, d);
             Ok(Decoder::Delta(Box::new(de)))
         }
@@ -763,7 +763,7 @@ pub fn add_decoder<I: Read>(
             }
             let mut de = Aes256Sha256Decoder::new(
                 input,
-                &coder.properties,
+                coder.properties(),
                 password,
                 opts.limits.max_aes_cycles_power,
                 opts.limits.max_aes_kdf_rounds,
@@ -783,7 +783,7 @@ pub fn add_decoder<I: Read>(
 fn get_ppmd_params(coder: &Coder, max_mem_limit_kb: usize) -> Result<PpmdParams, Error> {
     // 7-Zip reads the first five property bytes and ignores any after them.
     let props = coder
-        .properties
+        .properties()
         .get(..5)
         .ok_or_else(|| Error::other("PPMD properties too short"))?;
     let params = PpmdParams::from_7z_props(props).map_err(|_| {

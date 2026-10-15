@@ -77,6 +77,47 @@ mod storage_tests {
     use super::{Block, Coder, SmallSlice};
 
     #[test]
+    fn packed_coders_preserve_every_wire_field_across_storage_transitions() {
+        assert_eq!(size_of::<Coder>(), 24);
+        for id_len in 0..=15 {
+            for prop_len in [0, 1, 5, 7, 8, 15, 127, 128, 4096] {
+                for counts in [[0, 0], [1, 1], [4, 1], [u64::MAX, u64::MAX]] {
+                    let id: Vec<u8> = (0..id_len).map(|i| 255 - i).collect();
+                    let props: Vec<u8> = (0..prop_len).map(|i| i as u8).collect();
+                    let mut coder = Coder::single_stream();
+                    coder.set_id_size(id_len);
+                    coder.decompression_method_id_mut().copy_from_slice(&id);
+                    coder.set_properties(props.clone().into());
+                    coder.set_stream_counts(counts[0], counts[1]);
+                    assert_eq!(coder.encoder_method_id(), id);
+                    assert_eq!(coder.properties(), props);
+                    assert_eq!(coder.counts(), counts);
+                    let saved = coder.clone();
+                    // Logical equality must not depend on whether storage was
+                    // promoted by an earlier exceptional graph or long property.
+                    coder.promote();
+                    assert_eq!(coder, saved);
+                    coder.compact();
+                    assert_eq!(coder, saved);
+                    if let Some(byte) = coder.properties_mut().first_mut() {
+                        *byte ^= 0xff;
+                    }
+                    if let Some(byte) = coder.decompression_method_id_mut().first_mut() {
+                        *byte ^= 0xff;
+                    }
+                    assert_eq!(saved.encoder_method_id(), id);
+                    assert_eq!(saved.properties(), props);
+                    coder.set_properties(vec![17; 7].into());
+                    coder.set_stream_counts(1, 1);
+                    assert!(matches!(coder.storage, super::CoderStorage::Inline { .. }));
+                    assert_eq!(coder.properties(), [17; 7]);
+                    assert_eq!(coder.counts(), [1, 1]);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn coder_counts_preserve_defaults_full_width_and_clone_independence() {
         let default = Coder::default();
         assert_eq!(
@@ -85,7 +126,7 @@ mod storage_tests {
         );
         let mut coder = Coder::single_stream();
         assert_eq!((coder.num_in_streams(), coder.num_out_streams()), (1, 1));
-        assert!(coder.stream_counts.is_none());
+        assert!(matches!(coder.storage, super::CoderStorage::Inline { .. }));
         for pair in [[0, 1], [4, 1], [u64::MAX, 0], [0, u64::MAX]] {
             coder.set_stream_counts(pair[0], pair[1]);
             let mut cloned = coder.clone();
@@ -432,18 +473,44 @@ impl Block {
 ///
 /// A coder defines a specific compression method, filter, or encryption method
 /// used to process data within a block.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Coder {
-    encoder_method_id: [u8; 0xF],
-    pub(crate) id_size: u8,
-    // C: CCoderInfo's common single-stream form needs no separate counts.
-    // Exceptional graphs retain both complete wire-width values.
-    stream_counts: Option<Box<[u64; 2]>>,
-    // All supported non-AES coder properties fit seven bytes. Keeping this
-    // payload within one word also fits the enum in a boxed-slice footprint;
-    // longer properties retain their complete bounded allocation.
-    pub(crate) properties: SmallSlice<u8, 7>,
+    storage: CoderStorage,
 }
+
+// C: SzGetNextFolderItem reconstructs compact CSzCoderInfo records from
+// packed headers. Keep the common record compact without adopting the SDK's
+// narrower method-ID, property-size or stream-count restrictions.
+#[derive(Debug, Clone)]
+#[repr(u8)]
+enum CoderStorage {
+    Inline {
+        id: [u8; 15],
+        properties: [u8; 7],
+        // Low four bits: ID length. Next three: property length.
+        // High bit: default 0/0 counts; otherwise the common 1/1 counts.
+        descriptor: u8,
+    },
+    Full(Box<FullCoder>),
+}
+
+#[derive(Debug, Clone)]
+struct FullCoder {
+    id: [u8; 15],
+    id_size: u8,
+    counts: [u64; 2],
+    properties: SmallSlice<u8, 7>,
+}
+
+impl PartialEq for Coder {
+    fn eq(&self, other: &Self) -> bool {
+        self.encoder_method_id() == other.encoder_method_id()
+            && self.properties() == other.properties()
+            && self.counts() == other.counts()
+    }
+}
+
+impl Eq for Coder {}
 
 impl Default for Coder {
     fn default() -> Self {
@@ -456,46 +523,143 @@ impl Default for Coder {
 impl Coder {
     pub(crate) fn single_stream() -> Self {
         Self {
-            encoder_method_id: [0; 0xF],
-            id_size: 0,
-            stream_counts: None,
-            properties: SmallSlice::default(),
+            storage: CoderStorage::Inline {
+                id: [0; 15],
+                properties: [0; 7],
+                descriptor: 0,
+            },
+        }
+    }
+
+    fn counts(&self) -> [u64; 2] {
+        match &self.storage {
+            CoderStorage::Inline { descriptor, .. } => [u64::from(descriptor & 0x80 == 0); 2],
+            CoderStorage::Full(full) => full.counts,
         }
     }
 
     pub(crate) fn num_in_streams(&self) -> u64 {
-        self.stream_counts.as_ref().map_or(1, |counts| counts[0])
+        self.counts()[0]
     }
 
     pub(crate) fn num_out_streams(&self) -> u64 {
-        self.stream_counts.as_ref().map_or(1, |counts| counts[1])
+        self.counts()[1]
+    }
+
+    fn promote(&mut self) -> &mut FullCoder {
+        if let CoderStorage::Inline {
+            id,
+            properties,
+            descriptor,
+        } = &self.storage
+        {
+            let len = usize::from((descriptor >> 4) & 7);
+            let mut props = SmallSlice::with_len(len);
+            props.copy_from_slice(&properties[..len]);
+            self.storage = CoderStorage::Full(Box::new(FullCoder {
+                id: *id,
+                id_size: descriptor & 15,
+                counts: [u64::from(descriptor & 0x80 == 0); 2],
+                properties: props,
+            }));
+        }
+        match &mut self.storage {
+            CoderStorage::Full(full) => full,
+            CoderStorage::Inline { .. } => unreachable!("promoted coder"),
+        }
+    }
+
+    fn compact(&mut self) {
+        if let CoderStorage::Full(full) = &self.storage
+            && full.properties.len() <= 7
+            && matches!(full.counts, [0, 0] | [1, 1])
+        {
+            let mut properties = [0; 7];
+            properties[..full.properties.len()].copy_from_slice(&full.properties);
+            self.storage = CoderStorage::Inline {
+                id: full.id,
+                properties,
+                descriptor: full.id_size
+                    | ((full.properties.len() as u8) << 4)
+                    | if full.counts == [0, 0] { 0x80 } else { 0 },
+            };
+        }
     }
 
     pub(crate) fn set_stream_counts(&mut self, input: u64, output: u64) {
-        self.stream_counts = if (input, output) == (1, 1) {
-            None
-        } else {
-            Some(Box::new([input, output]))
-        };
+        if let CoderStorage::Inline { descriptor, .. } = &mut self.storage
+            && matches!((input, output), (0, 0) | (1, 1))
+        {
+            *descriptor = (*descriptor & 0x7f) | if input == 0 { 0x80 } else { 0 };
+            return;
+        }
+        self.promote().counts = [input, output];
+        self.compact();
+    }
+
+    pub(crate) fn set_id_size(&mut self, size: u8) {
+        assert!(size <= 15, "method ID exceeds wire width");
+        match &mut self.storage {
+            CoderStorage::Inline { descriptor, .. } => *descriptor = (*descriptor & 0xf0) | size,
+            CoderStorage::Full(full) => full.id_size = size,
+        }
+    }
+
+    pub(crate) fn set_properties(&mut self, props: SmallSlice<u8, 7>) {
+        if let CoderStorage::Inline {
+            properties,
+            descriptor,
+            ..
+        } = &mut self.storage
+            && props.len() <= 7
+        {
+            properties.fill(0);
+            properties[..props.len()].copy_from_slice(&props);
+            *descriptor = (*descriptor & 0x8f) | ((props.len() as u8) << 4);
+            return;
+        }
+        self.promote().properties = props;
+        self.compact();
     }
 
     /// Returns the encoder method ID for this coder.
-    ///
-    /// This ID identifies the specific compression method, filter, or encryption
-    /// method used by this coder.
     pub fn encoder_method_id(&self) -> &[u8] {
-        &self.encoder_method_id[0..usize::from(self.id_size)]
+        match &self.storage {
+            CoderStorage::Inline { id, descriptor, .. } => &id[..usize::from(descriptor & 15)],
+            CoderStorage::Full(full) => &full.id[..usize::from(full.id_size)],
+        }
     }
 
-    /// Returns this coder's properties: the method-specific parameters stored alongside the method
-    /// ID, empty for a method that takes none. How to interpret them depends on
-    /// [`encoder_method_id`](Self::encoder_method_id).
+    /// Returns this coder's method-specific properties, empty for a method
+    /// that takes none. See [`encoder_method_id`](Self::encoder_method_id).
     pub fn properties(&self) -> &[u8] {
-        &self.properties
+        match &self.storage {
+            CoderStorage::Inline {
+                properties,
+                descriptor,
+                ..
+            } => &properties[..usize::from((descriptor >> 4) & 7)],
+            CoderStorage::Full(full) => &full.properties,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn properties_mut(&mut self) -> &mut [u8] {
+        match &mut self.storage {
+            CoderStorage::Inline {
+                properties,
+                descriptor,
+                ..
+            } => &mut properties[..usize::from((*descriptor >> 4) & 7)],
+            CoderStorage::Full(full) => &mut full.properties,
+        }
     }
 
     pub(crate) fn decompression_method_id_mut(&mut self) -> &mut [u8] {
-        &mut self.encoder_method_id[0..usize::from(self.id_size)]
+        match &mut self.storage {
+            CoderStorage::Inline { id, descriptor, .. } => &mut id[..usize::from(*descriptor & 15)],
+            CoderStorage::Full(full) => &mut full.id[..usize::from(full.id_size)],
+        }
     }
 }
 
