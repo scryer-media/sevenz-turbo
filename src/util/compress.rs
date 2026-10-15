@@ -133,7 +133,7 @@ fn compress_path<W: Write + Seek, P: AsRef<Path>>(
             }
         }
     } else {
-        archive_writer.push_archive_entry(
+        archive_writer.push_archive_entry_send(
             entry,
             Some(
                 File::open(path)
@@ -224,7 +224,7 @@ fn encode_path<W: Write + Seek>(
         for ele in paths.into_iter() {
             let name = extract_file_name(&src, &ele)?;
 
-            zip.push_archive_entry(
+            zip.push_archive_entry_send(
                 ArchiveEntry::from_path(ele.as_path(), name),
                 Some(File::open(ele.as_path())?),
             )?;
@@ -238,14 +238,14 @@ fn encode_path<W: Write + Seek>(
         let name = extract_file_name(&src, &ele)?;
 
         if size >= MAX_BLOCK_SIZE {
-            zip.push_archive_entry(
+            zip.push_archive_entry_send(
                 ArchiveEntry::from_path(ele.as_path(), name),
                 Some(File::open(ele.as_path())?),
             )?;
             continue;
         }
         if file_size + size >= MAX_BLOCK_SIZE {
-            zip.push_archive_entries(entries, files)?;
+            zip.push_archive_entries_send(entries, files)?;
             entries = Vec::new();
             files = Vec::new();
             file_size = 0;
@@ -255,7 +255,7 @@ fn encode_path<W: Write + Seek>(
         files.push(LazyFileReader::new(ele).into());
     }
     if !entries.is_empty() {
-        zip.push_archive_entries(entries, files)?;
+        zip.push_archive_entries_send(entries, files)?;
     }
 
     Ok(())

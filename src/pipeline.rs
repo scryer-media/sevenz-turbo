@@ -11,10 +11,11 @@
 //! The stages are joined by pipes of a few [`PIPE_CHUNK`]-sized pieces each.
 //! A stage whose pipe is full waits until the stage above has taken a piece,
 //! so nothing runs further ahead than [`PIPE_DEPTH`] pieces, whatever the
-//! speeds. The pack streams themselves borrow the caller's reader and cannot
-//! leave its thread, so the thread reading the block's output also tops up
-//! the pipes of the stages that read a pack stream, each time it takes a piece
-//! and whenever it has to wait.
+//! speeds. Borrowed pack streams stay on the caller's thread, which tops up
+//! their input pipes each time it takes a piece and whenever it has to wait.
+//! Complete positional graph inputs instead have independent owned cursors:
+//! workers read those directly, without a caller-fed input pipe. Progressive
+//! and adaptive inputs retain the borrowed path.
 //!
 //! An error keeps its place in the stream: whatever a stage produced before it
 //! is delivered first, and the error itself, unchanged, is what the stage
@@ -33,14 +34,18 @@ use std::thread::JoinHandle;
 use crate::archive::EncoderMethod;
 use crate::block::Block;
 use crate::codec::lzma_turbo::MT_MIN_BLOCK_BYTES;
-use crate::decoder::{DecodeOptions, DecodeRead, INPUT_BUF_SIZE, ReadOnly, add_decoder};
+use crate::decoder::{
+    BufferedInput, DecodeOptions, DecodeRead, INPUT_BUF_SIZE, ReadOnly, add_decoder,
+};
 use crate::{Error, Password};
 
 /// Bytes a stage hands on at a time.
 pub(crate) const PIPE_CHUNK: usize = 256 << 10;
 
-/// Pieces a pipe holds before the stage writing it waits.
-pub(crate) const PIPE_DEPTH: usize = 4;
+/// Pieces a pipe holds before the stage writing it waits. This permits
+/// 512 KiB queued at each edge, the buffer size CMixerMT::Init negotiates
+/// between SDK coders, plus the piece the consumer is reading.
+pub(crate) const PIPE_DEPTH: usize = 2;
 
 /// The most one pipe holds: its queued pieces and the one its reader is
 /// working through. A piece being filled is one the reader handed back, or
@@ -168,14 +173,25 @@ pub(crate) fn parallel_lzma2_coder(block: &Block) -> Option<usize> {
 /// threads beyond the caller's, largest first, each once every coder it reads
 /// from is a pack stream or has a thread too.
 pub(crate) fn offload_plan(block: &Block, threads: u32) -> u64 {
+    offload_plan_with_serial(block, threads, None)
+}
+
+fn offload_plan_with_serial(block: &Block, threads: u32, serial: Option<usize>) -> u64 {
     let coders = &block.coders;
     let count = coders.len();
+    // T1 deliberately has no auxiliary pipeline threads. SDK CDecoder::Decode
+    // selects CMixerMT independently of -mmt=1 via the default-enabled mtf
+    // property. Benchmark that SDK pipeline against our T2, or disable its
+    // mixer with -mmtf=off for a serial control. Never relax this guard to fix
+    // a mismatched T1 wall-time comparison; see docs/benchmarking.md.
     if cfg!(target_arch = "wasm32") || threads < 2 || count > 64 {
         return 0;
     }
     let size = |index: usize| block.get_unpack_size_at_index(index);
     let parallel_coder = parallel_lzma2_coder(block);
-    let parallel = |index: usize| parallel_coder == Some(index) && size(index) > MT_MIN_BLOCK_BYTES;
+    let parallel = |index: usize| {
+        parallel_coder == Some(index) && serial != Some(index) && size(index) > MT_MIN_BLOCK_BYTES
+    };
     let heavy: Vec<bool> = (0..count)
         .map(|index| is_heavy(coders[index].encoder_method_id()) && !parallel(index))
         .collect();
@@ -184,7 +200,7 @@ pub(crate) fn offload_plan(block: &Block, threads: u32) -> u64 {
     }
     let bound = |index: usize| {
         block
-            .bind_pairs
+            .bind_pairs()
             .iter()
             .any(|bp| bp.out_index == index as u64)
     };
@@ -195,20 +211,20 @@ pub(crate) fn offload_plan(block: &Block, threads: u32) -> u64 {
     let mut stream = 0u64;
     for coder in coders {
         first_in.push(stream);
-        stream = stream.saturating_add(coder.num_in_streams);
+        stream = stream.saturating_add(coder.num_in_streams());
     }
     let candidate = |index: usize| {
         let coder = &coders[index];
         heavy[index]
             && index != top
-            && coder.num_in_streams == 1
-            && coder.num_out_streams == 1
+            && coder.num_in_streams() == 1
+            && coder.num_out_streams() == 1
             && size(index) >= min_stage_bytes()
     };
     // Whether a coder's one input is a pack stream or a coder already chosen.
     let fed = |index: usize, chosen: u64| {
         let stream = first_in[index];
-        if block.packed_streams.contains(&stream) {
+        if block.packed_streams().contains(&stream) {
             return true;
         }
         block
@@ -237,9 +253,9 @@ fn plan_pipes(block: &Block, offload: u64) -> usize {
     for (index, coder) in block.coders.iter().enumerate() {
         // A coder given a thread has one input: see `offload_plan`.
         if index < 64 && offload & (1 << index) != 0 {
-            pipes += 1 + usize::from(block.packed_streams.contains(&stream));
+            pipes += 1 + usize::from(block.packed_streams().contains(&stream));
         }
-        stream = stream.saturating_add(coder.num_in_streams);
+        stream = stream.saturating_add(coder.num_in_streams());
     }
     pipes
 }
@@ -248,6 +264,8 @@ fn plan_pipes(block: &Block, offload: u64) -> usize {
 pub(crate) enum Stage<'r> {
     /// A pack stream, read on the caller's thread.
     Leaf(Box<dyn Read + 'r>),
+    /// A complete pack stream with its own cursor, safe to move to a worker.
+    OwnedLeaf(Box<dyn Read + Send>),
     /// A coder on the caller's thread.
     Here(Box<dyn DecodeRead + 'r>),
     /// The pipe a coder on a thread of its own writes.
@@ -301,9 +319,11 @@ impl PipeState {
     /// read, and a read after the end must not find it again.
     fn take(&mut self, buf: &mut Vec<u8>) -> Option<io::Result<bool>> {
         if let Some(chunk) = self.chunks.pop_front() {
-            let mut used = std::mem::replace(buf, chunk);
+            let used = std::mem::replace(buf, chunk);
             if used.capacity() > 0 && self.spare.len() < PIPE_DEPTH {
-                used.clear();
+                // Keep initialized storage: fill overwrites from byte zero
+                // and truncates to the bytes read, including before errors.
+                // Clearing here makes every recycled full piece zero-fill.
                 self.spare.push(used);
             }
             return Some(Ok(true));
@@ -513,11 +533,8 @@ struct CallerInput<'r> {
     pos: usize,
 }
 
-impl Read for CallerInput<'_> {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if out.is_empty() {
-            return Ok(0);
-        }
+impl CallerInput<'_> {
+    fn refill(&mut self) -> io::Result<()> {
         if self.pos == self.buf.len() {
             let shared = &self.inner.shared;
             loop {
@@ -531,7 +548,7 @@ impl Read for CallerInput<'_> {
                         // while this thread works through the piece.
                         self.inner.pump();
                         if !outcome? {
-                            return Ok(0);
+                            return Ok(());
                         }
                         break;
                     }
@@ -546,7 +563,37 @@ impl Read for CallerInput<'_> {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+impl Read for CallerInput<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        self.refill()?;
         Ok(copy_out(&self.buf, &mut self.pos, out))
+    }
+}
+
+impl DecodeRead for CallerInput<'_> {
+    fn take_chunk(&mut self, max: usize, spare: &mut Vec<u8>) -> Option<io::Result<usize>> {
+        // A partial ordinary read must keep its cursor. The caller can
+        // finish that piece with Read before asking for ownership again.
+        if max < PIPE_CHUNK || (self.pos != 0 && self.pos != self.buf.len()) {
+            return None;
+        }
+        if let Err(error) = self.refill() {
+            return Some(Err(error));
+        }
+        // CStreamBinder::Read avoids an intermediate output copy. Transfer
+        // the existing queue allocation instead of sharing a borrowed
+        // pointer across threads. The returned spare replaces our consumed
+        // buffer and joins the same bounded recycling pool on the next take.
+        std::mem::swap(&mut self.buf, spare);
+        self.pos = self.buf.len();
+        Some(Ok(spare.len()))
     }
 }
 
@@ -591,6 +638,7 @@ impl<'r> Pipeline<'r> {
     pub(crate) fn here(&mut self, stage: Stage<'r>) -> Box<dyn Read + 'r> {
         match stage {
             Stage::Leaf(reader) => reader,
+            Stage::OwnedLeaf(reader) => reader,
             Stage::Here(reader) => reader,
             Stage::There(pipe) => Box::new(CallerInput {
                 inner: Rc::clone(self.inner()),
@@ -607,6 +655,12 @@ impl<'r> Pipeline<'r> {
     pub(crate) fn top(&mut self, stage: Stage<'r>) -> Box<dyn DecodeRead + 'r> {
         match stage {
             Stage::Here(reader) => reader,
+            Stage::There(pipe) => Box::new(CallerInput {
+                inner: Rc::clone(self.inner()),
+                pipe,
+                buf: Vec::new(),
+                pos: 0,
+            }),
             stage => Box::new(ReadOnly(self.here(stage))),
         }
     }
@@ -615,6 +669,16 @@ impl<'r> Pipeline<'r> {
     /// thread cannot be one: [`offload_plan`] never asks for that.
     pub(crate) fn there(&mut self, stage: Stage<'r>) -> io::Result<Box<dyn Read + Send>> {
         let pipe = match stage {
+            // CLockedSequentialInStreamMT::Read feeds SDK coders directly.
+            // A complete positional source likewise needs no caller-fed
+            // input pipe. Its 64 KiB buffer fits within the conservative
+            // input-pipe reservation retained by Chain::with_serial_coder.
+            Stage::OwnedLeaf(source) => {
+                return Ok(Box::new(io::BufReader::with_capacity(
+                    INPUT_BUF_SIZE,
+                    source,
+                )));
+            }
             Stage::There(pipe) => pipe,
             Stage::Leaf(source) => {
                 let pipe = self.new_pipe();
@@ -729,7 +793,21 @@ impl<'r> Chain<'r> {
     /// Those figures stay out of `opts.reserved_kb`, which a coder fitting
     /// itself to what is left subtracts: its own would be in it.
     pub(crate) fn new(block: &Block, opts: &mut DecodeOptions<'_>) -> Self {
-        let mut offload = offload_plan(block, opts.threads);
+        Self::with_serial_coder(block, opts, None)
+    }
+
+    /// A framing-only probe may prove the largest LZMA2 stream is one run.
+    /// Keep its ring decoder serial, while allowing it a pipeline stage to
+    /// overlap the other coders. An unproven stream retains the normal plan.
+    pub(crate) fn with_serial_coder(
+        block: &Block,
+        opts: &mut DecodeOptions<'_>,
+        serial: Option<usize>,
+    ) -> Self {
+        let mut offload = match serial {
+            None => offload_plan(block, opts.threads),
+            Some(_) => offload_plan_with_serial(block, opts.threads, serial),
+        };
         if offload != 0 {
             let pipes_kb = plan_pipes(block, offload)
                 .saturating_mul(PIPE_BYTES)
@@ -744,7 +822,7 @@ impl<'r> Chain<'r> {
         Self {
             pipeline: Pipeline::default(),
             offload,
-            parallel_lzma2: parallel_lzma2_coder(block),
+            parallel_lzma2: parallel_lzma2_coder(block).filter(|&index| Some(index) != serial),
         }
     }
 
@@ -759,6 +837,25 @@ impl<'r> Chain<'r> {
     ) -> Result<Stage<'r>, Error> {
         let coder = &block.coders[index];
         let len = block.get_unpack_size_at_index(index) as usize;
+        if coder.encoder_method_id() == EncoderMethod::ID_COPY
+            && opts.limits.memory_limit_bytes != u64::MAX
+        {
+            // COPY has no properties, allocation or length check in
+            // add_decoder: it forwards the input. Preserve that stage's
+            // push buffer, including AES plaintext, rather than hide it
+            // behind a second COPY buffer. A leaf uses the same charged
+            // pack buffer as the ordinary construction below. Declared
+            // lengths and CRCs remain checked by the enclosing readers.
+            return Ok(match input {
+                Stage::Leaf(source) => Stage::Here(Box::new(BufferedInput(
+                    io::BufReader::with_capacity(INPUT_BUF_SIZE, source),
+                ))),
+                Stage::OwnedLeaf(source) => Stage::Here(Box::new(BufferedInput(
+                    io::BufReader::with_capacity(INPUT_BUF_SIZE, source),
+                ))),
+                stage => stage,
+            });
+        }
         // Every other LZMA2 coder of the chain is built without the control,
         // which is what a single-threaded plan is.
         let single_threaded;
@@ -790,6 +887,9 @@ impl<'r> Chain<'r> {
         // reads it in small pieces: see `INPUT_BUF_SIZE`.
         let input: Box<dyn Read + 'r> = match input {
             Stage::Leaf(source) => Box::new(io::BufReader::with_capacity(INPUT_BUF_SIZE, source)),
+            Stage::OwnedLeaf(source) => {
+                Box::new(io::BufReader::with_capacity(INPUT_BUF_SIZE, source))
+            }
             stage => self.pipeline.here(stage),
         };
         Ok(Stage::Here(Box::new(add_decoder(
@@ -845,6 +945,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn recycled_storage_never_exposes_bytes_beyond_a_short_fill() {
+        let mut state = PipeState {
+            chunks: VecDeque::from([vec![1; PIPE_CHUNK]]),
+            spare: Vec::new(),
+            end: End::Open,
+        };
+        let mut consumed = vec![0xaa; PIPE_CHUNK];
+        assert!(state.take(&mut consumed).unwrap().unwrap());
+        let mut reused = state.spare();
+        assert_eq!(reused.len(), PIPE_CHUNK);
+        assert!(reused.iter().all(|&byte| byte == 0xaa));
+        let error = fill(&mut FailsAfter { good: 17 }, &mut reused).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(reused, [7; 17]);
+    }
+
     /// What a stage produced before it failed arrives first, and then its
     /// error, unchanged, in the reader above it.
     #[test]
@@ -881,10 +998,9 @@ mod tests {
     }
 
     fn coder(method: &[u8], inputs: u64) -> crate::block::Coder {
-        let mut coder = crate::block::Coder::default();
-        coder.id_size = method.len();
-        coder.num_in_streams = inputs;
-        coder.num_out_streams = 1;
+        let mut coder = crate::block::Coder::single_stream();
+        coder.id_size = u8::try_from(method.len()).expect("test method ID fits a byte");
+        coder.set_stream_counts(inputs, 1);
         coder.decompression_method_id_mut().copy_from_slice(method);
         coder
     }
@@ -899,35 +1015,38 @@ mod tests {
     /// AES (coder 1) under LZMA2 (coder 0), as 7-Zip writes it, with the
     /// LZMA2 coder of `lzma2` bytes over `aes` bytes of ciphertext.
     fn aes_under(method: &[u8], unpacked: u64, packed: u64) -> Block {
-        Block {
-            coders: vec![coder(method, 1), coder(EncoderMethod::ID_AES256_SHA256, 1)],
-            total_input_streams: 2,
-            total_output_streams: 2,
-            bind_pairs: vec![bind(0, 1)],
-            packed_streams: vec![1],
-            unpack_sizes: vec![unpacked, packed],
-            ..Default::default()
-        }
+        let mut block = Block::with_coders(vec![
+            coder(method, 1),
+            coder(EncoderMethod::ID_AES256_SHA256, 1),
+        ]);
+        block.set_streams(
+            2,
+            2,
+            vec![bind(0, 1)].into(),
+            vec![1].into(),
+            vec![unpacked, packed].into(),
+        );
+        block
     }
 
     /// A BCJ2 graph as 7-Zip writes it: BCJ2 (coder 0) over a main-stream
     /// coder (1) and two LZMA coders for the call and jump streams (2, 3),
     /// with the range-coder stream straight off the pack streams.
     fn bcj2(main: &[u8], main_len: u64, side_len: u64) -> Block {
-        Block {
-            coders: vec![
-                coder(EncoderMethod::ID_BCJ2, 4),
-                coder(main, 1),
-                coder(EncoderMethod::ID_LZMA, 1),
-                coder(EncoderMethod::ID_LZMA, 1),
-            ],
-            total_input_streams: 7,
-            total_output_streams: 4,
-            bind_pairs: vec![bind(0, 1), bind(1, 2), bind(2, 3)],
-            packed_streams: vec![4, 5, 6, 3],
-            unpack_sizes: vec![main_len + 2 * side_len, main_len, side_len, side_len],
-            ..Default::default()
-        }
+        let mut block = Block::with_coders(vec![
+            coder(EncoderMethod::ID_BCJ2, 4),
+            coder(main, 1),
+            coder(EncoderMethod::ID_LZMA, 1),
+            coder(EncoderMethod::ID_LZMA, 1),
+        ]);
+        block.set_streams(
+            7,
+            4,
+            vec![bind(0, 1), bind(1, 2), bind(2, 3)].into(),
+            vec![4, 5, 6, 3].into(),
+            vec![main_len + 2 * side_len, main_len, side_len, side_len].into(),
+        );
+        block
     }
 
     /// A chain of LZMA2 coders, the first on top and each reading the next,
@@ -943,15 +1062,15 @@ mod tests {
             unpack_sizes.push(len);
         }
         let count = coders.len() as u64;
-        Block {
-            coders,
-            total_input_streams: count as usize,
-            total_output_streams: count as usize,
-            bind_pairs: (1..count).map(|index| bind(index - 1, index)).collect(),
-            packed_streams: vec![count - 1],
-            unpack_sizes,
-            ..Default::default()
-        }
+        let mut block = Block::with_coders(coders);
+        block.set_streams(
+            count as usize,
+            count as usize,
+            (1..count).map(|index| bind(index - 1, index)).collect(),
+            vec![count - 1].into(),
+            unpack_sizes.into(),
+        );
+        block
     }
 
     /// One LZMA2 coder of a chain decodes in parallel: the one with the most
@@ -983,6 +1102,16 @@ mod tests {
         let over_aes = lzma2_chain(&[64 * MIB, 60 * MIB], Some(60 * MIB));
         assert_eq!(parallel_lzma2_coder(&over_aes), Some(0));
         assert_eq!(offload_plan(&over_aes, 8), 0b110);
+    }
+
+    #[test]
+    fn proven_single_run_coders_share_the_graph_thread_budget() {
+        const MIB: u64 = 1 << 20;
+        let main = bcj2(EncoderMethod::ID_LZMA2, 64 * MIB, 2 * MIB);
+        assert_eq!(offload_plan_with_serial(&main, 1, Some(1)), 0);
+        assert_eq!(offload_plan_with_serial(&main, 2, Some(1)), 0b0010);
+        assert_eq!(offload_plan_with_serial(&main, 8, Some(1)), 0b1110);
+        assert_eq!(offload_plan_with_serial(&main, 8, None), 0b1100);
     }
 
     /// The decisions, for the chains 7-Zip writes.
@@ -1139,7 +1268,7 @@ mod tests {
         };
         let with_properties = |method: &[u8], properties: &[u8]| {
             let mut coder = coder(method, 1);
-            coder.properties = properties.to_vec();
+            coder.properties = properties.to_vec().into();
             coder
         };
         // Sized coders are the chain check's: an LZMA coder of a 1 MiB
@@ -1168,8 +1297,21 @@ mod tests {
 
     /// Every entry of an archive, in order, read at `threads`.
     fn decode_all(archive: &[u8], password: &str, threads: u32) -> Vec<(String, Vec<u8>)> {
+        decode_all_with_source(archive, password, threads, false)
+    }
+
+    fn decode_all_with_source(
+        archive: &[u8],
+        password: &str,
+        threads: u32,
+        complete: bool,
+    ) -> Vec<(String, Vec<u8>)> {
         let mut reader =
             crate::ArchiveReader::new(io::Cursor::new(archive), password.into()).unwrap();
+        if complete {
+            reader.set_positional_source(archive.to_vec());
+            reader.set_input_complete(true);
+        }
         reader.set_threads(threads);
         let mut out = Vec::new();
         reader
@@ -1274,6 +1416,212 @@ mod tests {
                 assert!(piped == alone, "{name} at {threads} threads");
             }
         }
+    }
+
+    #[test]
+    fn complete_positional_graphs_match_with_full_or_refused_workers() {
+        for (name, archive, password) in fixtures() {
+            let alone = decode_all(archive, password, 1);
+            for threads in [2, 4, 8] {
+                for allowed in [0, 1, 8] {
+                    let direct = with_stage_threads(allowed, || {
+                        with_any_stage_size(|| {
+                            decode_all_with_source(archive, password, threads, true)
+                        })
+                    });
+                    assert!(
+                        direct == alone,
+                        "{name}, threads={threads}, allowed={allowed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owned_pack_input_runs_on_the_worker_and_keeps_error_order() {
+        struct WorkerSource(FailsAfter);
+        impl Read for WorkerSource {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                assert_eq!(std::thread::current().name(), Some("sevenz-coder"));
+                self.0.read(out)
+            }
+        }
+        let good = 3 * PIPE_CHUNK + 777;
+        let mut pipeline = Pipeline::default();
+        let input = pipeline
+            .there(Stage::OwnedLeaf(Box::new(WorkerSource(FailsAfter {
+                good,
+            }))))
+            .unwrap();
+        assert!(
+            pipeline.inner.is_none(),
+            "direct input must not open a feed pipe"
+        );
+        let stage = pipeline.spawn(input).unwrap();
+        let mut reader = pipeline.here(stage);
+        let mut out = Vec::new();
+        let error = reader.read_to_end(&mut out).unwrap_err();
+        assert_eq!(out, vec![7; good]);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "broken coder");
+    }
+
+    #[test]
+    fn positional_graph_input_requires_complete_nonadaptive_permission() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ShortSource {
+            bytes: Vec<u8>,
+            reads: AtomicUsize,
+        }
+        impl crate::ReadAt for ShortSource {
+            fn read_at(&self, out: &mut [u8], offset: u64) -> io::Result<usize> {
+                // Exercise Interrupted and short reads without changing
+                // the packed cursor or consuming bytes on the error.
+                if self.reads.fetch_add(1, Ordering::Relaxed) == 0 {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let want = out.len().min(31);
+                crate::ReadAt::read_at(&self.bytes, &mut out[..want], offset)
+            }
+            fn size(&self) -> io::Result<u64> {
+                Ok(self.bytes.len() as u64)
+            }
+        }
+        let (_, archive, password) = fixtures()
+            .into_iter()
+            .find(|(name, _, _)| *name == "lzma2_bcj2")
+            .unwrap();
+        for (complete, adaptive) in [(false, false), (true, true), (true, false)] {
+            let source = Arc::new(ShortSource {
+                bytes: archive.to_vec(),
+                reads: AtomicUsize::new(0),
+            });
+            let mut reader =
+                crate::ArchiveReader::new(io::Cursor::new(archive), password.into()).unwrap();
+            let block_index = reader
+                .archive()
+                .blocks
+                .iter()
+                .position(|block| {
+                    block
+                        .coders
+                        .iter()
+                        .any(|coder| coder.encoder_method_id() == EncoderMethod::ID_BCJ2)
+                })
+                .unwrap();
+            // The corpus archive has two folders. Exercise just the BCJ2
+            // graph: folder parallelism legitimately uses ReadAt even when
+            // this graph's complete-input permission is false.
+            let mut expected = Vec::new();
+            reader
+                .block_decoder(block_index)
+                .unwrap()
+                .for_each_entries(&mut |entry, data| {
+                    let mut bytes = Vec::new();
+                    data.read_to_end(&mut bytes)?;
+                    expected.push((entry.name().to_string(), bytes));
+                    Ok(true)
+                })
+                .unwrap();
+            reader.set_positional_source(Arc::clone(&source));
+            reader.set_input_complete(complete);
+            reader.set_adaptive_lzma2(adaptive);
+            reader.set_threads(4);
+            let mut actual = Vec::new();
+            with_any_stage_size(|| {
+                reader
+                    .block_decoder(block_index)
+                    .unwrap()
+                    .for_each_entries(&mut |entry, data| {
+                        let mut bytes = Vec::new();
+                        data.read_to_end(&mut bytes)?;
+                        actual.push((entry.name().to_string(), bytes));
+                        Ok(true)
+                    })
+            })
+            .unwrap();
+            assert!(actual == expected);
+            assert_eq!(
+                source.reads.load(Ordering::Relaxed) > 0,
+                complete && !adaptive
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_an_owned_pack_pipeline_joins_its_worker() {
+        let mut pipeline = Pipeline::default();
+        let input = pipeline
+            .there(Stage::OwnedLeaf(Box::new(io::Cursor::new(data(8 << 20)))))
+            .unwrap();
+        let stage = pipeline.spawn(input).unwrap();
+        let mut reader = pipeline.here(stage);
+        reader.read_exact(&mut [0; 1000]).unwrap();
+        drop(reader);
+        drop(pipeline);
+    }
+
+    #[test]
+    fn chunk_delivery_transfers_allocation_and_preserves_mixed_read_cursor() {
+        let first = data(PIPE_CHUNK);
+        let first_ptr = first.as_ptr();
+        let tail = data(37);
+        let mut pipeline = Pipeline::default();
+        let pipe = pipeline.new_pipe();
+        {
+            let mut state = pipeline.inner().shared.lock();
+            state.pipes[pipe].send(first, Ok(true));
+            state.pipes[pipe].send(tail.clone(), Ok(false));
+        }
+        let mut reader = pipeline.top(Stage::There(pipe));
+        let mut spare = vec![0; PIPE_CHUNK];
+        assert!(reader.take_chunk(PIPE_CHUNK - 1, &mut spare).is_none());
+        assert_eq!(
+            reader.take_chunk(PIPE_CHUNK, &mut spare).unwrap().unwrap(),
+            PIPE_CHUNK
+        );
+        assert_eq!(spare.as_ptr(), first_ptr);
+        assert_eq!(spare, data(PIPE_CHUNK));
+        let mut prefix = [0; 13];
+        reader.read_exact(&mut prefix).unwrap();
+        assert_eq!(prefix, tail[..13]);
+        assert!(reader.take_chunk(PIPE_CHUNK, &mut spare).is_none());
+        assert_eq!(spare.as_ptr(), first_ptr);
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, tail[13..]);
+        for _ in 0..2 {
+            assert_eq!(
+                reader.take_chunk(PIPE_CHUNK, &mut spare).unwrap().unwrap(),
+                0
+            );
+            assert!(spare.is_empty());
+        }
+    }
+
+    #[test]
+    fn chunk_delivery_preserves_a_workers_prefix_before_its_error() {
+        let good = 3 * PIPE_CHUNK + 777;
+        let mut pipeline = Pipeline::default();
+        let stage = pipeline.spawn(Box::new(FailsAfter { good })).unwrap();
+        let mut reader = pipeline.top(stage);
+        let mut buffer = vec![0; PIPE_CHUNK];
+        let mut output = Vec::new();
+        let error = loop {
+            match reader.take_chunk(PIPE_CHUNK, &mut buffer).unwrap() {
+                Ok(n) => {
+                    assert!(n > 0 && n <= PIPE_CHUNK);
+                    assert_eq!(n, buffer.len());
+                    output.extend_from_slice(&buffer);
+                }
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(output, vec![7; good]);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "broken coder");
     }
 
     /// A stage thread the system refuses is not an error. The coder it was

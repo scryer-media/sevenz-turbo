@@ -203,8 +203,10 @@ impl<R: Read> Read for BcjReader<R> {
             // the beginning of the buffer so that more data can be
             // copied into filterBuf on the next loop iteration.
             if state.pos + state.filtered + state.unfiltered == FILTER_BUF_SIZE {
-                // state.filter_buf.copy_from_slice(src);
-                state.filter_buf.rotate_left(state.pos);
+                // FilterCoder moves only the bytes that still need delivery
+                // or filtering; consumed bytes need not travel through memory.
+                let end = state.pos + state.filtered + state.unfiltered;
+                state.filter_buf.copy_within(state.pos..end, 0);
                 state.pos = 0;
             }
 
@@ -426,6 +428,39 @@ mod tests {
             let mut reader = make(Cursor::new(data), usize::MAX);
             let mut out = Vec::new();
             copy(&mut reader, &mut out).unwrap();
+        }
+    }
+
+    #[test]
+    fn compaction_preserves_filtered_bytes_and_instruction_tails() {
+        let data = sample(3 * FILTER_BUF_SIZE + 37);
+        let pairs: [(MakeWriter, MakeReader); 8] = [
+            (BcjWriter::new_x86, BcjReader::new_x86),
+            (BcjWriter::new_arm, BcjReader::new_arm),
+            (BcjWriter::new_arm64, BcjReader::new_arm64),
+            (BcjWriter::new_arm_thumb, BcjReader::new_arm_thumb),
+            (BcjWriter::new_ppc, BcjReader::new_ppc),
+            (BcjWriter::new_sparc, BcjReader::new_sparc),
+            (BcjWriter::new_ia64, BcjReader::new_ia64),
+            (BcjWriter::new_riscv, BcjReader::new_riscv),
+        ];
+        for (filter, (writer, reader)) in pairs.into_iter().enumerate() {
+            let mut writer = writer(Cursor::new(Vec::new()), 0);
+            writer.write_all(&data).unwrap();
+            let encoded = writer.finish().unwrap().into_inner();
+            for size in [1, 7, 4093, FILTER_BUF_SIZE - 1, FILTER_BUF_SIZE + 3] {
+                let mut reader = reader(Cursor::new(encoded.clone()), 0);
+                let mut chunk = vec![0; size];
+                let mut decoded = Vec::new();
+                loop {
+                    let count = reader.read(&mut chunk).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    decoded.extend_from_slice(&chunk[..count]);
+                }
+                assert_eq!(decoded, data, "filter {filter}, read size {size}");
+            }
         }
     }
 

@@ -17,7 +17,7 @@ use std::{
 use std::{fs::File, path::Path};
 
 pub(crate) use counting_writer::CountingWriter;
-use lzma_turbo::crc::{Crc32, crc32 as crc32_of};
+use lzma_turbo::crc::{Crc32, crc32 as crc32_of, crc32_combine};
 
 #[cfg(all(feature = "util", not(target_arch = "wasm32")))]
 pub(crate) use self::lazy_file_reader::LazyFileReader;
@@ -143,14 +143,16 @@ fn folder_methods(
         let encrypted =
             |mc: &EncoderConfiguration| matches!(mc.options, Some(EncoderOptions::Aes(_)));
         if sized.iter().any(encrypted) {
-            let mut fresh = Vec::clone(&sized);
-            for mc in &mut fresh {
+            // Sizing usually gave this folder its own allocation already.
+            // Clone only when the configured method list is still shared.
+            let mut fresh = sized;
+            for mc in Arc::make_mut(&mut fresh) {
                 if let Some(EncoderOptions::Aes(options)) = &mut mc.options {
                     getrandom::fill(&mut options.iv)
                         .map_err(|e| Error::other(format!("AES IV: {e}")))?;
                 }
             }
-            return Ok(Arc::new(fresh));
+            return Ok(fresh);
         }
     }
     Ok(sized)
@@ -192,6 +194,14 @@ const SOURCE_READ_LEN: usize = 1 << 20;
 /// one write call per byte or two of output. The buffer is flushed when the folder is done,
 /// explicitly, so that a failed write is an error of that push and not lost in a drop.
 const OUTPUT_BUF_LEN: usize = 256 << 10;
+
+fn output_buffer_len(size: Option<u64>) -> usize {
+    // A size hint chooses only buffering, never how much input is accepted.
+    // Small folders do not need a full large-stream output allocation.
+    size.map_or(OUTPUT_BUF_LEN, |size| {
+        (size.clamp(4096, OUTPUT_BUF_LEN as u64) as usize).next_power_of_two()
+    })
+}
 
 /// The folder's size, as the entries declare it or, failing that, as reading up to
 /// [`READ_AHEAD`] bytes of it finds: the bytes read, which the caller codes first, and the size
@@ -283,21 +293,57 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         self.push_entry(entry, reader, &mut encoder::FolderCoder::default())
     }
 
+    /// Adds an entry whose reader may run on scoped finder or block workers.
+    /// The output stays on this thread and need not implement `Send`.
+    /// Reads are serialized but can move between workers; size read-ahead
+    /// may read here first. Other data-facing methods retain their pipeline.
+    ///
+    /// # Errors
+    /// As [`Self::push_archive_entry`]: invalid coder settings, source or
+    /// destination I/O failures, or an encoder failure. The threaded pull
+    /// route retains source error kinds, including `Interrupted`.
+    ///
+    /// # Panics
+    /// On the threaded pull route, reader panics resume on this thread
+    /// after workers have stopped; output panics also join the scoped
+    /// workers before unwinding out of the encode call. An in-progress
+    /// blocking reader must return before that join can complete.
+    pub fn push_archive_entry_send<R: Read + Send>(
+        &mut self,
+        entry: ArchiveEntry,
+        mut reader: Option<R>,
+    ) -> Result<&ArchiveEntry> {
+        self.push_entry_input(
+            entry,
+            reader.as_mut().map(|r| FolderInput::Send(r)),
+            &mut encoder::FolderCoder::default(),
+        )
+    }
+
     /// [`ArchiveWriter::push_archive_entry`], with `coder` kept by the caller
     /// from one folder to the next.
     fn push_entry<R: Read>(
         &mut self,
+        entry: ArchiveEntry,
+        mut reader: Option<R>,
+        coder: &mut encoder::FolderCoder,
+    ) -> Result<&ArchiveEntry> {
+        self.push_entry_input(entry, reader.as_mut().map(|r| FolderInput::Local(r)), coder)
+    }
+
+    fn push_entry_input(
+        &mut self,
         mut entry: ArchiveEntry,
-        reader: Option<R>,
+        reader: Option<FolderInput<'_>>,
         coder: &mut encoder::FolderCoder,
     ) -> Result<&ArchiveEntry> {
         if !entry.is_directory
-            && let Some(mut r) = reader
+            && let Some(r) = reader
         {
-            let folder = encode_entry(
+            let folder = encode_entry_input(
                 &self.content_methods,
                 entry,
-                &mut r,
+                r,
                 &mut self.output,
                 encoder::Bcj2Sides::Threads,
                 coder,
@@ -366,7 +412,9 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let mut sizes = more_sizes;
         sizes.push(size);
 
-        self.unpack_info.add(methods, sizes, crc).bcj2 = tail.map(|t| t.sizes);
+        self.unpack_info
+            .add(methods, sizes, crc)
+            .set_bcj2(tail.map(|t| t.sizes));
 
         self.files.push(entry);
         Ok(self.files.last().unwrap())
@@ -436,9 +484,21 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         F: Fn(usize, &ArchiveEntry) -> std::io::Result<Option<R>> + Sync,
     {
         let threads = threads.clamp(1, 256);
+        // Every entry is retained for the header. Reserve the known count
+        // without doubling a nearly full metadata vector for one directory.
+        self.files.reserve_exact(entries.len());
         // What a folder on a worker keeps busy, and so how many fit `threads`.
         let per_folder = encoder::folder_threads(&encoder::one_thread_each(&self.content_methods));
         let workers = threads / per_folder;
+        // The serial route owns the entries already: move each one into the
+        // header rather than keeping a second copy until the batch ends.
+        let mut coder = encoder::FolderCoder::default();
+        if workers <= 1 {
+            for (index, entry) in entries.into_iter().enumerate() {
+                self.push_owned(entry, index, &open, &mut coder)?;
+            }
+            return Ok(self);
+        }
         let parallel = |entry: &ArchiveEntry| {
             entry.is_directory
                 || encoder::folder_threads(&sized_methods(
@@ -447,8 +507,6 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 )) <= per_folder
         };
         let eligible: Vec<bool> = entries.iter().map(parallel).collect();
-        // The folders coded here, one after another, share one coder.
-        let mut coder = encoder::FolderCoder::default();
         let mut index = 0;
         while index < entries.len() {
             let start = index;
@@ -482,7 +540,20 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         R: Read,
         F: Fn(usize, &ArchiveEntry) -> std::io::Result<Option<R>>,
     {
-        let entry = entries[index].clone();
+        self.push_owned(entries[index].clone(), index, open, coder)
+    }
+
+    fn push_owned<R, F>(
+        &mut self,
+        entry: ArchiveEntry,
+        index: usize,
+        open: &F,
+        coder: &mut encoder::FolderCoder,
+    ) -> Result<()>
+    where
+        R: Read,
+        F: Fn(usize, &ArchiveEntry) -> std::io::Result<Option<R>>,
+    {
         let reader = if entry.is_directory {
             None
         } else {
@@ -702,7 +773,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 sub_stream_sizes,
                 sub_stream_crcs,
             )
-            .bcj2 = bcj2.map(|b| b.sizes);
+            .set_bcj2(bcj2.map(|b| b.sizes));
         self.files.extend(entries);
         Ok(self)
     }
@@ -716,30 +787,63 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         entries: Vec<ArchiveEntry>,
         reader: Vec<SourceReader<R>>,
     ) -> Result<&mut Self> {
+        self.push_entries_input(entries, reader, |r| FolderInput::Local(r))
+    }
+
+    /// Solid compression with readers that may run on scoped finder or block
+    /// workers. Reads are serialized but may move between workers, with
+    /// size read-ahead here first. Output, bookkeeping and later coders stay here.
+    ///
+    /// # Errors
+    /// As [`Self::push_archive_entries`]: invalid coder settings, source or
+    /// destination I/O failures, or an encoder failure. The threaded pull
+    /// route retains source error kinds, including `Interrupted`.
+    ///
+    /// # Panics
+    /// Mismatched entry/reader counts panic. On the threaded pull route,
+    /// reader panics resume here after workers have stopped; output
+    /// panics also join the scoped workers before leaving the encode call.
+    /// An in-progress blocking reader must return before joining can complete.
+    pub fn push_archive_entries_send<R: Read + Send>(
+        &mut self,
+        entries: Vec<ArchiveEntry>,
+        reader: Vec<SourceReader<R>>,
+    ) -> Result<&mut Self> {
+        self.push_entries_input(entries, reader, |r| FolderInput::Send(r))
+    }
+
+    fn push_entries_input<R: Read>(
+        &mut self,
+        entries: Vec<ArchiveEntry>,
+        reader: Vec<SourceReader<R>>,
+        wrap: for<'a> fn(&'a mut SeqReader<SourceReader<R>>) -> FolderInput<'a>,
+    ) -> Result<&mut Self> {
         let mut entries = entries;
         let mut r = SeqReader::new(reader);
         assert_eq!(r.reader_len(), entries.len());
         let mut compressed_len = 0;
         let mut compressed = CompressWrapWriter::new(&mut self.output, &mut compressed_len);
-        let mut out = std::io::BufWriter::with_capacity(OUTPUT_BUF_LEN, &mut compressed);
         let (head, folder) = folder_size(&entries, &mut r)
             .map_err(|e| Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries))))?;
+        let mut out = std::io::BufWriter::with_capacity(output_buffer_len(folder), &mut compressed);
         let content_methods = &folder_methods(&self.content_methods, folder)?;
         let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(content_methods.len() - 1);
         let mut bcj2 = None;
+        let mut input = wrap(&mut r);
         let pulled = match content_methods.split_last() {
-            Some((first, _)) => encoder::FolderCoder::plan(first)?,
+            Some((first, _)) => input.plan(first)?,
             None => None,
         };
 
-        let (crc, size) = if let Some(pulled) = pulled {
-            // A one-thread coder pulls the members itself: no read buffer,
-            // no hand-off chunks and no encoder thread.
-            encode_pulled(
+        let (_, size) = if let Some(pulled) = pulled {
+            // Pull into the coder's owned window; the scoped finder can
+            // borrow Send inputs while output remains on this thread.
+            encode_pulled::<false, _>(
                 content_methods,
                 &pulled,
                 &mut encoder::FolderCoder::default(),
-                &mut head.as_slice().chain(&mut r),
+                &mut input,
+                &head,
                 &mut out,
                 &mut more_sizes,
                 &mut bcj2,
@@ -754,8 +858,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 &mut bcj2,
                 encoder::Bcj2Sides::Threads,
             )?;
-            let mut write_len = 0;
-            let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
+            let mut w = CountingWriter::new(&mut w);
             w.write_all(&head).map_err(|e| {
                 Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries)))
             })?;
@@ -763,7 +866,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             let mut buf = input_buffer::InputBuffer::new(folder, content_methods);
 
             loop {
-                match r.read(&mut buf) {
+                match input.read(&mut buf) {
                     Ok(n) => {
                         if n == 0 {
                             break;
@@ -795,11 +898,12 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 Error::io_msg(e, format!("Encode entry:{}", entries_names(&entries)))
             })?;
 
-            (w.crc_value(), write_len)
+            (0, w.counting().get())
         };
         out.flush()
             .map_err(|e| Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries))))?;
         drop(out);
+        let crc = fold_source_crcs(&r);
         let compressed_crc = compressed.crc_value();
         let mut sub_stream_crcs = Vec::with_capacity(entries.len());
         let mut sub_stream_sizes = Vec::with_capacity(entries.len());
@@ -834,7 +938,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 sub_stream_sizes,
                 sub_stream_crcs,
             )
-            .bcj2 = bcj2.map(|b| b.sizes);
+            .set_bcj2(bcj2.map(|b| b.sizes));
 
         self.files.extend(entries);
         Ok(self)
@@ -963,6 +1067,12 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     fn write_encoded_header<H: Write>(&mut self, header: &mut H) -> std::io::Result<()> {
         let mut raw_header = Vec::with_capacity(64 * 1024);
         self.write_header(&mut raw_header)?;
+        // Only finish calls this: the serialized header now owns every
+        // member record needed below. Release those records before allocating
+        // the header coder's dictionary and match-finder tables.
+        self.files = Vec::new();
+        self.pack_info = PackInfo::default();
+        self.unpack_info = UnpackInfo::default();
         let mut pack_info = PackInfo::default();
 
         let position = self.output.stream_position()?;
@@ -986,7 +1096,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             }
         }
 
-        methods.push(EncoderConfiguration::new(EncoderMethod::LZMA));
+        let (header_method, pulled) = encoder::header_coder(size);
+        methods.push(header_method);
 
         // The header's length is known: a dictionary larger than it is never used.
         let methods =
@@ -996,19 +1107,22 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
         let mut compress_size = 0;
         let mut compressed = CompressWrapWriter::new(&mut encoded_data, &mut compress_size);
-        {
-            let mut encoder = Self::create_writer(
-                &methods,
-                &mut compressed,
-                &mut more_sizes,
-                &mut None,
-                encoder::Bcj2Sides::Threads,
-            )
-            .map_err(std::io::Error::other)?;
-            encoder.write_all(&raw_header)?;
-            encoder.flush()?;
-            let _ = encoder.write(&[])?;
-        }
+        // The header's first coder is always single-threaded LZMA. Pull it
+        // here, as for a single-threaded data folder, keeping the optional
+        // AES coder and its size counter after it in the same order.
+        encode_pulled::<false, _>(
+            &methods,
+            &pulled,
+            &mut encoder::FolderCoder::default(),
+            &mut FolderInput::Local(&mut raw_header.as_slice()),
+            &[],
+            &mut compressed,
+            &mut more_sizes,
+            &mut None,
+            encoder::Bcj2Sides::Threads,
+            Error::from,
+        )
+        .map_err(std::io::Error::other)?;
 
         let compress_crc = compressed.crc_value();
         let compress_size = *compressed.bytes_written;
@@ -1222,27 +1336,98 @@ struct EncodedFolder {
     bcj2: Option<Bcj2Packed>,
 }
 
-/// Codes `entry`'s data from `r` as one folder with `content_methods`, sized
-/// for the folder, writing the main pack stream to `output`. `sides` is where
-/// a BCJ2 chain's call and jump coders run.
-///
-/// When the coder the data meets first is LZMA or LZMA2 on one thread,
-/// `coder` runs it here, reading `r` itself, and keeps it for the next folder
-/// this thread codes (see [`encoder::FolderCoder`]); the bytes are the ones the
-/// chain [`ArchiveWriter::create_writer`] builds would write.
-///
-/// The checksums of the data and of the compressed bytes are taken here, on
-/// the thread doing the coding, which is what lets a worker do all of it.
-/// Codes one folder whose data-facing coder is `pulled`: that coder runs on
-/// this thread and pulls `input` itself, and the rest of `methods` is built
-/// after it as `create_writer` builds a chain. Returns the CRC-32 and length
-/// of what was read.
+/// C: `CFolderInStream::Read` checksums each file once. Preserve our folder
+/// checksum by folding those checksums instead of hashing every byte twice.
+fn fold_source_crcs<R>(readers: &[SourceReader<R>]) -> u32 {
+    let Some((first, rest)) = readers.split_first() else {
+        return 0;
+    };
+    rest.iter().fold(first.crc_value(), |crc, source| {
+        crc32_combine(crc, source.crc_value(), source.read_count() as u64)
+    })
+}
+
+/// Keeps a reader's Send capability until the scoped finder borrows it.
+/// This enum itself is deliberately not Send: local readers remain valid.
+enum FolderInput<'a> {
+    Local(&'a mut dyn Read),
+    Send(&'a mut (dyn Read + Send)),
+}
+
+impl Read for FolderInput<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Local(input) => input.read(buf),
+            Self::Send(input) => input.read(buf),
+        }
+    }
+}
+
+impl FolderInput<'_> {
+    fn plan(&self, method: &EncoderConfiguration) -> Result<Option<encoder::PulledCoder>> {
+        match self {
+            Self::Local(_) => encoder::FolderCoder::plan(method),
+            Self::Send(_) => encoder::FolderCoder::plan_send(method),
+        }
+    }
+
+    fn encode<const CHECKSUM: bool>(
+        &mut self,
+        prefix: &[u8],
+        coder: &mut encoder::FolderCoder,
+        plan: &encoder::PulledCoder,
+        out: &mut dyn Write,
+    ) -> std::io::Result<(u32, usize)> {
+        let mut read_len = 0;
+        let crc = match self {
+            Self::Local(reader) => {
+                let mut input = CrcReader {
+                    inner: prefix.chain(&mut **reader),
+                    crc: CHECKSUM.then(Crc32::new),
+                    read: &mut read_len,
+                };
+                coder.encode(plan, &mut input, out)?;
+                input.crc
+            }
+            Self::Send(reader) => {
+                let mut input = CrcReader {
+                    inner: prefix.chain(&mut **reader),
+                    crc: CHECKSUM.then(Crc32::new),
+                    read: &mut read_len,
+                };
+                coder.encode_send(plan, &mut FolderReadCap(&mut input), out)?;
+                // All workers joined: checksum and count are ours again.
+                input.crc
+            }
+        };
+        Ok((crc.map_or(0, Crc32::finalize), read_len))
+    }
+}
+
+/// C++: CFolderInStream::Read caps each request before reading and CRCing
+/// the same destination bytes. Keep that order for the Send archive route;
+/// this wrapper owns no staging buffer and does not limit the stream length.
+struct FolderReadCap<R>(R);
+
+impl<R: Read> Read for FolderReadCap<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(1 << 20);
+        self.0.read(&mut buf[..n])
+    }
+}
+
+/// Codes one folder whose data-facing coder pulls `input` directly, locally
+/// or through its scoped workers. The rest of `methods` is built on this
+/// thread as `create_writer` builds a chain. Returns the CRC-32 and length
+/// of what was read. With `CHECKSUM` disabled, the caller already owns the
+/// checksum and the returned CRC is zero; input length is still counted.
 #[allow(clippy::too_many_arguments)]
-fn encode_pulled<W: Write>(
+fn encode_pulled<const CHECKSUM: bool, W: Write>(
     methods: &[EncoderConfiguration],
     pulled: &encoder::PulledCoder,
     coder: &mut encoder::FolderCoder,
-    input: &mut dyn Read,
+    input: &mut FolderInput<'_>,
+    prefix: &[u8],
     out: &mut W,
     more_sizes: &mut Vec<Rc<Cell<usize>>>,
     bcj2: &mut Option<encoder::Bcj2Slot>,
@@ -1264,22 +1449,18 @@ fn encode_pulled<W: Write>(
         more_sizes.push(counting.counting());
         Box::new(counting)
     };
-    let mut read_len = 0;
-    let mut input = CrcReader {
-        inner: input,
-        crc: Crc32::new(),
-        read: &mut read_len,
-    };
-    coder
-        .encode(pulled, &mut input, &mut chain)
+    let result = input
+        .encode::<CHECKSUM>(prefix, coder, pulled, &mut chain)
         .map_err(&error)?;
     chain.flush().map_err(&error)?;
     // The empty write ends every coder after this one.
     chain.write(&[]).map_err(&error)?;
     drop(chain);
-    Ok((input.crc.finalize(), read_len))
+    Ok(result)
 }
 
+/// Codes an entry's folder, retaining a pulled coder for the next folder
+/// when possible. Both input and packed CRCs are computed on this worker.
 fn encode_entry<R: Read, O: Write>(
     content_methods: &Arc<Vec<EncoderConfiguration>>,
     entry: ArchiveEntry,
@@ -1288,26 +1469,44 @@ fn encode_entry<R: Read, O: Write>(
     sides: encoder::Bcj2Sides,
     coder: &mut encoder::FolderCoder,
 ) -> Result<EncodedFolder> {
+    encode_entry_input(
+        content_methods,
+        entry,
+        FolderInput::Local(r),
+        output,
+        sides,
+        coder,
+    )
+}
+
+fn encode_entry_input<O: Write>(
+    content_methods: &Arc<Vec<EncoderConfiguration>>,
+    entry: ArchiveEntry,
+    mut r: FolderInput<'_>,
+    output: O,
+    sides: encoder::Bcj2Sides,
+    coder: &mut encoder::FolderCoder,
+) -> Result<EncodedFolder> {
     let mut compressed_len = 0;
     let mut compressed = CompressWrapWriter::new(output, &mut compressed_len);
-    let mut out = std::io::BufWriter::with_capacity(OUTPUT_BUF_LEN, &mut compressed);
-
     let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(content_methods.len() - 1);
-    let (head, folder) = folder_size([&entry], r)
+    let (head, folder) = folder_size([&entry], &mut r)
         .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+    let mut out = std::io::BufWriter::with_capacity(output_buffer_len(folder), &mut compressed);
     let methods = folder_methods(content_methods, folder)?;
     let mut bcj2 = None;
     let pulled = match methods.split_last() {
-        Some((first, _)) => encoder::FolderCoder::plan(first)?,
+        Some((first, _)) => r.plan(first)?,
         None => None,
     };
 
     let (crc, size) = if let Some(pulled) = pulled {
-        encode_pulled(
+        encode_pulled::<true, _>(
             &methods,
             &pulled,
             coder,
-            &mut head.as_slice().chain(&mut *r),
+            &mut r,
+            &head,
             &mut out,
             &mut more_sizes,
             &mut bcj2,
@@ -1476,14 +1675,16 @@ impl Write for StageSink<'_, '_> {
 /// written into a coder.
 struct CrcReader<'a, R> {
     inner: R,
-    crc: Crc32,
+    crc: Option<Crc32>,
     read: &'a mut usize,
 }
 
 impl<R: Read> Read for CrcReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
-        self.crc.update(&buf[..n]);
+        if let Some(crc) = &mut self.crc {
+            crc.update(&buf[..n]);
+        }
         *self.read += n;
         Ok(n)
     }
@@ -1647,13 +1848,13 @@ pub fn prepare_block<R: Read>(
     let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(methods.len() - 1);
     let mut bcj2 = None;
 
-    let (crc, size, compressed_crc) = {
+    let (size, compressed_crc) = {
         // Outer wrapper: the CRC of the compressed bytes, computed as they are produced on this
         // thread. `push_prepared_block` would otherwise have to make a second pass over the whole
         // buffer on the serialized side, which is the work this function exists to move off it.
         let mut compressed_len = 0;
         let mut compressed = CompressWrapWriter::new(&mut out, &mut compressed_len);
-        let (crc, size) = {
+        let size = {
             let mut w = ArchiveWriter::<std::io::Cursor<Vec<u8>>>::create_writer(
                 &methods,
                 &mut compressed,
@@ -1661,8 +1862,7 @@ pub fn prepare_block<R: Read>(
                 &mut bcj2,
                 encoder::Bcj2Sides::Threads,
             )?;
-            let mut write_len = 0;
-            let mut w = CompressWrapWriter::new(&mut w, &mut write_len);
+            let mut w = CountingWriter::new(&mut w);
             w.write_all(&head).map_err(|e| {
                 Error::io_msg(
                     e,
@@ -1700,11 +1900,12 @@ pub fn prepare_block<R: Read>(
                     format!("prepare_block: finish:{}", entries_names(&entries)),
                 )
             })?;
-            (w.crc_value(), write_len)
+            w.counting().get()
         };
-        (crc, size, compressed.crc_value())
+        (size, compressed.crc_value())
     };
 
+    let crc = fold_source_crcs(&r);
     let mut sub_stream_crcs = Vec::with_capacity(entries.len());
     let mut sub_stream_sizes = Vec::with_capacity(entries.len());
     for i in 0..entries.len() {
@@ -1732,6 +1933,66 @@ pub fn prepare_block<R: Read>(
         sub_stream_crcs,
         bcj2: Bcj2Packed::take(bcj2),
     })
+}
+
+#[cfg(test)]
+mod solid_crc_tests {
+    use super::*;
+    use crate::{ArchiveReader, Password, encoder_options::Lzma2Options};
+    use std::io::Cursor;
+
+    #[test]
+    fn folded_solid_crcs_preserve_pulled_pushed_and_prepared_archives() {
+        let parts: Vec<Vec<u8>> = [17, 0, 65_553, 131_079]
+            .into_iter()
+            .map(|len| (0..len).map(|i| ((i * 29) ^ (i >> 7)) as u8).collect())
+            .collect();
+        let expected_crc = crc32_of(&parts.concat());
+        let methods = [
+            EncoderConfiguration::from(EncoderMethod::COPY),
+            Lzma2Options::from_level(1).into(),
+            Lzma2Options::from_level_mt(5, 4, 1 << 16).into(),
+        ];
+        for method in methods {
+            for known in [false, true] {
+                for prepared in [false, true] {
+                    let entries = parts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, bytes)| {
+                            let mut entry = ArchiveEntry::new_file(&format!("member-{i}"));
+                            if known {
+                                entry.size = bytes.len() as u64;
+                            }
+                            entry
+                        })
+                        .collect();
+                    let readers = parts
+                        .iter()
+                        .map(|p| SourceReader::new(p.as_slice()))
+                        .collect();
+                    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+                    writer.set_content_methods(vec![method.clone()]);
+                    if prepared {
+                        let block = prepare_block(Arc::new(vec![method.clone()]), entries, readers)
+                            .unwrap();
+                        assert_eq!(block.crc, expected_crc);
+                        assert_eq!(block.compressed_crc, crc32_of(&block.compressed));
+                        writer.push_prepared_block(block).unwrap();
+                    } else {
+                        writer.push_archive_entries(entries, readers).unwrap();
+                        assert_eq!(writer.unpack_info.blocks[0].crc, expected_crc);
+                    }
+                    let archive = writer.finish().unwrap().into_inner();
+                    let mut reader =
+                        ArchiveReader::new(Cursor::new(archive), Password::empty()).unwrap();
+                    for (i, bytes) in parts.iter().enumerate() {
+                        assert_eq!(reader.read_file(&format!("member-{i}")).unwrap(), *bytes);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1807,18 +2068,18 @@ mod bcj2_tests {
         );
         for side in &block.coders[..2] {
             assert_eq!(side.properties(), [0x6C, 0x00, 0x00, 0x10, 0x00]);
-            assert_eq!((side.num_in_streams, side.num_out_streams), (1, 1));
+            assert_eq!((side.num_in_streams(), side.num_out_streams()), (1, 1));
         }
         let bcj2 = &block.coders[3];
-        assert_eq!((bcj2.num_in_streams, bcj2.num_out_streams), (4, 1));
+        assert_eq!((bcj2.num_in_streams(), bcj2.num_out_streams()), (4, 1));
         assert!(bcj2.properties().is_empty());
-        assert_eq!(block.total_input_streams, 7);
-        assert_eq!(block.total_output_streams, 4);
-        assert_eq!(block.bind_pairs, [bp(5, 0), bp(4, 1), bp(3, 2)]);
-        assert_eq!(block.packed_streams, [2, 6, 1, 0]);
+        assert_eq!(block.total_input_streams(), 7);
+        assert_eq!(block.total_output_streams(), 4);
+        assert_eq!(block.bind_pairs(), &[bp(5, 0), bp(4, 1), bp(3, 2)]);
+        assert_eq!(block.packed_streams(), &[2, 6, 1, 0]);
 
-        let [jump, call, main, total] = block.unpack_sizes[..] else {
-            panic!("four unpack sizes: {:?}", block.unpack_sizes);
+        let [jump, call, main, total] = block.unpack_sizes()[..] else {
+            panic!("four unpack sizes: {:?}", block.unpack_sizes());
         };
         assert_eq!(total, data.len() as u64);
         assert!(jump > 0 && call > 0, "jump {jump} call {call}");
@@ -1846,10 +2107,83 @@ mod bcj2_tests {
             ArchiveReader::new(Cursor::new(bytes.as_slice()), Password::empty()).unwrap();
         let block = &reader.archive().blocks[0];
         assert_eq!(block.coders.len(), 5);
-        assert_eq!(block.coders[4].num_in_streams, 4);
-        assert_eq!(block.bind_pairs, [bp(6, 0), bp(5, 1), bp(4, 3), bp(3, 2)]);
-        assert_eq!(block.packed_streams, [2, 7, 1, 0]);
+        assert_eq!(block.coders[4].num_in_streams(), 4);
+        assert_eq!(
+            block.bind_pairs(),
+            &[bp(6, 0), bp(5, 1), bp(4, 3), bp(3, 2)]
+        );
+        assert_eq!(block.packed_streams(), &[2, 7, 1, 0]);
         assert!(reader.read_file("amber_quarry/tool.exe").unwrap() == data);
+    }
+}
+
+#[cfg(test)]
+mod header_coder_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn pulled_headers_match_the_writer_chain_bytes_and_sizes() {
+        let chains = [
+            vec![EncoderConfiguration::new(EncoderMethod::LZMA)],
+            #[cfg(feature = "aes256")]
+            vec![
+                crate::encoder_options::AesEncoderOptions {
+                    password: "header-test".into(),
+                    iv: [0x31; 16],
+                    salt: [0x72; 16],
+                    num_cycles_power: 4,
+                }
+                .into(),
+                EncoderConfiguration::new(EncoderMethod::LZMA),
+            ],
+        ];
+        for chain in chains {
+            for len in [0, 1, 17, 65_537, 524_289] {
+                let raw: Vec<u8> = (0..len).map(|i| (i ^ (i >> 9)) as u8).collect();
+                let methods = sized_methods(&Arc::new(chain.clone()), Some(len as u64));
+                let mut old = Vec::new();
+                let mut old_sizes = Vec::new();
+                {
+                    let mut writer = ArchiveWriter::<Cursor<Vec<u8>>>::create_writer(
+                        &methods,
+                        &mut old,
+                        &mut old_sizes,
+                        &mut None,
+                        encoder::Bcj2Sides::Threads,
+                    )
+                    .unwrap();
+                    writer.write_all(&raw).unwrap();
+                    writer.flush().unwrap();
+                    let _ = writer.write(&[]).unwrap();
+                }
+                let pulled = encoder::FolderCoder::plan(methods.last().unwrap())
+                    .unwrap()
+                    .unwrap();
+                let mut new = Vec::new();
+                let mut new_sizes = Vec::new();
+                let (crc, size) = encode_pulled::<true, _>(
+                    &methods,
+                    &pulled,
+                    &mut encoder::FolderCoder::default(),
+                    &mut FolderInput::Local(&mut raw.as_slice()),
+                    &[],
+                    &mut new,
+                    &mut new_sizes,
+                    &mut None,
+                    encoder::Bcj2Sides::Threads,
+                    Error::from,
+                )
+                .unwrap();
+                assert_eq!(new, old, "length {len}, methods {}", methods.len());
+                assert_eq!(size, len);
+                assert_eq!(crc, crc32_of(&raw));
+                assert_eq!(
+                    new_sizes.iter().map(|n| n.get()).collect::<Vec<_>>(),
+                    old_sizes.iter().map(|n| n.get()).collect::<Vec<_>>()
+                );
+            }
+        }
     }
 }
 
@@ -1958,5 +2292,60 @@ mod bcj2_tail_stage_tests {
                 assert!(streams[i] == *bytes, "job {job} stream {i}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod send_request_tests {
+    use super::*;
+
+    #[test]
+    fn send_folder_requests_crc_and_count_bounded_pieces() {
+        struct Observed<'a> {
+            bytes: &'a [u8],
+            requests: Vec<usize>,
+        }
+        impl Read for Observed<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                self.requests.push(out.len());
+                self.bytes.read(out)
+            }
+        }
+        let data: Vec<_> = (0..(3 << 20) + 19).map(|i| (i % 251) as u8).collect();
+        let mut observed = Observed {
+            bytes: &data,
+            requests: Vec::new(),
+        };
+        let mut source = SourceReader::new(&mut observed);
+        let mut count = 0;
+        let crc = {
+            let mut counted = CrcReader {
+                inner: &mut source,
+                crc: Some(Crc32::new()),
+                read: &mut count,
+            };
+            let mut cap = FolderReadCap(&mut counted);
+            let mut destination = vec![0; data.len()];
+            let mut pos = 0;
+            loop {
+                // Deliberately request more than one chunk, as a finder
+                // refill does; the underlying reader must see <= 1 MiB.
+                let mut scratch = vec![0; 2 << 20];
+                let n = cap.read(&mut scratch).unwrap();
+                if n == 0 {
+                    break;
+                }
+                destination[pos..pos + n].copy_from_slice(&scratch[..n]);
+                pos += n;
+            }
+            assert_eq!(destination, data);
+            counted.crc.unwrap().finalize()
+        };
+        assert_eq!(count, data.len());
+        assert_eq!(crc, crc32_of(&data));
+        assert_eq!(source.read_count(), data.len());
+        assert_eq!(source.crc_value(), crc);
+        assert!(observed.requests.iter().all(|n| *n == 1 << 20));
+        assert_eq!(observed.requests.len(), 5);
     }
 }

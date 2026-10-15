@@ -4,6 +4,8 @@ mod password;
 
 #[cfg(feature = "aes256")]
 pub(crate) use aes::*;
+#[cfg(feature = "aes256")]
+pub use aes::{AesKey, AesProperties};
 pub use password::*;
 
 // Hard decoder ceiling; raw-key mode (63) performs no derivation.

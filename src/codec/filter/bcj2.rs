@@ -21,12 +21,15 @@ use super::error_invalid_data;
 /// How much of a stream is read at a time.
 const BUF_SIZE: usize = 1 << 18;
 
+type ChunkReader<R> = fn(&mut R, usize, &mut Vec<u8>) -> Option<std::io::Result<usize>>;
+
 /// Reader for BCJ2-filtered data with multiple input streams.
 pub struct Bcj2Reader<R> {
     inputs: Vec<R>,
     /// A window per stream, allocated once: read into up to `filled` and
     /// consumed from `pos`.
-    bufs: [Box<[u8]>; NUM_STREAMS],
+    bufs: [Vec<u8>; NUM_STREAMS],
+    chunk_reader: Option<ChunkReader<R>>,
     pos: [usize; NUM_STREAMS],
     filled: [usize; NUM_STREAMS],
     /// Which inputs have returned end-of-stream.
@@ -44,13 +47,26 @@ impl<R> Bcj2Reader<R> {
     pub fn new(inputs: Vec<R>, uncompressed_size: u64) -> Self {
         Self {
             inputs,
-            bufs: std::array::from_fn(|_| vec![0u8; BUF_SIZE].into_boxed_slice()),
+            bufs: std::array::from_fn(|_| vec![0u8; BUF_SIZE]),
+            chunk_reader: None,
             pos: [0; NUM_STREAMS],
             filled: [0; NUM_STREAMS],
             eof: [false; NUM_STREAMS],
             decoder: Bcj2Dec::new(),
             remaining: uncompressed_size,
         }
+    }
+
+    /// A pipeline may transfer its already-owned output instead of copying
+    /// it into our next input window. Ordinary readers retain Read behavior.
+    pub(crate) fn with_chunks(
+        inputs: Vec<R>,
+        uncompressed_size: u64,
+        chunk_reader: ChunkReader<R>,
+    ) -> Self {
+        let mut reader = Self::new(inputs, uncompressed_size);
+        reader.chunk_reader = Some(chunk_reader);
+        reader
     }
 }
 
@@ -75,6 +91,7 @@ impl<R: Read> Read for Bcj2Reader<R> {
         let Self {
             inputs,
             bufs,
+            chunk_reader,
             pos,
             filled,
             eof,
@@ -103,39 +120,71 @@ impl<R: Read> Read for Bcj2Reader<R> {
                 break;
             }
 
-            // The decoder stopped short of the window, so a stream it needs
-            // is dry: an empty buffer, or a word stream holding fewer than
-            // the four bytes it is read in. A stream that still has a whole
-            // read's worth was not the one that stopped it, so it is left.
-            let mut refilled = false;
-            for stream in 0..NUM_STREAMS {
-                if eof[stream]
-                    || !pending(&bufs[stream], pos[stream], filled[stream], stream).is_empty()
-                {
-                    continue;
-                }
-                // Move what is left — at most the three bytes of a partial
-                // word — to the front and read on top of it. The window is
-                // allocated once and never resized: a stream that is handed
-                // over a few bytes at a time is refilled once per few bytes,
-                // and growing a buffer back to its full length each time
-                // would spend the whole read zeroing it.
-                bufs[stream].copy_within(pos[stream]..filled[stream], 0);
-                filled[stream] -= pos[stream];
-                pos[stream] = 0;
-                let n = inputs[stream].read(&mut bufs[stream][filled[stream]..])?;
-                filled[stream] += n;
+            // CBaseDecoder::ReadInStream refills only dec.state. An unrelated
+            // empty input may be on a slow worker: reading it here would
+            // stall output that the requested stream can already supply.
+            let Some(stream) = decoder.required_input() else {
+                break;
+            };
+            if eof[stream] {
+                break;
+            }
+            // Retain the partial word (at most three bytes) without clearing
+            // or growing the initialized window. Retry Interrupted here:
+            // this read may follow output already consumed from the decoder.
+            bufs[stream].copy_within(pos[stream]..filled[stream], 0);
+            filled[stream] -= pos[stream];
+            pos[stream] = 0;
+            if filled[stream] == 0
+                && let Some(take) = chunk_reader
+                && let Some(result) = take(&mut inputs[stream], BUF_SIZE, &mut bufs[stream])
+            {
+                let n = result?;
+                debug_assert_eq!(n, bufs[stream].len());
+                debug_assert!(n <= BUF_SIZE);
+                filled[stream] = n;
                 if n == 0 {
                     eof[stream] = true;
-                } else {
-                    refilled = true;
+                    break;
                 }
+                continue;
             }
-            if !refilled {
+            // A transferred short piece or a remaining partial word must
+            // leave room for the ordinary reader to finish the next word.
+            bufs[stream].resize(BUF_SIZE, 0);
+            let n = loop {
+                match inputs[stream].read(&mut bufs[stream][filled[stream]..]) {
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    result => break result?,
+                }
+            };
+            filled[stream] += n;
+            if n == 0 {
+                eof[stream] = true;
                 break;
             }
         }
 
+        if *remaining == 0 {
+            // Preserve initialization/error checks for unused side coders.
+            // The old eager refill touched them before decoding the main
+            // stream. Defer that touch until output is complete, rather than
+            // silently accepting an error from an input we no longer need.
+            for stream in [STREAM_CALL, STREAM_JUMP] {
+                if filled[stream] == 0 && !eof[stream] {
+                    let n = loop {
+                        match inputs[stream].read(&mut bufs[stream]) {
+                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                continue;
+                            }
+                            result => break result?,
+                        }
+                    };
+                    filled[stream] = n;
+                    eof[stream] = n == 0;
+                }
+            }
+        }
         if *remaining == 0 && !decoder.is_maybe_finished_code() {
             return Err(error_invalid_data(
                 "bcj2 decode error: range coder did not end",
@@ -356,6 +405,104 @@ mod tests {
             self.at += n;
             Ok(n)
         }
+    }
+
+    #[test]
+    fn unrelated_inputs_do_not_block_the_requested_stream() {
+        struct Input {
+            data: std::io::Cursor<Vec<u8>>,
+            unused: bool,
+            main: bool,
+            main_read: std::rc::Rc<std::cell::Cell<bool>>,
+        }
+        impl Read for Input {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                assert!(
+                    !self.unused || self.main_read.get(),
+                    "waited on an unused stream"
+                );
+                let n = self.data.read(buf)?;
+                if self.main && self.data.position() == self.data.get_ref().len() as u64 {
+                    self.main_read.set(true);
+                }
+                Ok(n)
+            }
+        }
+        let expected = vec![0x90; BUF_SIZE + 17];
+        let streams = encode(&expected);
+        assert!(streams[STREAM_CALL].is_empty() && streams[STREAM_JUMP].is_empty());
+        let main_read = std::rc::Rc::new(std::cell::Cell::new(false));
+        let inputs = streams
+            .into_iter()
+            .enumerate()
+            .map(|(stream, data)| Input {
+                data: std::io::Cursor::new(data),
+                unused: stream == STREAM_CALL || stream == STREAM_JUMP,
+                main: stream == STREAM_MAIN,
+                main_read: main_read.clone(),
+            })
+            .collect();
+        let mut actual = Vec::new();
+        Bcj2Reader::new(inputs, expected.len() as u64)
+            .read_to_end(&mut actual)
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn an_unused_side_coder_still_reports_its_error() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(error_invalid_data("broken side coder"))
+            }
+        }
+        let expected = vec![0x90; 128];
+        for broken in [STREAM_CALL, STREAM_JUMP] {
+            let mut inputs: Vec<Box<dyn Read>> = encode(&expected)
+                .into_iter()
+                .map(|data| Box::new(std::io::Cursor::new(data)) as Box<dyn Read>)
+                .collect();
+            inputs[broken] = Box::new(Broken);
+            let error = Bcj2Reader::new(inputs, expected.len() as u64)
+                .read_to_end(&mut Vec::new())
+                .unwrap_err();
+            assert_eq!(error.to_string(), "broken side coder");
+        }
+    }
+
+    #[test]
+    fn interrupted_refills_preserve_already_decoded_output() {
+        struct Input {
+            data: Trickle,
+            interrupt: bool,
+        }
+        impl Read for Input {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.interrupt = !self.interrupt;
+                if self.interrupt {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                self.data.read(buf)
+            }
+        }
+        let expected = pseudo_x86(128 * 1024);
+        let inputs = encode(&expected)
+            .into_iter()
+            .map(|data| Input {
+                data: Trickle {
+                    data,
+                    at: 0,
+                    step: 3,
+                },
+                interrupt: false,
+            })
+            .collect();
+        let mut actual = Vec::new();
+        Bcj2Reader::new(inputs, expected.len() as u64)
+            .read_to_end(&mut actual)
+            .unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -45,13 +45,15 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   hooks, renovate, issue templates, `AGENTS.md`, `SECURITY.md`,
   `CONTRIBUTORS.md`. Upstream's `.github/workflows/rust.yml` and
   `.github/dependabot.yml` were removed as duplicates of these.
-- The `lzma-turbo` dependency is a crates.io version pin. While the two
-  crates are developed together a `path` to the sibling checkout is added and
-  dropped again before release; `cargo xtask release` refuses to tag while it
-  is there.
+- The performance checkpoint pins `lzma-turbo` to its reviewed Git revision,
+  so paired development builds do not require a machine-specific checkout.
+  Registry packaging awaits the matching library publication and a registry
+  dependency pin in a separate operator-owned release step.
 
 ### Decoding
 
+- Parsed header storage is released before final stream maps are allocated,
+  avoiding overlap between the encoded representation and lookup tables.
 - LZMA (`0x030101`) and LZMA2 (`0x21`) are decoded by
   [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo) instead of
   `lzma-rust2`. On the fixtures in `docs/benchmarking.md` this is 1.62x
@@ -139,6 +141,20 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   would share one thread decodes as a pipeline of stages on threads of their
   own. Upstream decodes every folder and every coder chain on the calling
   thread.
+- Complete positional graph inputs feed their workers directly. BCJ2 takes
+  ownership of queued output buffers, avoiding another copy while preserving
+  the stream cursor, checksums and worker error ordering.
+- `PositionalBlockDecoder` owns an independent source cursor and can move to
+  a caller's worker pool, sharing parsed metadata and password state. COPY
+  and AES support owned-buffer delivery through `EntryRead::write_rest`.
+  Finite COPY budgets reuse the charged input buffer or upstream plaintext,
+  preserving admission without a second output allocation.
+- `ArchiveReader::extract_to` shares the confined filesystem extraction
+  guards and can write large single-member LZMA2 archives directly from
+  bounded ring workers. Ordered reads and other archive graphs retain their
+  existing scheduling and delivery contracts. File-backed `open` enables
+  complete-input inspection; custom sources explicitly opt in through
+  `set_input_complete` so progressive inputs are not scanned ahead.
 - LZMA1 is now subject to the same dictionary memory limit as LZMA2. Upstream
   bounded only LZMA2, so an archive declaring a 4 GiB LZMA1 dictionary would
   try to allocate it.
@@ -431,6 +447,88 @@ Everything here is new surface; no upstream signature changed meaning.
 - The vendored BCJ round-trip tests generate their sample data instead of
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
+
+## Unreleased
+
+- Reduce non-solid archive metadata storage for ordinary one-input/one-output
+  coders and one-member folders, preserving public metadata mutation semantics
+  and full-width public checksum validation. Deliver contiguous single-thread
+  LZMA2 output directly to entry consumers while preserving checksum and error
+  ordering, partial reads and dictionary-wrap fallback.
+- Add `ArchiveWriter::push_archive_entry_send` and `push_archive_entries_send`
+  for Send readers while preserving non-Send outputs and the existing generic
+  APIs. Filesystem helpers use the new route to feed LZMA2 finder and block
+  workers directly, without the archive source buffer or input bridge
+  copies. Match the SDK's 1 MiB read/CRC pieces; retain caller-local output,
+  thread-start and other-coder fallbacks, checksums, source errors and panic
+  propagation.
+- Add `PositionalBlockDecoder` for independent folder decoding on a caller's
+  worker pool, with existing checksums, limits and located errors.
+- Expose positional LZMA2 folder/run jobs for caller-owned pools, using capped
+  ring dictionaries and write-at sinks. Bound per-run memory and verify exact
+  coverage and file CRCs before returning verified member completions; filtered
+  and encrypted graphs retain the ordinary decoder path.
+- Add `ArchiveReader::extract_to` with guarded, library-owned positional ring
+  extraction for eligible large single-member LZMA2 archives. Preserve the
+  ordered path for multiple members, finite budgets, live controls and hooks.
+- Start proven single-run LZMA2 streams directly in the existing ring decoder
+  for complete seekable inputs, avoiding compressed-input read-ahead. File
+  `open` enables bounded framing inspection; custom sources opt in with
+  `set_input_complete`. Progressive, adaptive and unproven streams keep their
+  existing plan. Payload checks, live progress and ledger reporting remain
+  active on the controlled ring path.
+- Deliver COPY and AES output from bounded owned buffers on the direct entry
+  path. Finite COPY budgets reuse existing input or upstream output storage;
+  AES releases consumed storage before growing its plaintext buffer. Preserve
+  admission and partial cipher blocks across interrupted reads or failed
+  buffer growth. Finite-budget AES delivery keeps 64 KiB push pieces to
+  avoid an RSS increase; unlimited delivery retains its larger buffer.
+- Refill only the BCJ2 input stream requested by the decoder, retrying
+  interrupted reads without losing decoded output and preserving errors
+  from unused side coders at completion.
+- Feed complete positional graph inputs directly to decoder workers, removing
+  an input pipe and copy per offloaded packed stream. Keep existing memory
+  admission, thread-failure fallback and progressive/adaptive input behavior.
+- Transfer queued output buffers into BCJ2 input windows without copying,
+  preserving partial reads, partial words, error ordering and bounded reuse.
+- Expose validated AES coder parameters and bounded password-owned key caching
+  for consumers that decrypt stored members through their own AES backend.
+  Derived keys clear on drop; existing work-factor and KDF budget limits apply.
+- Reuse each parallel LZMA2 block's output allocation after delivery, including
+  clean shutdown when the destination fails or the writer is abandoned.
+- Retain initialized block output storage across delivery and fold solid
+  member CRCs without checksumming the same input twice. Empty reads no longer
+  skip or finalize source members, and encoder chains propagate downstream
+  finalization failures.
+- Reduce allocation overhead when parsing common single-coder folders while
+  preserving header validation and the public archive metadata types.
+  Store single-coder output sizes directly and retain only the two output
+  sizes for ordinary AES/filter chains, preserving both coder orders.
+- Release parsed header bytes before allocating final stream maps, reducing
+  peak memory when opening archives with many folders. Plain and compressed
+  headers retain validation, including headers without a file table.
+- Walk sequential folders without allocating a per-folder scheduling plan.
+  Store small coder properties inline while preserving longer properties.
+- Compact only the live suffix of the BCJ reader buffer between refills.
+- Reuse the decode ledger's bounded history buffers when publishing snapshots,
+  preserving live counters and open-wave reporting without allocation churn.
+- Compress archive headers on the calling thread and release serialized
+  member metadata before allocating the header coder. Use the SDK's header
+  settings: BT2, 273 fast bytes and a dictionary capped at 1 MiB, reduced
+  for smaller headers. Encrypted headers retain a fresh IV.
+- Reconfigure retained non-solid LZMA/LZMA2 encoders for each folder's
+  settings, reusing their dictionaries and match-finder tables while keeping
+  the encoded data identical to a freshly allocated coder.
+- Retain serialized decoder descriptors for finished folders, releasing
+  encoder configurations and their password handles. Equivalent descriptors
+  share storage; fresh encrypted-folder IVs remain independent.
+- Move serial non-solid entries into the writer, reserve their known count,
+  and reuse equivalent folder descriptors across size-specific settings.
+  Ordinary single-stream folders omit unused solid and BCJ2 metadata.
+- Size output buffers for small folders without limiting accepted input or
+  changing their encoded bytes.
+- Limit encoder block workers to the known folder's block count, avoiding
+  workers with no input while preserving block boundaries and encoded bytes.
 
 ## 0.27.0 - 2026-10-11
 

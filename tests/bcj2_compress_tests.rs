@@ -156,6 +156,38 @@ fn assert_round_trip(bytes: &[u8], members: &[(String, Vec<u8>)], threads: u32) 
     }
 }
 
+#[test]
+fn a_proven_single_run_uses_a_ring_but_adaptive_chase_keeps_its_control() {
+    let members = vec![("member.bin".into(), pseudo_x86(4 << 20, 19))];
+    let bytes = write_archive(
+        vec![
+            Lzma2Options::from_level(1).into(),
+            EncoderMethod::BCJ2_FILTER.into(),
+        ],
+        &members,
+        Layout::Solid,
+        65536,
+    )
+    .unwrap();
+    for (complete, adaptive, ledger_blocks) in [
+        (false, false, 1),
+        (true, false, 0),
+        (false, true, 1),
+        (true, true, 1),
+    ] {
+        let mut reader = ArchiveReader::new(Cursor::new(&bytes), Password::empty()).unwrap();
+        reader.set_thread_count(2);
+        reader.set_input_complete(complete);
+        reader.set_adaptive_lzma2(adaptive);
+        let handle = reader.lzma2_handle();
+        handle.keep_ledger();
+        assert_eq!(reader.read_file("member.bin").unwrap(), members[0].1);
+        // A proven serial ring contributes no parallel ledger; adaptive or
+        // potentially progressive sources retain the controlled reader.
+        assert_eq!(handle.ledger().unwrap().blocks, ledger_blocks);
+    }
+}
+
 /// Every block with data is a BCJ2 block: four coders ending in BCJ2, four
 /// pack streams.
 fn assert_bcj2_blocks(bytes: &[u8]) -> usize {

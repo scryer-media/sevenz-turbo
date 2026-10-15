@@ -58,6 +58,12 @@ fn archive(path: u8, data: &[u8], known: bool, fail: bool) -> Result<Vec<u8>, se
                 prepare_block(methods.into(), vec![entry], vec![SourceReader::new(source)])?;
             writer.push_prepared_block(block)?;
         }
+        3 => {
+            writer.push_archive_entry_send(entry, Some(source))?;
+        }
+        4 => {
+            writer.push_archive_entries_send(vec![entry], vec![SourceReader::new(source)])?;
+        }
         _ => unreachable!(),
     }
     Ok(writer.finish()?.into_inner())
@@ -66,7 +72,7 @@ fn archive(path: u8, data: &[u8], known: bool, fail: bool) -> Result<Vec<u8>, se
 #[test]
 fn aligned_source_paths_preserve_short_reads_bytes_and_crcs() {
     let data: Vec<u8> = (0..(8 << 20) + 37).map(|i| (i % 251) as u8).collect();
-    for path in 0..3 {
+    for path in 0..5 {
         // Unknown size keeps the ordinary buffer. Both sources are longer
         // than the dictionary, so sizing leaves the same coder properties.
         let ordinary = archive(path, &data, false, false).unwrap();
@@ -91,7 +97,7 @@ fn aligned_source_paths_preserve_short_reads_bytes_and_crcs() {
 #[test]
 fn aligned_source_paths_propagate_read_failures() {
     let data = vec![0; (8 << 20) + 37];
-    for path in 0..3 {
+    for path in 0..5 {
         let err = archive(path, &data, true, true).unwrap_err();
         assert!(
             err.to_string().contains("source refused"),

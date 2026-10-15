@@ -32,6 +32,15 @@ pub(crate) mod writer;
 mod ledger;
 pub use ledger::Lzma2Ledger;
 
+mod seek_probe;
+pub(crate) use seek_probe::{is_single_run, is_single_run_with_limit};
+
+mod positional;
+pub use positional::{
+    Lzma2RunCompletion, Lzma2RunCrc, PositionalLzma2Folder, PositionalLzma2Run,
+    PositionalLzma2Scanner,
+};
+
 /// Bytes an LZMA or LZMA2 decoder holds beyond its dictionary: the range
 /// decoder's input buffer, the probability tables and the chunk buffer. The
 /// reference decoder's own accounting is tens of kilobytes; a megabyte covers
@@ -867,6 +876,17 @@ pub(crate) enum Lzma2Coder<R: Read> {
     Adaptive(Box<Lzma2MtReader<R>>),
 }
 
+impl<R: Read> Lzma2Coder<R> {
+    pub(crate) fn use_single_run_ring(&mut self) {
+        if let Self::Adaptive(reader) = self {
+            // A complete framing proof replaces the usual first-run size
+            // heuristic. Enter the existing chase ring after the first read,
+            // preserving its control, checksum folding and ledger lifecycle.
+            reader.give_up_bytes = 0;
+        }
+    }
+}
+
 impl<R: Read> Read for Lzma2Coder<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
@@ -877,6 +897,21 @@ impl<R: Read> Read for Lzma2Coder<R> {
 }
 
 impl<R: Read> crate::decoder::DecodeRead for Lzma2Coder<R> {
+    fn supports_borrowed(&self) -> bool {
+        matches!(self, Self::SingleThreaded(_))
+    }
+
+    fn read_borrowed(
+        &mut self,
+        max: usize,
+        sink: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> Option<std::io::Result<usize>> {
+        match self {
+            Self::SingleThreaded(r) => r.read_borrowed(max, sink),
+            Self::Adaptive(_) => None,
+        }
+    }
+
     fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<std::io::Result<usize>> {
         match self {
             Self::SingleThreaded(_) => None,
@@ -2916,6 +2951,31 @@ mod tests {
         assert_eq!(clamp_dictionary(1 << 20, 1 << 20), 1 << 20);
     }
 
+    #[test]
+    fn tiny_clamped_single_thread_folders_engage_borrowed_delivery() {
+        use crate::decoder::DecodeRead;
+        for len in [1usize, 4095, 4096, 17003, 32767] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 31) as u8).collect();
+            let mut packed = vec![1];
+            packed.extend_from_slice(&((len - 1) as u16).to_be_bytes());
+            packed.extend_from_slice(&data);
+            packed.push(0);
+            let prop = lzma2_clamped_prop(24, len as u64);
+            let mut reader =
+                lzma2_decoder(packed.as_slice(), prop, Lzma2Plan::SingleThreaded).unwrap();
+            let mut delivered = Vec::new();
+            let n = reader
+                .read_borrowed(len, &mut |bytes| {
+                    delivered.extend_from_slice(bytes);
+                    Ok(())
+                })
+                .expect("clamped folder must use the borrowed path")
+                .unwrap();
+            assert_eq!(n, len);
+            assert_eq!(delivered, data);
+        }
+    }
+
     /// LZMA2 carries the dictionary as a table index, so the clamp has to round
     /// back up to a value the table can express — never past what was declared.
     #[test]
@@ -3630,13 +3690,28 @@ mod stall_tests {
     /// corrupt.
     #[test]
     fn a_refused_piece_at_the_end_of_the_stream_still_finishes() {
-        let (packed, plain) = stream(24, 4);
+        let (packed, plain) = stream(3, 4);
         // Not one thread: that hands over a run at a time, which an allowance
         // of two never refuses.
         for threads in [2, 4] {
             let (mut rd, control) =
                 reader_limited(Cursor::new(packed.clone()), threads, 2 * run_cost(4));
             rd.trace = Some(Box::default());
+            // Dispatch the first run without collecting its result. Then
+            // reach source EOF with the remaining pieces still queued, so
+            // refusal does not depend on worker speed or buffer recycling.
+            rd.refill().expect("first piece");
+            rd.refill().expect("next run header");
+            let first = run_packed(4) as usize + 1;
+            assert_eq!(rd.hand_over(first, false).expect("first run"), first);
+            rd.decoder.drain_upto(0, |_, _| {}).expect("dispatch");
+            assert_eq!(rd.decoder.runs_claimed(), 1);
+            while !rd.input_done {
+                rd.refill().expect("remaining input");
+            }
+            let queued = rd.held;
+            assert!(rd.hand_over(queued, false).expect("refused tail") < queued);
+            assert!(!rd.told_end, "a refused tail must defer EOF");
             let (out, _peak, _widest) = drain_watching(&mut rd, &control);
             assert_eq!(out, plain, "threads={threads}");
             assert!(rd.told_end, "threads={threads}");
@@ -4448,6 +4523,34 @@ mod stall_tests {
         }
     }
 
+    #[test]
+    fn a_proven_single_run_retains_control_without_buffering_the_packed_run() {
+        let (packed, plain) = stream(1, 96);
+        let read = std::rc::Rc::new(std::cell::Cell::new(0));
+        let source = Counted {
+            inner: Cursor::new(&packed),
+            read: std::rc::Rc::clone(&read),
+        };
+        let (reader, control) = reader_limited(source, 4, u64::MAX >> 1);
+        let mut coder = super::Lzma2Coder::Adaptive(Box::new(reader));
+        coder.use_single_run_ring();
+        let mut out = Vec::new();
+        let mut buffer = [0; 8191];
+        let mut ahead = 0;
+        loop {
+            let count = coder.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            out.extend_from_slice(&buffer[..count]);
+            ahead = ahead.max(read.get().saturating_sub(out.len() as u64));
+            assert!(control.progress().is_some());
+        }
+        assert_eq!(out, plain);
+        assert!(ahead <= (3 * super::MT_INPUT_CHUNK) as u64, "{ahead}");
+        assert_eq!(control.progress().unwrap().spawned_threads, 0);
+    }
+
     /// The most a decode of `packed` has read ahead of its output, in bytes.
     /// The streams here are stored chunks, so a byte of output is a byte of
     /// input give or take three header bytes per 64 KiB chunk.
@@ -4471,6 +4574,34 @@ mod stall_tests {
         }
         assert!(out == plain, "the decode differs");
         most
+    }
+
+    #[test]
+    fn a_complete_single_run_streams_below_the_read_ahead_give_up_cap() {
+        for runs in [1, 2] {
+            let (packed, plain) = stream(runs, 24);
+            for threads in [2, 8] {
+                let (mut rd, _control) =
+                    reader_limited(Cursor::new(&packed), threads, u64::MAX >> 1);
+                assert!(run_unpacked(24) < rd.run_cap);
+                let mut out = Vec::new();
+                let mut buffer = [0; 8_191];
+                loop {
+                    let n = rd.read(&mut buffer).expect("decode");
+                    if n == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&buffer[..n]);
+                }
+                assert_eq!(out, plain);
+                assert_eq!(rd.read(&mut buffer).unwrap(), 0);
+                assert_eq!(
+                    rd.decoder.chase_decoded_bytes(),
+                    if runs == 1 { plain.len() as u64 } else { 0 },
+                    "only the proven single run should use the dictionary"
+                );
+            }
+        }
     }
 
     /// The longest run an encoder writes is four dictionaries, kept to

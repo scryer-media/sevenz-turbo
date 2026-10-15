@@ -32,11 +32,11 @@ jobs:
         run: |
           set -eu
           # Small archives under tests/resources and examples/data are the
-          # differential corpus and are tracked deliberately. Anything else
-          # binary is a generated fixture that must not be committed, and no
-          # tracked archive may exceed 1 MiB.
+          # differential corpus and are tracked deliberately; each is capped
+          # at 1 MiB. Compressed JSON evidence under docs is validated below.
           if git ls-files | grep -E '\.(7z|lzma|xz|zst|bin)$' \
-              | grep -vE '^(tests/resources/|examples/data/)' ; then
+              | grep -vE '^(tests/resources/|examples/data/)' \
+              | grep -vE '^docs/.+\.json\.zst$' ; then
             echo "generated archives must never be committed" >&2
             exit 1
           fi
@@ -46,6 +46,22 @@ jobs:
             echo "tracked fixture over 1 MiB: $big" >&2
             exit 1
           fi
+          python3 - <<'PY'
+          import json
+          import subprocess
+
+          def reject_constant(value):
+              raise ValueError(f"not a JSON constant: {value}")
+
+          tracked = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+          for name in tracked:
+              if name.startswith("docs/") and name.endswith(".json.zst"):
+                  decoded = subprocess.check_output(["zstd", "-qdc", "--", name])
+                  try:
+                      json.loads(decoded.decode("utf-8"), parse_constant=reject_constant)
+                  except (UnicodeError, ValueError) as error:
+                      raise SystemExit(f"invalid compressed JSON evidence: {name}: {error}")
+          PY
 
   fmt:
     name: fmt

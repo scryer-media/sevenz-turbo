@@ -28,6 +28,9 @@ impl<R> SeqReader<R> {
 
 impl<R: Read> Read for SeqReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let mut i = 0;
         while self.current < self.readers.len() {
             let r = &mut self.readers[self.current];

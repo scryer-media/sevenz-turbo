@@ -460,7 +460,7 @@ impl Archive {
     /// | Coder | Estimate |
     /// | --- | --- |
     /// | every block, under its coders | 64 KiB (the pack stream's read buffer) |
-    /// | Copy | 0 |
+    /// | Copy | 0 (owned push is disabled under finite memory limits) |
     /// | LZMA, LZMA2 | declared dictionary + 1 MiB |
     /// | PPMd | declared model size + 1 MiB |
     /// | BZip2 | 8 MiB |
@@ -646,7 +646,7 @@ impl Archive {
             crc: info
                 .has_crc
                 .contains(index)
-                .then(|| info.crcs.get(index).map(|crc| *crc as u32))
+                .then(|| info.crcs.get(index).copied())
                 .flatten(),
         })
     }
@@ -660,7 +660,7 @@ impl Archive {
         let Some(block) = self.blocks.get(block_index) else {
             return Vec::new();
         };
-        let Some(&first) = self
+        let Some(first) = self
             .stream_map
             .block_first_sub_stream_index
             .get(block_index)
@@ -691,7 +691,7 @@ impl Archive {
         else {
             return Vec::new();
         };
-        let count = block.packed_streams.len().max(1);
+        let count = block.packed_streams().len().max(1);
         (first..first + count)
             .filter_map(|index| {
                 let offset = *self.stream_map.pack_stream_offsets.get(index)?;
@@ -729,7 +729,7 @@ mod aes_budget_tests {
         coder
             .decompression_method_id_mut()
             .copy_from_slice(EncoderMethod::ID_AES256_SHA256);
-        coder.properties = vec![63, 0];
+        coder.properties = vec![63, 0].into();
         check_aes_coders([&coder].into_iter(), &ArchiveLimits::unlimited()).unwrap();
         coder.properties[0] = crate::encryption::MAX_AES_CYCLES_POWER + 1;
         assert_eq!(

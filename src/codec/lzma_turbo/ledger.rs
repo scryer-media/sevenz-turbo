@@ -287,7 +287,46 @@ impl Probe {
     /// Writes the figures so far over `total`, with the wave in progress
     /// counted as it stands.
     fn snapshot_into(&self, total: &mut Lzma2Ledger) {
-        total.clone_from(&self.ledger);
+        // Derived Clone replaces the vectors on every look. Reuse the bounded
+        // histories, including the spare slot for a wave that is still open.
+        let history = |target: &mut Vec<u64>, source: &Vec<u64>| {
+            target.clone_from(source);
+            std::mem::take(target)
+        };
+        let source = &self.ledger;
+        *total = Lzma2Ledger {
+            blocks: source.blocks,
+            dictionary_bytes: source.dictionary_bytes,
+            budget_bytes: source.budget_bytes,
+            threads: source.threads,
+            worker_threads: source.worker_threads,
+            peak_held_bytes: source.peak_held_bytes,
+            peak_queue_bytes: source.peak_queue_bytes,
+            peak_queue_capacity_bytes: source.peak_queue_capacity_bytes,
+            peak_spill_bytes: source.peak_spill_bytes,
+            peak_total_bytes: source.peak_total_bytes,
+            peak_runs_out: source.peak_runs_out,
+            peak_runs_pending: source.peak_runs_pending,
+            runs: source.runs,
+            chase_bytes: source.chase_bytes,
+            wave_count: source.wave_count,
+            wave_runs: history(&mut total.wave_runs, &source.wave_runs),
+            wave_runs_out: history(&mut total.wave_runs_out, &source.wave_runs_out),
+            refused_feeds: source.refused_feeds,
+            refused_at_boundary: source.refused_at_boundary,
+            refused_at_boundary_busy: source.refused_at_boundary_busy,
+            refused_at_boundary_small: source.refused_at_boundary_small,
+            refused_at_boundary_bytes: source.refused_at_boundary_bytes,
+            refused_mid_run: source.refused_mid_run,
+            refused_run_pending: source.refused_run_pending,
+            gate_refusals: source.gate_refusals,
+            backlog_stops: source.backlog_stops,
+            waits: source.waits,
+            wait_nanos_by_runs_out: history(
+                &mut total.wait_nanos_by_runs_out,
+                &source.wait_nanos_by_runs_out,
+            ),
+        };
         if self.claimed > self.wave_from {
             push_wave(total, self.claimed - self.wave_from, self.wave_peak);
         }
@@ -538,6 +577,54 @@ mod tests {
         assert_eq!(ledger.peak_runs_out, 2);
         assert_eq!(ledger.wave_runs, [1, 1, 1]);
         assert_eq!(ledger.wave_runs_out, [1, 1, 1]);
+    }
+
+    #[test]
+    fn snapshots_reuse_their_bounded_history_buffers() {
+        let mut probe = probe();
+        let mut total = Lzma2Ledger {
+            wave_runs: Vec::with_capacity(WAVES_KEPT),
+            wave_runs_out: Vec::with_capacity(WAVES_KEPT),
+            wait_nanos_by_runs_out: Vec::with_capacity(RUNS_OUT_ROWS),
+            ..Lzma2Ledger::default()
+        };
+        let buffers = (
+            total.wave_runs.as_ptr(),
+            total.wave_runs_out.as_ptr(),
+            total.wait_nanos_by_runs_out.as_ptr(),
+        );
+        for claimed in 1..=600 {
+            probe.look(&Gauges {
+                claimed,
+                delivered: claimed.saturating_sub(4),
+                held: claimed * 1024,
+                ..Gauges::default()
+            });
+            for closed in [false, true] {
+                if closed {
+                    probe.slept(claimed % RUNS_OUT_ROWS as u64, claimed, claimed);
+                }
+                let mut expected = probe.ledger.clone();
+                if probe.claimed > probe.wave_from {
+                    push_wave(
+                        &mut expected,
+                        probe.claimed - probe.wave_from,
+                        probe.wave_peak,
+                    );
+                }
+                probe.snapshot_into(&mut total);
+                assert_eq!(total, expected);
+                assert_eq!(
+                    (
+                        total.wave_runs.as_ptr(),
+                        total.wave_runs_out.as_ptr(),
+                        total.wait_nanos_by_runs_out.as_ptr(),
+                    ),
+                    buffers,
+                    "a bounded snapshot must retain its allocated history"
+                );
+            }
+        }
     }
 
     /// A wave still open when the ledger is read is counted as it stands,

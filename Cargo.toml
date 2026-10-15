@@ -11,7 +11,7 @@ repository = "https://github.com/scryer-media/sevenz-turbo"
 rust-version = "1.97.1"
 version = "0.27.0"
 # Repository scaffolding that has no business in the crate archive.
-exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml"]
+exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml", "docs/**/*.json.zst"]
 
 # `tools/decode-bench` is a workspace member rather than an example because it
 # depends on upstream `sevenz-rust2` to time the fork against it, and that
@@ -82,10 +82,9 @@ bzip2 = { version = "0.6", optional = true }
 cbc = { version = "0.2", optional = true }
 flate2 = { version = "1", optional = true, features = ["zlib-rs"] }
 getrandom = { version = "0.4", optional = true }
-# From crates.io. While the two crates are developed together a `path` to the
-# sibling checkout is added here and dropped again before release
-# (`cargo xtask release` refuses to tag while it is here).
-lzma-turbo = { version = "=0.9.0", default-features = false, features = ["std", "asm", "crc", "filters"] }
+# Pin the reviewed library checkpoint while both performance PRs are open.
+# Registry packaging awaits the corresponding library publication.
+lzma-turbo = { version = "=0.9.1", git = "https://github.com/scryer-media/lzma-turbo", rev = "39b275c71dc958f84c4287d8abcaa187c759c9f2", default-features = false, features = ["std", "asm", "crc", "filters"] }
 ppmd-turbo = { version = "0.1.1", optional = true }
 lz4_flex = { version = "0.14", optional = true }
 nt-time = { version = "0.15", optional = true }

@@ -81,6 +81,21 @@ impl Password {
         Self::default()
     }
 
+    /// Retains up to `entries` derived AES keys across this password's clones.
+    ///
+    /// The default is four. Storage grows lazily; the caller must bound this
+    /// capacity before using archive-derived counts. Increasing it before
+    /// parsing lets header and member readers share an archive-sized cache.
+    /// This does not reset the KDF budget. Zero selects the default capacity.
+    #[cfg(feature = "aes256")]
+    pub fn with_aes_key_cache_capacity(self, entries: usize) -> Self {
+        self.key_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_capacity(entries);
+        self
+    }
+
     /// Returns the byte representation of the password.
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes
