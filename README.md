@@ -20,7 +20,9 @@ the two have diverged for good. The public API and the Rust module paths
 started as upstream's and are kept compatible while that costs nothing, so
 migrating is `sevenz_rust2::` → `sevenz_turbo::` plus whatever new calls you
 want; an API the container work needs to change will change, with a version
-bump and a changelog entry.
+bump and a changelog entry. One such change is in place: every public enum,
+`Error` included, is `#[non_exhaustive]`, so a `match` on `Error` that
+named every upstream variant needs a wildcard arm here.
 
 Two things are the reason the fork exists; the default thread count, the
 cryptography backends, the PPMd engine (`ppmd-turbo`) and the limits on
@@ -198,7 +200,7 @@ in [docs/benchmarking.md](docs/benchmarking.md).
 
 ```toml
 [dependencies]
-sevenz-turbo = "0.26"
+sevenz-turbo = "0.28"
 ```
 
 The minimum supported Rust version is 1.97.1, which `lzma-turbo` requires.

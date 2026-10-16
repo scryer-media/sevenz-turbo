@@ -59,7 +59,9 @@ with a version bump and a changelog entry like any other.
   - `src/container.rs`, which re-exports `lzma_turbo::crc::{crc32_combine,
     CrcFolder}` as public API;
   - `lzma_turbo::crc` wherever a CRC-32 is computed (`src/reader.rs`,
-    `src/writer.rs`, `src/writer/source_reader.rs`; see the CRC rules
+    `src/writer.rs`, `src/writer/source_reader.rs`, and
+    `src/reader/store_overlap.rs`, whose stage thread checksums a stored
+    folder's files where it reads or decrypts them; see the CRC rules
     below).
 
   The option types in `src/encoder_options.rs` name no encoder; what codes
@@ -151,7 +153,12 @@ with a version bump and a changelog entry like any other.
   `cargo test --doc --all-features --no-fail-fast` must pass before a commit
   is proposed.
 - Any code change bumps the crate version, `Cargo.lock` and `CHANGELOG.md` in
-  the same change.
+  the same change. The bump is what `cargo semver-checks` says it is: the
+  release workflow runs it against the published version and refuses a
+  patch bump that carries a breaking change. Every public enum (`Error`,
+  `Limit`, `BlockErrorKind`, `EncoderOptions`, `hooks::HostAesError`) is
+  `#[non_exhaustive]` so that a new variant is not one; a new public enum is
+  too.
 - `tools/wasm-conformance` is the only place `wasmtime` is allowed: it is a
   workspace member, not a test of this crate, and every workspace-wide
   `cargo nextest run`/`cargo clippy` in CI and the release path excludes it. Do not

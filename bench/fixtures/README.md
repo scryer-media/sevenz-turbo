@@ -49,6 +49,7 @@ benchmark passphrase `bench-passphrase`, a public constant):
 | `lzma.7z` | payload-sub | `-mx=5 -m0=lzma -mmt=1` | LZMA (not LZMA2) |
 | `tree_solid.7z` | tree | `-mx=5 -m0=lzma2 -mmt=8 -ms=on` | many small members in one solid folder |
 | `tree_nonsolid.7z` | tree | `-mx=5 -m0=lzma2 -mmt=8 -ms=off` | the same members, one folder each |
+| `store.7z` | payload | `-mx=0` | stored (COPY): read, CRC and write only |
 | `aes_store.7z` | payload | `-mx=0 -p -mhe=on` | stored + AES-256: decrypt and CRC only |
 | `aes_mx1.7z` | payload | `-mx=1 -m0=lzma2 -mmt=8 -p -mhe=on` | LZMA2 under AES-256 |
 | `aes_kdf.7z` | kdf-tree | `-mx=5 -m0=lzma2 -ms=off -p -mhe=on` | one encrypted folder per tiny member: SHA-256 key derivation |

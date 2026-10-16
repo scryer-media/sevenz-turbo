@@ -9,6 +9,7 @@ use std::sync::RwLock;
 /// a contract violation on this crate's side, because the caller below only
 /// ever passes a 32-byte key, a 16-byte IV, and a block-aligned buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HostAesError {
     /// `key` was not 32 bytes.
     BadKeyLength,

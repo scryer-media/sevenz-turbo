@@ -151,6 +151,7 @@ func build(name string, s sizes) Profile {
 			{Name: "lzma.7z", Source: "payload-sub", Args: []string{"-mx=5", "-m0=lzma", "-mmt=1"}, Note: "LZMA (not LZMA2), one stream"},
 			{Name: "tree_solid.7z", Source: "tree", Args: []string{"-mx=5", lzma2MT, "-mmt=8", "-ms=on"}, Note: "many small members in one solid folder"},
 			{Name: "tree_nonsolid.7z", Source: "tree", Args: []string{"-mx=5", "-m0=lzma2", "-mmt=8", "-ms=off"}, Note: "the same members, one folder each"},
+			{Name: "store.7z", Source: "payload", Args: []string{"-mx=0"}, Note: "stored (COPY): read, CRC and write are all of the work; one folder, so its read-ahead is on the calling thread's path"},
 			{Name: "aes_store.7z", Source: "payload", Args: []string{"-mx=0", password, "-mhe=on"}, Encrypted: true, Note: "stored and AES-256 encrypted: decrypt + CRC is nearly all of the work"},
 			{Name: "aes_mx1.7z", Source: "payload", Args: []string{"-mx=1", lzma2MT, "-mmt=8", password, "-mhe=on"}, Encrypted: true, Note: "LZMA2 -mx1 under AES-256"},
 			{Name: "aes_kdf.7z", Source: "kdf-tree", Args: []string{"-mx=5", "-m0=lzma2", "-ms=off", password, "-mhe=on"}, Encrypted: true, Note: "tiny members, one encrypted folder each, encrypted header: SHA-256 key derivation dominated"},

@@ -14,6 +14,8 @@ mod positional_block;
 pub use positional_block::PositionalBlockDecoder;
 #[cfg(all(feature = "util", not(target_arch = "wasm32")))]
 mod extract;
+#[cfg(not(target_arch = "wasm32"))]
+mod store_overlap;
 
 use crate::{
     ByteReader, Password,
@@ -3078,6 +3080,19 @@ impl<R: Read + Seek> ArchiveReader<R> {
             })
             .ok_or_else(|| Error::other("block offset out of range"))?;
 
+        // A large stored folder, with threads to spare and a cursor of its
+        // own on the archive, is read ahead on a thread that checksums as it
+        // reads (and decrypts on another): see `store_overlap`.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(decoder) =
+            Self::stored_overlap(archive, block_index, block_offset, password, &opts)?
+        {
+            return Ok((
+                decoder,
+                archive.pack_sizes[first_pack_stream_index] as usize,
+            ));
+        }
+
         let (mut has_crc, mut crc) = (block.has_crc, block.crc);
 
         // Single stream blocks might have it's CRC stored in the single substream information.
@@ -3173,6 +3188,103 @@ impl<R: Read + Seek> ArchiveReader<R> {
         }
 
         Ok((decoder, pack_size))
+    }
+
+    /// The decode chain of a stored folder (COPY, AES, or AES under COPY)
+    /// with its reading, checksumming and decryption on threads of their
+    /// own, or `None` where the folder is decoded on the calling thread as
+    /// before.
+    ///
+    /// Only for a folder of at least [`FOLDER_STAGE_BYTES`] — below that the
+    /// threads cost more than the overlap gains, and the folder-parallel
+    /// planner has it — given two threads or more, a complete input and a
+    /// positional source, the one thing that can be read from another
+    /// thread. Its checksums must be the caller's to fold
+    /// (`checksum_splits`), or not wanted at all, so that none is taken on
+    /// the thread that delivers the bytes. The spans in flight are held
+    /// within the memory limit beside the chain's coders; a limit that
+    /// cannot afford them, or a thread the system will not give, leaves the
+    /// folder to the serial path.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn stored_overlap(
+        archive: &Archive,
+        block_index: usize,
+        block_offset: u64,
+        password: &Password,
+        opts: &DecodeOptions<'_>,
+    ) -> Result<Option<Box<dyn DecodeRead + 'static>>, Error> {
+        let block = &archive.blocks[block_index];
+        let unpack_size = block.get_unpack_size();
+        let (Some(positional), Some(control)) = (opts.positional, opts.lzma2_control) else {
+            return Ok(None);
+        };
+        if opts.threads < 2
+            || !opts.input_complete
+            || unpack_size < FOLDER_STAGE_BYTES
+            || (opts.verify_checksums && opts.checksum_splits.is_empty())
+            || block.packed_streams().len() != 1
+        {
+            return Ok(None);
+        }
+        let Some(aes) = stored_chain(block) else {
+            return Ok(None);
+        };
+        let stages = 1 + u64::from(aes.is_some());
+        let spans_kb =
+            usize::try_from(stages * store_overlap::STAGE_BYTES / 1024).unwrap_or(usize::MAX);
+        if opts
+            .reserved_kb
+            .saturating_add(opts.unsized_kb)
+            .saturating_add(spans_kb)
+            > opts.limits.memory_limit_kb()
+        {
+            return Ok(None);
+        }
+        let first_pack_stream_index = archive.stream_map.block_first_pack_stream_index[block_index];
+        let pack_size = archive.pack_sizes[first_pack_stream_index];
+        let mut cursor = ReadAtCursor::new(Arc::clone(positional));
+        cursor.seek(SeekFrom::Start(block_offset))?;
+        let packed = BoundedReader::new(
+            cursor,
+            usize::try_from(pack_size)
+                .map_err(|_| Error::other("pack stream size exceeds address space"))?,
+        );
+        let checksums = (!opts.checksum_splits.is_empty()).then(|| {
+            store_overlap::Checksums::new(Arc::clone(control), opts.checksum_splits, unpack_size)
+        });
+        let plain = match aes {
+            None => store_overlap::spawn(packed, unpack_size, checksums),
+            #[cfg(feature = "aes256")]
+            Some(index) => {
+                let Ok(fetch) = store_overlap::spawn(packed, pack_size, None) else {
+                    return Ok(None);
+                };
+                let coder = &block.coders[index];
+                let len = block.get_unpack_size_at_index(index) as usize;
+                // The serial path's decoder, over the fetched ciphertext.
+                let crate::decoder::Decoder::Aes256Sha256(decrypting) =
+                    add_decoder(fetch, len, coder, password, opts)?
+                else {
+                    return Ok(None);
+                };
+                store_overlap::spawn(decrypting, unpack_size, checksums)
+            }
+            #[cfg(not(feature = "aes256"))]
+            Some(_) => {
+                let _ = password;
+                return Ok(None);
+            }
+        };
+        let Ok(plain) = plain else {
+            return Ok(None);
+        };
+        if !opts.checksum_splits.is_empty() {
+            control.fold_elsewhere();
+        }
+        Ok(Some(Box::new(DeclaredLength {
+            inner: plain,
+            owed: unpack_size,
+        })))
     }
 
     fn build_decode_stack2<'r>(
@@ -4433,7 +4545,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                     let check = lzma2.folded(unpacked_offset, file.size);
                     if let (Some(crc32), true) = (check, owed.queue.is_empty()) {
                         if file.has_crc && u64::from(crc32) != file.crc {
-                            return Err(Error::ChecksumVerificationFailed
+                            return Err(folded_mismatch(opts.encrypted)
                                 .in_block(block_index, packed_offset));
                         }
                         crc_report.set(Some(crc32));
@@ -4537,7 +4649,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
             match check {
                 Some(crc32) if u64::from(crc32) != archive.blocks[block_index].crc => {
                     return Err(
-                        Error::ChecksumVerificationFailed.in_block(block_index, packed_offset)
+                        folded_mismatch(opts.encrypted).in_block(block_index, packed_offset)
                     );
                 }
                 Some(_) => {}
@@ -4566,7 +4678,11 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         // sees. Such a block keeps the streaming checksum on the consuming
         // thread, which is where it has to happen, because the filter runs
         // there too.
-        if block.coders.len() != 1 {
+        //
+        // A stored folder's bytes are the files' too, whatever its coders —
+        // COPY, AES, or both — and its reader thread checksums them the same
+        // way when it has one: see `store_overlap`.
+        if block.coders.len() != 1 && stored_chain(block).is_none() {
             return Vec::new();
         }
         let files = &archive.files[block_file_range(archive, block_index)];
@@ -4606,6 +4722,44 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
 /// alone, with the reader's whole thread count for its own LZMA2 coder, which
 /// is where a large folder's parallelism is.
 pub(crate) const FOLDER_STAGE_BYTES: u64 = 8 << 20;
+
+/// A folded checksum that did not match, as the serial path reports it: a
+/// plain [`Error::ChecksumVerificationFailed`], or for a folder that decrypts
+/// (only a stored one folds), the verifying reader's error as a possible
+/// wrong password.
+fn folded_mismatch(encrypted: bool) -> Error {
+    if encrypted {
+        Error::from(io::Error::other(Error::ChecksumVerificationFailed)).maybe_bad_password(true)
+    } else {
+        Error::ChecksumVerificationFailed
+    }
+}
+
+/// Whether `block` is stored data: one COPY coder, one AES coder, or the
+/// two of them in a chain, one pack stream in. `Some(None)` for COPY alone,
+/// `Some(Some(index))` naming the AES coder otherwise.
+fn stored_chain(block: &Block) -> Option<Option<usize>> {
+    if block.coders.is_empty()
+        || block.coders.len() > 2
+        || block.packed_streams().len() != 1
+        || block.total_input_streams() != block.total_output_streams()
+    {
+        return None;
+    }
+    let mut aes = None;
+    let mut copies = 0;
+    for (index, coder) in block.coders.iter().enumerate() {
+        if coder.num_in_streams() != 1 || coder.num_out_streams() != 1 {
+            return None;
+        }
+        match coder.encoder_method_id() {
+            EncoderMethod::ID_COPY => copies += 1,
+            EncoderMethod::ID_AES256_SHA256 if aes.is_none() => aes = Some(index),
+            _ => return None,
+        }
+    }
+    (copies <= 1).then_some(aes)
+}
 
 /// How many folders each worker may have decoded ahead of the callback: one
 /// being decoded and one waiting, so a worker that finishes a folder while the

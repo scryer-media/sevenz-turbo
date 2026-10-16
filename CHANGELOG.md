@@ -45,7 +45,7 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   hooks, renovate, issue templates, `AGENTS.md`, `SECURITY.md`,
   `CONTRIBUTORS.md`. Upstream's `.github/workflows/rust.yml` and
   `.github/dependabot.yml` were removed as duplicates of these.
-- `lzma-turbo` is a caret requirement on a published version (since 0.27.2;
+- `lzma-turbo` is a caret requirement on a published version (since 0.28.0;
   0.27.1 pinned `=0.9.1`): the manifest states the floor this crate needs,
   `Cargo.lock` fixes the version CI tested with `--locked`, and no Git
   dependency or machine-specific checkout is involved.
@@ -168,10 +168,15 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
 - The LZMA coder's properties are length-checked before being sliced, instead
   of panicking on a short field.
 - A callback that reads part of a file and asks to go on has the rest of that
-  file read and CRC-checked for it (0.27.2). Upstream leaves the unread bytes
+  file read and CRC-checked for it (0.28.0). Upstream leaves the unread bytes
   in the stream, so the next file begins at the wrong offset.
 - A zero-length file's CRC is checked against the CRC of no bytes, as 7-Zip
-  checks it (0.27.2); upstream does not compare it.
+  checks it (0.28.0); upstream does not compare it.
+- A stored folder of 8 MiB or more, decoded with two threads or more from a
+  complete positional source, is read ahead and checksummed on a stage
+  thread, and an AES one is decrypted on a second, while the caller writes
+  (0.28.0). Upstream reads, decrypts, checksums and copies stored data on
+  the calling thread, one after the other.
 
 ### Safety against hostile archives
 
@@ -216,7 +221,10 @@ differential matrix against `7zz` stays green.
 
 ### Container API (additions only)
 
-Everything here is new surface; no upstream signature changed meaning.
+Everything here is new surface; no upstream signature changed meaning. The
+one exception is `Error`, which is `#[non_exhaustive]` since 0.28.0: a
+consumer that matched every variant of upstream's `Error` needs a wildcard
+arm, and this crate can add a variant without a breaking release.
 
 - `ArchiveLimits`, with `ArchiveReader::with_limits`,
   `Archive::read_with_limits` and `BlockDecoder::with_limits`: one model for
@@ -344,7 +352,7 @@ Everything here is new surface; no upstream signature changed meaning.
   a single LZMA2 block is coded on one thread. `ArchiveEntry::from_path`
   records the file's length so the size is known before the push.
 - A writer whose push failed after writing part of a folder is poisoned
-  (0.27.2): later pushes return `Error::WriterPoisoned` and `finish()` writes
+  (0.28.0): later pushes return `Error::WriterPoisoned` and `finish()` writes
   no header. Upstream lets the caller go on and writes an archive whose pack
   offsets are wrong.
 
@@ -393,7 +401,7 @@ Everything here is new surface; no upstream signature changed meaning.
   encoder (`compress`) follows the same switch over the same unpadded CBC:
   AWS-LC's `EncryptingKey::cbc` by default, RustCrypto's `cbc::Encryptor`
   under `native-crypto` (a wasm build encrypts in the guest). The host hook
-  decrypts only, so since 0.27.2 a wasm `crypto-host` build with `compress`
+  decrypts only, so since 0.28.0 a wasm `crypto-host` build with `compress`
   and `aes256` must also enable `native-crypto`; without it the build is a
   compile error.
   `aws-lc-rs` is a direct optional dependency on the pin and features
@@ -426,7 +434,7 @@ Everything here is new surface; no upstream signature changed meaning.
   wasm build), for consumers who want to assert on it.
 - The `aes` and `cbc` dependencies are enabled by `native-crypto` alone, and
   the RustCrypto encryptor is compiled only with `compress`, `aes256` and
-  `native-crypto` together (since 0.27.2; before it, `compress` pulled them
+  `native-crypto` together (since 0.28.0; before it, `compress` pulled them
   in as well). The AWS-LC lane, the default, compiles neither. The direct
   `sha2` dependency is gone.
 - When both backends are compiled, a differential test checks they agree on
@@ -472,8 +480,20 @@ Everything here is new surface; no upstream signature changed meaning.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
-## 0.27.2 - 2026-10-16
+## 0.28.0 - 2026-10-16
 
+This release was prepared as 0.27.2. The release workflow's `cargo
+semver-checks` gate refused that number: `Error` had no `#[non_exhaustive]`,
+so the new `Error::WriterPoisoned` variant is a breaking change for a
+consumer matching it exhaustively, and a breaking change is a minor bump
+before 1.0. Nothing else differs from what 0.27.2 would have shipped.
+
+- `Error` is `#[non_exhaustive]`, as `Limit`, `BlockErrorKind` and `lzma-turbo`'s
+  `Error` already are: a consumer that matched every variant needs a
+  wildcard arm, and a variant added later is no longer a breaking change.
+  `EncoderOptions` (`compress`) and `hooks::HostAesError` (`crypto-host`),
+  the other two public enums, are marked the same way in this release, so
+  every public enum of the crate can grow without a breaking release.
 - Accept SDK-valid empty archives without a next header (a zero
   next-header size).
 - Preserve empty entries interleaved with solid substreams in block iteration
@@ -567,6 +587,32 @@ Everything here is new surface; no upstream signature changed meaning.
   builds compile `aes`/`cbc`, and where `lzma_turbo::` is used.
 - Drop a crate-archive `exclude` pattern (`docs/**/*.json.zst`) that matched
   no file.
+- Stored folders overlap reading with writing. A stored (COPY) folder of
+  8 MiB or more on the calling thread's path, decoded with `set_threads(2)`
+  or more from a complete positional source, is read by a stage thread in
+  1 MiB spans, two queued, and each file's CRC-32 is taken on that thread
+  and folded as the parallel LZMA2 coder's are; the caller hands the spans
+  to its sink. On 1 GiB stored in one folder (macOS arm64, median of 9) a
+  hashing sink went from 0.117 s to 0.082 s at two threads and 0.083 s at
+  four and eight; a sink that does nothing went from 0.064-0.066 s to
+  0.068-0.070 s, 5-9% slower, which no thread or size gate can tell apart
+  from a sink that writes. Peak RSS rises by the spans, 3.6 to 6.8 MiB.
+  One thread is unchanged.
+- AES over stored data (`7zz a -mx0 -p`) of 8 MiB or more decrypts on a
+  stage thread of its own, through the same `Aes256Sha256Decoder`, behind a
+  fetch stage, and checksums the plaintext there: 0.182 s to 0.106 s at two,
+  four and eight threads into a hashing sink, 0.139 s to 0.104 s into one
+  that does nothing, peak RSS 3.9 to 9.9 MiB. A checksum mismatch is the
+  same `MaybeBadPassword`, kind `Password`, at the same folder as one
+  thread gives.
+- The spans in flight (4 MiB per stage) are charged against
+  `ArchiveLimits::memory`; a limit that cannot afford them, or a thread the
+  system refuses, leaves the folder on the serial path. A read error reaches
+  the sink after every byte before it; a callback that stops early or a sink
+  that fails stops the stage threads before the call returns.
+- A stored folder's push buffer is no larger than what is left of the
+  folder, so a small stored member no longer allocates and zeroes 1 MiB;
+  the stage spans follow the same rule.
 
 ## 0.27.1 - 2026-10-15
 

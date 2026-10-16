@@ -2,6 +2,7 @@ use std::{borrow::Cow, fmt::Display};
 
 /// The error type of the crate.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// Invalid 7z signature found in file header.
     BadSignature([u8; 6]),

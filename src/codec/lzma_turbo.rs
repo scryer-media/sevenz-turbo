@@ -500,6 +500,10 @@ pub(crate) struct Lzma2Control {
     /// stream they came from. Empty unless the coder was built with split
     /// points; see [`Lzma2Control::folded`].
     folder: Mutex<CrcFolder<u32>>,
+    /// Set while a stored folder is read on a thread of its own, which
+    /// checksums what it reads into `folder` as the LZMA2 workers would: see
+    /// `reader::store_overlap`. Cleared as each block starts.
+    folded_elsewhere: AtomicBool,
     /// Bumped by every [`Lzma2Control::set_threads`], which is what a decode
     /// listening for its caller waits on. See [`Lzma2MtReader::listening`].
     changes: Mutex<u64>,
@@ -519,6 +523,7 @@ impl Lzma2Control {
             in_flight_bytes: AtomicU64::new(0),
             spawned_threads: AtomicU32::new(0),
             folder: Mutex::new(CrcFolder::new()),
+            folded_elsewhere: AtomicBool::new(false),
             changes: Mutex::new(0),
             changed: Condvar::new(),
             ledger: ledger::LedgerSlot::default(),
@@ -549,6 +554,27 @@ impl Lzma2Control {
     /// that far.
     pub(crate) fn folded(&self, offset: u64, len: u64) -> Option<u32> {
         self.folder.lock().ok()?.range(offset, len)
+    }
+
+    /// Adds one piece a stored folder's reader thread checksummed, before it
+    /// hands the bytes on: see `reader::store_overlap`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn fold_piece(&self, offset: u64, len: u64, crc32: u32) {
+        if let Ok(mut folder) = self.folder.lock() {
+            folder.push(offset, len, crc32);
+        }
+    }
+
+    /// Says that this block's checksums are folded from pieces computed off
+    /// the calling thread, by a stored folder's reader thread.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn fold_elsewhere(&self) {
+        self.folded_elsewhere.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether [`Lzma2Control::fold_elsewhere`] was said for this block.
+    pub(crate) fn folds_elsewhere(&self) -> bool {
+        self.folded_elsewhere.load(Ordering::Relaxed)
     }
 
     /// Drops the pieces of the block just finished. A new block starts its own
@@ -613,6 +639,7 @@ impl Lzma2Control {
         self.runs_claimed.store(0, Ordering::Relaxed);
         self.in_flight_bytes.store(0, Ordering::Relaxed);
         self.spawned_threads.store(0, Ordering::Relaxed);
+        self.folded_elsewhere.store(false, Ordering::Relaxed);
         self.clear_folded();
     }
 
