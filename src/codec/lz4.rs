@@ -24,7 +24,7 @@ impl<R: Read> Lz4Decoder<R> {
         let mut header = [0u8; 12];
         let header_read = match Read::read(&mut input, &mut header) {
             Ok(n) if n >= 4 => n,
-            Ok(_) => return Err(Error::other("Input too short")),
+            Ok(_) => return Err(Error::corrupted("Input too short")),
             Err(e) => return Err(e.into()),
         };
 
@@ -33,7 +33,7 @@ impl<R: Read> Lz4Decoder<R> {
         let inner_reader = if magic_value == SKIPPABLE_FRAME_MAGIC && header_read >= 12 {
             let skippable_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
             if skippable_size != 4 {
-                return Err(Error::other("Invalid lz4 skippable frame size"));
+                return Err(Error::corrupted("Invalid lz4 skippable frame size"));
             }
 
             let compressed_size =

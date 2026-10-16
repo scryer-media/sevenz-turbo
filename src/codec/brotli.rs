@@ -23,7 +23,7 @@ impl<R: Read> BrotliDecoder<R> {
         let mut header = [0u8; 16];
         let header_read = match Read::read(&mut input, &mut header) {
             Ok(n) if n >= 4 => n,
-            Ok(_) => return Err(Error::other("Input too short")),
+            Ok(_) => return Err(Error::corrupted("Input too short")),
             Err(e) => return Err(e.into()),
         };
 
@@ -32,7 +32,7 @@ impl<R: Read> BrotliDecoder<R> {
         let inner_reader = if magic_value == SKIPPABLE_FRAME_MAGIC && header_read >= 16 {
             let skippable_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
             if skippable_size != 8 {
-                return Err(Error::other("Invalid brotli skippable frame size"));
+                return Err(Error::corrupted("Invalid brotli skippable frame size"));
             }
 
             let compressed_size =
@@ -40,7 +40,7 @@ impl<R: Read> BrotliDecoder<R> {
 
             let brotli_magic_value = u16::from_le_bytes([header[12], header[13]]);
             if brotli_magic_value != BROTLI_MAGIC {
-                return Err(Error::other("Invalid brotli magic value"));
+                return Err(Error::corrupted("Invalid brotli magic value"));
             }
 
             InnerReader::new_skippable(input, compressed_size)

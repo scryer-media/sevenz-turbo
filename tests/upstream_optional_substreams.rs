@@ -130,7 +130,7 @@ fn explicit_invalid_substreams_section_never_uses_missing_section_defaults() {
         if unknown {
             assert!(matches!(error, Error::BadTerminatedSubStreamsInfo));
         } else {
-            assert!(matches!(error, Error::Other(ref text)
+            assert!(matches!(error, Error::Corrupted(ref text)
                 if text == "Archive declares more streamed files than sub-streams"));
         }
     }

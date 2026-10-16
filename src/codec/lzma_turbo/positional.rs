@@ -82,7 +82,7 @@ impl PositionalLzma2Folder {
         let block = archive
             .blocks
             .get(block_index)
-            .ok_or_else(|| Error::other("block index out of range"))?;
+            .ok_or_else(|| Error::invalid_argument("block index out of range"))?;
         if block.coders.len() != 1
             || block.coders[0].encoder_method_id() != EncoderMethod::ID_LZMA2
             || block.total_input_streams() != 1
@@ -96,32 +96,32 @@ impl PositionalLzma2Folder {
         }
         let properties = block.coders[0].properties();
         if properties.len() != 1 || properties[0] > 40 {
-            return Err(Error::other("invalid LZMA2 dictionary property"));
+            return Err(Error::corrupted("invalid LZMA2 dictionary property"));
         }
         let first_pack = *archive
             .stream_map
             .block_first_pack_stream_index
             .get(block_index)
-            .ok_or_else(|| Error::other("missing block pack mapping"))?;
+            .ok_or_else(|| Error::corrupted("missing block pack mapping"))?;
         let relative = *archive
             .stream_map
             .pack_stream_offsets
             .get(first_pack)
-            .ok_or_else(|| Error::other("missing pack offset"))?;
+            .ok_or_else(|| Error::corrupted("missing pack offset"))?;
         let size = *archive
             .pack_sizes
             .get(first_pack)
-            .ok_or_else(|| Error::other("missing pack size"))?;
+            .ok_or_else(|| Error::corrupted("missing pack size"))?;
         let offset = 32u64
             .checked_add(archive.pack_pos)
             .and_then(|v| v.checked_add(relative))
             .filter(|v| v.checked_add(size).is_some())
-            .ok_or_else(|| Error::other("pack range overflow"))?;
+            .ok_or_else(|| Error::corrupted("pack range overflow"))?;
         let first_file = *archive
             .stream_map
             .block_first_file_index
             .get(block_index)
-            .ok_or_else(|| Error::other("missing block file mapping"))?;
+            .ok_or_else(|| Error::corrupted("missing block file mapping"))?;
         let file_count = block.num_unpack_sub_streams;
         // Recheck finite aggregate limits against the caller's public metadata.
         // An unlimited caller needs no archive-wide scan on each folder admission.
@@ -155,7 +155,7 @@ impl PositionalLzma2Folder {
             }
         }
         if file_count > archive.files.len().saturating_sub(first_file) {
-            return Err(Error::other("sub-stream count exceeds file mapping"));
+            return Err(Error::corrupted("sub-stream count exceeds file mapping"));
         }
         let mut file_indexes = Vec::new();
         file_indexes
@@ -167,13 +167,13 @@ impl PositionalLzma2Folder {
             }
             if entry.has_stream {
                 if file_indexes.len() == file_count {
-                    return Err(Error::other("invalid block file mapping"));
+                    return Err(Error::corrupted("invalid block file mapping"));
                 }
                 file_indexes.push(index);
             }
         }
         if file_indexes.len() != file_count {
-            return Err(Error::other("invalid block file mapping"));
+            return Err(Error::corrupted("invalid block file mapping"));
         }
         let output_len = block.get_unpack_size();
         if output_len > limits.max_unpack_bytes {
@@ -199,11 +199,11 @@ impl PositionalLzma2Folder {
             let entry = &archive.files[index];
             boundary = boundary
                 .checked_add(entry.size)
-                .ok_or_else(|| Error::other("file size overflow"))?;
+                .ok_or_else(|| Error::corrupted("file size overflow"))?;
             splits.push(boundary);
         }
         if boundary != output_len || size == 0 {
-            return Err(Error::other("inconsistent LZMA2 folder bounds"));
+            return Err(Error::corrupted("inconsistent LZMA2 folder bounds"));
         }
         let mut streams = archive.block_sub_streams(block_index);
         if streams.is_empty() && archive.sub_streams_info.is_none() && file_count == 1 {
@@ -212,7 +212,7 @@ impl PositionalLzma2Folder {
                 .stream_map
                 .block_first_sub_stream_index
                 .get(block_index)
-                .ok_or_else(|| Error::other("missing sub-stream mapping"))?;
+                .ok_or_else(|| Error::corrupted("missing sub-stream mapping"))?;
             let crc = if block.has_crc {
                 Some(block.crc)
             } else {
@@ -233,7 +233,7 @@ impl PositionalLzma2Folder {
                 .zip(&file_indexes)
                 .any(|(stream, &index)| stream.size != archive.files[index].size)
         {
-            return Err(Error::other("inconsistent folder sub-stream metadata"));
+            return Err(Error::corrupted("inconsistent folder sub-stream metadata"));
         }
         let prop = properties[0];
         Ok(Some(Self(Arc::new(Folder {
@@ -409,12 +409,12 @@ impl PositionalLzma2Scanner {
                     .size
                     .saturating_sub(self.scanner.in_position())
         {
-            return Err(Error::other("LZMA2 scan exceeds packed range"));
+            return Err(Error::corrupted("LZMA2 scan exceeds packed range"));
         }
         let mut used = 0;
         while used < bytes.len() && self.scanner.pending_runs() == 0 {
             if self.scanner.finished() {
-                return Err(Error::other("bytes follow LZMA2 EOS"));
+                return Err(Error::corrupted("bytes follow LZMA2 EOS"));
             }
             let skipped = self.scanner.skip_payload((bytes.len() - used) as u64) as usize;
             if skipped != 0 {
@@ -424,9 +424,9 @@ impl PositionalLzma2Scanner {
             used += self
                 .scanner
                 .feed(&bytes[used..used + 1])
-                .map_err(|e| Error::other(e.to_string()))?;
+                .map_err(|e| Error::from(std::io::Error::from(e)))?;
             if self.scanner.out_position() > self.folder.0.output_len {
-                return Err(Error::other("LZMA2 scan exceeds folder output"));
+                return Err(Error::corrupted("LZMA2 scan exceeds folder output"));
             }
         }
         Ok(used)
@@ -458,7 +458,7 @@ impl PositionalLzma2Scanner {
             || self.scanner.out_position() != self.folder.0.output_len
             || self.scanner.pending_runs() != 0
         {
-            return Err(Error::other("incomplete LZMA2 folder scan"));
+            return Err(Error::corrupted("incomplete LZMA2 folder scan"));
         }
         Ok(())
     }
@@ -501,13 +501,13 @@ impl PositionalLzma2Run {
     /// Invalid dictionary properties fail before allocation.
     pub fn memory_required(&self) -> Result<u64, Error> {
         let ring = Lzma2RunDecoder::memory_required(self.folder.0.prop, self.run.unpacked_len)
-            .map_err(|e| Error::other(e.to_string()))?;
+            .map_err(|e| Error::from(std::io::Error::from(e)))?;
         let checks = Lzma2RunDecoder::checksum_memory_required(
             &self.folder.0.plan,
             self.run.out_offset,
             self.run.unpacked_len,
         )
-        .map_err(|e| Error::other(e.to_string()))?;
+        .map_err(|e| Error::from(std::io::Error::from(e)))?;
         // At completion the codec records and public records may briefly
         // coexist. Both layouts fit in this doubled codec-record reservation.
         Ok(ring + self.run.packed_len.min(INPUT_BYTES as u64) + checks * 2)
@@ -543,10 +543,10 @@ impl PositionalLzma2Run {
             self.run,
             self.folder.0.limit - input_size as u64,
         )
-        .map_err(|e| locate(Error::other(e.to_string())))?;
+        .map_err(|e| locate(Error::from(std::io::Error::from(e))))?;
         decoder
             .set_checksum_plan(&self.folder.0.plan)
-            .map_err(|e| locate(Error::other(e.to_string())))?;
+            .map_err(|e| locate(Error::from(std::io::Error::from(e))))?;
         let mut input = Vec::new();
         input
             .try_reserve_exact(input_size)
@@ -569,7 +569,7 @@ impl PositionalLzma2Run {
         };
         while position < packed.size {
             if cancel.load(Ordering::Acquire) {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, "run cancelled").into());
+                return Err(Error::Cancelled);
             }
             let want = (packed.size - position).min(input.len() as u64) as usize;
             let size = loop {
@@ -597,7 +597,7 @@ impl PositionalLzma2Run {
                     Ok(progress) if progress.read != 0 || progress.written != 0 => {
                         used += progress.read
                     }
-                    Ok(_) => return Err(locate(Error::other("LZMA2 run made no progress"))),
+                    Ok(_) => return Err(locate(Error::corrupted("LZMA2 run made no progress"))),
                     Err(error) => {
                         return Err(if failed_sink {
                             error.into()
@@ -623,10 +623,8 @@ impl PositionalLzma2Run {
             }
         }
         let complete = decoder.finish(cancel).map_err(|error| match error {
-            LzmaError::Cancelled => {
-                locate(io::Error::new(io::ErrorKind::Interrupted, error).into())
-            }
-            other => locate(Error::other(other.to_string())),
+            LzmaError::Cancelled => locate(Error::Cancelled),
+            other => locate(std::io::Error::from(other).into()),
         })?;
         let mut checks = Vec::new();
         checks

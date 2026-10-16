@@ -21,8 +21,24 @@ pub enum Error {
     Io(std::io::Error, Cow<'static, str>),
     /// Error opening file.
     FileOpen(std::io::Error, String),
-    /// Other error with description.
+    /// An error the caller's own code raised, such as a callback that gives
+    /// up, passed through as it is. The crate never raises it itself.
     Other(Cow<'static, str>),
+    /// The archive is malformed: a header field out of range or inconsistent
+    /// with another, a stream map that does not add up, a coder's properties
+    /// too short, or a stream that does not end where it should. The string
+    /// says which; it is for people, not for matching.
+    Corrupted(Cow<'static, str>),
+    /// The caller asked for something this call cannot do with what it was
+    /// given: an index past the end, an entry with no data where data is
+    /// needed, arguments that do not agree. The archive is not at fault.
+    InvalidArgument(Cow<'static, str>),
+    /// The work stopped before it finished: the caller's cancel flag was
+    /// set, or whoever was to receive its output had gone.
+    Cancelled,
+    /// A worker thread panicked or stopped early, or an invariant of this
+    /// crate's own failed. Neither the archive nor the caller is at fault.
+    Internal(Cow<'static, str>),
     /// Bad terminated streams info.
     BadTerminatedStreamsInfo(u8),
     /// Bad terminated unpack info.
@@ -95,12 +111,13 @@ pub enum Error {
         /// What the archive declared, in the same unit.
         requested: u64,
     },
-    /// An entry's stored name would escape the extraction directory, and the
-    /// caller asked for such an archive to be refused.
+    /// An entry's stored name would escape the extraction directory or names
+    /// no file there.
     ///
-    /// Only raised when [`ArchiveLimits::reject_unsafe_paths`] is set. A
-    /// consumer that lists rather than extracts leaves it off and asks
-    /// [`ArchiveEntry::is_unsafe_path`] per entry instead.
+    /// The reader raises it only when [`ArchiveLimits::reject_unsafe_paths`]
+    /// is set; a consumer that lists rather than extracts leaves that off and
+    /// asks [`ArchiveEntry::is_unsafe_path`] per entry instead. The
+    /// extraction helpers refuse such an entry with it whatever the setting.
     ///
     /// [`ArchiveLimits::reject_unsafe_paths`]: crate::ArchiveLimits::reject_unsafe_paths
     /// [`ArchiveEntry::is_unsafe_path`]: crate::ArchiveEntry::is_unsafe_path
@@ -244,8 +261,33 @@ impl From<std::io::Error> for Error {
 
 impl Error {
     #[inline]
-    pub(crate) fn other<S: Into<Cow<'static, str>>>(s: S) -> Self {
-        Self::Other(s.into())
+    pub(crate) fn corrupted<S: Into<Cow<'static, str>>>(s: S) -> Self {
+        Self::Corrupted(s.into())
+    }
+
+    #[inline]
+    pub(crate) fn invalid_argument<S: Into<Cow<'static, str>>>(s: S) -> Self {
+        Self::InvalidArgument(s.into())
+    }
+
+    #[inline]
+    pub(crate) fn internal<S: Into<Cow<'static, str>>>(s: S) -> Self {
+        Self::Internal(s.into())
+    }
+
+    /// This error, to travel up a `Read` or `Write` chain; [`Error::in_block`]
+    /// takes it back out. Its I/O kind is the nearest std one, except that a
+    /// cancellation is `Other`: std's read and copy helpers retry an
+    /// `Interrupted` read, so a cancelled chain would spin instead of stop.
+    pub(crate) fn into_io(self) -> std::io::Error {
+        let kind = match self {
+            Self::Corrupted(_) | Self::ChecksumVerificationFailed => {
+                std::io::ErrorKind::InvalidData
+            }
+            Self::InvalidArgument(_) => std::io::ErrorKind::InvalidInput,
+            _ => std::io::ErrorKind::Other,
+        };
+        std::io::Error::new(kind, self)
     }
 
     /// A limit check that failed, before whatever it bounds was attempted.
@@ -331,32 +373,24 @@ impl Error {
     /// [`Error::BlockDecode`] whose cause it is, with the
     /// [`kind`](BlockErrorKind) its cause implies.
     ///
-    /// An error that is already a block error is returned as it is, and so is
-    /// [`Error::LimitExceeded`], which refuses the caller's budget rather than
-    /// reporting damage. A CRC-32 that failed inside a `Read` chain becomes
-    /// [`Error::ChecksumVerificationFailed`] first, so every path reports a
-    /// checksum the same way.
+    /// One of this crate's errors raised inside a `Read` chain, which arrives
+    /// as an [`Error::Io`] carrying it, is taken back out first, so a checksum,
+    /// a cancellation or a failed worker is reported the same way on every
+    /// path. A result that is not damage in the block is returned as it is:
+    /// a block error already, [`Error::LimitExceeded`] (the caller's budget),
+    /// [`Error::Cancelled`], [`Error::InvalidArgument`] and
+    /// [`Error::Internal`].
     #[must_use]
     pub fn in_block(self, block_index: usize, packed_offset: u64) -> Self {
-        // Already located; do not re-wrap an inner block's context away.
-        if matches!(self, Self::BlockDecode { .. }) {
-            return self;
-        }
-        // A checksum that did not match is one error whichever verifying
-        // reader caught it — the block's, a file's on the consuming thread,
-        // or the workers' folded one — so it is reported as the same
-        // `ChecksumMismatch`, with the same message, on every path. Raised
-        // inside the `Read` chain it arrives wrapped in an `io::Error`, whose
-        // kind (`Other`) says nothing about the archive.
-        let error = if self.is_checksum_failure() {
-            Self::ChecksumVerificationFailed
-        } else {
-            self
-        };
-        // A limit is a refusal, not damage: the block is fine, the caller's
-        // budget is not. Keep it typed rather than rendering it into a
-        // `BlockDecode` message, so `limit_hit` still answers.
-        if matches!(error, Self::LimitExceeded { .. }) {
+        let error = self.out_of_io();
+        if matches!(
+            error,
+            Self::BlockDecode { .. }
+                | Self::LimitExceeded { .. }
+                | Self::Cancelled
+                | Self::InvalidArgument(_)
+                | Self::Internal(_)
+        ) {
             return error;
         }
         let kind = match &error {
@@ -376,6 +410,38 @@ impl Error {
             kind,
             cause: Box::new(error),
         }
+    }
+
+    /// The crate's own error an [`Error::Io`] carries, if it carries one, or
+    /// the class of a coder's error that is not damage in its stream.
+    fn out_of_io(self) -> Self {
+        match self {
+            Self::Io(io, context) => match io.downcast::<Error>() {
+                Ok(error) => error.out_of_io(),
+                Err(io) => Self::from_coder(&io).unwrap_or(Self::Io(io, context)),
+            },
+            error => error,
+        }
+    }
+
+    /// A cancellation or failed invariant that a coder raised inside a `Read`
+    /// chain, as this crate reports it. Damage the coder found stays the I/O
+    /// error it is, of the kind the coder gave it.
+    fn from_coder(io: &std::io::Error) -> Option<Self> {
+        let inner = io.get_ref()?;
+        if let Some(error) = inner.downcast_ref::<lzma_turbo::Error>() {
+            return match error {
+                lzma_turbo::Error::Cancelled => Some(Self::Cancelled),
+                lzma_turbo::Error::InternalFailure => Some(Self::internal(error.to_string())),
+                _ => None,
+            };
+        }
+        #[cfg(feature = "ppmd")]
+        if let Some(error) = inner.downcast_ref::<ppmd_turbo::Error>() {
+            return matches!(error.kind(), ppmd_turbo::ErrorKind::Internal(_))
+                .then(|| Self::internal(error.to_string()));
+        }
+        None
     }
 
     /// The I/O error this one reports, if an I/O error is what it reports:
@@ -467,6 +533,11 @@ impl Display for Error {
                 .field("packed_offset", packed_offset)
                 .field("kind", kind)
                 .finish(),
+            Self::Other(message) => f.write_str(message),
+            Self::Corrupted(detail) => write!(f, "corrupted archive: {detail}"),
+            Self::InvalidArgument(detail) => write!(f, "invalid argument: {detail}"),
+            Self::Cancelled => f.write_str("cancelled"),
+            Self::Internal(detail) => write!(f, "internal error: {detail}"),
             _ => std::fmt::Debug::fmt(&self, f),
         }
     }
@@ -550,7 +621,7 @@ mod tests {
         assert!(crc.has_checksum_mismatch());
         assert!(Error::NextHeaderCrcMismatch.has_checksum_mismatch());
         assert!(
-            !Error::other("damaged")
+            !Error::corrupted("damaged")
                 .in_block(0, 32)
                 .has_checksum_mismatch()
         );

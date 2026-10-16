@@ -507,6 +507,36 @@ it, destructures it, or reads its `Display` rendering.
   cause. `has_checksum_mismatch` also recognises a CRC-32 carried inside an
   I/O error from a `Read` chain, one behind `MaybeBadPassword`, the next
   header's CRC, and an LZ4 frame's header, block or content checksum.
+- The crate's own failures that used to be `Error::Other(text)` each land in
+  a class a caller can decide on: `Error::Corrupted` for a malformed
+  archive, `Error::Unsupported` for a feature this crate does not decode,
+  the new `Error::InvalidArgument` for a request this call cannot serve
+  (a block index out of range, an unsafe destination), the new
+  `Error::Cancelled` when the cancel flag is set or the output's receiver
+  has gone, and the new `Error::Internal` for a worker that panicked or
+  stopped and a broken invariant. The text inside each says which, for
+  people. `Error::Other` is now only a caller's own error, such as one a
+  callback returns, passed through as it is.
+- An entry name that leaves the extraction directory or names no file is
+  `Error::UnsafeEntryName`, which the extraction helpers raise whatever
+  `reject_unsafe_paths` is set to.
+- These errors travel inside an `io::Error` from a `Read` chain as
+  themselves, with a kind that matches (`InvalidData` for corruption,
+  `InvalidInput` for a bad argument, and `Other` for a cancellation, which
+  std's read helpers would retry as `Interrupted`), and `Error::in_block`
+  takes them back out. A cancellation, a caller's bad argument or an
+  internal failure is returned as itself rather than blamed on the block it
+  happened in. So is an LZMA decoder's cancellation or internal failure,
+  and a PPMd codec's internal failure.
+- `Error::Other`, `Corrupted`, `InvalidArgument`, `Cancelled` and
+  `Internal` render as text (`internal error: ...`) rather than as their
+  `Debug` form.
+- Requires `lzma-turbo` 0.10 and, with the `ppmd` feature, `ppmd-turbo`
+  0.2. An LZMA or LZMA2 failure, streaming or in a positional block walk,
+  keeps the `lzma-turbo` error inside its `io::Error` with the I/O kind of
+  its class (`UnexpectedEof` for a truncated stream, `OutOfMemory` for a
+  memory limit), where 0.28 made every one `InvalidData` and a positional
+  walk kept only its rendering.
 
 ## 0.28.0 - 2026-10-16
 

@@ -188,18 +188,7 @@ fn positional_run_limits_and_sink_errors_preserve_their_identity() {
             Ok(data.len())
         })
         .unwrap_err();
-    assert!(matches!(
-        error,
-        Error::BlockDecode {
-            kind: sevenz_turbo::BlockErrorKind::Io,
-            ..
-        }
-    ));
-    assert_eq!(
-        error.io_error().map(std::io::Error::kind),
-        Some(std::io::ErrorKind::Interrupted),
-        "{error:?}"
-    );
+    assert!(matches!(error, Error::Cancelled), "{error:?}");
 }
 
 #[test]

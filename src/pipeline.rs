@@ -341,7 +341,9 @@ impl PipeState {
                 Some(Ok(false))
             }
             End::Failed(error) => Some(Err(error)),
-            End::Reported => Some(Err(io::Error::other("a coder stage already failed"))),
+            End::Reported => Some(Err(
+                Error::internal("a coder stage already failed").into_io()
+            )),
         }
     }
 }
@@ -378,7 +380,7 @@ impl Shared {
 }
 
 fn abandoned() -> io::Error {
-    io::Error::other("the block's reader was dropped")
+    Error::Cancelled.into_io()
 }
 
 /// Fills `chunk` to [`PIPE_CHUNK`] from `reader`: `Ok(true)` when full,
@@ -690,9 +692,10 @@ impl<'r> Pipeline<'r> {
                 pipe
             }
             Stage::Here(_) => {
-                return Err(io::Error::other(
+                return Err(crate::Error::internal(
                     "a coder stage cannot read a coder on the caller's thread",
-                ));
+                )
+                .into_io());
             }
         };
         Ok(Box::new(StageInput {
@@ -730,7 +733,8 @@ impl<'r> Pipeline<'r> {
                 let ran = catch_unwind(AssertUnwindSafe(|| run_stage(&shared, pipe, &mut *coder)));
                 if ran.is_err() {
                     let mut state = shared.lock();
-                    state.pipes[pipe].end = End::Failed(io::Error::other("a coder stage panicked"));
+                    state.pipes[pipe].end =
+                        End::Failed(Error::internal("a coder stage panicked").into_io());
                     shared.changed(&mut state);
                 }
             })?;
@@ -747,7 +751,8 @@ impl<'r> Pipeline<'r> {
             // left waiting for a writer.
             let shared = &self.inner().shared;
             let mut state = shared.lock();
-            state.pipes[pipe].end = End::Failed(io::Error::other("a coder stage did not start"));
+            state.pipes[pipe].end =
+                End::Failed(Error::internal("a coder stage did not start").into_io());
             shared.changed(&mut state);
         }
         Stage::There(pipe)
@@ -1786,7 +1791,7 @@ mod tests {
                 // the unwind; every piece sent before it arrives.
                 let sent = good / PIPE_CHUNK * PIPE_CHUNK;
                 assert_eq!(out, vec![9; sent], "{good} bytes, {depth} stages");
-                assert_eq!(error.to_string(), "a coder stage panicked");
+                assert_eq!(error.to_string(), "internal error: a coder stage panicked");
                 assert!(reader.read(&mut [0u8; 8]).is_err());
                 drop(reader);
                 drop(pipeline);

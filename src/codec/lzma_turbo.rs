@@ -55,7 +55,7 @@ pub(crate) const LZ_STATE_BYTES: u64 = 1 << 20;
 /// as a little-endian `u32`.
 pub(crate) fn lzma_dictionary_size(properties: &[u8]) -> Result<u32, Error> {
     if properties.len() < 5 {
-        return Err(Error::other("LZMA properties too short"));
+        return Err(Error::corrupted("LZMA properties too short"));
     }
     Ok(u32::from_le_bytes([
         properties[1],
@@ -71,14 +71,16 @@ pub(crate) fn lzma_dictionary_size(properties: &[u8]) -> Result<u32, Error> {
 /// maximum; anything else, or any reserved bit, is a malformed archive.
 pub(crate) fn lzma2_dictionary_size(properties: &[u8]) -> Result<u32, Error> {
     let Some(&bits) = properties.first() else {
-        return Err(Error::other("LZMA2 properties too short"));
+        return Err(Error::corrupted("LZMA2 properties too short"));
     };
     let bits = u32::from(bits);
     if (bits & !0x3F) != 0 {
-        return Err(Error::other("Unsupported LZMA2 property bits"));
+        return Err(Error::unsupported("Unsupported LZMA2 property bits"));
     }
     if bits > 40 {
-        return Err(Error::other("Dictionary larger than 4GiB maximum size"));
+        return Err(Error::unsupported(
+            "Dictionary larger than 4GiB maximum size",
+        ));
     }
     if bits == 40 {
         return Ok(0xFFFF_FFFF);
@@ -1185,7 +1187,8 @@ impl<R: Read> Lzma2MtReader<R> {
             threads: threads as usize,
             memory_limit,
         };
-        let mut decoder = Lzma2AdaptiveDecoder::new(dict_prop, &options).map_err(decode_error)?;
+        let mut decoder =
+            Lzma2AdaptiveDecoder::new(dict_prop, &options).map_err(std::io::Error::from)?;
         decoder.set_threads(Self::decoder_threads(threads));
         // The property was accepted by the decoder just now, so this cannot
         // fail; a cap of "never" would only cost the early give-up.
@@ -2182,7 +2185,7 @@ impl<R: Read> Lzma2MtReader<R> {
             // against a limit drawn in by the difference: the room it is
             // taken into is the room it is charged for.
             self.charge_queue_and(seg.capacity().saturating_sub(seg.len()) as u64);
-            match self.decoder.feed_owned(seg).map_err(decode_error)? {
+            match self.decoder.feed_owned(seg).map_err(std::io::Error::from)? {
                 None => {
                     self.decoder_refusing = false;
                     self.fed_to += take as u64;
@@ -2353,7 +2356,7 @@ impl<R: Read> Lzma2MtReader<R> {
         let took = self
             .decoder
             .feed(&front[..offer])
-            .map_err(decode_error)?
+            .map_err(std::io::Error::from)?
             .min(offer);
         if took == 0 {
             self.charge_queue();
@@ -2627,7 +2630,7 @@ impl<R: Read> Lzma2MtReader<R> {
             {
                 self.decoder
                     .drain_upto(0, |_, _| {})
-                    .map_err(decode_error)?;
+                    .map_err(std::io::Error::from)?;
             }
             if taken < offered {
                 // The decoder is holding all it is allowed to.
@@ -2830,7 +2833,7 @@ impl<R: Read> Lzma2MtReader<R> {
                 Ok(status) => status,
                 Err(err) => {
                     self.control.finish();
-                    return Err(decode_error(err));
+                    return Err(std::io::Error::from(err));
                 }
             };
             self.collect_checks();
@@ -2919,9 +2922,10 @@ impl<R: Read> Lzma2MtReader<R> {
                         idle_turns += 1;
                         if idle_turns >= MT_IDLE_TURNS_BEFORE_STALLED {
                             self.control.finish();
-                            return Err(std::io::Error::other(
+                            return Err(crate::Error::corrupted(
                                 "LZMA2 decode stopped making progress",
-                            ));
+                            )
+                            .into_io());
                         }
                     }
                 } else {
@@ -2930,10 +2934,6 @@ impl<R: Read> Lzma2MtReader<R> {
             }
         }
     }
-}
-
-fn decode_error(err: lzma_turbo::Error) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, err)
 }
 
 /// Builds the LZMA2 decoder for a 7z coder.

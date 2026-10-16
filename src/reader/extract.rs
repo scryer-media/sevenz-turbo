@@ -124,9 +124,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
                         .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))?;
                     runs.push(run);
                 } else if count == 0 {
-                    return Err(
-                        Error::other("LZMA2 scanner made no progress").in_block(0, packed.offset)
-                    );
+                    return Err(Error::corrupted("LZMA2 scanner made no progress")
+                        .in_block(0, packed.offset));
                 }
                 used += count;
             }
@@ -401,7 +400,7 @@ impl RingExtraction {
 
         let relative = safe_join(Path::new(""), entry.name())?;
         let file = create_extract_entry(root, entry, &relative)?
-            .ok_or_else(|| Error::other("ring destination must be a file"))?;
+            .ok_or_else(|| Error::invalid_argument("ring destination must be a file"))?;
         let workers = (threads as usize).min(self.runs.len());
         let cancel = AtomicBool::new(false);
         let next = AtomicUsize::new(0);
@@ -465,7 +464,7 @@ impl RingExtraction {
                     cancel.store(true, Ordering::Release);
                     let mut first = first_error.lock().unwrap();
                     if first.is_none() {
-                        *first = Some(Error::other("ring worker panicked"));
+                        *first = Some(Error::internal("ring worker panicked"));
                     }
                 }
             }
