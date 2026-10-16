@@ -546,8 +546,11 @@ Everything here is new surface; no upstream signature changed meaning.
   source is approved.
 - Docs: `docs/unsafe-validation.md` lists each lane's features and selectors
   and what remains uninstrumented.
-- `lzma-turbo` is a caret requirement (`"0.9.1"`) instead of an exact
+- `lzma-turbo` is a caret requirement (`"0.9.2"`) instead of an exact
   `=0.9.1` pin: the manifest names the floor, `Cargo.lock` the tested version.
+  0.9.2 fixes the x86-64 match-finder crash in Intel macOS release builds
+  (its `.L` assembly labels were dead-stripped as Mach-O atoms) and the LZMA2
+  run decoder returning before all owed output was delivered.
 - `compress` no longer enables the `aes` and `cbc` dependencies, so a default
   (AWS-LC) build no longer compiles the RustCrypto AES-256-CBC encryptor; it
   is built only with `compress`, `aes256` and `native-crypto` together. A
