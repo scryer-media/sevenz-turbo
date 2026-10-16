@@ -297,8 +297,7 @@ impl<W: std::io::Write, S: std::io::Write> Bcj2Writer<W, S> {
             }
             // It wants more source, and it has taken all of this: what it
             // could not decide about yet is held back inside it.
-            debug_assert_eq!(src_pos, src.len());
-            return Ok(());
+            return check_consumed(src_pos, src.len());
         }
     }
 
@@ -315,6 +314,22 @@ impl<W: std::io::Write, S: std::io::Write> Bcj2Writer<W, S> {
             call_len: self.call_len,
             jump_len: self.jump_len,
         })
+    }
+}
+
+/// Refuses an encoder call that asked for more source without having taken
+/// all it was given. `Write::write` reports the whole buffer as written, and
+/// the folder's CRC is taken from the source, so bytes left behind here would
+/// be missing from the archive with a checksum that still matches what the
+/// caller wrote: an archive that fails only when it is extracted.
+#[cfg(feature = "compress")]
+fn check_consumed(src_pos: usize, src_len: usize) -> std::io::Result<()> {
+    if src_pos == src_len {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "bcj2 encoder asked for more input after taking {src_pos} of {src_len} bytes"
+        )))
     }
 }
 
@@ -599,5 +614,18 @@ mod tests {
             .collect();
         let mut reader = Bcj2Reader::new(inputs, data.len() as u64);
         assert!(reader.read_to_end(&mut Vec::new()).is_err());
+    }
+
+    /// The encoder cannot be made to leave input behind from here, so the
+    /// check `pump` returns through is exercised directly: a shortfall is an
+    /// error in every build, not a debug assertion.
+    #[cfg(feature = "compress")]
+    #[test]
+    fn an_encoder_that_leaves_input_behind_is_an_error() {
+        assert!(check_consumed(4096, 4096).is_ok());
+        assert!(check_consumed(0, 0).is_ok());
+        let error = check_consumed(4092, 4096).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(error.to_string().contains("4092 of 4096"), "{error}");
     }
 }

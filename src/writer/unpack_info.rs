@@ -83,6 +83,25 @@ impl UnpackInfo {
         self.blocks.last_mut().expect("just pushed")
     }
 
+    /// How many pack streams the recorded blocks read: four for a BCJ2 block
+    /// (main, rc, call, jump), one for any other.
+    pub(crate) fn pack_streams(&self) -> usize {
+        self.blocks
+            .iter()
+            .map(|block| {
+                if block
+                    .extra
+                    .as_ref()
+                    .is_some_and(|extra| extra.bcj2.is_some())
+                {
+                    4
+                } else {
+                    1
+                }
+            })
+            .sum()
+    }
+
     pub(crate) fn write_to<H: Write>(&mut self, header: &mut H) -> std::io::Result<()> {
         header.write_u8(K_UNPACK_INFO)?;
         header.write_u8(K_FOLDER)?;

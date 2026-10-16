@@ -65,10 +65,14 @@ fn advise(data: *mut u8, len: usize) {
     unsafe extern "C" {
         fn madvise(addr: *mut core::ffi::c_void, length: usize, advice: i32) -> i32;
     }
+    /// `MADV_HUGEPAGE`, as `<asm-generic/mman-common.h>` defines it.
+    const MADV_HUGEPAGE: i32 = 14;
     // SAFETY: huge_with_advice supplies the complete owned, 2 MiB-aligned
     // allocation. MADV_HUGEPAGE changes page policy, never bytes or ownership.
-    // Advice is best effort: unsupported/denied advice leaves ordinary pages.
-    let _ = unsafe { madvise(data.cast(), len, 14) };
+    // The result is deliberately ignored: advice is best effort, and a kernel
+    // without transparent huge pages, or one that denies the advice, leaves
+    // ordinary pages, which hold the same bytes.
+    let _ = unsafe { madvise(data.cast(), len, MADV_HUGEPAGE) };
 }
 
 #[cfg(all(target_os = "linux", miri))]
