@@ -151,7 +151,10 @@ with a version bump and a changelog entry like any other.
   `cargo test --doc --all-features --no-fail-fast` must pass before a commit
   is proposed.
 - Any code change bumps the crate version, `Cargo.lock` and `CHANGELOG.md` in
-  the same change.
+  the same change. The bump is what `cargo semver-checks` says it is: the
+  release workflow runs it against the published version and refuses a
+  patch bump that carries a breaking change. Public enums are
+  `#[non_exhaustive]` so that a new variant is not one.
 - `tools/wasm-conformance` is the only place `wasmtime` is allowed: it is a
   workspace member, not a test of this crate, and every workspace-wide
   `cargo nextest run`/`cargo clippy` in CI and the release path excludes it. Do not

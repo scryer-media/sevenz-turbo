@@ -216,7 +216,10 @@ differential matrix against `7zz` stays green.
 
 ### Container API (additions only)
 
-Everything here is new surface; no upstream signature changed meaning.
+Everything here is new surface; no upstream signature changed meaning. The
+one exception is `Error`, which is `#[non_exhaustive]` since 0.28.0: a
+consumer that matched every variant of upstream's `Error` needs a wildcard
+arm, and this crate can add a variant without a breaking release.
 
 - `ArchiveLimits`, with `ArchiveReader::with_limits`,
   `Archive::read_with_limits` and `BlockDecoder::with_limits`: one model for
@@ -344,7 +347,7 @@ Everything here is new surface; no upstream signature changed meaning.
   a single LZMA2 block is coded on one thread. `ArchiveEntry::from_path`
   records the file's length so the size is known before the push.
 - A writer whose push failed after writing part of a folder is poisoned
-  (0.27.2): later pushes return `Error::WriterPoisoned` and `finish()` writes
+  (0.28.0): later pushes return `Error::WriterPoisoned` and `finish()` writes
   no header. Upstream lets the caller go on and writes an archive whose pack
   offsets are wrong.
 
@@ -472,8 +475,17 @@ Everything here is new surface; no upstream signature changed meaning.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
-## 0.27.2 - 2026-10-16
+## 0.28.0 - 2026-10-16
 
+This release was prepared as 0.27.2. The release workflow's `cargo
+semver-checks` gate refused that number: `Error` had no `#[non_exhaustive]`,
+so the new `Error::WriterPoisoned` variant is a breaking change for a
+consumer matching it exhaustively, and a breaking change is a minor bump
+before 1.0. Nothing else differs from what 0.27.2 would have shipped.
+
+- `Error` is `#[non_exhaustive]`, as `Limit`, `BlockErrorKind` and `lzma-turbo`'s
+  `Error` already are: a consumer that matched every variant needs a
+  wildcard arm, and a variant added later is no longer a breaking change.
 - Accept SDK-valid empty archives without a next header (a zero
   next-header size).
 - Preserve empty entries interleaved with solid substreams in block iteration
