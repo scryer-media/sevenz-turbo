@@ -1,8 +1,8 @@
-//! Stored folders read and checksummed off the calling thread.
+//! Stored folders read, checksummed and decrypted off the calling thread.
 //!
 //! A stored folder of 8 MiB or more, decoded with two threads or more from a
 //! complete positional source, is read ahead on a thread that checksums as it
-//! reads. None of that may show in
+//! reads, and an AES one is decrypted on a second. None of that may show in
 //! what comes out: the same bytes, hook calls and errors as one thread gives,
 //! a read error after every byte before it, and a caller that stops — or
 //! whose sink fails — stops the reading too.
@@ -71,6 +71,17 @@ fn solid(methods: Vec<EncoderConfiguration>, files: &[(String, Vec<u8>)]) -> Vec
 
 fn stored(files: &[(String, Vec<u8>)]) -> Vec<u8> {
     solid(vec![EncoderMethod::COPY.into()], files)
+}
+
+#[cfg(feature = "aes256")]
+fn stored_aes(files: &[(String, Vec<u8>)], password: &str) -> Vec<u8> {
+    solid(
+        vec![
+            encoder_options::AesEncoderOptions::new(Password::from(password)).into(),
+            EncoderMethod::COPY.into(),
+        ],
+        files,
+    )
 }
 
 /// What the positional source saw.
@@ -284,6 +295,17 @@ fn a_stored_folder_decodes_the_same_at_every_width() {
     same_at_every_width(&stored(&files), "", &files);
 }
 
+#[cfg(feature = "aes256")]
+#[test]
+fn an_encrypted_stored_folder_decodes_the_same_at_every_width() {
+    let files = members(12);
+    same_at_every_width(
+        &stored_aes(&files, "correct horse"),
+        "correct horse",
+        &files,
+    );
+}
+
 /// Below 8 MiB the folder stays on the calling thread.
 #[test]
 fn a_small_stored_folder_is_not_read_ahead() {
@@ -347,6 +369,12 @@ fn a_damaged_stored_folder_fails_its_checksum() {
     corrupt_fails_the_same(&stored(&members(12)), "");
 }
 
+#[cfg(feature = "aes256")]
+#[test]
+fn a_damaged_encrypted_stored_folder_fails_its_checksum() {
+    corrupt_fails_the_same(&stored_aes(&members(12), "pw-9"), "pw-9");
+}
+
 /// A source that fails partway: the error, after every byte before it.
 fn read_error_after_every_byte_before_it(archive: &[u8], password: &str, plain: &[u8]) {
     let fail_at = packed(archive, password, (6 << 20) + 4321) as u64;
@@ -404,6 +432,14 @@ fn a_read_error_mid_folder_follows_every_byte_before_it() {
     read_error_after_every_byte_before_it(&stored(&files), "", &plain);
 }
 
+#[cfg(feature = "aes256")]
+#[test]
+fn a_read_error_mid_encrypted_folder_follows_every_byte_before_it() {
+    let files = members(12);
+    let plain: Vec<u8> = files.iter().flat_map(|f| f.1.clone()).collect();
+    read_error_after_every_byte_before_it(&stored_aes(&files, "pw"), "pw", &plain);
+}
+
 /// Reading stops with the caller: what was read past the bytes the caller
 /// took is no more than the spans the stages may be ahead by.
 fn stops_with_the_caller(archive: &[u8], password: &str, drive: Drive, taken: u64, stages: u64) {
@@ -449,6 +485,18 @@ fn a_failing_sink_stops_the_reader_thread() {
         other => panic!("the sink's error was not passed on: {other:?}"),
     }
     stops_with_the_caller(&stored(&files), "", drive, room as u64, 1);
+}
+
+#[cfg(feature = "aes256")]
+#[test]
+fn a_failing_sink_stops_both_encrypted_stages() {
+    let files = members(40);
+    let room = 3 << 20;
+    let drive = Drive {
+        sink_room: room,
+        ..Drive::at(4)
+    };
+    stops_with_the_caller(&stored_aes(&files, "pw"), "pw", drive, room as u64, 2);
 }
 
 /// Is the `7zz` oracle available? With `SEVENZ_TURBO_7ZZ_REQUIRED` set, a
@@ -524,4 +572,39 @@ fn sevenzip_stored(password: &str) {
 #[test]
 fn sevenzip_stored_archives_decode_the_same() {
     sevenzip_stored("");
+}
+
+#[cfg(feature = "aes256")]
+#[test]
+fn sevenzip_encrypted_stored_archives_decode_the_same() {
+    sevenzip_stored("7zz-pass");
+}
+
+/// A wrong password is the error one thread gives: the plaintext fails its
+/// checksum, and the folder says the password may be wrong. 7-Zip's archive,
+/// because it leaves the header in the clear and the crate's writer does not.
+#[cfg(feature = "aes256")]
+#[test]
+fn a_wrong_password_fails_the_same_at_every_width() {
+    let Some(archive) = sevenzip_archive("right") else {
+        return;
+    };
+    let log = Arc::new(Log::default());
+    let (_, _, one) = decode(&archive, "wrong", Drive::at(1), &log);
+    let one = one.expect("one thread accepted a wrong password");
+    let log = Arc::new(Log::default());
+    let (_, _, four) = decode(&archive, "wrong", Drive::at(4), &log);
+    let four = four.expect("four threads accepted a wrong password");
+    assert_eq!(format!("{four:?}"), format!("{one:?}"));
+    assert!(log.off_thread.load(Ordering::Relaxed) > 0);
+    assert!(
+        matches!(
+            one,
+            Error::BlockDecode {
+                kind: BlockErrorKind::Password,
+                ..
+            }
+        ),
+        "{one:?}"
+    );
 }

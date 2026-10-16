@@ -3190,9 +3190,10 @@ impl<R: Read + Seek> ArchiveReader<R> {
         Ok((decoder, pack_size))
     }
 
-    /// The decode chain of a stored (COPY) folder with its reading and
-    /// checksumming on a thread of its own, or `None` where the folder is
-    /// decoded on the calling thread as before.
+    /// The decode chain of a stored folder (COPY, AES, or AES under COPY)
+    /// with its reading, checksumming and decryption on threads of their
+    /// own, or `None` where the folder is decoded on the calling thread as
+    /// before.
     ///
     /// Only for a folder of at least [`FOLDER_STAGE_BYTES`] — below that the
     /// threads cost more than the overlap gains, and the folder-parallel
@@ -3253,6 +3254,22 @@ impl<R: Read + Seek> ArchiveReader<R> {
         });
         let plain = match aes {
             None => store_overlap::spawn(packed, unpack_size, checksums),
+            #[cfg(feature = "aes256")]
+            Some(index) => {
+                let Ok(fetch) = store_overlap::spawn(packed, pack_size, None) else {
+                    return Ok(None);
+                };
+                let coder = &block.coders[index];
+                let len = block.get_unpack_size_at_index(index) as usize;
+                // The serial path's decoder, over the fetched ciphertext.
+                let crate::decoder::Decoder::Aes256Sha256(decrypting) =
+                    add_decoder(fetch, len, coder, password, opts)?
+                else {
+                    return Ok(None);
+                };
+                store_overlap::spawn(decrypting, unpack_size, checksums)
+            }
+            #[cfg(not(feature = "aes256"))]
             Some(_) => {
                 let _ = password;
                 return Ok(None);

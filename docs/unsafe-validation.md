@@ -60,7 +60,7 @@ order and cut at its limit, an error after every byte before it and again
 on a retried read, per-file checksums folded before the bytes arrive, a
 dropped consumer stopping its stage, and a panicking stage resumed on its
 consumer. `tests/store_overlap_tests.rs` decodes 12 MiB and 40 MiB solid
-stored folders at one to eight threads from a positional
+stored folders, plain and AES-256, at one to eight threads from a positional
 source: byte-identical to one thread, damaged, read from a source that fails
 part way, stopped early, and written to a sink that fails, each checking
 that the stage threads stop with the caller. Those stage threads are not in

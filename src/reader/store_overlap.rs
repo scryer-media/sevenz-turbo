@@ -1,4 +1,4 @@
-//! Stored folders read and checksummed off the calling thread.
+//! Stored folders read, checksummed and decrypted off the calling thread.
 //!
 //! A stored (COPY) folder has no coder to speak of: decoding it is reading
 //! the pack stream, checking each file's CRC-32 and handing the bytes to the
@@ -8,6 +8,11 @@
 //! own and checksums them as it reads, and the calling thread only writes:
 //! the two copies run at once, and no checksum is taken on the thread that
 //! delivers the bytes (see `AGENTS.md`).
+//!
+//! An AES folder over stored data adds one stage: the reader thread fetches
+//! ciphertext, a second thread decrypts it through the same
+//! `Aes256Sha256Decoder` the serial path uses and checksums the plaintext,
+//! which is where it is produced, and the caller writes.
 //!
 //! The checksums go where the parallel LZMA2 coder's go, into the reader's
 //! [`Lzma2Control`] fold, a piece per file, before the span holding a file's

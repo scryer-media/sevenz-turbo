@@ -259,9 +259,9 @@ jobs:
         run: cargo +nightly-2026-09-01 nextest run -Zbuild-std --target ${{ matrix.target }} --locked --no-default-features --features compress,aes256,native-crypto,ppmd --lib -E 'test(/^(ordered|pipeline|reader::store_overlap)::tests::/)' --no-fail-fast
       - name: Instrument parallel LZMA2, folder-parallel and BCJ2 decodes
         run: cargo +nightly-2026-09-01 nextest run -Zbuild-std --target ${{ matrix.target }} --locked --no-default-features --features compress,aes256,native-crypto,ppmd --test parallel_decode_tests --no-fail-fast
-      # Stored folders read ahead on a stage thread: early stop, a failing
-      # sink, a failing source, damage.
-      - name: Instrument stored-folder read-ahead
+      # Stored and AES-over-stored folders read and decrypted on stage
+      # threads: early stop, a failing sink, a failing source, damage.
+      - name: Instrument stored-folder read-ahead and decryption
         run: cargo +nightly-2026-09-01 nextest run -Zbuild-std --target ${{ matrix.target }} --locked --no-default-features --features compress,aes256,native-crypto,ppmd --test store_overlap_tests --no-fail-fast
 
   unsafe-miri-plan:
