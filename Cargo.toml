@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/scryer-media/sevenz-turbo"
 # Raised from upstream's 1.93: `lzma-turbo` requires 1.97.1.
 rust-version = "1.97.1"
-version = "0.27.0"
+version = "0.27.1"
 # Repository scaffolding that has no business in the crate archive.
 exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml", "docs/**/*.json.zst"]
 
@@ -84,9 +84,8 @@ bzip2 = { version = "0.6", optional = true }
 cbc = { version = "0.2", optional = true }
 flate2 = { version = "1", optional = true, features = ["zlib-rs"] }
 getrandom = { version = "0.4", optional = true }
-# Pin the reviewed library checkpoint while both performance PRs are open.
-# Registry packaging awaits the corresponding library publication.
-lzma-turbo = { version = "=0.9.1", git = "https://github.com/scryer-media/lzma-turbo", rev = "8f436d76b3ae4c8b51fc5a54dc23c9aea5531679", default-features = false, features = ["std", "asm", "crc", "filters"] }
+# Use the published version of the validated library checkpoint.
+lzma-turbo = { version = "=0.9.1", default-features = false, features = ["std", "asm", "crc", "filters"] }
 ppmd-turbo = { version = "0.1.1", optional = true }
 lz4_flex = { version = "0.14", optional = true }
 nt-time = { version = "0.15", optional = true }

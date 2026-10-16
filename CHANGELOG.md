@@ -45,10 +45,9 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   hooks, renovate, issue templates, `AGENTS.md`, `SECURITY.md`,
   `CONTRIBUTORS.md`. Upstream's `.github/workflows/rust.yml` and
   `.github/dependabot.yml` were removed as duplicates of these.
-- The performance checkpoint pins `lzma-turbo` to its reviewed Git revision,
-  so paired development builds do not require a machine-specific checkout.
-  Registry packaging awaits the matching library publication and a registry
-  dependency pin in a separate operator-owned release step.
+- The performance checkpoint uses the published `lzma-turbo =0.9.1`, so
+  registry builds use the validated library without a Git dependency or a
+  machine-specific checkout.
 
 ### Decoding
 
@@ -453,7 +452,9 @@ Everything here is new surface; no upstream signature changed meaning.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
-## Unreleased
+## 0.27.1 - Unreleased
+
+- Use the published `lzma-turbo 0.9.1` dependency for registry packaging.
 
 - Reduce non-solid archive metadata storage for ordinary one-input/one-output
   coders and one-member folders, preserving public metadata mutation semantics

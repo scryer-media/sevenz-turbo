@@ -118,9 +118,14 @@ with a version bump and a changelog entry like any other.
 - Do not push. The maintainer pushes.
 - The pre-commit hook (`.githooks/pre-commit`) rejects home paths, the local
   username and secrets. Keep it enabled: `git config core.hooksPath .githooks`.
-- Never commit generated archives. The small archives under `tests/resources/`
-  and `examples/data/` are the tracked differential corpus; anything larger
-  than 1 MiB, or anywhere else, is rejected by the `hygiene` CI lane.
+- Never commit generated archive fixtures outside `tests/resources/` and
+  `examples/data/`. Every tracked file in that differential corpus is capped
+  at 1 MiB by the `hygiene` CI lane. This is a repository fixture rule, not
+  a limit on archives the library can process.
+- Sanitized benchmark evidence under `docs/**/*.json.zst` is explicitly
+  allowed and is not subject to the fixture size cap. CI must decompress it
+  and validate strict UTF-8 JSON. Preserve the measurements and source
+  identities; do not discard evidence to satisfy a fixture-only size limit.
 - `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`
   and `cargo test --all-features` must pass before a commit is proposed.
 - Any code change bumps the crate version, `Cargo.lock` and `CHANGELOG.md` in
