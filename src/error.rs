@@ -117,6 +117,13 @@ pub enum Error {
     /// [`kind`](BlockErrorKind) says which, and `packed_offset` is the absolute
     /// file offset of the block's first packed stream, so a caller can name the
     /// damaged region without re-parsing the header.
+    ///
+    /// The error it locates is `cause`, which [`source`] returns and the
+    /// [`Display`] rendering leaves out. [`Error::in_block`] builds one and
+    /// derives `kind` from the cause.
+    ///
+    /// [`source`]: std::error::Error::source
+    #[non_exhaustive]
     BlockDecode {
         /// Index of the block (7-Zip calls it a folder) in [`Archive::blocks`].
         ///
@@ -126,14 +133,9 @@ pub enum Error {
         packed_offset: u64,
         /// What went wrong.
         kind: BlockErrorKind,
-        /// The underlying error, already rendered.
-        message: String,
-        /// The underlying error itself, so a caller can ask what it was —
-        /// [`Error::io_error`], [`Error::is_password_required`],
-        /// [`Error::has_checksum_mismatch`] — without reading `message`.
-        ///
-        /// Not part of the [`Display`] rendering, which stays the four fields
-        /// above.
+        /// The error this one locates. [`Error::io_error`],
+        /// [`Error::is_password_required`] and [`Error::has_checksum_mismatch`]
+        /// answer through it.
         cause: Box<Error>,
     },
     /// An earlier push on this `ArchiveWriter` failed after it had put bytes
@@ -325,8 +327,17 @@ impl Error {
         }
     }
 
-    /// Adds block context to an error raised while decoding that block.
-    pub(crate) fn in_block(self, block_index: usize, packed_offset: u64) -> Self {
+    /// Locates an error raised while decoding a block: the
+    /// [`Error::BlockDecode`] whose cause it is, with the
+    /// [`kind`](BlockErrorKind) its cause implies.
+    ///
+    /// An error that is already a block error is returned as it is, and so is
+    /// [`Error::LimitExceeded`], which refuses the caller's budget rather than
+    /// reporting damage. A CRC-32 that failed inside a `Read` chain becomes
+    /// [`Error::ChecksumVerificationFailed`] first, so every path reports a
+    /// checksum the same way.
+    #[must_use]
+    pub fn in_block(self, block_index: usize, packed_offset: u64) -> Self {
         // Already located; do not re-wrap an inner block's context away.
         if matches!(self, Self::BlockDecode { .. }) {
             return self;
@@ -363,7 +374,6 @@ impl Error {
             block_index,
             packed_offset,
             kind,
-            message: error.to_string(),
             cause: Box::new(error),
         }
     }
@@ -445,20 +455,17 @@ fn io_error_has_checksum_mismatch(error: &std::io::Error) -> bool {
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            // The cause is already rendered into `message`; leaving it out
-            // keeps the rendering what it was before the cause was kept.
+            // The cause is the error's source, so it is not rendered here too.
             Self::BlockDecode {
                 block_index,
                 packed_offset,
                 kind,
-                message,
                 cause: _,
             } => f
                 .debug_struct("BlockDecode")
                 .field("block_index", block_index)
                 .field("packed_offset", packed_offset)
                 .field("kind", kind)
-                .field("message", message)
                 .finish(),
             _ => std::fmt::Debug::fmt(&self, f),
         }
@@ -466,12 +473,12 @@ impl Display for Error {
 }
 
 impl std::error::Error for Error {
+    /// A block error's cause. The variants that hold an [`std::io::Error`]
+    /// render it, so they return none, as `io::Error` does for its own
+    /// payload; [`Error::io_error`] reaches it instead.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::BlockDecode { cause, .. } => Some(cause.as_ref()),
-            Self::Io(error, _) | Self::FileOpen(error, _) | Self::MaybeBadPassword(error) => {
-                Some(error)
-            }
             _ => None,
         }
     }
@@ -483,7 +490,8 @@ mod tests {
 
     /// A block error keeps the error it locates, so its I/O kind, its OS code
     /// and whether it was a password problem are answered from the error and
-    /// not from its wording; the rendering is the one it always had.
+    /// not from its wording. The cause is its source and is rendered once
+    /// along the chain: by the cause, not by the block error as well.
     #[test]
     fn a_block_error_keeps_its_cause() {
         let short =
@@ -499,9 +507,18 @@ mod tests {
             short.io_error().map(std::io::Error::kind),
             Some(std::io::ErrorKind::UnexpectedEof)
         );
+        let mut chain = vec![short.to_string()];
+        let mut next = std::error::Error::source(&short);
+        while let Some(error) = next {
+            chain.push(error.to_string());
+            next = error.source();
+        }
         assert_eq!(
-            short.to_string(),
-            "BlockDecode { block_index: 2, packed_offset: 32, kind: Io, message: \"Io(Kind(UnexpectedEof), \\\"\\\")\" }"
+            chain,
+            [
+                "BlockDecode { block_index: 2, packed_offset: 32, kind: Io }",
+                "Io(Kind(UnexpectedEof), \"\")",
+            ]
         );
 
         let os = Error::from(std::io::Error::from_raw_os_error(24)).in_block(0, 32);

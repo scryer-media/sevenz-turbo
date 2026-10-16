@@ -310,10 +310,9 @@ arm, and this crate can add a variant without a breaking release.
   from an I/O failure on the source or a method this build cannot decode. An
   error raised by the *caller's* own callback is passed through untouched — the
   decode chain is wrapped so the two can be told apart.
-  Since 0.29.0 it also keeps the error it locates as `cause`, answered by
-  `Error::io_error`, `Error::is_password_required` and
-  `Error::has_checksum_mismatch` and reported through
-  `std::error::Error::source`.
+  Since 0.29.0 it keeps the error it locates as `cause` in place of `message`,
+  answered by `Error::io_error`, `Error::is_password_required` and
+  `Error::has_checksum_mismatch` and returned by `std::error::Error::source`.
 
 ### Documentation
 
@@ -486,20 +485,28 @@ arm, and this crate can add a variant without a breaking release.
 
 ## 0.29.0 - 2026-10-16
 
-- `Error::BlockDecode` keeps the error it locates as a new `cause:
-  Box<Error>` field, so a caller can read the I/O kind, OS code and payload of
-  a failed read, whether the archive wanted a password, and whether a checksum
-  disagreed, without parsing `message`. `message` and the `Display` rendering
-  are unchanged; the cause is left out of both. This is a breaking change for
-  code that builds `BlockDecode` or destructures it without `..`.
+This release changes `Error::BlockDecode` in ways that break code that builds
+it, destructures it, or reads its `Display` rendering.
+
+- `Error::BlockDecode` keeps the error it locates as `cause: Box<Error>`, in
+  place of `message: String`, its rendering. A caller reads the I/O kind, OS
+  code and payload of a failed read, whether the archive wanted a password,
+  and whether a checksum disagreed, from the error rather than its wording.
+- `std::error::Error::source` returns a block error's cause, and the block
+  error's `Display` leaves it out, so a reporter that walks the chain prints
+  it once: `BlockDecode { block_index: 2, packed_offset: 32, kind: Io }`, then
+  the cause. A consumer that printed only the block error's `Display` prints
+  the chain, or `cause`, to keep the cause in its message. `Io`, `FileOpen`
+  and `MaybeBadPassword` render their I/O error, as before, and so return no
+  source.
+- `Error::BlockDecode` is `#[non_exhaustive]`: it is matched with `..` and
+  built by `Error::in_block`, which is now public and derives `kind` from the
+  cause.
 - New `Error::io_error`, `Error::is_password_required` and
   `Error::has_checksum_mismatch`. Each looks through a block error to its
   cause. `has_checksum_mismatch` also recognises a CRC-32 carried inside an
   I/O error from a `Read` chain, one behind `MaybeBadPassword`, the next
   header's CRC, and an LZ4 frame's header, block or content checksum.
-- `Error` reports its cause through `std::error::Error::source`: the cause of
-  a block error, and the I/O error behind `Io`, `FileOpen` and
-  `MaybeBadPassword`.
 
 ## 0.28.0 - 2026-10-16
 
