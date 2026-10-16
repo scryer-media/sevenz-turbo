@@ -530,8 +530,8 @@ fn io_error_has_checksum_mismatch(error: &std::io::Error) -> bool {
 
 /// A copy of an I/O error, for a failure that is reported more than once: the
 /// same kind, with its OS code, or with a copy of its payload when it is one
-/// of this crate's errors, a coder's, or a checksum failure. Any other payload
-/// is copied as its message.
+/// of this crate's errors, a coder's, a refused reservation, or a checksum
+/// failure. Any other payload is copied as its message.
 pub(crate) fn copy_io(error: &std::io::Error) -> std::io::Error {
     if let Some(code) = error.raw_os_error() {
         return std::io::Error::from_raw_os_error(code);
@@ -555,6 +555,13 @@ pub(crate) fn copy_io(error: &std::io::Error) -> std::io::Error {
     #[cfg(feature = "ppmd")]
     if let Some(inner) = inner.downcast_ref::<ppmd_turbo::Error>() {
         return std::io::Error::new(kind, *inner);
+    }
+    #[cfg(feature = "lz4")]
+    if let Some(copy) = crate::codec::lz4::copy_io(kind, inner) {
+        return copy;
+    }
+    if let Some(inner) = inner.downcast_ref::<std::collections::TryReserveError>() {
+        return std::io::Error::new(kind, inner.clone());
     }
     if io_error_has_checksum_mismatch(error) {
         return std::io::Error::new(kind, Error::ChecksumVerificationFailed);
@@ -705,6 +712,66 @@ mod tests {
         let copy = copy_io(&IoError::other("worker said no"));
         assert_eq!(copy.kind(), ErrorKind::Other);
         assert_eq!(copy.to_string(), "worker said no");
+
+        let refused = Vec::<u8>::new().try_reserve_exact(usize::MAX).unwrap_err();
+        let copy = copy_io(&IoError::new(ErrorKind::OutOfMemory, refused.clone()));
+        assert_eq!(copy.kind(), ErrorKind::OutOfMemory);
+        assert_eq!(
+            copy.get_ref()
+                .and_then(|inner| inner.downcast_ref::<std::collections::TryReserveError>()),
+            Some(&refused)
+        );
+    }
+
+    /// An lz4 frame error is copied as itself, so a failure reported twice
+    /// can still be downcast to it.
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn a_copied_io_error_keeps_its_lz4_payload() {
+        use lz4_flex::block::DecompressError;
+        use lz4_flex::frame::Error as Lz4Error;
+
+        for (original, check) in [
+            (
+                std::io::Error::from(Lz4Error::UnsupportedVersion(9)),
+                (|e: &Lz4Error| matches!(e, Lz4Error::UnsupportedVersion(9)))
+                    as fn(&Lz4Error) -> bool,
+            ),
+            (
+                std::io::Error::from(Lz4Error::DecompressionError(
+                    DecompressError::OffsetOutOfBounds,
+                )),
+                |e| {
+                    matches!(
+                        e,
+                        Lz4Error::DecompressionError(DecompressError::OffsetOutOfBounds)
+                    )
+                },
+            ),
+            (
+                std::io::Error::from(Lz4Error::ContentLengthError {
+                    expected: 5,
+                    actual: 4,
+                }),
+                |e| {
+                    matches!(
+                        e,
+                        Lz4Error::ContentLengthError {
+                            expected: 5,
+                            actual: 4
+                        }
+                    )
+                },
+            ),
+        ] {
+            let copy = copy_io(&original);
+            assert_eq!(copy.kind(), original.kind());
+            let inner = copy
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<Lz4Error>())
+                .unwrap_or_else(|| panic!("{copy} lost its lz4 payload"));
+            assert!(check(inner), "{inner:?}");
+        }
     }
 
     /// A block error keeps the error it locates, so its I/O kind, its OS code

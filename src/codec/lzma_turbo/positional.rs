@@ -579,10 +579,12 @@ impl PositionalLzma2Run {
                     .source
                     .read_at(&mut input[..want], packed.offset + position)
                 {
-                    Err(e)
-                        if e.kind() == io::ErrorKind::Interrupted
-                            && !cancel.load(Ordering::Acquire) =>
-                    {
+                    // A source woken by the cancellation returns
+                    // `Interrupted`, and the cancellation is what is reported.
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                        if cancel.load(Ordering::Acquire) {
+                            return Err(Error::Cancelled);
+                        }
                         continue;
                     }
                     result => break result.map_err(|e| locate(e.into()))?,
@@ -742,6 +744,57 @@ mod tests {
                 Ok(_) => panic!("out-of-range public fallback CRC was accepted"),
             }
         }
+    }
+
+    /// A source woken by the cancellation while a run waits on it returns
+    /// `Interrupted`; the run reports the cancellation, not a source failure.
+    #[test]
+    fn an_interrupted_read_after_cancel_is_cancelled() {
+        struct WakesOnCancel {
+            bytes: Arc<Vec<u8>>,
+            cancel: Arc<AtomicBool>,
+        }
+        impl ReadAt for WakesOnCancel {
+            fn read_at(&self, _: &mut [u8], _: u64) -> io::Result<usize> {
+                self.cancel.store(true, Ordering::Release);
+                Err(io::ErrorKind::Interrupted.into())
+            }
+            fn size(&self) -> io::Result<u64> {
+                Ok(self.bytes.len() as u64)
+            }
+        }
+
+        let expected = b"a run waiting on its source when it is cancelled";
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        writer.set_content_methods(vec![Lzma2Options::from_level(1).into()]);
+        writer.set_encrypt_header(false);
+        let mut entry = ArchiveEntry::new_file("member");
+        entry.size = expected.len() as u64;
+        writer
+            .push_archive_entry(entry, Some(expected.as_slice()))
+            .unwrap();
+        let bytes = Arc::new(writer.finish().unwrap().into_inner());
+        let archive =
+            Archive::read(&mut Cursor::new(bytes.as_slice()), &Password::empty()).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(WakesOnCancel {
+            bytes: bytes.clone(),
+            cancel: cancel.clone(),
+        });
+        let folder =
+            PositionalLzma2Folder::new(Arc::new(archive), source, 0, ArchiveLimits::default())
+                .unwrap()
+                .unwrap();
+        let pack = folder.packed_range();
+        let mut scanner = folder.scanner();
+        scanner
+            .feed(&bytes[pack.offset as usize..pack.end() as usize])
+            .unwrap();
+        let run = scanner.next_run().unwrap();
+        let error = run
+            .decode(&cancel, &mut |_, data: &[u8]| Ok(data.len()))
+            .unwrap_err();
+        assert!(matches!(error, Error::Cancelled), "{error:?}");
     }
 
     #[test]
