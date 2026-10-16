@@ -12,8 +12,8 @@ version = "0.0.0"
 # dev-dependencies is what keeps it out of every other `cargo test` and
 # `cargo clippy`; the wasm-conformance CI job is the one place it is built.
 [dev-dependencies]
-wasmtime = "~48.0.6"
-wasmtime-wasi = "~48.0.6"
+wasmtime = "48.0.6"
+wasmtime-wasi = "48.0.6"
 # The reference host AES, CRC-32 and SHA-256 the guest imports, and the writer
 # that makes the archives it extracts. The CRC and SHA-256 are the crates
 # `lzma-turbo` itself computes them with.
