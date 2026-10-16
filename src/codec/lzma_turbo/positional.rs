@@ -424,7 +424,7 @@ impl PositionalLzma2Scanner {
             used += self
                 .scanner
                 .feed(&bytes[used..used + 1])
-                .map_err(|e| Error::from(std::io::Error::from(e)))?;
+                .map_err(super::scan_error)?;
             if self.scanner.out_position() > self.folder.0.output_len {
                 return Err(Error::corrupted("LZMA2 scan exceeds folder output"));
             }

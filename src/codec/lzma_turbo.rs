@@ -43,6 +43,28 @@ pub use positional::{
     PositionalLzma2Scanner,
 };
 
+/// How this crate reports an error `lzma-turbo` raised that is not damage in
+/// a stream: a cancellation, or a failed invariant. Anything else is `None`.
+pub(crate) fn fault(error: &LzmaError) -> Option<Error> {
+    match error {
+        LzmaError::Cancelled => Some(Error::Cancelled),
+        LzmaError::InternalFailure => Some(Error::internal(error.to_string())),
+        _ => None,
+    }
+}
+
+/// [`fault`] for the `lzma-turbo` error an I/O error carries, if it carries
+/// one.
+pub(crate) fn io_fault(io: &std::io::Error) -> Option<Error> {
+    fault(io.get_ref()?.downcast_ref::<LzmaError>()?)
+}
+
+/// An error the run scanner raised over a folder's packed bytes. Those bytes
+/// are the archive's contents, so what the scanner rejects is corruption.
+pub(crate) fn scan_error(error: LzmaError) -> Error {
+    fault(&error).unwrap_or_else(|| Error::corrupted(error.to_string()))
+}
+
 /// Bytes an LZMA or LZMA2 decoder holds beyond its dictionary: the range
 /// decoder's input buffer, the probability tables and the chunk buffer. The
 /// reference decoder's own accounting is tens of kilobytes; a megabyte covers
@@ -75,11 +97,11 @@ pub(crate) fn lzma2_dictionary_size(properties: &[u8]) -> Result<u32, Error> {
     };
     let bits = u32::from(bits);
     if (bits & !0x3F) != 0 {
-        return Err(Error::unsupported("Unsupported LZMA2 property bits"));
+        return Err(Error::corrupted("reserved LZMA2 property bits set"));
     }
     if bits > 40 {
-        return Err(Error::unsupported(
-            "Dictionary larger than 4GiB maximum size",
+        return Err(Error::corrupted(
+            "LZMA2 dictionary larger than the 4 GiB maximum",
         ));
     }
     if bits == 40 {
@@ -2966,6 +2988,63 @@ pub(crate) fn lzma2_decoder<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BlockErrorKind;
+
+    fn block_kind(error: Error) -> Option<BlockErrorKind> {
+        match error.in_block(0, 0) {
+            Error::BlockDecode { kind, .. } => Some(kind),
+            _ => None,
+        }
+    }
+
+    /// LZMA2 property bytes past 40 are malformed archives, not a codec this
+    /// crate lacks.
+    #[test]
+    fn an_invalid_lzma2_property_is_corruption() {
+        for prop in [41u8, 63, 0x40, 0xFF] {
+            let error = lzma2_dictionary_size(&[prop]).unwrap_err();
+            assert!(matches!(error, Error::Corrupted(_)), "{prop}: {error:?}");
+            assert_eq!(block_kind(error), Some(BlockErrorKind::Corrupted), "{prop}");
+        }
+    }
+
+    /// What the run scanner rejects is in the archive's bytes, and is blamed
+    /// on them rather than on the source that read them.
+    #[test]
+    fn a_scanner_error_is_corruption_unless_it_is_a_fault() {
+        let error = scan_error(LzmaError::CorruptData);
+        assert!(matches!(error, Error::Corrupted(_)), "{error:?}");
+        assert_eq!(block_kind(error), Some(BlockErrorKind::Corrupted));
+        assert!(matches!(scan_error(LzmaError::Cancelled), Error::Cancelled));
+        assert!(matches!(
+            scan_error(LzmaError::InternalFailure),
+            Error::Internal(_)
+        ));
+    }
+
+    /// No password cancels a decode or breaks an invariant, so an encrypted
+    /// block's coder fault is returned as itself. Its damage stays a possibly
+    /// wrong password.
+    #[test]
+    fn an_encrypted_blocks_coder_fault_is_not_the_password() {
+        let wrapped = |e: LzmaError| Error::MaybeBadPassword(std::io::Error::from(e));
+        assert!(matches!(
+            wrapped(LzmaError::Cancelled).in_block(0, 0),
+            Error::Cancelled
+        ));
+        assert!(matches!(
+            wrapped(LzmaError::InternalFailure).in_block(0, 0),
+            Error::Internal(_)
+        ));
+        assert!(matches!(
+            Error::MaybeBadPassword(std::io::Error::other(Error::Cancelled)).in_block(0, 0),
+            Error::Cancelled
+        ));
+        assert_eq!(
+            block_kind(wrapped(LzmaError::CorruptData)),
+            Some(BlockErrorKind::Password)
+        );
+    }
 
     /// A dictionary is only ever as big as the output it could be read from.
     #[test]

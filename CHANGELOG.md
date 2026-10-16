@@ -527,7 +527,12 @@ it, destructures it, or reads its `Display` rendering.
   takes them back out. A cancellation, a caller's bad argument or an
   internal failure is returned as itself rather than blamed on the block it
   happened in. So is an LZMA decoder's cancellation or internal failure,
-  and a PPMd codec's internal failure.
+  and a PPMd codec's internal failure, inside an encrypted folder too, where
+  `MaybeBadPassword` used to blame it on the password.
+- An LZMA2 property byte above 40, or with a reserved bit set, is
+  `Error::Corrupted` rather than `Error::Unsupported`. A block error over
+  it is `BlockErrorKind::Corrupted`, not `UnsupportedMethod`: no codec
+  decodes it.
 - `Error::Other`, `Corrupted`, `InvalidArgument`, `Cancelled` and
   `Internal` render as text (`internal error: ...`) rather than as their
   `Debug` form.

@@ -414,12 +414,27 @@ impl Error {
 
     /// The crate's own error an [`Error::Io`] carries, if it carries one, or
     /// the class of a coder's error that is not damage in its stream.
+    ///
+    /// A cancellation or failed invariant comes out of
+    /// [`Error::MaybeBadPassword`] too: no password causes either.
     fn out_of_io(self) -> Self {
         match self {
             Self::Io(io, context) => match io.downcast::<Error>() {
                 Ok(error) => error.out_of_io(),
                 Err(io) => Self::from_coder(&io).unwrap_or(Self::Io(io, context)),
             },
+            Self::MaybeBadPassword(io) => {
+                let own_fault = io
+                    .get_ref()
+                    .and_then(|inner| inner.downcast_ref::<Error>())
+                    .is_some_and(|error| matches!(error, Self::Cancelled | Self::Internal(_)));
+                if own_fault {
+                    return io
+                        .downcast::<Error>()
+                        .unwrap_or_else(Self::MaybeBadPassword);
+                }
+                Self::from_coder(&io).unwrap_or(Self::MaybeBadPassword(io))
+            }
             error => error,
         }
     }
@@ -428,16 +443,11 @@ impl Error {
     /// chain, as this crate reports it. Damage the coder found stays the I/O
     /// error it is, of the kind the coder gave it.
     fn from_coder(io: &std::io::Error) -> Option<Self> {
-        let inner = io.get_ref()?;
-        if let Some(error) = inner.downcast_ref::<lzma_turbo::Error>() {
-            return match error {
-                lzma_turbo::Error::Cancelled => Some(Self::Cancelled),
-                lzma_turbo::Error::InternalFailure => Some(Self::internal(error.to_string())),
-                _ => None,
-            };
+        if let Some(error) = crate::codec::lzma_turbo::io_fault(io) {
+            return Some(error);
         }
         #[cfg(feature = "ppmd")]
-        if let Some(error) = inner.downcast_ref::<ppmd_turbo::Error>() {
+        if let Some(error) = io.get_ref()?.downcast_ref::<ppmd_turbo::Error>() {
             return matches!(error.kind(), ppmd_turbo::ErrorKind::Internal(_))
                 .then(|| Self::internal(error.to_string()));
         }
