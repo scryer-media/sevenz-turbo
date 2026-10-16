@@ -532,7 +532,15 @@ it, destructures it, or reads its `Display` rendering.
 - An LZMA2 property byte above 40, or with a reserved bit set, is
   `Error::Corrupted` rather than `Error::Unsupported`. A block error over
   it is `BlockErrorKind::Corrupted`, not `UnsupportedMethod`: no codec
-  decodes it.
+  decodes it. An LZMA coder whose first property byte encodes no
+  `lc/lp/pb` (225 or more) is `Error::Corrupted` before a decoder is
+  built. It was an `InvalidData` I/O error, a block of kind `Io`, or a
+  possibly wrong password in an encrypted folder.
+- A failure that is reported again is the same failure. This covers a
+  folder decoded in parallel whose callback went on past it, and a read
+  after a failure, there or in a stored folder read ahead. It keeps its
+  OS code, this crate's error inside it, or a coder's, instead of being
+  rebuilt from its kind and message.
 - `Error::Other`, `Corrupted`, `InvalidArgument`, `Cancelled` and
   `Internal` render as text (`internal error: ...`) rather than as their
   `Debug` form.

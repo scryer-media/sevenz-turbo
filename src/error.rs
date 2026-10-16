@@ -528,6 +528,118 @@ fn io_error_has_checksum_mismatch(error: &std::io::Error) -> bool {
     false
 }
 
+/// A copy of an I/O error, for a failure that is reported more than once: the
+/// same kind, with its OS code, or with a copy of its payload when it is one
+/// of this crate's errors, a coder's, or a checksum failure. Any other payload
+/// is copied as its message.
+pub(crate) fn copy_io(error: &std::io::Error) -> std::io::Error {
+    if let Some(code) = error.raw_os_error() {
+        return std::io::Error::from_raw_os_error(code);
+    }
+    let kind = error.kind();
+    let Some(inner) = error.get_ref() else {
+        let bare = std::io::Error::from(kind);
+        let message = error.to_string();
+        return if message == bare.to_string() {
+            bare
+        } else {
+            std::io::Error::new(kind, message)
+        };
+    };
+    if let Some(inner) = inner.downcast_ref::<Error>() {
+        return std::io::Error::new(kind, inner.copy());
+    }
+    if let Some(copy) = crate::codec::lzma_turbo::copy_io(kind, inner) {
+        return copy;
+    }
+    #[cfg(feature = "ppmd")]
+    if let Some(inner) = inner.downcast_ref::<ppmd_turbo::Error>() {
+        return std::io::Error::new(kind, *inner);
+    }
+    if io_error_has_checksum_mismatch(error) {
+        return std::io::Error::new(kind, Error::ChecksumVerificationFailed);
+    }
+    std::io::Error::new(kind, inner.to_string())
+}
+
+impl Error {
+    /// A copy of this error, with any I/O error in it copied by [`copy_io`].
+    pub(crate) fn copy(&self) -> Self {
+        match self {
+            Self::BadSignature(signature) => Self::BadSignature(*signature),
+            Self::UnsupportedVersion { major, minor } => Self::UnsupportedVersion {
+                major: *major,
+                minor: *minor,
+            },
+            Self::ChecksumVerificationFailed => Self::ChecksumVerificationFailed,
+            Self::NextHeaderCrcMismatch => Self::NextHeaderCrcMismatch,
+            Self::Io(error, context) => Self::Io(copy_io(error), context.clone()),
+            Self::FileOpen(error, name) => Self::FileOpen(copy_io(error), name.clone()),
+            Self::Other(message) => Self::Other(message.clone()),
+            Self::Corrupted(detail) => Self::Corrupted(detail.clone()),
+            Self::InvalidArgument(detail) => Self::InvalidArgument(detail.clone()),
+            Self::Cancelled => Self::Cancelled,
+            Self::Internal(detail) => Self::Internal(detail.clone()),
+            Self::BadTerminatedStreamsInfo(id) => Self::BadTerminatedStreamsInfo(*id),
+            Self::BadTerminatedUnpackInfo => Self::BadTerminatedUnpackInfo,
+            Self::BadTerminatedPackInfo(id) => Self::BadTerminatedPackInfo(*id),
+            Self::BadTerminatedSubStreamsInfo => Self::BadTerminatedSubStreamsInfo,
+            Self::BadTerminatedHeader(id) => Self::BadTerminatedHeader(*id),
+            Self::ExternalUnsupported => Self::ExternalUnsupported,
+            Self::UnsupportedCompressionMethod(method) => {
+                Self::UnsupportedCompressionMethod(method.clone())
+            }
+            Self::MaxMemLimited { max_kb, actaul_kb } => Self::MaxMemLimited {
+                max_kb: *max_kb,
+                actaul_kb: *actaul_kb,
+            },
+            Self::PasswordRequired => Self::PasswordRequired,
+            Self::Unsupported(detail) => Self::Unsupported(detail.clone()),
+            Self::MaybeBadPassword(error) => Self::MaybeBadPassword(copy_io(error)),
+            Self::FileNotFound => Self::FileNotFound,
+            Self::EndHeaderTooLarge {
+                limit_bytes,
+                declared_bytes,
+            } => Self::EndHeaderTooLarge {
+                limit_bytes: *limit_bytes,
+                declared_bytes: *declared_bytes,
+            },
+            Self::MemoryLimited {
+                limit_bytes,
+                required_bytes,
+            } => Self::MemoryLimited {
+                limit_bytes: *limit_bytes,
+                required_bytes: *required_bytes,
+            },
+            Self::LimitExceeded {
+                what,
+                limit,
+                requested,
+            } => Self::LimitExceeded {
+                what: *what,
+                limit: *limit,
+                requested: *requested,
+            },
+            Self::UnsafeEntryName { name, reason } => Self::UnsafeEntryName {
+                name: name.clone(),
+                reason,
+            },
+            Self::BlockDecode {
+                block_index,
+                packed_offset,
+                kind,
+                cause,
+            } => Self::BlockDecode {
+                block_index: *block_index,
+                packed_offset: *packed_offset,
+                kind: *kind,
+                cause: Box::new(cause.copy()),
+            },
+            Self::WriterPoisoned(message) => Self::WriterPoisoned(message.clone()),
+        }
+    }
+}
+
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -568,6 +680,32 @@ impl std::error::Error for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failure reported twice is the same failure the second time: its
+    /// kind, its OS code, and this crate's error inside it.
+    #[test]
+    fn a_copied_io_error_keeps_its_code_and_payload() {
+        use std::io::{Error as IoError, ErrorKind};
+
+        let copy = copy_io(&IoError::from_raw_os_error(5));
+        assert_eq!(copy.raw_os_error(), Some(5));
+
+        let copy = copy_io(&IoError::from(ErrorKind::UnexpectedEof));
+        assert_eq!(copy.kind(), ErrorKind::UnexpectedEof);
+        assert!(copy.get_ref().is_none());
+
+        let original = IoError::new(
+            ErrorKind::InvalidData,
+            Error::ChecksumVerificationFailed.in_block(1, 32),
+        );
+        let copy = copy_io(&original);
+        assert_eq!(copy.kind(), ErrorKind::InvalidData);
+        assert!(Error::from(copy).has_checksum_mismatch());
+
+        let copy = copy_io(&IoError::other("worker said no"));
+        assert_eq!(copy.kind(), ErrorKind::Other);
+        assert_eq!(copy.to_string(), "worker said no");
+    }
 
     /// A block error keeps the error it locates, so its I/O kind, its OS code
     /// and whether it was a password problem are answered from the error and

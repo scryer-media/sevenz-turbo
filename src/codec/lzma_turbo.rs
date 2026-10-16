@@ -59,6 +59,16 @@ pub(crate) fn io_fault(io: &std::io::Error) -> Option<Error> {
     fault(io.get_ref()?.downcast_ref::<LzmaError>()?)
 }
 
+/// A copy of the `lzma-turbo` error an I/O error carries, as the payload of a
+/// new one of `kind`; `None` if it carries none.
+pub(crate) fn copy_io(
+    kind: std::io::ErrorKind,
+    inner: &(dyn std::error::Error + Send + Sync + 'static),
+) -> Option<std::io::Error> {
+    let error = *inner.downcast_ref::<LzmaError>()?;
+    Some(std::io::Error::new(kind, error))
+}
+
 /// An error the run scanner raised over a folder's packed bytes. Those bytes
 /// are the archive's contents, so what the scanner rejects is corruption.
 pub(crate) fn scan_error(error: LzmaError) -> Error {
@@ -73,11 +83,15 @@ pub(crate) const LZ_STATE_BYTES: u64 = 1 << 20;
 
 /// Decodes the dictionary size an LZMA coder's five property bytes declare.
 ///
-/// The properties are `lc/lp/pb` packed into byte 0, then the dictionary size
-/// as a little-endian `u32`.
+/// The properties are `lc/lp/pb` packed into byte 0 as `(pb * 5 + lp) * 9 +
+/// lc`, then the dictionary size as a little-endian `u32`. A byte 0 of 225 or
+/// more encodes no `lc/lp/pb` and is a malformed archive.
 pub(crate) fn lzma_dictionary_size(properties: &[u8]) -> Result<u32, Error> {
     if properties.len() < 5 {
         return Err(Error::corrupted("LZMA properties too short"));
+    }
+    if properties[0] >= 9 * 5 * 5 {
+        return Err(Error::corrupted("invalid LZMA lc/lp/pb byte"));
     }
     Ok(u32::from_le_bytes([
         properties[1],
@@ -3022,6 +3036,18 @@ mod tests {
         ));
     }
 
+    /// A copied coder failure is still the coder's error, of the same kind.
+    #[test]
+    fn a_copied_coder_error_keeps_its_payload() {
+        let original = std::io::Error::from(LzmaError::Truncated);
+        let copy = crate::error::copy_io(&original);
+        assert_eq!(copy.kind(), original.kind());
+        assert_eq!(
+            copy.downcast::<LzmaError>().ok(),
+            Some(LzmaError::Truncated)
+        );
+    }
+
     /// No password cancels a decode or breaks an invariant, so an encrypted
     /// block's coder fault is returned as itself. Its damage stays a possibly
     /// wrong password.
@@ -3249,6 +3275,22 @@ mod tests {
         props.extend_from_slice(&(8u32 << 20).to_le_bytes());
         assert_eq!(lzma_dictionary_size(&props).unwrap(), 8 << 20);
         assert!(lzma_dictionary_size(&[0x5D, 0, 0]).is_err());
+    }
+
+    /// A first property byte that encodes no `lc/lp/pb` is a malformed
+    /// archive, refused before a decoder is built.
+    #[test]
+    fn an_invalid_lzma_property_byte_is_corruption() {
+        assert!(lzma_dictionary_size(&[224, 0, 0, 1, 0]).is_ok());
+        for first in [225u8, 0xFF] {
+            let error = lzma_dictionary_size(&[first, 0, 0, 1, 0]).unwrap_err();
+            assert!(matches!(error, Error::Corrupted(_)), "{first}: {error:?}");
+            assert_eq!(
+                block_kind(error),
+                Some(BlockErrorKind::Corrupted),
+                "{first}"
+            );
+        }
     }
 }
 

@@ -252,8 +252,8 @@ fn produce<R: Read>(
 enum Tail {
     Open,
     Ended,
-    /// The error, kept so a read after it fails the same way.
-    Failed(io::ErrorKind, String),
+    /// A copy of the error, kept so a read after it fails the same way.
+    Failed(io::Error),
 }
 
 /// What a stage's consumer reads: the spans, in order.
@@ -274,7 +274,7 @@ impl SpanReader {
             match &self.tail {
                 Tail::Open => {}
                 Tail::Ended => return Ok(false),
-                Tail::Failed(kind, message) => return Err(io::Error::new(*kind, message.clone())),
+                Tail::Failed(error) => return Err(crate::error::copy_io(error)),
             }
             let received = match self.rx.as_ref() {
                 Some(rx) => rx.recv(),
@@ -296,17 +296,15 @@ impl SpanReader {
                     self.join();
                 }
                 Ok(Message::Fail(error)) => {
-                    self.tail = Tail::Failed(error.kind(), error.to_string());
+                    self.tail = Tail::Failed(crate::error::copy_io(&error));
                     self.join();
                     return Err(error);
                 }
                 Err(_) => {
                     // Gone without saying how: it panicked, and `join`
                     // resumes the panic here.
-                    self.tail = Tail::Failed(
-                        io::ErrorKind::Other,
-                        "a stored folder's reader thread stopped".into(),
-                    );
+                    self.tail =
+                        Tail::Failed(io::Error::other("a stored folder's reader thread stopped"));
                     self.join();
                 }
             }

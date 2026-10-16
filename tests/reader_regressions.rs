@@ -315,3 +315,31 @@ fn zero_length_files_in_a_solid_block_are_checked() {
             .unwrap_or_else(|e| panic!("at {threads} threads with verification off: {e}"));
     }
 }
+
+/// A replayed folder's worker stops at a file's failure, so a callback handed
+/// that failure that goes on as if nothing happened gets it back as the
+/// folder's error. It was kept only as its kind and message, so a checksum
+/// mismatch came back as a bare I/O error; it is now copied with its payload.
+#[test]
+fn a_replayed_failure_the_callback_goes_on_from_keeps_its_class() {
+    let blocks = two_blocks();
+    let bytes = solid_archive(Lzma2Options::from_level(1), &blocks);
+    let mut reader = open(&bytes, Path::Replay, |archive| archive.files[1].crc ^= 1);
+    let mut handed = None;
+    let result = walk(&mut reader, Path::Replay, &mut |_, rd| {
+        let mut data = Vec::new();
+        if let Err(error) = rd.read_to_end(&mut data) {
+            handed.get_or_insert(error);
+        }
+        Ok(true)
+    });
+    let handed = handed.expect("the callback was handed the failure");
+    assert!(
+        handed
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<Error>())
+            .is_some_and(Error::has_checksum_mismatch),
+        "{handed:?}"
+    );
+    assert_checksum_mismatch(result, 0, "replay");
+}

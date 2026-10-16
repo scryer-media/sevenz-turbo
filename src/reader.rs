@@ -5069,7 +5069,7 @@ where
     };
     // A file's failure the callback was handed and did not return, kept so
     // that it is still the folder's error.
-    let mut swallowed: Option<(io::ErrorKind, String)> = None;
+    let mut swallowed: Option<io::Error> = None;
     // How much of the folder the callbacks have been handed. Once that is all
     // of it the folder's own CRC is owed too, whether or not the callback
     // handed the last byte then asked to stop.
@@ -5219,10 +5219,10 @@ where
             Some(FolderMessage::Done(FolderEnd::Finished)) => return Ok(ended(true, delivered)),
             Some(FolderMessage::Done(FolderEnd::Failed(error))) => return Err(error),
             Some(FolderMessage::Done(FolderEnd::Stopped)) => {
-                let (kind, message) = swallowed
+                let error = swallowed
                     .take()
-                    .unwrap_or((io::ErrorKind::Other, "folder decode stopped".to_string()));
-                return Err(Error::from(io::Error::new(kind, message))
+                    .unwrap_or_else(|| io::Error::other("folder decode stopped"));
+                return Err(Error::from(error)
                     .maybe_bad_password(encrypted)
                     .in_block(block_index, packed_offset));
             }
@@ -5256,9 +5256,9 @@ struct ReplayEntry<'r, 'a> {
     /// How much of the file the callback has been handed.
     delivered: u64,
     state: ReplayState,
-    /// The failure the callback was handed, described, for a later read and
+    /// A copy of the failure the callback was handed, for a later read and
     /// for a callback that does not return it.
-    fault: Option<(io::ErrorKind, String)>,
+    fault: Option<io::Error>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -5337,11 +5337,10 @@ impl ReplayEntry<'_, '_> {
                 ReplayState::Open => {}
                 ReplayState::Ended => return Ok(false),
                 ReplayState::Faulted | ReplayState::Lost => {
-                    let (kind, message) = self
-                        .fault
-                        .clone()
-                        .unwrap_or((io::ErrorKind::Other, "folder decode failed".to_string()));
-                    return Err(io::Error::new(kind, message));
+                    return Err(self.fault.as_ref().map_or_else(
+                        || io::Error::other("folder decode failed"),
+                        crate::error::copy_io,
+                    ));
                 }
             }
             match self.rx.recv() {
@@ -5355,7 +5354,7 @@ impl ReplayEntry<'_, '_> {
                 }
                 Some(FolderMessage::Fault(error)) => {
                     self.state = ReplayState::Faulted;
-                    self.fault = Some((error.kind(), error.to_string()));
+                    self.fault = Some(crate::error::copy_io(&error));
                     return Err(error);
                 }
                 _ => {
@@ -5364,7 +5363,7 @@ impl ReplayEntry<'_, '_> {
                         "the worker decoding this folder stopped before finishing it",
                     )
                     .into_io();
-                    self.fault = Some((error.kind(), error.to_string()));
+                    self.fault = Some(crate::error::copy_io(&error));
                     return Err(error);
                 }
             }

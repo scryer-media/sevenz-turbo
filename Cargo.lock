@@ -1318,7 +1318,7 @@ checksum = "5e2a88783b84d2d67ef2791778a9e76bfb68b8017aaf6c9d7d5f2626a478b16c"
 [[package]]
 name = "lzma-turbo"
 version = "0.10.0"
-source = "git+https://github.com/scryer-media/lzma-turbo?rev=7ee55ac33214ba7091b23c07596fcd2c28bf1e84#7ee55ac33214ba7091b23c07596fcd2c28bf1e84"
+source = "git+https://github.com/scryer-media/lzma-turbo?rev=1b1f763b282889e365bc35d63d19e8ef74a0e940#1b1f763b282889e365bc35d63d19e8ef74a0e940"
 dependencies = [
  "aws-lc-rs",
  "crc-fast",
