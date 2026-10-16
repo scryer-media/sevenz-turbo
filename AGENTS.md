@@ -59,7 +59,9 @@ with a version bump and a changelog entry like any other.
   - `src/container.rs`, which re-exports `lzma_turbo::crc::{crc32_combine,
     CrcFolder}` as public API;
   - `lzma_turbo::crc` wherever a CRC-32 is computed (`src/reader.rs`,
-    `src/writer.rs`, `src/writer/source_reader.rs`; see the CRC rules
+    `src/writer.rs`, `src/writer/source_reader.rs`, and
+    `src/reader/store_overlap.rs`, whose stage thread checksums a stored
+    folder's files where it reads or decrypts them; see the CRC rules
     below).
 
   The option types in `src/encoder_options.rs` name no encoder; what codes

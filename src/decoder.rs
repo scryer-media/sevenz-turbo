@@ -141,12 +141,14 @@ impl<'a> DecodeOptions<'a> {
     /// True only once the coder has actually been built and engaged the
     /// parallel path: a plan can always degrade to the single-threaded
     /// decoder, which computes no checksums, so the answer is read from the
-    /// live coder and not from what was asked for.
+    /// live coder and not from what was asked for. True as well for a stored
+    /// folder whose reader thread checksums what it reads
+    /// (`reader::store_overlap`), once that thread has been started.
     pub(crate) fn folding_checksums(&self) -> bool {
         !self.checksum_splits.is_empty()
             && self
                 .lzma2_control
-                .is_some_and(|control| control.progress().is_some())
+                .is_some_and(|control| control.progress().is_some() || control.folds_elsewhere())
     }
 }
 

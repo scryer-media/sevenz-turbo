@@ -26,15 +26,15 @@ tests of those as well.
 | --- | --- | --- | --- |
 | `guard-pages` | Source, codec and output allocations during pull, Send and prepared-block APIs; short reads, failure and teardown. Parallel LZMA2 decode at two threads (cursor and positional source), BCJ2 written and committed, AES-256 encode and decode with a wrong-password refusal, PPMd encode and decode | `compress,aes256,aws-lc-crypto,ppmd` | All four native platforms |
 | `unsafe-valgrind` | The allocation unit tests and source-buffer lifecycle integration tests, on separate runners | `compress` | Linux x86-64 and ARM64 |
-| `unsafe-sanitizer` | The allocation and lifecycle tests above (`compress`); `ordered::tests` and `pipeline::tests`; `tests/parallel_decode_tests.rs`. Each under AddressSanitizer and ThreadSanitizer, with instrumented std | `compress`; `compress,aes256,native-crypto,ppmd` for the concurrency tests | Linux x86-64 and ARM64 |
+| `unsafe-sanitizer` | The allocation and lifecycle tests above (`compress`); `ordered::tests`, `pipeline::tests` and `reader::store_overlap::tests`; `tests/parallel_decode_tests.rs` and `tests/store_overlap_tests.rs`. Each under AddressSanitizer and ThreadSanitizer, with instrumented std | `compress`; `compress,aes256,native-crypto,ppmd` for the concurrency tests | Linux x86-64 and ARM64 |
 | `unsafe-miri` | Initialization, unsupported advice, panic cleanup, independent allocations, movement between threads, and allocation-policy boundaries | `compress` | One Linux runner per discovered portable test |
 
 The sanitizer selectors, exactly:
 
 - `--lib -E 'test(/^writer::input_buffer::tests::/)'` and
   `--test input_buffer_tests`, with `--features compress`;
-- `--lib -E 'test(/^(ordered|pipeline)::tests::/)'` and
-  `--test parallel_decode_tests`, with
+- `--lib -E 'test(/^(ordered|pipeline|reader::store_overlap)::tests::/)'`,
+  `--test parallel_decode_tests` and `--test store_overlap_tests`, with
   `--features compress,aes256,native-crypto,ppmd`.
 
 `ordered::tests` covers in-order delivery, the staging bound, pacing,
@@ -55,7 +55,17 @@ with zero-size sub-streams, a solid block with empty-stream files
 interleaved between its streamed ones, a non-solid archive decoded
 folder-parallel from the positional source, a BCJ2 chain over parallel LZMA2,
 the committed BCJ2 archives, a corrupt block, and decodes a callback stops
-or fails part way through. The concurrency tests use RustCrypto so that the
+or fails part way through. `reader::store_overlap::tests` covers a stored-folder stage's spans in
+order and cut at its limit, an error after every byte before it and again
+on a retried read, per-file checksums folded before the bytes arrive, a
+dropped consumer stopping its stage, and a panicking stage resumed on its
+consumer. `tests/store_overlap_tests.rs` decodes 12 MiB and 40 MiB solid
+stored folders at one to eight threads from a positional
+source: byte-identical to one thread, damaged, read from a source that fails
+part way, stopped early, and written to a sink that fails, each checking
+that the stage threads stop with the caller. Those stage threads are not in
+the Miri or Memcheck lanes, which hold no concurrency tests.
+The concurrency tests use RustCrypto so that the
 AES and SHA-256 inside the pipeline are Rust the sanitizers instrument.
 
 The guard allocator supports the source buffer's full 2 MiB alignment; it
