@@ -1290,6 +1290,12 @@ impl Archive {
             return Err(Error::NextHeaderCrcMismatch);
         }
 
+        // C/7zArcIn.c: SzArEx_Open2 accepts an empty archive without a next
+        // header. Its start header, offset and declared size were checked above.
+        if buf.is_empty() {
+            return Ok(Archive::default());
+        }
+
         let mut archive = Archive::default();
         let mut buf_reader = buf.as_slice();
         let mut nid = buf_reader.read_u8()?;
@@ -4080,18 +4086,39 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         }
     }
 
+    fn file_range(archive: &Archive, block_index: usize) -> std::ops::Range<usize> {
+        let map = &archive.stream_map;
+        let start = map.block_first_file_index[block_index];
+        if archive.blocks[block_index].num_unpack_sub_streams == 0 {
+            return start..start;
+        }
+        let mut end = archive
+            .blocks
+            .iter()
+            .enumerate()
+            .skip(block_index + 1)
+            .find(|(_, block)| block.num_unpack_sub_streams != 0)
+            .map(|(index, _)| map.block_first_file_index[index])
+            .unwrap_or(archive.files.len());
+        // SzReadHeader2: empty entries between a folder's streams still belong
+        // to that folder. Its substream count alone is not its file span.
+        // Empty entries after the final stream are delivered separately.
+        while end > start && map.file_block_index[end - 1] != Some(block_index) {
+            end -= 1;
+        }
+        start..end
+    }
+
     /// Returns a slice of archive entries contained in this block.
     ///
     /// The entries are returned in the order they appear in the block.
     pub fn entries(&self) -> &[ArchiveEntry] {
-        let start = self.archive.stream_map.block_first_file_index[self.block_index];
-        let file_count = self.archive.blocks[self.block_index].num_unpack_sub_streams;
-        &self.archive.files[start..(file_count + start)]
+        &self.archive.files[Self::file_range(self.archive, self.block_index)]
     }
 
     /// Returns the number of entries contained in this block.
     pub fn entry_count(&self) -> usize {
-        self.archive.blocks[self.block_index].num_unpack_sub_streams
+        self.entries().len()
     }
 
     /// Takes a closure to decode each files in this block.
@@ -4173,8 +4200,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
             inner: block_reader,
             faulted: Rc::clone(&faulted),
         };
-        let start = archive.stream_map.block_first_file_index[block_index];
-        let file_count = archive.blocks[block_index].num_unpack_sub_streams;
+        let files = Self::file_range(archive, block_index);
 
         let first_sub_stream = archive
             .stream_map
@@ -4201,7 +4227,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         };
         let mut finished = true;
 
-        for file_index in start..(file_count + start) {
+        for file_index in files {
             let file = &archive.files[file_index];
             if file.has_stream && file.size > 0 {
                 let bound = file.size as usize;
@@ -4383,12 +4409,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         if block.coders.len() != 1 {
             return Vec::new();
         }
-        let start = archive.stream_map.block_first_file_index[block_index];
-        let files = archive
-            .files
-            .iter()
-            .skip(start)
-            .take(block.num_unpack_sub_streams);
+        let files = &archive.files[Self::file_range(archive, block_index)];
         let mut offsets = Vec::new();
         let mut at = 0u64;
         let mut wanted = block.has_crc;

@@ -139,6 +139,36 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn panicking_advice_releases_the_uninitialized_allocation() {
+        // In its own Miri process this also checks that unwinding drops the
+        // Box with its original aligned allocation layout, without a leak.
+        let result = std::panic::catch_unwind(|| {
+            InputBuffer::huge_with_advice(|_, _| panic!("advice interrupted"))
+        });
+        assert!(result.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn aligned_storage_keeps_ownership_when_moved_between_threads() {
+        let mut first = InputBuffer::huge_with_advice(|_, _| {});
+        let mut second = InputBuffer::huge_with_advice(|_, _| {});
+        assert_ne!(first.as_ptr(), second.as_ptr());
+        first[0] = 7;
+        second[HUGE_PAGE - 1] = 11;
+        let first = std::thread::spawn(move || {
+            assert_eq!((first[0], first[HUGE_PAGE - 1]), (7, 0));
+            first[HUGE_PAGE - 1] = 13;
+            first
+        })
+        .join()
+        .unwrap();
+        assert_eq!((first[0], first[HUGE_PAGE - 1]), (7, 13));
+        assert_eq!((second[0], second[HUGE_PAGE - 1]), (0, 11));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn native_advice_preserves_the_initialized_buffer() {
         let methods = [EncoderConfiguration::new(EncoderMethod::LZMA2)];
         let buffer = InputBuffer::new(Some(8 << 20), &methods);

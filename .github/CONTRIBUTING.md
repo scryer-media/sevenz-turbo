@@ -18,3 +18,7 @@ Thanks for looking. A few things before you open a pull request:
 
 Install the native test runner with `cargo install cargo-nextest --locked --version 0.9.143`.
 Nextest runs unit and integration tests; Cargo runs doctests, and Miri uses its own interpreter.
+
+Changes to native allocation, ownership or assembly paths must preserve the
+focused [unsafe validation lanes](../docs/unsafe-validation.md). Use the
+pinned SDK oracle when changing archive parsing or member iteration.

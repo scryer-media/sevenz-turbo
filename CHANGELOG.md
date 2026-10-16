@@ -51,6 +51,9 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
 
 ### Decoding
 
+- SDK conformance covers empty archive encodings and interleaved empty
+  members. Block iteration uses the parsed file span rather than the count
+  of non-empty substreams, preserving all solid-folder members.
 - Parsed header storage is released before final stream maps are allocated,
   avoiding overlap between the encoded representation and lookup tables.
 - LZMA (`0x030101`) and LZMA2 (`0x21`) are decoded by
@@ -453,6 +456,12 @@ Everything here is new surface; no upstream signature changed meaning.
   not ours to vendor.
 
 ## 0.27.1 - 2026-10-15
+
+- Accept SDK-valid empty archives without a next header. Preserve empty
+  entries interleaved with solid substreams in block iteration and checksum
+  boundaries; do not omit later members by treating a stream count as a file count.
+- Split CI feature configurations across runners and add targeted native guards,
+  Valgrind, sanitizers, sharded Miri, and pinned SDK archive conformance checks.
 
 - Enforce aggregate coder limits when admitting positional LZMA2 work from
   previously parsed metadata. Keep backend access behind the codec facade.

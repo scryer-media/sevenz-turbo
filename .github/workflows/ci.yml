@@ -97,7 +97,55 @@ jobs:
       - run: cargo doc --locked --no-deps --all-features
 
   test:
-    name: test-${{ matrix.platform }}
+    name: test-${{ matrix.platform.name }}-${{ matrix.configuration.name }}
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - name: macos-aarch64
+            runner: macos-15
+          - name: windows-x86_64
+            runner: windows-2025
+        configuration:
+          - name: aws-lc
+            args: ""
+          - name: all-features
+            args: --all-features
+          - name: no-default-features
+            args: --no-default-features
+          - name: rustcrypto
+            args: --no-default-features --features aes256,native-crypto,bzip2,compress,ppmd,util
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # aws-lc-rs assembles AWS-LC with NASM on Windows. Every other lane on
+      # this matrix has an assembler the build script already finds.
+      - name: Install NASM (Windows, for aws-lc-rs)
+        if: matrix.platform.name == 'windows-x86_64' && (matrix.configuration.name == 'aws-lc' || matrix.configuration.name == 'all-features')
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+      - name: Test ${{ matrix.configuration.name }}
+        run: cargo nextest run --locked --no-fail-fast ${{ matrix.configuration.args }}
+      - name: Run doctests
+        run: cargo test --doc --locked --no-fail-fast ${{ matrix.configuration.args }}
+
+  # Native guards also cover assembly reached through the archive APIs.
+  # The 2 MiB guard alignment includes sevenz's HugeInput allocation.
+  guard-pages:
+    name: guard-pages-${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -116,34 +164,175 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install Nextest
-        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
-        with:
-          tool: cargo-nextest@0.9.143
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      # aws-lc-rs assembles AWS-LC with NASM on Windows. Every other lane on
-      # this matrix has an assembler the build script already finds.
-      - name: Install NASM (Windows, for aws-lc-rs)
-        if: matrix.platform == 'windows-x86_64'
-        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
-      - name: Test default features (aws-lc crypto backend)
-        run: cargo nextest run --locked --no-fail-fast
-      - name: Run doctests
-        run: cargo test --doc --locked --no-fail-fast
-      - name: Test all features
-        run: cargo nextest run --locked --all-features --no-fail-fast
-      - name: Run doctests
-        run: cargo test --doc --locked --all-features --no-fail-fast
-      - name: Test without default features
-        run: cargo nextest run --locked --no-default-features --no-fail-fast
-      - name: Run doctests
-        run: cargo test --doc --locked --no-default-features --no-fail-fast
-      - name: Test the RustCrypto backend
-        run: cargo nextest run --locked --no-default-features --features aes256,native-crypto,bzip2,compress,ppmd,util --no-fail-fast
-      - name: Run doctests
-        run: cargo test --doc --locked --no-default-features --features aes256,native-crypto,bzip2,compress,ppmd,util --no-fail-fast
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Guard both sides of native source and codec allocations
+        run: cargo nextest run --locked --no-default-features --features compress --test guard_pages --run-ignored all --no-fail-fast
+
+  unsafe-valgrind:
+    name: unsafe-valgrind-${{ matrix.platform }}-${{ matrix.scope }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-x86_64, linux-aarch64]
+        scope: [allocation, source-lifecycle]
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+    env:
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Install Valgrind
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends valgrind
+      - name: Aligned allocation and native madvise under Memcheck
+        if: matrix.scope == 'allocation'
+        run: cargo nextest run --locked --release --no-default-features --features compress --lib -E 'test(/^writer::input_buffer::tests::/)' --no-fail-fast
+      - name: Archive source lifetimes, short reads and failures under Memcheck
+        if: matrix.scope == 'source-lifecycle'
+        run: cargo nextest run --locked --release --no-default-features --features compress --test input_buffer_tests --no-fail-fast
+
+  unsafe-sanitizer:
+    name: unsafe-${{ matrix.sanitizer }}-${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-x86_64, linux-aarch64]
+        sanitizer: [address, thread]
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    env:
+      RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: nightly-2026-09-01
+          components: rust-src
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Instrument the aligned allocation and ownership tests
+        run: cargo +nightly-2026-09-01 nextest run -Zbuild-std --target ${{ matrix.target }} --locked --no-default-features --features compress --lib -E 'test(/^writer::input_buffer::tests::/)' --no-fail-fast
+      - name: Instrument source handoff, errors and teardown
+        run: cargo +nightly-2026-09-01 nextest run -Zbuild-std --target ${{ matrix.target }} --locked --no-default-features --features compress --test input_buffer_tests --no-fail-fast
+
+  unsafe-miri-plan:
+    name: unsafe-miri-plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: nightly-2026-09-01
+          components: miri, rust-src
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Discover only portable sevenz unsafe tests under cfg(miri)
+        id: plan
+        run: |
+          cargo +nightly-2026-09-01 miri nextest list --locked --lib \
+            --no-default-features --features compress --message-format json \
+            -E 'test(/^writer::input_buffer::tests::/) & !test(/native_advice/)' > "$RUNNER_TEMP/miri-tests.json"
+          python3 .github/scripts/miri-matrix.py "$RUNNER_TEMP/miri-tests.json" "$GITHUB_OUTPUT"
+
+  unsafe-miri:
+    name: unsafe-miri-${{ matrix.test }}
+    needs: unsafe-miri-plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.unsafe-miri-plan.outputs.matrix) }}
+    env:
+      MIRI_TEST: ${{ matrix.test }}
+      MIRIFLAGS: -Zmiri-strict-provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: nightly-2026-09-01
+          components: miri, rust-src
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Check one portable allocation invariant
+        run: cargo +nightly-2026-09-01 miri nextest run --locked --lib --no-default-features --features compress --no-fail-fast -- --exact "$MIRI_TEST"
+
+  unsafe-complete:
+    name: unsafe-complete
+    if: always()
+    needs: [guard-pages, unsafe-valgrind, unsafe-sanitizer, unsafe-miri-plan, unsafe-miri]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every native and Miri safety shard
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: python3 -c 'import json, os; assert all(job["result"] == "success" for job in json.loads(os.environ["RESULTS"]).values()), os.environ["RESULTS"]'
+
+  sdk-functional:
+    name: sdk-functional-${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Build the pinned SDK C archive decoder
+        run: bash .github/scripts/build-sdk-oracle.sh
+      - name: Compare archive contracts and decoded bytes with the SDK
+        run: cargo nextest run --locked --test sdk_functional --no-fail-fast
 
   unthreaded:
     name: unthreaded
@@ -264,7 +453,7 @@ jobs:
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [hygiene, fmt, clippy, docs, test, unthreaded, wasm, msrv, package]
+    needs: [hygiene, fmt, clippy, docs, test, unsafe-complete, sdk-functional, unthreaded, wasm, msrv, package]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

@@ -139,3 +139,8 @@ with a version bump and a changelog entry like any other.
 - Keep raw benchmark data, machine-readable reports and profiling bundles
   outside the repository. Commit Markdown summaries and source identities.
   Existing evidence is preserved as described in `docs/benchmark-data.md`.
+- Keep the sevenz unsafe inventory and focused CI selectors in
+  `docs/unsafe-validation.md` current. Native guards, Memcheck and sanitizers
+  cover FFI and assembly paths; Miri runs only portable ownership invariants,
+  one discovered test per job. Do not suppress failures or broaden Miri to
+  the full archive/codec suite.
