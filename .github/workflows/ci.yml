@@ -143,7 +143,9 @@ jobs:
         run: cargo test --doc --locked --no-fail-fast ${{ matrix.configuration.args }}
 
   # Native guards also cover assembly reached through the archive APIs.
-  # The 2 MiB guard alignment includes sevenz's HugeInput allocation.
+  # The 2 MiB guard alignment includes sevenz's HugeInput allocation. The
+  # guarded cases: LZMA2 through every push path, parallel LZMA2 decode at two
+  # threads, BCJ2, AES-256 (AWS-LC) and PPMd.
   guard-pages:
     name: guard-pages-${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
@@ -170,8 +172,11 @@ jobs:
       - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-nextest@0.9.143
+      - name: Install NASM (Windows, for aws-lc-rs)
+        if: matrix.platform == 'windows-x86_64'
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
       - name: Guard both sides of native source and codec allocations
-        run: cargo nextest run --locked --no-default-features --features compress --test guard_pages --run-ignored all --no-fail-fast
+        run: cargo nextest run --locked --no-default-features --features compress,aes256,aws-lc-crypto,ppmd --test guard_pages --run-ignored all --no-fail-fast
 
   unsafe-valgrind:
     name: unsafe-valgrind-${{ matrix.platform }}-${{ matrix.scope }}
@@ -244,6 +249,16 @@ jobs:
         run: cargo +nightly-2026-09-01 nextest run -Zbuild-std --target ${{ matrix.target }} --locked --no-default-features --features compress --lib -E 'test(/^writer::input_buffer::tests::/)' --no-fail-fast
       - name: Instrument source handoff, errors and teardown
         run: cargo +nightly-2026-09-01 nextest run -Zbuild-std --target ${{ matrix.target }} --locked --no-default-features --features compress --test input_buffer_tests --no-fail-fast
+      # The concurrency machinery: the ordered job queue (send, receive,
+      # cancellation, early drop, panics, at two to four workers) and the
+      # coder-stage pipeline (failing and panicking coders, drop while
+      # running, and every committed fixture chain). RustCrypto rather than
+      # AWS-LC, so that the AES and SHA-256 under the pipeline are Rust the
+      # sanitizer instruments.
+      - name: Instrument the ordered queue and the coder pipeline
+        run: cargo +nightly-2026-09-01 nextest run -Zbuild-std --target ${{ matrix.target }} --locked --no-default-features --features compress,aes256,native-crypto,ppmd --lib -E 'test(/^(ordered|pipeline)::tests::/)' --no-fail-fast
+      - name: Instrument parallel LZMA2, folder-parallel and BCJ2 decodes
+        run: cargo +nightly-2026-09-01 nextest run -Zbuild-std --target ${{ matrix.target }} --locked --no-default-features --features compress,aes256,native-crypto,ppmd --test parallel_decode_tests --no-fail-fast
 
   unsafe-miri-plan:
     name: unsafe-miri-plan
@@ -430,6 +445,42 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.version }}
       - run: cargo check --locked --all-features
 
+  # Prepared, not enabled. The 7-Zip interop tests (sevenzip_encode_tests,
+  # the 7zz half of bcj2_compress_tests, differential_7zz_tests) skip
+  # themselves where no 7-Zip is on PATH, which is every other lane. With
+  # SEVENZ_TURBO_7ZZ_REQUIRED set they fail instead. Enabling this job needs
+  # the operator's approval of the install source, one of:
+  #   - apt's `7zip` package on ubuntu-24.04 (provides `7zz`):
+  #       sudo apt-get update && sudo apt-get install -y --no-install-recommends 7zip
+  #   - `7zz` built from the pinned 7-Zip tree that
+  #     .github/scripts/build-sdk-oracle.sh already fetches
+  #     (CPP/7zip/Bundles/Alone2, makefile.gcc).
+  # The job is commented out rather than gated on `if: false`, which
+  # actionlint rejects as a constant condition. To enable it, uncomment it,
+  # replace the placeholder install step and add it to ci-complete's needs.
+  # sevenzip-interop:
+  #   name: sevenzip-interop
+  #   runs-on: ubuntu-24.04
+  #   timeout-minutes: 30
+  #   env:
+  #     SEVENZ_TURBO_7ZZ_REQUIRED: "1"
+  #   steps:
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+  #       with:
+  #         persist-credentials: false
+  #     - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+  #       with:
+  #         toolchain: ${{ env.RUST_TOOLCHAIN }}
+  #     - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+  #       with:
+  #         tool: cargo-nextest@0.9.143
+  #     - name: Install 7-Zip (source pending the operator's approval)
+  #       run: |
+  #         echo "choose and approve a 7-Zip install source before enabling this job" >&2
+  #         exit 1
+  #     - name: Check 7-Zip interop with the tool required
+  #       run: cargo nextest run --locked --all-features --test sevenzip_encode_tests --test bcj2_compress_tests --test differential_7zz_tests --test lzma2_mt_tests --no-fail-fast
+
   package:
     name: package
     runs-on: ubuntu-24.04
@@ -457,11 +508,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Fail if any required lane failed
+      # Every required lane must have succeeded: a skipped lane is as much a
+      # gap as a failed one, so the check is the one unsafe-complete makes.
+      - name: Require every lane to have succeeded
         env:
           RESULTS: ${{ toJSON(needs) }}
-        run: |
-          echo "$RESULTS"
-          if echo "$RESULTS" | grep -Eq '"result": *"(failure|cancelled)"'; then
-            exit 1
-          fi
+        run: python3 -c 'import json, os; assert all(job["result"] == "success" for job in json.loads(os.environ["RESULTS"]).values()), os.environ["RESULTS"]'

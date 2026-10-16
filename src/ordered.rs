@@ -788,4 +788,143 @@ mod tests {
         assert!(matches!(outcome, Some(Ok(()))));
         assert_eq!(seen, (0..8).collect::<Vec<_>>());
     }
+
+    /// A heap-owning message that counts itself out, so that a message left
+    /// in a queue is seen to be freed and not leaked or freed twice.
+    struct Counted<'a> {
+        bytes: Vec<u8>,
+        dropped: &'a AtomicUsize,
+    }
+
+    impl Drop for Counted<'_> {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_job_the_caller_moves_past_unread_frees_what_it_queued() {
+        // The caller takes one message of every job and moves on, leaving
+        // the rest in the slot and its worker mid-send; the worker is told at
+        // its next send. At every width, everything made is freed once.
+        for workers in 2..=4 {
+            let made = AtomicUsize::new(0);
+            let dropped = AtomicUsize::new(0);
+            let cancelled = AtomicUsize::new(0);
+            let outcome = run::<Counted<'_>, (), _, _>(
+                24,
+                workers,
+                workers * 2,
+                3,
+                |job, tx| {
+                    for piece in 0..16u8 {
+                        made.fetch_add(1, Ordering::SeqCst);
+                        let message = Counted {
+                            bytes: vec![piece; 64 + job],
+                            dropped: &dropped,
+                        };
+                        if tx.send(message, 1).is_err() {
+                            cancelled.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                },
+                |job, rx| {
+                    let first = rx.recv().unwrap();
+                    assert_eq!(first.bytes, vec![0; 64 + job]);
+                    Ok(())
+                },
+            );
+            assert!(matches!(outcome, Some(Ok(()))), "{workers} workers");
+            assert_eq!(
+                made.load(Ordering::SeqCst),
+                dropped.load(Ordering::SeqCst),
+                "{workers} workers"
+            );
+            assert!(cancelled.load(Ordering::SeqCst) > 0, "{workers} workers");
+        }
+    }
+
+    #[test]
+    fn a_failure_mid_run_stops_every_width_and_frees_every_queued_message() {
+        for workers in 2..=4 {
+            let made = AtomicUsize::new(0);
+            let dropped = AtomicUsize::new(0);
+            let outcome = run::<Counted<'_>, usize, _, _>(
+                64,
+                workers,
+                workers * 2,
+                8,
+                |job, tx| {
+                    loop {
+                        made.fetch_add(1, Ordering::SeqCst);
+                        let message = Counted {
+                            bytes: vec![job as u8; 256],
+                            dropped: &dropped,
+                        };
+                        if tx.send(message, 1).is_err() {
+                            return;
+                        }
+                        if job % 3 != 0 {
+                            // Jobs off the multiple of three end on their own.
+                            return;
+                        }
+                    }
+                },
+                |job, rx| {
+                    // Never ends a job of the multiple of three: it fails there
+                    // after taking a few, with its worker still sending.
+                    for _ in 0..4 {
+                        let message = rx.recv().unwrap();
+                        assert_eq!(message.bytes[0], job as u8);
+                        if job % 3 != 0 {
+                            break;
+                        }
+                    }
+                    if job == 9 { Err(job) } else { Ok(()) }
+                },
+            );
+            assert!(matches!(outcome, Some(Err(9))), "{workers} workers");
+            assert_eq!(
+                made.load(Ordering::SeqCst),
+                dropped.load(Ordering::SeqCst),
+                "{workers} workers"
+            );
+        }
+    }
+
+    #[test]
+    fn a_consumer_dropping_its_receiver_early_does_not_strand_a_worker() {
+        // The caller drops every receiver without reading at all, while a
+        // worker of each width sends more than the cap holds.
+        for workers in 2..=4 {
+            let made = AtomicUsize::new(0);
+            let dropped = AtomicUsize::new(0);
+            let outcome = run::<Counted<'_>, (), _, _>(
+                16,
+                workers,
+                workers,
+                2,
+                |job, tx| {
+                    for _ in 0..8 {
+                        made.fetch_add(1, Ordering::SeqCst);
+                        let message = Counted {
+                            bytes: vec![job as u8; 32],
+                            dropped: &dropped,
+                        };
+                        if tx.send(message, 1).is_err() {
+                            return;
+                        }
+                    }
+                },
+                |_, _| Ok(()),
+            );
+            assert!(matches!(outcome, Some(Ok(()))), "{workers} workers");
+            assert_eq!(
+                made.load(Ordering::SeqCst),
+                dropped.load(Ordering::SeqCst),
+                "{workers} workers"
+            );
+        }
+    }
 }

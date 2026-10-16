@@ -1736,4 +1736,102 @@ mod tests {
             assert_eq!(format!("{piped:?}"), format!("{:?}", alone.unwrap_err()));
         }
     }
+
+    /// A coder that hands out `good` bytes and then panics.
+    struct PanicsAfter {
+        good: usize,
+    }
+
+    impl Read for PanicsAfter {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if self.good == 0 {
+                panic!("coder stage test panic");
+            }
+            let n = out.len().min(self.good).min(4093);
+            out[..n].fill(9);
+            self.good -= n;
+            Ok(n)
+        }
+    }
+
+    /// A coder that never ends.
+    struct Endless(u8);
+
+    impl Read for Endless {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let n = out.len().min(5003);
+            out[..n].fill(self.0);
+            self.0 = self.0.wrapping_add(1);
+            Ok(n)
+        }
+    }
+
+    /// A stage whose coder panics hands on the pieces it sent and then an
+    /// error, and the stage above it hands that error on in turn: the panic
+    /// stays on its thread, and nobody is left waiting on its pipe.
+    #[test]
+    fn a_panicking_stage_delivers_what_it_made_and_then_an_error() {
+        for good in [0, 1, PIPE_CHUNK - 1, 2 * PIPE_CHUNK + 333] {
+            for depth in 1..=2 {
+                let mut pipeline = Pipeline::default();
+                let mut stage = pipeline.spawn(Box::new(PanicsAfter { good })).unwrap();
+                for _ in 1..depth {
+                    let input = pipeline.there(stage).unwrap();
+                    stage = pipeline.spawn(input).unwrap();
+                }
+                let mut reader = pipeline.here(stage);
+                let mut out = Vec::new();
+                let error = reader.read_to_end(&mut out).unwrap_err();
+                // The piece being filled when the coder panicked goes with
+                // the unwind; every piece sent before it arrives.
+                let sent = good / PIPE_CHUNK * PIPE_CHUNK;
+                assert_eq!(out, vec![9; sent], "{good} bytes, {depth} stages");
+                assert_eq!(error.to_string(), "a coder stage panicked");
+                assert!(reader.read(&mut [0u8; 8]).is_err());
+                drop(reader);
+                drop(pipeline);
+            }
+        }
+    }
+
+    /// Dropping a chain whose stages are all still running joins every one
+    /// of them, wherever its reader stopped: before its first byte, inside a
+    /// piece, or at a piece's edge.
+    #[test]
+    fn dropping_a_chain_while_every_stage_runs_joins_them_all() {
+        for read in [0, 1, PIPE_CHUNK, 3 * PIPE_CHUNK + 17] {
+            for depth in 1..=3 {
+                let mut pipeline = Pipeline::default();
+                let mut stage = pipeline.spawn(Box::new(Endless(depth as u8))).unwrap();
+                for _ in 1..depth {
+                    let input = pipeline.there(stage).unwrap();
+                    stage = pipeline.spawn(input).unwrap();
+                }
+                let mut reader = pipeline.here(stage);
+                let mut some = vec![0u8; read];
+                reader.read_exact(&mut some).unwrap();
+                drop(reader);
+                drop(pipeline);
+            }
+        }
+    }
+
+    /// A caller-fed pack stream under running stages, dropped part way: the
+    /// feed and the stages over it are let go together.
+    #[test]
+    fn dropping_a_fed_chain_part_way_joins_its_stages() {
+        for read in [1, PIPE_CHUNK + 5] {
+            let mut pipeline = Pipeline::default();
+            let leaf = Stage::Leaf(Box::new(Endless(7)));
+            let input = pipeline.there(leaf).unwrap();
+            let stage = pipeline.spawn(input).unwrap();
+            let input = pipeline.there(stage).unwrap();
+            let stage = pipeline.spawn(input).unwrap();
+            let mut reader = pipeline.top(stage);
+            let mut some = vec![0u8; read];
+            reader.read_exact(&mut some).unwrap();
+            drop(reader);
+            drop(pipeline);
+        }
+    }
 }

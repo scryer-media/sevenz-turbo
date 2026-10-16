@@ -1,6 +1,10 @@
 //! Native buffer-edge checks, including the 2 MiB alignment of HugeInput.
 //! Miri cannot execute assembly or madvise; this allocator guards the native
-//! source, codec and output allocations while exercising the archive APIs.
+//! source, codec and output allocations while exercising the archive APIs:
+//! LZMA2 written through every push path and decoded on one thread, LZMA2
+//! decoded in parallel at two threads, BCJ2, and, when their features are
+//! built, AES-256 and PPMd. CI builds it with
+//! `--features compress,aes256,aws-lc-crypto,ppmd`.
 
 #![cfg(all(
     feature = "compress",
@@ -16,8 +20,8 @@ use std::{
 };
 
 use sevenz_turbo::{
-    ArchiveEntry, ArchiveReader, ArchiveWriter, EncoderConfiguration, Password, SourceReader,
-    encoder_options::Lzma2Options, prepare_block,
+    ArchiveEntry, ArchiveLimits, ArchiveReader, ArchiveWriter, EncoderConfiguration, EncoderMethod,
+    Password, SourceReader, encoder_options::Lzma2Options, prepare_block,
 };
 
 // Unlike the codec's 64 KiB guard unit, this also guards sevenz's aligned Box.
@@ -318,4 +322,172 @@ fn guarded_aligned_sources_survive_short_reads_errors_and_ownership_transfer() {
             );
         }
     }
+}
+
+/// Compressible bytes shaped like x86 code, so that BCJ2 has calls and
+/// jumps to split out and every other coder has something to model.
+fn code_like(len: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut out = Vec::with_capacity(len);
+    while out.len() < len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        out.extend(std::iter::repeat_n(
+            b'a' + (x >> 40) as u8 % 26,
+            1 + (x % 7) as usize,
+        ));
+        out.push((x >> 8) as u8);
+    }
+    out.truncate(len);
+    let mut i = (seed % 7) as usize;
+    while i + 5 <= out.len() {
+        out[i] = if i.is_multiple_of(3) { 0xE9 } else { 0xE8 };
+        out[i + 1..i + 5].copy_from_slice(&((i as u32 * 3) % 0x4000).to_le_bytes());
+        i += 11;
+    }
+    out
+}
+
+/// LZMA2 in many independent runs: written by two threads in 256 KiB
+/// chunks over a 64 KiB dictionary.
+fn multi_run() -> EncoderConfiguration {
+    let mut options = Lzma2Options::from_level_mt(1, 2, 256 << 10);
+    options.set_dictionary_size(64 << 10);
+    options.into()
+}
+
+/// Members with an empty one between streamed ones, written solid.
+fn members() -> Vec<(String, Vec<u8>)> {
+    [(700 << 10) + 3, 0, (1 << 20) + 11, 1]
+        .into_iter()
+        .enumerate()
+        .map(|(i, len)| (format!("guarded-{i}"), code_like(len, i as u64)))
+        .collect()
+}
+
+fn solid(methods: Vec<EncoderConfiguration>, members: &[(String, Vec<u8>)]) -> Vec<u8> {
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    writer.set_content_methods(methods);
+    let entries = members
+        .iter()
+        .map(|(name, data)| {
+            let mut entry = ArchiveEntry::new_file(name);
+            entry.size = data.len() as u64;
+            entry
+        })
+        .collect();
+    let readers = members
+        .iter()
+        .map(|(_, data)| SourceReader::new(ShortSource { data, fail: None }))
+        .collect();
+    writer.push_archive_entries(entries, readers).unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+/// Decodes `bytes` through a seekable cursor and through a positional source
+/// at each of `threads`, with allocations against each edge, and compares.
+fn decodes_to(bytes: &[u8], password: &str, members: &[(String, Vec<u8>)], threads: &[u32]) {
+    for front in [false, true] {
+        FRONT.store(front, Ordering::Relaxed);
+        for &threads in threads {
+            let password = Password::from(password);
+            let cursor = ArchiveReader::new(Cursor::new(bytes), password.clone())
+                .unwrap()
+                .with_threads(threads);
+            let positional =
+                ArchiveReader::from_read_at(bytes.to_vec(), password, ArchiveLimits::default())
+                    .unwrap()
+                    .with_threads(threads);
+            for decoded in [entries_of(cursor), entries_of(positional)] {
+                assert!(decoded == members, "front {front}, {threads} threads");
+            }
+        }
+    }
+}
+
+fn entries_of<R: Read + io::Seek>(mut reader: ArchiveReader<R>) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    reader
+        .for_each_entries(|entry, input| {
+            let mut data = Vec::new();
+            input.read_to_end(&mut data)?;
+            out.push((entry.name().to_owned(), data));
+            Ok(true)
+        })
+        .unwrap();
+    out
+}
+
+#[test]
+#[ignore = "native memory-safety CI runs the parallel decode with guards"]
+fn guarded_parallel_lzma2_decode_at_two_threads() {
+    let members = members();
+    let bytes = solid(vec![multi_run()], &members);
+    decodes_to(&bytes, "", &members, &[1, 2]);
+}
+
+#[test]
+#[ignore = "native memory-safety CI runs the BCJ2 chain with guards"]
+fn guarded_bcj2_chain_encode_and_decode() {
+    let members = members();
+    let bytes = solid(
+        vec![multi_run(), EncoderMethod::BCJ2_FILTER.into()],
+        &members,
+    );
+    decodes_to(&bytes, "", &members, &[1, 2]);
+    // An archive 7-Zip wrote, whose BCJ2 side streams are LZMA.
+    let committed = std::fs::read("tests/resources/7za433_7zip_lzma2_bcj2.7z").unwrap();
+    let mut expected = None;
+    for front in [false, true] {
+        FRONT.store(front, Ordering::Relaxed);
+        for threads in [1, 2] {
+            let reader = ArchiveReader::new(Cursor::new(&committed), Password::empty())
+                .unwrap()
+                .with_threads(threads);
+            let decoded = entries_of(reader);
+            assert!(&decoded == expected.get_or_insert_with(|| decoded.clone()));
+        }
+    }
+}
+
+#[cfg(feature = "aes256")]
+#[test]
+#[ignore = "native memory-safety CI runs AES-256 with guards"]
+fn guarded_aes256_encode_and_decode() {
+    use sevenz_turbo::encoder_options::AesEncoderOptions;
+    let members = members();
+    // A low work factor: the key derivation allocates nothing, and the
+    // default 2^19 rounds would only make the lane slower.
+    let aes = AesEncoderOptions::new(Password::from("guarded")).with_num_cycles_power(10);
+    let bytes = solid(vec![aes.into(), multi_run()], &members);
+    decodes_to(&bytes, "guarded", &members, &[1, 2]);
+    // A wrong password is refused, at the encrypted header or at the first
+    // block, without touching memory it does not own.
+    for threads in [1, 2] {
+        let refused =
+            ArchiveReader::new(Cursor::new(&bytes), Password::from("not it")).and_then(|reader| {
+                reader
+                    .with_threads(threads)
+                    .for_each_entries(|_, input| {
+                        io::copy(input, &mut io::sink())?;
+                        Ok(true)
+                    })
+                    .map(drop)
+            });
+        assert!(refused.is_err(), "{threads} threads");
+    }
+}
+
+#[cfg(feature = "ppmd")]
+#[test]
+#[ignore = "native memory-safety CI runs PPMd with guards"]
+fn guarded_ppmd_encode_and_decode() {
+    use sevenz_turbo::encoder_options::PpmdOptions;
+    let members = members();
+    let bytes = solid(
+        vec![PpmdOptions::from_order_memory_size(6, 4 << 20).into()],
+        &members,
+    );
+    decodes_to(&bytes, "", &members, &[1, 2]);
 }

@@ -15,7 +15,8 @@
 //! which decoder took which run is not observable in the output.
 //!
 //! `7zz` is not installed on the CI runners, so the whole file skips itself
-//! when `7zz` is not on `PATH`. Run it locally before proposing a decoder
+//! when `7zz` is not on `PATH`, unless `SEVENZ_TURBO_7ZZ_REQUIRED` is set,
+//! which turns the skip into a failure. Run it locally before proposing a decoder
 //! change; `docs/benchmarking.md` records the matrix it covers.
 
 use std::collections::BTreeMap;
@@ -24,13 +25,19 @@ use std::process::Command;
 
 use sevenz_turbo::{ArchiveReader, Password};
 
-/// Is the oracle available?
+/// Is the oracle available? With `SEVENZ_TURBO_7ZZ_REQUIRED` set, a missing
+/// `7zz` fails the test instead of skipping it.
 fn have_7zz() -> bool {
-    Command::new("7zz")
+    let found = Command::new("7zz")
         .arg("i")
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    assert!(
+        found || std::env::var_os("SEVENZ_TURBO_7ZZ_REQUIRED").is_none(),
+        "SEVENZ_TURBO_7ZZ_REQUIRED is set but 7zz does not run"
+    );
+    found
 }
 
 /// Deterministic, barely compressible bytes.

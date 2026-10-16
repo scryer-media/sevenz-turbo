@@ -15,20 +15,58 @@ initializing an aligned allocation before `assume_init`, and the Linux
 this inventory and the focused selectors rather than run the whole archive
 suite under Miri.
 
-| Lane | Scope | Platforms |
-| --- | --- | --- |
-| `guard-pages` | Source, codec and output allocations during pull, Send and prepared-block APIs; short reads, failure and teardown | All four native platforms |
-| `unsafe-valgrind` | The allocation unit tests and source-buffer lifecycle integration tests, on separate runners | Linux x86-64 and ARM64 |
-| `unsafe-sanitizer` | The same allocation and lifecycle tests under AddressSanitizer and ThreadSanitizer, including instrumented std | Linux x86-64 and ARM64 |
-| `unsafe-miri` | Initialization, unsupported advice, panic cleanup, independent allocations, movement between threads, and allocation-policy boundaries | One Linux runner per discovered portable test |
+The crate's own threading has no unsafe code, but it is where a data race or
+a use after free across threads would come from: the ordered job queue
+(`src/ordered.rs`, which the folder-parallel decode and the parallel encoders
+run on), the coder-stage pipeline (`src/pipeline.rs`), and the parallel LZMA2
+decode driven through `lzma-turbo`. The sanitizer and guard lanes run focused
+tests of those as well.
+
+| Lane | Scope | Features | Platforms |
+| --- | --- | --- | --- |
+| `guard-pages` | Source, codec and output allocations during pull, Send and prepared-block APIs; short reads, failure and teardown. Parallel LZMA2 decode at two threads (cursor and positional source), BCJ2 written and committed, AES-256 encode and decode with a wrong-password refusal, PPMd encode and decode | `compress,aes256,aws-lc-crypto,ppmd` | All four native platforms |
+| `unsafe-valgrind` | The allocation unit tests and source-buffer lifecycle integration tests, on separate runners | `compress` | Linux x86-64 and ARM64 |
+| `unsafe-sanitizer` | The allocation and lifecycle tests above (`compress`); `ordered::tests` and `pipeline::tests`; `tests/parallel_decode_tests.rs`. Each under AddressSanitizer and ThreadSanitizer, with instrumented std | `compress`; `compress,aes256,native-crypto,ppmd` for the concurrency tests | Linux x86-64 and ARM64 |
+| `unsafe-miri` | Initialization, unsupported advice, panic cleanup, independent allocations, movement between threads, and allocation-policy boundaries | `compress` | One Linux runner per discovered portable test |
+
+The sanitizer selectors, exactly:
+
+- `--lib -E 'test(/^writer::input_buffer::tests::/)'` and
+  `--test input_buffer_tests`, with `--features compress`;
+- `--lib -E 'test(/^(ordered|pipeline)::tests::/)'` and
+  `--test parallel_decode_tests`, with
+  `--features compress,aes256,native-crypto,ppmd`.
+
+`ordered::tests` covers in-order delivery, the staging bound, pacing,
+cancellation by a failing consumer, a consumer moving past or ignoring a job
+with its worker mid-send, panicking workers, consumers and state
+constructors, at one to four workers, with heap-owning messages counted out
+so that a leaked or doubly freed message fails the test. `pipeline::tests`
+covers a failing and a panicking coder stage, a chain dropped while every
+stage runs (and while a caller-fed pack stream is still being read), chunk
+ownership transfer, refused stage threads, and every committed fixture chain
+the lane's features build (BCJ2 over LZMA2 and over delta, BCJ x86 and
+ARM64, delta, solid and non-solid LZMA, AES-256, PPMd) decoded through a
+pipeline.
+`tests/parallel_decode_tests.rs` decodes small multi-run LZMA2 archives at
+two and four threads through a seekable cursor, `ArchiveReader::from_read_at`
+and `ArchiveReader::open`, with and without the adaptive coder: a solid block
+with zero-size sub-streams, a solid block with empty-stream files
+interleaved between its streamed ones, a non-solid archive decoded
+folder-parallel from the positional source, a BCJ2 chain over parallel LZMA2,
+the committed BCJ2 archives, a corrupt block, and decodes a callback stops
+or fails part way through. The concurrency tests use RustCrypto so that the
+AES and SHA-256 inside the pipeline are Rust the sanitizers instrument.
 
 The guard allocator supports the source buffer's full 2 MiB alignment; it
 does not silently send this allocation to the system allocator. A child
 process proves inaccessible pages actually fault. The archive cases place
 allocations against each edge and exercise native encode and decode paths,
 including assembly selected by the codec dependencies. Guard pages catch
-buffer overruns; they do not prove all reads inside a buffer are initialized.
-Memcheck adds byte initialization and allocation/free checking.
+buffer overruns of Rust-owned allocations; they do not prove all reads inside
+a buffer are initialized, and AWS-LC's own allocations go through its
+allocator, not the guarded one. Memcheck adds byte initialization and
+allocation/free checking.
 
 Miri runs through Nextest with strict provenance. Discovery uses the actual
 `cfg(miri)` build, requires the known ownership tests, and creates one job per
@@ -37,9 +75,50 @@ stub under Miri. Native Memcheck, sanitizers and guards cover that FFI and
 the machine code Miri cannot execute. Sanitizers cannot instrument assembly
 instructions; passing them alone is not evidence of assembly memory safety.
 
+### Not instrumented
+
+What no lane above runs, so that a pass is not read as more than it is:
+
+- Memcheck runs only the input-buffer tests. The ordered queue, the pipeline
+  and the parallel decodes are under the sanitizers and guards, not Valgrind.
+- The parallel *encoders* (multi-threaded LZMA2, `push_archive_entries_send`,
+  the folder-parallel `push_archive_entries_non_solid`, the BCJ2 side-coder
+  threads) are exercised only as far as the guard cases and the
+  concurrency tests write archives; no sanitizer test targets their
+  teardown and error paths directly.
+- The positional run API (`PositionalLzma2Folder`, its scanner and run
+  decoder), the adaptive coder widening while a decode runs, and
+  `decode_blocks_parallel` across a folder too large to stage are covered by
+  the ordinary test matrix only.
+- bzip2, Deflate, Zstandard, Brotli and LZ4 are not under any sanitizer or
+  guard lane; bzip2 and Zstandard are C libraries the sanitizers would not
+  instrument in any case.
+- AWS-LC's AES and SHA-256 are under the guard lane only; the sanitizer lanes
+  use RustCrypto. `lzma-turbo`'s assembly kernels run under the guards and
+  Memcheck but cannot be instrumented by the sanitizers.
+- The `crypto-host`/`crc-host` wasm delegation is covered by the wasm
+  conformance harness, not by any memory-safety lane.
+- The sanitizer and Valgrind lanes are Linux only; macOS and Windows have the
+  guard lane alone.
+
 `unsafe-complete` fails if discovery, any shard, or any native safety lane is
-failed, cancelled or skipped. The required `ci-complete` gate depends on it.
-No sanitizer suppression, retry or interpreter check is disabled.
+failed, cancelled or skipped. The required `ci-complete` gate depends on it
+and makes the same all-success check over every lane it needs, so a skipped
+lane fails it too. No sanitizer suppression, retry or interpreter check is
+disabled.
+
+## 7-Zip interoperability
+
+`tests/sevenzip_encode_tests.rs`, the 7-Zip half of
+`tests/bcj2_compress_tests.rs` and `tests/differential_7zz_tests.rs` need
+`7zz` (or `7z`) on `PATH` and skip themselves without it, which they do on
+every CI lane today. With `SEVENZ_TURBO_7ZZ_REQUIRED` set, a missing 7-Zip
+fails them instead, as `SEVENZ_TURBO_SDK_REQUIRED` does for the SDK oracle.
+A `sevenzip-interop` job that sets it is prepared in `ci.yml`, commented
+out until the operator approves where 7-Zip comes from (apt's `7zip` on
+ubuntu-24.04, or `7zz` built from the pinned tree the SDK lane fetches).
+`tests/lzma2_mt_tests.rs` also needs `7zz` and does not yet honour the
+variable.
 
 ## SDK functional contracts
 
