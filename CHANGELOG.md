@@ -532,6 +532,8 @@ Everything here is new surface; no upstream signature changed meaning.
   run with `compress,aes256,native-crypto,ppmd`.
 - CI: the guard-pages lane builds with `compress,aes256,aws-lc-crypto,ppmd`
   and adds guarded parallel LZMA2 decode, BCJ2, AES-256 and PPMd cases.
+- CI: the `dtolnay/rust-toolchain` pins name the commit its `v1` tag points
+  to, which resolves zizmor's `ref-version-mismatch` findings.
 - Tests: setting `SEVENZ_TURBO_7ZZ_REQUIRED` turns the 7-Zip interop tests'
   skip into a failure when neither `7zz` nor `7z` runs. Affected:
   `sevenzip_encode_tests`, `bcj2_compress_tests`, `differential_7zz_tests`.
