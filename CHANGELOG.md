@@ -310,6 +310,10 @@ arm, and this crate can add a variant without a breaking release.
   from an I/O failure on the source or a method this build cannot decode. An
   error raised by the *caller's* own callback is passed through untouched — the
   decode chain is wrapped so the two can be told apart.
+  Since 0.29.0 it also keeps the error it locates as `cause`, answered by
+  `Error::io_error`, `Error::is_password_required` and
+  `Error::has_checksum_mismatch` and reported through
+  `std::error::Error::source`.
 
 ### Documentation
 
@@ -479,6 +483,23 @@ arm, and this crate can add a variant without a breaking release.
 - The vendored BCJ round-trip tests generate their sample data instead of
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
+
+## 0.29.0 - 2026-10-16
+
+- `Error::BlockDecode` keeps the error it locates as a new `cause:
+  Box<Error>` field, so a caller can read the I/O kind, OS code and payload of
+  a failed read, whether the archive wanted a password, and whether a checksum
+  disagreed, without parsing `message`. `message` and the `Display` rendering
+  are unchanged; the cause is left out of both. This is a breaking change for
+  code that builds `BlockDecode` or destructures it without `..`.
+- New `Error::io_error`, `Error::is_password_required` and
+  `Error::has_checksum_mismatch`. Each looks through a block error to its
+  cause. `has_checksum_mismatch` also recognises a CRC-32 carried inside an
+  I/O error from a `Read` chain, one behind `MaybeBadPassword`, the next
+  header's CRC, and an LZ4 frame's header, block or content checksum.
+- `Error` reports its cause through `std::error::Error::source`: the cause of
+  a block error, and the I/O error behind `Io`, `FileOpen` and
+  `MaybeBadPassword`.
 
 ## 0.28.0 - 2026-10-16
 

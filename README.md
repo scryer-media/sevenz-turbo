@@ -200,7 +200,7 @@ in [docs/benchmarking.md](docs/benchmarking.md).
 
 ```toml
 [dependencies]
-sevenz-turbo = "0.28"
+sevenz-turbo = "0.29"
 ```
 
 The minimum supported Rust version is 1.97.1, which `lzma-turbo` requires.
