@@ -70,8 +70,10 @@
 //! delegation.
 //!
 //! Only the *decrypt* is delegated. The encoder (`compress` + `aes256`) uses
-//! RustCrypto's `cbc::Encryptor` in the guest; writing archives is not the
-//! path this seam exists for.
+//! RustCrypto's `cbc::Encryptor` in the guest, and only with `native-crypto`:
+//! since the host hook only decrypts, a wasm `crypto-host` build with
+//! `compress` and `aes256` but without `native-crypto` is a compile error.
+//! Writing archives is not the path this seam exists for.
 //!
 //! ## Contract the hash hooks must satisfy
 //!

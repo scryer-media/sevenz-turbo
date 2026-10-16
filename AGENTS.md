@@ -43,22 +43,40 @@ with a version bump and a changelog entry like any other.
 
 ## Codec rules
 
-- LZMA and LZMA2 coding is `lzma-turbo`'s, reached only through
-  `src/codec/lzma_turbo.rs` (decoding, and the multi-threaded LZMA2 coder;
-  see `docs/lzma-turbo-requests.md`) and `src/codec/lzma_turbo/writer.rs`
-  (encoding: the `Write` bridge over its pull-driven encoders). Nothing else
-  in the crate names `lzma_turbo::` except the filter wrappers below. The
-  option types in `src/encoder_options.rs` name no encoder; what codes them
-  is decided in `src/encoder.rs` alone.
+- LZMA and LZMA2 coding is `lzma-turbo`'s. The crate names `lzma_turbo::`
+  only at these seams, and a new use goes in one of them or is added to this
+  list with a reason:
+  - `src/codec/lzma_turbo.rs` (decoding, and the multi-threaded LZMA2 coder;
+    see `docs/lzma-turbo-requests.md`) and `src/codec/lzma_turbo/writer.rs`
+    (encoding: the `Write` bridge over its pull-driven encoders);
+  - `src/encoder.rs`, which turns the option types into the encoder's
+    settings in `turbo_props` (`LzmaEncProps`, `MatchFinderKind`,
+    `BLOCK_SIZE_SOLID`);
+  - `src/decoder.rs`, which builds the single-threaded `LzmaReader`;
+  - the filter wrappers in `src/codec/filter/` (below);
+  - `src/crypto_backend.rs`, for SHA-256 (`lzma_turbo::crypto`);
+  - `src/hooks.rs`, which re-exports `lzma_turbo::hooks`;
+  - `src/container.rs`, which re-exports `lzma_turbo::crc::{crc32_combine,
+    CrcFolder}` as public API;
+  - `lzma_turbo::crc` wherever a CRC-32 is computed (`src/reader.rs`,
+    `src/writer.rs`, `src/writer/source_reader.rs`; see the CRC rules
+    below).
+
+  The option types in `src/encoder_options.rs` name no encoder; what codes
+  them is decided in `src/encoder.rs` alone.
 - The BCJ and delta filters are `lzma-turbo`'s (`lzma_turbo::filters`, behind
   its `filters` feature); `src/codec/filter/bcj.rs` and `delta.rs` are handles
-  on them, and `bcj2.rs` is this crate's `Read` over `lzma_turbo::filters::bcj2`.
-  The readers and writers of `bcj` and `delta` are this crate's, ported from
-  the SDK's.
-- Crypto goes through `src/crypto_backend.rs` — SHA-256 *and* AES-256-CBC:
-  `aws-lc-rs` by default, RustCrypto when the `native-crypto` feature is on.
-  Never call a backend crate directly from anywhere else. The one exception is
-  the encoder's `cbc::Encryptor` in `src/encryption/aes.rs`, behind `compress`.
+  on them, and `bcj2.rs` is this crate's `Read` and `Write` over
+  `lzma_turbo::filters::bcj2`. The `Read` and `Write` wrappers in `bcj.rs`
+  and `delta.rs` come from `lzma-rust2` 0.20.1 (Apache-2.0), itself a port of
+  XZ for Java; each file's header records that origin and the changes made
+  here (Apache-2.0 section 4(b)). Keep those notices when editing the files,
+  and add to the list of changes.
+- Crypto goes through `src/crypto_backend.rs` — SHA-256 *and* AES-256-CBC,
+  decrypt and encrypt: `aws-lc-rs` by default, RustCrypto when the
+  `native-crypto` feature is on. Never call a backend crate directly from
+  anywhere else; the one exception is the test-only reference host hook in
+  `src/hooks/aes.rs`, which stands in for an embedder's AES.
 - CRC-32 is `crc-fast` (via `lzma-turbo`'s `crc` module), never `crc32fast`.
 - **No CRC-32 is computed in a serialised section of the multi-threaded path.**
   Checksumming is O(bytes) and the in-order section is the one place where the
@@ -78,6 +96,12 @@ with a version bump and a changelog entry like any other.
 - Thread counts default to one, everywhere. A library does not decide on its
   own to occupy every core, or to hold the memory that doing so costs; the
   consumer asks.
+  - One carve-out, matching 7-Zip: when a BCJ2 folder is coded alone, the
+    LZMA coders of its call and jump streams run on threads of their own,
+    as 7-Zip's `CMixerMT` runs one thread per non-main coder whatever `-mmt`
+    says. `Bcj2Sides::Inline` is the equivalent of 7-Zip's `-mtf=off` and is
+    what a thread-budgeted multi-folder encode uses. This is not a
+    thread-count default; do not re-raise it as one.
 - **The parallel LZMA2 reader feeds whole runs, and never stops the ring.** The
   decoder gives the run at its cursor to its chase path — single-threaded, on
   the calling thread, with dispatch switched off until that run is done —

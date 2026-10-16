@@ -45,9 +45,10 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   hooks, renovate, issue templates, `AGENTS.md`, `SECURITY.md`,
   `CONTRIBUTORS.md`. Upstream's `.github/workflows/rust.yml` and
   `.github/dependabot.yml` were removed as duplicates of these.
-- The performance checkpoint uses the published `lzma-turbo =0.9.1`, so
-  registry builds use the validated library without a Git dependency or a
-  machine-specific checkout.
+- `lzma-turbo` is a caret requirement on a published version (since 0.27.2;
+  0.27.1 pinned `=0.9.1`): the manifest states the floor this crate needs,
+  `Cargo.lock` fixes the version CI tested with `--locked`, and no Git
+  dependency or machine-specific checkout is involved.
 
 ### Decoding
 
@@ -67,10 +68,12 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   second time on the way out. Measured on x86 at eight threads, a gigabyte
   went from 4.82 s to 4.59 s. Needs lzma-turbo 0.3.0 for `drain_upto`.
 - `lzma-rust2` has left the dependency graph. Since 0.25.0 archives are
-  written with `lzma-turbo`'s encoder as well, and `lzma-rust2` is reached
-  only through the non-default `lzma-rust2-encoder` feature; with
+  written with `lzma-turbo`'s encoder as well, and 0.27.0 removed the
+  non-default `lzma-rust2-encoder` feature and the optional `lzma-rust2`
+  dependency it enabled, so no feature set reaches `lzma-rust2`; with
   `--no-default-features` the graph is `sevenz-turbo → lzma-turbo → crc-fast`
-  and nothing else.
+  and nothing else. (The unpublished `tools/decode-bench` still depends on
+  sevenz-rust2, and through it on `lzma-rust2`, to time the fork against it.)
 - The branch converters, the delta filter and BCJ2 are all `lzma-turbo`'s
   (`lzma_turbo::filters`). The `Read` and `Write` wrappers around the BCJ and
   delta converters are vendored from `lzma-rust2` 0.20.1 (Apache-2.0, same
@@ -164,6 +167,11 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   `crc32fast` dependency is gone.
 - The LZMA coder's properties are length-checked before being sliced, instead
   of panicking on a short field.
+- A callback that reads part of a file and asks to go on has the rest of that
+  file read and CRC-checked for it (0.27.2). Upstream leaves the unread bytes
+  in the stream, so the next file begins at the wrong offset.
+- A zero-length file's CRC is checked against the CRC of no bytes, as 7-Zip
+  checks it (0.27.2); upstream does not compare it.
 
 ### Safety against hostile archives
 
@@ -335,6 +343,10 @@ Everything here is new surface; no upstream signature changed meaning.
   dictionary is coded with one its size (never below 4 KiB), and one that fits
   a single LZMA2 block is coded on one thread. `ArchiveEntry::from_path`
   records the file's length so the size is known before the push.
+- A writer whose push failed after writing part of a folder is poisoned
+  (0.27.2): later pushes return `Error::WriterPoisoned` and `finish()` writes
+  no header. Upstream lets the caller go on and writes an archive whose pack
+  offsets are wrong.
 
 ### Cryptography
 
@@ -364,7 +376,8 @@ Everything here is new surface; no upstream signature changed meaning.
   from `lzma-turbo`'s crypto module. The default backend is
   `aws-lc-rs` (feature `aws-lc-crypto`, in `default`), the scryer-media house
   convention shared with `lzma-turbo` and `rarpar`; `native-crypto` selects
-  RustCrypto's `sha2` and **takes precedence** when both are compiled, so a
+  RustCrypto (SHA-256 through `lzma-turbo`'s `native-crypto` hash, AES through
+  `aes`/`cbc`) and **takes precedence** when both are compiled, so a
   consumer who cannot build C uses `default-features = false` plus
   `native-crypto`.
 - **AES-256-CBC is this crate's own code, but not its own backend.** `lzma-turbo`
@@ -379,8 +392,10 @@ Everything here is new surface; no upstream signature changed meaning.
   block, copied out before the in-place decrypt, is the next chunk's IV. The
   encoder (`compress`) follows the same switch over the same unpadded CBC:
   AWS-LC's `EncryptingKey::cbc` by default, RustCrypto's `cbc::Encryptor`
-  under `native-crypto` and wherever AWS-LC is not selected (a wasm build
-  encrypts in the guest).
+  under `native-crypto` (a wasm build encrypts in the guest). The host hook
+  decrypts only, so since 0.27.2 a wasm `crypto-host` build with `compress`
+  and `aes256` must also enable `native-crypto`; without it the build is a
+  compile error.
   `aws-lc-rs` is a direct optional dependency on the pin and features
   `lzma-turbo` uses, so a build with both crates resolves one copy of AWS-LC.
 - `aes256` no longer implies a backend: enabling it with neither
@@ -409,9 +424,11 @@ Everything here is new surface; no upstream signature changed meaning.
 - New `sevenz_turbo::crypto_backend() -> &'static str`, reporting which backend
   a build selected (`"aws-lc"`, `"rustcrypto"`, or `"host"` on a delegating
   wasm build), for consumers who want to assert on it.
-- The `aes` and `cbc` dependencies are enabled by `native-crypto` (decryption)
-  and by `compress` (encryption); the AWS-LC lane does not compile them. The
-  direct `sha2` dependency is gone.
+- The `aes` and `cbc` dependencies are enabled by `native-crypto` alone, and
+  the RustCrypto encryptor is compiled only with `compress`, `aes256` and
+  `native-crypto` together (since 0.27.2; before it, `compress` pulled them
+  in as well). The AWS-LC lane, the default, compiles neither. The direct
+  `sha2` dependency is gone.
 - When both backends are compiled, a differential test checks they agree on
   SHA-256, on the 7z key derivation and on AES-256-CBC — the NIST SP 800-38A
   F.2.6 vector on each lane, whole-buffer equality at several sizes, chunked
@@ -455,13 +472,93 @@ Everything here is new surface; no upstream signature changed meaning.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
-## 0.27.1 - 2026-10-15
+## 0.27.2 - 2026-10-16
 
-- Accept SDK-valid empty archives without a next header. Preserve empty
-  entries interleaved with solid substreams in block iteration and checksum
-  boundaries; do not omit later members by treating a stream count as a file count.
+- Accept SDK-valid empty archives without a next header (a zero
+  next-header size).
+- Preserve empty entries interleaved with solid substreams in block iteration
+  and checksum boundaries: iterate each block over its mapped file span; do
+  not omit later members by treating a stream count as a file count.
+- `BlockDecoder::entry_count()` and `BlockDecoder::entries()` now include the
+  empty entries interleaved inside a block's span, and
+  `StreamMap::file_block_index` maps such an entry to `Some(block)`; only
+  empty entries outside every block's span map to `None`. `PositionalBlockDecoder`
+  is unchanged: it still requires a folder's data members to be contiguous
+  and refuses a folder with interleaved empty entries.
 - Split CI feature configurations across runners and add targeted native guards,
   Valgrind, sanitizers, sharded Miri, and pinned SDK archive conformance checks.
+- A callback that reads part of a file and asks to go on no longer misplaces
+  the next one: the reader reads the rest of that file for it, through the
+  reader it was handed, so the files after it begin where they do and the
+  skipped bytes are still checked against the file's CRC.
+- `BlockCompletion` reports a block only when every byte of it went through
+  the callbacks, and never claims `crc_verified` for a block left part-read.
+- A zero-length file's CRC is compared, as 7-Zip compares it, against the CRC
+  of no bytes.
+- Archives with fewer streamed files than sub-streams, or with an empty
+  header anywhere but offset zero, are refused at open, and a folder after
+  the last file maps past it.
+- A caller-built `Archive` or `StreamMap` handed to `from_archive` or
+  `BlockDecoder` is checked before it is decoded and can no longer cause a
+  panic.
+- A push that failed part way through a folder (a source read error, a coder
+  error or an output write error) left that folder's bytes in the output
+  without recording them, and the writer stayed usable: a caller that caught
+  the error, pushed again and called `finish()` got an archive whose pack
+  offsets were wrong. Such a writer is now poisoned: later `push_*` calls
+  return `Error::WriterPoisoned` naming the original failure, and `finish()`
+  returns an `io::Error` of kind `Other` carrying it, without writing a
+  header. A failed push that left the output untouched does not poison the
+  writer.
+- New `Error::WriterPoisoned(String)`.
+- The BCJ2 writer's "encoder consumed all input" invariant was only a
+  `debug_assert!`; in release builds a shortfall would have silently dropped
+  bytes while the CRC still matched the source. It is now an `io::Error` in
+  every build.
+- The start header's next-header size is written as the full 64-bit value
+  instead of being masked to 32 bits.
+- Internal: the redundant worker-count check in
+  `push_archive_entries_non_solid` is removed, the solid path's duplicated
+  entry-name list is deduplicated (its error message now reads "Encode
+  entries:"), and the `madvise` advice constant is named `MADV_HUGEPAGE`.
+- CI: `ci-complete` now requires every lane it depends on to succeed; a
+  skipped lane fails the gate, as it already did for `unsafe-complete`.
+- CI: the AddressSanitizer and ThreadSanitizer lanes now also run the ordered
+  job queue and coder-pipeline unit tests (`ordered::tests`,
+  `pipeline::tests`) and the new `tests/parallel_decode_tests.rs`. That file
+  covers parallel LZMA2 decode at 2 and 4 threads through a cursor,
+  `from_read_at` and `open`; folder-parallel non-solid decode; interleaved
+  empty-stream files; BCJ2; corrupt blocks; and early-stopped decodes. These
+  run with `compress,aes256,native-crypto,ppmd`.
+- CI: the guard-pages lane builds with `compress,aes256,aws-lc-crypto,ppmd`
+  and adds guarded parallel LZMA2 decode, BCJ2, AES-256 and PPMd cases.
+- Tests: setting `SEVENZ_TURBO_7ZZ_REQUIRED` turns the 7-Zip interop tests'
+  skip into a failure when neither `7zz` nor `7z` runs. Affected:
+  `sevenzip_encode_tests`, `bcj2_compress_tests`, `differential_7zz_tests`.
+  A CI job that sets it is prepared but not enabled until a 7-Zip install
+  source is approved.
+- Docs: `docs/unsafe-validation.md` lists each lane's features and selectors
+  and what remains uninstrumented.
+- `lzma-turbo` is a caret requirement (`"0.9.1"`) instead of an exact
+  `=0.9.1` pin: the manifest names the floor, `Cargo.lock` the tested version.
+- `compress` no longer enables the `aes` and `cbc` dependencies, so a default
+  (AWS-LC) build no longer compiles the RustCrypto AES-256-CBC encryptor; it
+  is built only with `compress`, `aes256` and `native-crypto` together. A
+  wasm `crypto-host` build with `compress` and `aes256` but no
+  `native-crypto` is now a compile error, since the host hook only decrypts
+  and nothing would encrypt.
+- Restore the provenance and change notices for the BCJ and delta filter
+  wrappers: they come from `lzma-rust2` 0.20.1 by Nils Hasenbanck
+  (Apache-2.0), itself a port of XZ for Java, over `lzma-turbo`'s port of the
+  LZMA SDK converters. `src/codec/filter/{mod,bcj,delta}.rs` list the
+  modifications.
+- The `Fork` section of this changelog and `AGENTS.md` are corrected on the
+  removed `lzma-rust2-encoder` feature, where SHA-256 comes from, which
+  builds compile `aes`/`cbc`, and where `lzma_turbo::` is used.
+- Drop a crate-archive `exclude` pattern (`docs/**/*.json.zst`) that matched
+  no file.
+
+## 0.27.1 - 2026-10-15
 
 - Enforce aggregate coder limits when admitting positional LZMA2 work from
   previously parsed metadata. Keep backend access behind the codec facade.

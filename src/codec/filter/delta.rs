@@ -1,7 +1,20 @@
 //! The delta filter, over `lzma-turbo`'s.
 //!
-//! The readers and writers below are this crate's, ported from the SDK's.
-//! What sat under them was a 256-byte ring with a
+//! `DeltaReader` and `DeltaWriter` come from `lzma-rust2` 0.20.1
+//! (`src/filter/delta.rs`) by Nils Hasenbanck, Apache-2.0, itself a port of
+//! XZ for Java (public domain); see the provenance note in `mod.rs`. The
+//! filter under them is `lzma-turbo`'s port of the public-domain LZMA SDK
+//! delta filter.
+//!
+//! Modified from the `lzma-rust2` file (Apache-2.0 section 4(b)):
+//!
+//! - `Delta` is a handle on `lzma_turbo::filters::delta::Delta` instead of
+//!   `lzma-rust2`'s ring-buffer implementation (see below), and clamps the
+//!   distance to the 1..=256 range a 7z property byte can express;
+//! - `crate::Result` is `std::io::Result`, and the `encoder` feature (and the
+//!   tests' `encoder` + `std` gate) is `compress`.
+//!
+//! What sat under the wrappers in `lzma-rust2` was a 256-byte ring with a
 //! moving index, walked one byte at a time in both directions: per byte, two
 //! masked index computations, a load, an add and a store. The filter it
 //! implements is `out[i] = in[i] + out[i - distance]`, and the ring exists

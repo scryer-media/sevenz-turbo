@@ -600,7 +600,12 @@ pub struct StreamMap {
     pub(crate) block_first_sub_stream_index: SubStreamOffsets,
     /// Index of first file for each block.
     pub block_first_file_index: Vec<usize>,
-    /// Block index for each file (None if file has no data).
+    /// Block index for each file. A file with data maps to the block that
+    /// holds it. A file without data maps to `Some(block)` when it lies
+    /// inside that block's span, after the block's first streamed file and
+    /// before its last; it maps to `None` when it lies outside every block's
+    /// span (before the first streamed file, between two blocks, or after
+    /// the last).
     pub file_block_index: Vec<Option<usize>>,
 }
 

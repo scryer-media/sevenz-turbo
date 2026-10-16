@@ -9,9 +9,9 @@ readme = "README.md"
 repository = "https://github.com/scryer-media/sevenz-turbo"
 # Raised from upstream's 1.93: `lzma-turbo` requires 1.97.1.
 rust-version = "1.97.1"
-version = "0.27.1"
+version = "0.27.2"
 # Repository scaffolding that has no business in the crate archive.
-exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml", "docs/**/*.json.zst"]
+exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml"]
 
 # `tools/decode-bench` is a workspace member rather than an example because it
 # depends on upstream `sevenz-rust2` to time the fork against it, and that
@@ -37,8 +37,8 @@ aes256_wasm = ["aes256", "getrandom/wasm_js"]
 # not turn `aws-lc-crypto` off — it takes precedence over it. A build that
 # wants no AWS-LC asks for `default-features = false` plus `native-crypto`.
 # Enabling `aes256` with neither is a compile error, not a silent choice. The
-# encoder's AES follows the same choice; `compress` still pulls `aes`/`cbc`
-# in regardless, as the encryptor of every build that does not select AWS-LC.
+# encoder's AES follows the same choice: `aes`/`cbc` come in only through
+# `native-crypto`, so `compress` adds no RustCrypto AES to an AWS-LC build.
 aws-lc-crypto = ["dep:aws-lc-rs", "lzma-turbo/crypto"]
 native-crypto = ["dep:aes", "dep:cbc", "lzma-turbo/native-crypto"]
 # Delegate the 7z `aes256` cryptography to the embedding host (see the `hooks`
@@ -62,9 +62,12 @@ crc-host = ["lzma-turbo/crc-host"]
 brotli = ["dep:brotli"]
 bzip2 = ["dep:bzip2"]
 # Writing archives. LZMA and LZMA2 are encoded by `lzma-turbo`'s port of the
-# SDK encoder (see `src/codec/lzma_turbo/writer.rs`); the AES-256 encryptor
-# is RustCrypto's unless AWS-LC is the selected backend.
-compress = ["lzma-turbo/enc", "dep:aes", "dep:cbc"]
+# SDK encoder (see `src/codec/lzma_turbo/writer.rs`); with `aes256`, the
+# AES-256 encryptor is the selected backend's (RustCrypto under
+# `native-crypto`, AWS-LC otherwise). `crypto-host` delegates decryption only,
+# so a wasm `crypto-host` build with `compress` and `aes256` also needs
+# `native-crypto`; without it the build is a compile error.
+compress = ["lzma-turbo/enc"]
 deflate = ["dep:flate2"]
 lz4 = ["dep:lz4_flex"]
 # PPMd decodes and encodes through `ppmd-turbo`.
@@ -84,8 +87,10 @@ bzip2 = { version = "0.6", optional = true }
 cbc = { version = "0.2", optional = true }
 flate2 = { version = "1", optional = true, features = ["zlib-rs"] }
 getrandom = { version = "0.4", optional = true }
-# Use the published version of the validated library checkpoint.
-lzma-turbo = { version = "=0.9.1", default-features = false, features = ["std", "asm", "crc", "filters"] }
+# A caret requirement: the floor this crate is known to need, not a pin.
+# `Cargo.lock` fixes the exact version that was tested, and CI builds with
+# `--locked`.
+lzma-turbo = { version = "0.9.1", default-features = false, features = ["std", "asm", "crc", "filters"] }
 ppmd-turbo = { version = "0.1.1", optional = true }
 lz4_flex = { version = "0.14", optional = true }
 nt-time = { version = "0.15", optional = true }

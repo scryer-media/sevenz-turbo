@@ -511,6 +511,10 @@ impl FolderCoder {
             }
             _ => return Ok(None),
         };
+        // `drives_send` already includes every plan `drives` accepts, except
+        // on wasm and under `sevenz_turbo_unthreaded`, where it accepts none
+        // (there is no block thread to hand a `Send` source to). The `||` is
+        // what keeps the one-thread plan on this thread on those targets.
         let drives = if send {
             PullCoder::drives_send(&props, coder) || PullCoder::drives(&props, coder)
         } else {

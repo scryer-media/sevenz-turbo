@@ -37,6 +37,14 @@ impl<R: Read + Seek> ArchiveReader<R> {
         // the existing scheduler and its full accounting/progress contract.
         // A single file also avoids changing duplicate-name and directory
         // creation order when different runs finish out of order.
+        //
+        // `strong_count(&self.lzma2) != 1` is the "a live `Lzma2Handle` may
+        // retune this decode" test. It is sound here even though counts are
+        // racy in general: `extract_to` holds `&mut self`, so no clone can be
+        // taken from the reader while this runs, and a count of one means no
+        // handle exists anywhere that could later be used. A count above one
+        // that drops concurrently only sends this extraction down the
+        // ordinary path, which is never wrong.
         if !self.input_complete
             || self.thread_count <= 1
             || self.adaptive_lzma2
