@@ -2,7 +2,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use lzma_turbo::{Checksum, ChecksumPlan, Lzma2Run, Lzma2RunScanner, run::Lzma2RunDecoder};
+use super::{Checksum, ChecksumPlan, Lzma2Run, Lzma2RunDecoder, Lzma2RunScanner, LzmaError};
 
 use crate::{
     Archive, ArchiveEntry, ArchiveLimits, CrcFolder, EncoderMethod, Error, Limit, PackStreamRange,
@@ -123,6 +123,20 @@ impl PositionalLzma2Folder {
             .get(block_index)
             .ok_or_else(|| Error::other("missing block file mapping"))?;
         let file_count = block.num_unpack_sub_streams;
+        // Recheck finite aggregate limits against the caller's public metadata.
+        // An unlimited caller needs no archive-wide scan on each folder admission.
+        if limits.max_total_coders != u64::MAX {
+            let total_coders = archive.blocks.iter().fold(0u64, |total, block| {
+                total.saturating_add(block.coders.len() as u64)
+            });
+            if total_coders > limits.max_total_coders {
+                return Err(Error::LimitExceeded {
+                    what: Limit::TotalCoders,
+                    requested: total_coders,
+                    limit: limits.max_total_coders,
+                });
+            }
+        }
         for (what, requested, limit) in [
             (
                 Limit::Entries,
@@ -609,7 +623,7 @@ impl PositionalLzma2Run {
             }
         }
         let complete = decoder.finish(cancel).map_err(|error| match error {
-            lzma_turbo::Error::Cancelled => {
+            LzmaError::Cancelled => {
                 locate(io::Error::new(io::ErrorKind::Interrupted, error).into())
             }
             other => locate(Error::other(other.to_string())),

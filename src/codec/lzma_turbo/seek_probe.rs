@@ -2,7 +2,7 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use lzma_turbo::Lzma2RunScanner;
+use super::Lzma2RunScanner;
 
 /// Establishes one complete run without retaining its compressed payload.
 /// Uses the same scanner as `Lzma2MtReader`, but skips payload via `Seek`, as

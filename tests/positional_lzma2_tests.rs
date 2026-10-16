@@ -9,6 +9,9 @@ use sevenz_turbo::{
     encoder_options::Lzma2Options,
 };
 
+#[path = "support/multirun.rs"]
+mod multirun;
+
 fn fixture(methods: Option<Vec<EncoderConfiguration>>) -> (Arc<Archive>, Arc<Vec<u8>>, Vec<u8>) {
     let parts: Vec<Vec<u8>> = [1_048_593, 1_048_607, 1_048_623]
         .into_iter()
@@ -19,6 +22,17 @@ fn fixture(methods: Option<Vec<EncoderConfiguration>>) -> (Arc<Archive>, Arc<Vec
                 .collect()
         })
         .collect();
+    if methods.is_none() {
+        let bytes = Arc::new(multirun::archive(&[
+            ("member-0", &parts[0]),
+            ("member-1", &parts[1]),
+            ("member-2", &parts[2]),
+        ]));
+        let archive = Arc::new(
+            Archive::read(&mut Cursor::new(bytes.as_slice()), &Password::empty()).unwrap(),
+        );
+        return (archive, bytes, parts.concat());
+    }
     let mut options = Lzma2Options::from_level_mt(1, 2, 1 << 20);
     options.set_dictionary_size(1 << 16);
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
@@ -269,6 +283,33 @@ fn positional_file_mapping_skips_interspersed_empty_entries() {
 #[test]
 fn positional_constructor_honors_metadata_and_output_limits() {
     let (archive, bytes, _) = fixture(None);
+    for (extra_block, limit, requested) in [(false, 0, 1), (true, 1, 2)] {
+        let mut metadata = (*archive).clone();
+        if extra_block {
+            metadata.blocks.push(metadata.blocks[0].clone());
+        }
+        assert!(matches!(
+            PositionalLzma2Folder::new(
+                Arc::new(metadata), bytes.clone(), 0,
+                ArchiveLimits { max_total_coders: limit, ..ArchiveLimits::default() },
+            ),
+            Err(Error::LimitExceeded { what: sevenz_turbo::Limit::TotalCoders, requested: count, limit: cap })
+                if count == requested && cap == limit
+        ));
+    }
+    assert!(
+        PositionalLzma2Folder::new(
+            archive.clone(),
+            bytes.clone(),
+            0,
+            ArchiveLimits {
+                max_total_coders: 1,
+                ..ArchiveLimits::default()
+            },
+        )
+        .unwrap()
+        .is_some()
+    );
     for limits in [
         ArchiveLimits {
             max_entries: 2,

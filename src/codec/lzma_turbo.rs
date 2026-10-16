@@ -14,7 +14,9 @@ use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+use lzma_turbo::Error as LzmaError;
 use lzma_turbo::crc::CrcFolder;
+use lzma_turbo::run::Lzma2RunDecoder;
 use lzma_turbo::{
     Checksum, ChecksumPlan, DrainStatus, Lzma2AdaptiveDecoder, Lzma2MtOptions, Lzma2Reader,
     Lzma2Run, Lzma2RunScanner, LzmaProps, LzmaReader,

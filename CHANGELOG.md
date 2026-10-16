@@ -454,6 +454,11 @@ Everything here is new surface; no upstream signature changed meaning.
 
 ## 0.27.1 - Unreleased
 
+- Enforce aggregate coder limits when admitting positional LZMA2 work from
+  previously parsed metadata. Keep backend access behind the codec facade.
+- Generate multi-run decoder test fixtures independently of writer threading,
+  preserving coverage in the unthreaded build.
+
 - Use the published `lzma-turbo 0.9.1` dependency for registry packaging.
 
 - Reduce non-solid archive metadata storage for ordinary one-input/one-output

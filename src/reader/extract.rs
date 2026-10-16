@@ -130,26 +130,19 @@ impl<R: Read + Seek> ArchiveReader<R> {
 }
 
 #[cfg(all(test, feature = "compress", any(unix, windows)))]
+#[path = "../../tests/support/multirun.rs"]
+mod multirun;
+
+#[cfg(all(test, feature = "compress", any(unix, windows)))]
 mod tests {
     use super::*;
-    use crate::{ArchiveWriter, encoder_options::Lzma2Options};
     use std::io::Cursor;
 
     fn fixture() -> (ArchiveReader<Cursor<Vec<u8>>>, Vec<u8>) {
         let expected: Vec<_> = (0..(3 << 20) + 17)
             .map(|i| ((i * 29) ^ (i >> 7)) as u8)
             .collect();
-        let mut options = Lzma2Options::from_level_mt(1, 2, 1 << 20);
-        options.set_dictionary_size(1 << 16);
-        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
-        writer.set_content_methods(vec![options.into()]);
-        writer.set_encrypt_header(false);
-        let mut entry = ArchiveEntry::new_file("nested/member");
-        entry.size = expected.len() as u64;
-        writer
-            .push_archive_entry(entry, Some(expected.as_slice()))
-            .unwrap();
-        let bytes = writer.finish().unwrap().into_inner();
+        let bytes = multirun::archive(&[("nested/member", &expected)]);
         let source = bytes.clone();
         let mut reader = ArchiveReader::new(Cursor::new(bytes), Password::empty()).unwrap();
         reader.set_positional_source(source);
