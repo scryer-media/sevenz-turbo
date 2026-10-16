@@ -365,6 +365,50 @@ file read, 0.040 s of the bench's own digest and 0.009 s of CRC-32, against a
 fast. The `-mx1` fixture is LZMA2-bound and `7zz` spends all 18 cores on it
 while our parallel path is capped by the archive's chunking.
 
+#### Stored folders read ahead
+
+From two threads a stored folder of 8 MiB or more is read on a stage thread,
+which checksums each file as it reads, and an AES one is decrypted on a
+second; the caller only hands the spans to its sink (see
+`src/reader/store_overlap.rs`). Two fixtures from the same 1 GiB payload,
+`store.7z` (`7zz a -mx=0`) and `aes_store.7z` (`-mx=0 -p -mhe=on`), each one
+folder; `decode-bench op decode` before (0.28.0 at `46a143c`) and after, run
+alternately, median of 9, host load 8-11 on 18 cores. Every lane produced
+digest `4b5a5dbbc22a93c3`. Wall, CPU (user + system) and peak RSS:
+
+| Fixture, sink | Threads | Before | After |
+| --- | --- | --- | --- |
+| `store.7z`, digest | 1 | 0.118 s, 0.116 s, 3.6 MiB | 0.124 s, 0.120 s, 3.7 MiB |
+| `store.7z`, digest | 2 | 0.117 s, 0.115 s, 3.6 MiB | **0.082 s**, 0.126 s, 6.8 MiB |
+| `store.7z`, digest | 4 | 0.114 s, 0.113 s, 3.6 MiB | **0.083 s**, 0.125 s, 6.8 MiB |
+| `store.7z`, digest | 8 | 0.117 s, 0.115 s, 3.6 MiB | **0.083 s**, 0.128 s, 6.8 MiB |
+| `store.7z`, none | 1 | 0.066 s, 0.065 s, 3.6 MiB | 0.064 s, 0.063 s, 3.7 MiB |
+| `store.7z`, none | 2 | 0.064 s, 0.064 s, 3.6 MiB | 0.069 s, 0.070 s, 5.8 MiB |
+| `store.7z`, none | 4 | 0.066 s, 0.065 s, 3.6 MiB | 0.068 s, 0.070 s, 5.8 MiB |
+| `store.7z`, none | 8 | 0.065 s, 0.064 s, 3.6 MiB | 0.070 s, 0.071 s, 5.8 MiB |
+| `aes_store.7z`, digest | 1 | 0.182 s, 0.181 s, 3.9 MiB | 0.181 s, 0.181 s, 3.9 MiB |
+| `aes_store.7z`, digest | 2 | 0.183 s, 0.182 s, 3.9 MiB | **0.106 s**, 0.211 s, 9.9 MiB |
+| `aes_store.7z`, digest | 4 | 0.181 s, 0.180 s, 3.9 MiB | **0.105 s**, 0.208 s, 9.9 MiB |
+| `aes_store.7z`, digest | 8 | 0.181 s, 0.180 s, 3.9 MiB | **0.106 s**, 0.209 s, 9.9 MiB |
+| `aes_store.7z`, none | 1 | 0.138 s, 0.138 s, 3.9 MiB | 0.138 s, 0.137 s, 3.9 MiB |
+| `aes_store.7z`, none | 2 | 0.139 s, 0.138 s, 3.9 MiB | **0.104 s**, 0.166 s, 9.9 MiB |
+| `aes_store.7z`, none | 4 | 0.139 s, 0.138 s, 3.9 MiB | **0.104 s**, 0.166 s, 9.9 MiB |
+| `aes_store.7z`, none | 8 | 0.139 s, 0.138 s, 3.9 MiB | **0.104 s**, 0.166 s, 9.9 MiB |
+
+`7zz` 26.01 on the same files: `store.7z` 0.150-0.164 s under `7zz t` and
+0.247-0.304 s under `7zz x`; `aes_store.7z` 0.238-0.241 s and 0.332-0.337 s.
+
+With a sink that does any work — the digest stands in for writing a file —
+the stored fixture is 29% faster from two threads and the AES one 42%; the
+AES one is 25% faster even into a sink that does nothing, since decryption
+is a stage of its own. A stored folder into a sink that does nothing is
+5-9% slower from two threads: the reading is all there is, and handing
+1,024 spans across threads costs more than it overlaps. No thread count or
+size gate separates that case, because the difference is the caller's
+sink; a consumer that writes what it decodes is the other case. The second
+thread runs at two threads and above alike, so 2, 4 and 8 measure the
+same. Peak RSS grows by the spans in flight: 4 MiB per stage at most.
+
 #### `mt.7z` and `st.7z`
 
 The parallel series, re-measured after the read-ahead rewrite (load 2.5 at the

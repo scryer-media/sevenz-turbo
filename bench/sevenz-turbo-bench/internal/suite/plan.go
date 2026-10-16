@@ -300,7 +300,21 @@ func Plan(manifest *fixtures.Manifest, dir, scratch string, tools Tools, setting
 		p.decode("solid vs non-solid", name, "all", decodeOpts{noVerify: true, note: "per-member CRC-32 off"})
 		p.decode("solid vs non-solid", name, "all", decodeOpts{stream: true, note: "streaming consumer path"})
 	}
+	for _, threads := range []string{"1", "2", "4", "8"} {
+		if !p.affords(threads) {
+			continue
+		}
+		p.decode("stored", "store.7z", threads, decodeOpts{upstream: threads == "1",
+			note: "a stored folder: from two threads the pack stream is read ahead and checksummed on a stage thread while the caller writes"})
+	}
 	p.decode("aes-256", "aes_store.7z", "1", decodeOpts{upstream: true, native: true})
+	for _, threads := range []string{"2", "4", "8"} {
+		if !p.affords(threads) {
+			continue
+		}
+		p.decode("aes-256", "aes_store.7z", threads, decodeOpts{native: true,
+			note: "from two threads the ciphertext is fetched on one stage thread and decrypted and checksummed on another while the caller writes"})
+	}
 	for _, threads := range []string{"1", "all"} {
 		p.decode("aes-256", "aes_mx1.7z", threads, decodeOpts{upstream: threads == "1", native: true})
 	}
