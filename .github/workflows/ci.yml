@@ -33,10 +33,9 @@ jobs:
           set -eu
           # Small archives under tests/resources and examples/data are the
           # differential corpus and are tracked deliberately; each is capped
-          # at 1 MiB. Compressed JSON evidence under docs is validated below.
+          # at 1 MiB.
           if git ls-files | grep -E '\.(7z|lzma|xz|zst|bin)$' \
-              | grep -vE '^(tests/resources/|examples/data/)' \
-              | grep -vE '^docs/.+\.json\.zst$' ; then
+              | grep -vE '^(tests/resources/|examples/data/)' ; then
             echo "generated archives must never be committed" >&2
             exit 1
           fi
@@ -46,22 +45,12 @@ jobs:
             echo "tracked fixture over 1 MiB: $big" >&2
             exit 1
           fi
-          python3 - <<'PY'
-          import json
-          import subprocess
-
-          def reject_constant(value):
-              raise ValueError(f"not a JSON constant: {value}")
-
-          tracked = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
-          for name in tracked:
-              if name.startswith("docs/") and name.endswith(".json.zst"):
-                  decoded = subprocess.check_output(["zstd", "-qdc", "--", name])
-                  try:
-                      json.loads(decoded.decode("utf-8"), parse_constant=reject_constant)
-                  except (UnicodeError, ValueError) as error:
-                      raise SystemExit(f"invalid compressed JSON evidence: {name}: {error}")
-          PY
+      - name: Keep raw benchmark evidence outside Git
+        run: |
+          if git ls-files -- docs | grep -E '\.(json(\.zst)?|csv|tsv|tar\.gz|log)$'; then
+            echo "raw benchmark evidence belongs outside the repository; see docs/benchmark-data.md" >&2
+            exit 1
+          fi
 
   fmt:
     name: fmt
@@ -127,6 +116,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install Nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -136,13 +129,21 @@ jobs:
         if: matrix.platform == 'windows-x86_64'
         uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
       - name: Test default features (aws-lc crypto backend)
-        run: cargo test --locked --no-fail-fast
+        run: cargo nextest run --locked --no-fail-fast
+      - name: Run doctests
+        run: cargo test --doc --locked --no-fail-fast
       - name: Test all features
-        run: cargo test --locked --all-features --no-fail-fast
+        run: cargo nextest run --locked --all-features --no-fail-fast
+      - name: Run doctests
+        run: cargo test --doc --locked --all-features --no-fail-fast
       - name: Test without default features
-        run: cargo test --locked --no-default-features --no-fail-fast
+        run: cargo nextest run --locked --no-default-features --no-fail-fast
+      - name: Run doctests
+        run: cargo test --doc --locked --no-default-features --no-fail-fast
       - name: Test the RustCrypto backend
-        run: cargo test --locked --no-default-features --features aes256,native-crypto,bzip2,compress,ppmd,util --no-fail-fast
+        run: cargo nextest run --locked --no-default-features --features aes256,native-crypto,bzip2,compress,ppmd,util --no-fail-fast
+      - name: Run doctests
+        run: cargo test --doc --locked --no-default-features --features aes256,native-crypto,bzip2,compress,ppmd,util --no-fail-fast
 
   unthreaded:
     name: unthreaded
@@ -156,12 +157,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install Nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked --no-fail-fast
+      - run: cargo nextest run --locked --no-fail-fast
+      - run: cargo test --doc --locked --no-fail-fast
 
   wasm:
     name: wasm
@@ -171,6 +177,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install Nextest
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -209,7 +219,9 @@ jobs:
       - name: Run the wasm host-delegation conformance harness
         run: |
           cargo clippy --locked -p wasm-conformance --all-targets -- -D warnings
-          cargo test --locked -p wasm-conformance
+          cargo nextest run --no-fail-fast --locked -p wasm-conformance
+      - name: Run doctests
+        run: cargo test --doc --no-fail-fast --locked -p wasm-conformance
 
   msrv:
     name: msrv

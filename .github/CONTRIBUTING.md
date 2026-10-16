@@ -10,7 +10,11 @@ Thanks for looking. A few things before you open a pull request:
 - Keep the diff against upstream confined to `src/decoder.rs`, `src/reader.rs`
   and new files wherever you can. `AGENTS.md` explains why and how to rebase.
 - Run `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`
-  and `cargo test --all-features` locally.
+  and `cargo nextest run --all-features --no-fail-fast`
+  and `cargo test --doc --all-features --no-fail-fast` locally.
 - Record every divergence from upstream in the "Fork" section of
   [CHANGELOG.md](../CHANGELOG.md), in the same change.
 - Enable the hooks once per clone: `git config core.hooksPath .githooks`.
+
+Install the native test runner with `cargo install cargo-nextest --locked --version 0.9.143`.
+Nextest runs unit and integration tests; Cargo runs doctests, and Miri uses its own interpreter.

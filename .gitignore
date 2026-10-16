@@ -45,3 +45,11 @@
 **/fuzz/artifacts/
 **/fuzz/coverage/
 **/fuzz/Cargo.lock
+
+# Raw benchmark evidence belongs in an external local archive.
+/docs/**/*.json
+/docs/**/*.json.zst
+/docs/**/*.csv
+/docs/**/*.tsv
+/docs/**/*.tar.gz
+/docs/**/*.log

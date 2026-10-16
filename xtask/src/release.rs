@@ -23,8 +23,8 @@ cargo xtask release [--dry-run] [--publish] [--skip-tests]
                 on a dirty tree
   --publish     after tagging, `cargo publish` from this machine, then push
                 the tag (the first release, before trusted publishing exists)
-  --skip-tests  leave out `cargo test`; CI on the release commit and the
-                workflow's own verify job both run it";
+  --skip-tests  leave out native tests and doctests; CI on the release commit
+                and the workflow's own verify job both run them";
 
 struct Release {
     dry_run: bool,
@@ -156,13 +156,14 @@ impl Release {
         }
 
         if skip_tests {
-            println!("release: skipping cargo test");
+            println!("release: skipping native tests and doctests");
         } else {
             println!(
-                "release: cargo test --locked --workspace --exclude wasm-conformance --release"
+                "release: cargo nextest run --locked --workspace --exclude wasm-conformance --release"
             );
             if !cargo(&[
-                "test",
+                "nextest",
+                "run",
                 "--locked",
                 "--workspace",
                 // The wasm conformance harness builds wasmtime and needs a
@@ -173,6 +174,22 @@ impl Release {
                 "--no-fail-fast",
             ]) {
                 self.problem("tests failed")?;
+            }
+            // Nextest runs native tests; rustdoc still runs documentation examples.
+            println!(
+                "release: cargo test --doc --locked --workspace --exclude wasm-conformance --release"
+            );
+            if !cargo(&[
+                "test",
+                "--doc",
+                "--locked",
+                "--workspace",
+                "--exclude",
+                "wasm-conformance",
+                "--release",
+                "--no-fail-fast",
+            ]) {
+                self.problem("doctests failed")?;
             }
         }
 
