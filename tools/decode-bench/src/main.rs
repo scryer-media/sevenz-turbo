@@ -517,6 +517,7 @@ fn extract_fork_with(
             .expect("fork: read header")
     };
     reader.set_threads(threads);
+    reader.set_input_complete(true);
     reader.set_verify_checksums(verify);
     let mut sink = Sink::default();
     let mut buf = vec![0u8; 1 << 20];

@@ -1,7 +1,4 @@
-use std::{
-    borrow::Cow,
-    io::{Read, Seek},
-};
+use std::io::{Read, Seek};
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(feature = "compress")]
@@ -44,6 +41,7 @@ pub(crate) struct Aes256Sha256Decoder<R> {
     cipher: Aes256Cbc,
     input: R,
     done: bool,
+    compact_push: bool,
     /// Ciphertext that did not fill a block, waiting for the next read.
     carry: [u8; AES_BLOCK_LEN],
     carry_len: usize,
@@ -76,6 +74,7 @@ impl<R: Read> Aes256Sha256Decoder<R> {
             input,
             cipher,
             done: false,
+            compact_push: false,
             carry: [0; AES_BLOCK_LEN],
             carry_len: 0,
             plain: Box::default(),
@@ -99,8 +98,8 @@ impl<R: Read> Aes256Sha256Decoder<R> {
         }
     }
 
-    /// Decrypts up to [`AES_CHUNK_LEN`] into `plain`, for a caller reading
-    /// less than that at a time. Only such callers pay for this copy.
+    /// Decrypts into the owned plaintext buffer. Small reads allocate one
+    /// chunk; bulk pushes can grow it to the bounded push size.
     fn fill_plain(&mut self) -> std::io::Result<usize> {
         if self.plain.is_empty() {
             self.plain = vec![0; AES_CHUNK_LEN].into_boxed_slice();
@@ -114,6 +113,64 @@ impl<R: Read> Aes256Sha256Decoder<R> {
         Ok(decrypted)
     }
 
+    /// Finite budgets keep owned delivery at the ordinary AES chunk size.
+    /// A larger buffer buys little for this path while raising retained RSS.
+    pub(crate) fn keep_push_buffer_small(&mut self) {
+        self.compact_push = true;
+    }
+
+    fn reserve_plain(&mut self, want: usize) -> std::io::Result<()> {
+        debug_assert_eq!(self.plain_start, self.plain_end);
+        if self.plain.len() < want {
+            // This buffer is fully consumed. Retire it before growing,
+            // so small reads followed by pushes never retain two output
+            // allocations. An allocation failure consumes no new input.
+            self.plain.as_mut().zeroize();
+            self.plain = Box::default();
+            let mut buffer = Vec::new();
+            buffer
+                .try_reserve_exact(want)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
+            buffer.resize(want, 0);
+            self.plain = buffer.into_boxed_slice();
+        }
+        Ok(())
+    }
+
+    /// Delivers from the same owned plaintext the small-read path uses.
+    /// The buffer grows lazily for bulk pushes, never beyond the fixed bound;
+    /// mixed reads and pushes consume one cursor and retain partial blocks.
+    pub(crate) fn push(
+        &mut self,
+        max: usize,
+        sink: &mut dyn FnMut(&[u8]),
+    ) -> std::io::Result<usize> {
+        if max == 0 {
+            return Ok(0);
+        }
+        if self.plain_start == self.plain_end {
+            if self.done {
+                return Ok(0);
+            }
+            let limit = if self.compact_push {
+                AES_CHUNK_LEN
+            } else {
+                crate::decoder::PUSH_BUFFER_BYTES
+            };
+            let want = max.clamp(AES_CHUNK_LEN, limit);
+            self.reserve_plain(want)?;
+            if self.fill_plain()? == 0 {
+                return Ok(0);
+            }
+        }
+        let size = (self.plain_end - self.plain_start).min(max);
+        let start = self.plain_start;
+        self.plain_start += size;
+        self.pos += size;
+        sink(&self.plain[start..start + size]);
+        Ok(size)
+    }
+
     /// Fills `buf` with ciphertext from below, as much as one read gives past
     /// the first block, and decrypts the whole blocks of it in place. Zero is
     /// the end of the stream. `buf` is at least a block long.
@@ -123,7 +180,10 @@ impl<R: Read> Aes256Sha256Decoder<R> {
         let mut filled = self.carry_len;
         self.carry_len = 0;
         while filled < AES_BLOCK_LEN {
-            let read = self.input.read(&mut buf[filled..capacity])?;
+            let read = match self.input.read(&mut buf[filled..capacity]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => result?,
+            };
             if read == 0 {
                 self.carry[..filled].copy_from_slice(&buf[..filled]);
                 self.carry_len = filled;
@@ -209,67 +269,181 @@ impl<R: Read + Seek> Seek for Aes256Sha256Decoder<R> {
     }
 }
 
+/// Validated public parameters of a 7z AES-256-CBC coder.
+///
+/// These are header facts, not key material. The IV is zero-extended as the
+/// format requires. Construct through [`Self::parse`] to preserve the bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AesProperties {
+    cycles_power: u8,
+    salt: [u8; 16],
+    salt_len: u8,
+    iv: [u8; 16],
+}
+
+impl AesProperties {
+    /// Parses the coder's properties without deriving a key or allocating.
+    pub fn parse(properties: &[u8]) -> Result<Self, crate::Error> {
+        let Some(&b0) = properties.first() else {
+            return Err(crate::Error::other("AES256 properties too short"));
+        };
+        // Preserve the decoder's one-byte property compatibility.
+        let b1 = properties.get(1).copied().unwrap_or(0);
+        let iv_len = usize::from(((b0 >> 6) & 1) + (b1 & 15));
+        let salt_len = usize::from(((b0 >> 7) & 1) + (b1 >> 4));
+        if salt_len + iv_len != 0 && 2 + salt_len + iv_len > properties.len() {
+            return Err(crate::Error::other("Salt size + IV size too long"));
+        }
+        let mut salt = [0; 16];
+        let mut iv = [0; 16];
+        if salt_len != 0 {
+            salt[..salt_len].copy_from_slice(&properties[2..2 + salt_len]);
+        }
+        if iv_len != 0 {
+            iv[..iv_len].copy_from_slice(&properties[2 + salt_len..2 + salt_len + iv_len]);
+        }
+        Ok(Self {
+            cycles_power: b0 & 63,
+            salt,
+            salt_len: salt_len as u8,
+            iv,
+        })
+    }
+
+    /// SHA-256 work factor; 63 selects the format's raw-key mode.
+    pub fn cycles_power(&self) -> u8 {
+        self.cycles_power
+    }
+
+    /// Salt bytes, at most sixteen.
+    pub fn salt(&self) -> &[u8] {
+        &self.salt[..usize::from(self.salt_len)]
+    }
+
+    /// The CBC initialization vector, zero-extended to sixteen bytes.
+    pub fn iv(&self) -> &[u8; 16] {
+        &self.iv
+    }
+
+    /// Derives a key through the selected backend and the password's cache.
+    ///
+    /// Enforces the decoder's hard ceiling, the supplied work-factor limit,
+    /// and the password's cumulative KDF budget. Keep the same `Password`
+    /// through header parsing and member admission to reuse both accounting
+    /// and cached keys. A cache hit spends no additional rounds.
+    pub fn derive_key(
+        &self,
+        password: &Password,
+        limits: &crate::ArchiveLimits,
+    ) -> Result<AesKey, crate::Error> {
+        self.derive(
+            password,
+            limits.max_aes_cycles_power,
+            limits.max_aes_kdf_rounds,
+        )
+        .map(AesKey)
+    }
+
+    fn derive(
+        &self,
+        password: &Password,
+        max_cycles_power: u8,
+        max_kdf_rounds: u64,
+    ) -> Result<Zeroizing<[u8; 32]>, crate::Error> {
+        if password.is_empty() {
+            return Err(crate::Error::PasswordRequired);
+        }
+        if self.cycles_power == 63 {
+            let mut key = Zeroizing::new([0; 32]);
+            let salt = self.salt();
+            key[..salt.len()].copy_from_slice(salt);
+            let n = password.as_slice().len().min(32 - salt.len());
+            key[salt.len()..salt.len() + n].copy_from_slice(&password.as_slice()[..n]);
+            return Ok(key);
+        }
+        let cap = max_cycles_power.min(MAX_AES_CYCLES_POWER);
+        if self.cycles_power > cap {
+            return Err(crate::Error::limit(
+                crate::Limit::AesCyclesPower,
+                u64::from(cap),
+                u64::from(self.cycles_power),
+            ));
+        }
+        derive_key_with_budget(self.cycles_power, self.salt(), password, max_kdf_rounds)
+    }
+}
+
+/// An AES-256 key whose owned bytes are cleared on drop and never debug-printed.
+#[derive(Clone)]
+pub struct AesKey(Zeroizing<[u8; 32]>);
+
+impl AesKey {
+    /// Borrows the key for an AES backend. Copies made by the caller must be
+    /// kept secret and cleared by that caller when no longer needed.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AesKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AesKey([REDACTED])")
+    }
+}
+
+impl crate::Coder {
+    /// The input-stream count declared by this coder.
+    ///
+    /// Available with `aes256` for consumers validating an encrypted folder's
+    /// complete stream graph before mapping ciphertext to output files.
+    pub fn num_input_streams(&self) -> u64 {
+        self.num_in_streams()
+    }
+
+    /// The output-stream count declared by this coder.
+    /// Available with `aes256`, like [`Self::num_input_streams`].
+    pub fn num_output_streams(&self) -> u64 {
+        self.num_out_streams()
+    }
+
+    /// Parses this coder's AES facts, or returns `None` for another method.
+    pub fn aes_properties(&self) -> Result<Option<AesProperties>, crate::Error> {
+        if self.encoder_method_id() != crate::EncoderMethod::ID_AES256_SHA256 {
+            return Ok(None);
+        }
+        AesProperties::parse(self.properties()).map(Some)
+    }
+}
+
+impl crate::Archive {
+    /// Returns the AES coder facts of a folder in coder order.
+    ///
+    /// This does not establish that the folder is stored: consumers must
+    /// validate its full coder graph, stream geometry and member count.
+    pub fn block_aes_properties(&self, block: usize) -> Result<Vec<AesProperties>, crate::Error> {
+        let block = self
+            .blocks
+            .get(block)
+            .ok_or_else(|| crate::Error::other("AES block index out of range"))?;
+        block
+            .coders
+            .iter()
+            .filter_map(|coder| coder.aes_properties().transpose())
+            .collect()
+    }
+}
+
 fn get_aes_key(
     properties: &[u8],
     password: &Password,
     max_cycles_power: u8,
     max_kdf_rounds: u64,
 ) -> Result<(Zeroizing<[u8; 32]>, [u8; 16]), crate::Error> {
-    let properties = match properties.len() {
-        0 => {
-            return Err(crate::Error::other("AES256 properties too short"));
-        }
-        1 => {
-            // It seems that there are encrypted files that include the K_END (0x00) symbol as a
-            // property byte.
-            let mut prop = vec![0u8; 2];
-            prop[0] = properties[0];
-            Cow::Owned(prop)
-        }
-        _ => Cow::Borrowed(properties),
-    };
-
-    let b0 = properties[0];
-    let num_cycles_power = b0 & 63;
-    let b1 = properties[1];
-    let iv_size = (((b0 >> 6) & 1) + (b1 & 15)) as usize;
-    let salt_size = (((b0 >> 7) & 1) + (b1 >> 4)) as usize;
-    if 2 + salt_size + iv_size > properties.len() {
-        return Err(crate::Error::other("Salt size + IV size too long"));
-    }
-    let mut salt = vec![0u8; salt_size];
-    salt.copy_from_slice(&properties[2..(2 + salt_size)]);
-    let mut iv = [0u8; 16];
-    iv[0..iv_size].copy_from_slice(&properties[(2 + salt_size)..(2 + salt_size + iv_size)]);
-    if password.is_empty() {
-        return Err(crate::Error::PasswordRequired);
-    }
-    let aes_key = if num_cycles_power == 0x3F {
-        // "Raw key" mode: the 32-byte key is `salt` followed by the password (both
-        // truncated to fit). `salt_size` is at most 16, so copy only that prefix.
-        // `aes_key.copy_from_slice(&salt)` would panic on the 32-vs-<=16 length mismatch.
-        let mut aes_key = Zeroizing::new([0u8; 32]);
-        aes_key[..salt_size].copy_from_slice(&salt[..salt_size]);
-        let n = password.as_slice().len().min(aes_key.len() - salt_size);
-        aes_key[salt_size..n + salt_size].copy_from_slice(&password.as_slice()[0..n]);
-        aes_key
-    } else {
-        // Cap the work factor: `derive_key` runs `2^num_cycles_power` SHA-256 rounds, so
-        // a crafted large power is a CPU-exhaustion DoS (and `1 << power` also overflows
-        // the shift for power >= 32). The bound is the caller's
-        // `ArchiveLimits::max_aes_cycles_power`, never above what keeps the shift
-        // itself safe. No real archive uses a power above the default of 24.
-        let cap = max_cycles_power.min(MAX_AES_CYCLES_POWER);
-        if num_cycles_power > cap {
-            return Err(crate::Error::limit(
-                crate::Limit::AesCyclesPower,
-                u64::from(cap),
-                u64::from(num_cycles_power),
-            ));
-        }
-        derive_key_with_budget(num_cycles_power, &salt, password, max_kdf_rounds)?
-    };
-    Ok((aes_key, iv))
+    let properties = AesProperties::parse(properties)?;
+    Ok((
+        properties.derive(password, max_cycles_power, max_kdf_rounds)?,
+        properties.iv,
+    ))
 }
 
 fn derive_key(num_cycles_power: u8, salt: &[u8], password: &[u8]) -> [u8; 32] {
@@ -377,9 +551,41 @@ pub(crate) struct CachedKey {
 pub(crate) struct KeyCache {
     /// Least recently used first.
     entries: Vec<CachedKey>,
+    capacity: usize,
+    retained: std::collections::BTreeMap<(u8, Vec<u8>), Zeroizing<[u8; 32]>>,
     /// Derivations actually run, for the tests that hold the count to one.
     #[cfg(test)]
     pub(crate) derivations: u64,
+}
+
+impl KeyCache {
+    pub(crate) fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity;
+        let keep = self.capacity();
+        if keep > KEY_CACHE_ENTRIES {
+            for entry in self.entries.drain(..) {
+                self.retained.insert((entry.power, entry.salt), entry.key);
+            }
+            while self.retained.len() > keep {
+                self.retained.pop_first();
+            }
+        } else {
+            for ((power, salt), key) in std::mem::take(&mut self.retained) {
+                self.entries.push(CachedKey { power, salt, key });
+            }
+            if self.entries.len() > keep {
+                self.entries.drain(..self.entries.len() - keep);
+            }
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        if self.capacity == 0 {
+            KEY_CACHE_ENTRIES
+        } else {
+            self.capacity
+        }
+    }
 }
 
 #[cfg(test)]
@@ -396,6 +602,11 @@ fn derive_key_with_budget(
     use std::sync::atomic::Ordering::Relaxed;
 
     let mut cache = password.key_cache.lock().unwrap_or_else(|e| e.into_inner());
+    if !cache.retained.is_empty()
+        && let Some(key) = cache.retained.get(&(num_cycles_power, salt.to_vec()))
+    {
+        return Ok(key.clone());
+    }
     if let Some(hit) = cache
         .entries
         .iter()
@@ -428,14 +639,23 @@ fn derive_key_with_budget(
     {
         cache.derivations += 1;
     }
-    if cache.entries.len() == KEY_CACHE_ENTRIES {
-        cache.entries.remove(0);
+    if cache.capacity() > KEY_CACHE_ENTRIES {
+        if cache.retained.len() == cache.capacity() {
+            cache.retained.pop_first();
+        }
+        cache
+            .retained
+            .insert((num_cycles_power, salt.to_vec()), key.clone());
+    } else {
+        if cache.entries.len() == cache.capacity() {
+            cache.entries.remove(0);
+        }
+        cache.entries.push(CachedKey {
+            power: num_cycles_power,
+            salt: salt.to_vec(),
+            key: key.clone(),
+        });
     }
-    cache.entries.push(CachedKey {
-        power: num_cycles_power,
-        salt: salt.to_vec(),
-        key: key.clone(),
-    });
     Ok(key)
 }
 
@@ -544,6 +764,124 @@ mod key_derivation_tests {
 
     const CYCLES: u8 = 4;
 
+    #[cfg(feature = "compress")]
+    #[test]
+    fn public_folder_aes_facts_decode_writer_ciphertext() {
+        use crate::{
+            Archive, ArchiveEntry, ArchiveLimits, ArchiveWriter, EncoderConfiguration,
+            EncoderMethod,
+        };
+        use std::io::Cursor;
+        let password = Password::new("fixture-key");
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        writer.set_content_methods(vec![
+            EncoderConfiguration::from(crate::encoder_options::AesEncoderOptions::new(
+                password.clone(),
+            )),
+            EncoderConfiguration::new(EncoderMethod::COPY),
+        ]);
+        let payloads = [vec![7; 19], vec![31; 33]];
+        for (index, payload) in payloads.iter().enumerate() {
+            let mut entry = ArchiveEntry::new_file(&format!("member-{index}"));
+            entry.size = payload.len() as u64;
+            writer
+                .push_archive_entry(entry, Some(Cursor::new(payload)))
+                .unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let archive = Archive::read(&mut Cursor::new(&bytes), &password).unwrap();
+        assert_eq!(archive.blocks.len(), payloads.len());
+        for (block, payload) in payloads.iter().enumerate() {
+            let facts = archive.block_aes_properties(block).unwrap();
+            assert_eq!(facts.len(), 1);
+            let key = facts[0]
+                .derive_key(&password, &ArchiveLimits::default())
+                .unwrap();
+            let range = archive.block_pack_streams(block)[0];
+            let mut cipher =
+                bytes[range.offset as usize..(range.offset + range.size) as usize].to_vec();
+            Aes256Cbc::new(key.as_bytes(), facts[0].iv())
+                .unwrap()
+                .decrypt(&mut cipher)
+                .unwrap();
+            assert_eq!(&cipher[..payload.len()], payload);
+            assert_eq!(cipher.len(), payload.len().div_ceil(16) * 16);
+            assert!(cipher[payload.len()..].iter().all(|byte| *byte == 0));
+        }
+        assert!(archive.block_aes_properties(archive.blocks.len()).is_err());
+    }
+
+    #[test]
+    fn public_aes_facts_cover_short_full_and_invalid_properties() {
+        let empty_salt = AesProperties::parse(&[4]).unwrap();
+        assert_eq!(empty_salt.cycles_power(), 4);
+        assert_eq!(empty_salt.salt(), b"");
+        assert_eq!(empty_salt.iv(), &[0; 16]);
+        for properties in [vec![], vec![0xC4], vec![0xC4, 0xFF], vec![0x44, 0x0F, 0]] {
+            assert!(AesProperties::parse(&properties).is_err());
+        }
+        let mut bytes = vec![0xC4, 0xFF];
+        bytes.extend(0..32);
+        let facts = AesProperties::parse(&bytes).unwrap();
+        assert_eq!(facts.salt(), &(0..16).collect::<Vec<u8>>());
+        assert_eq!(facts.iv().as_slice(), &(16..32).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn public_aes_derivation_shares_decoder_cache_and_limits() {
+        let password = Password::new("fixture-password").with_aes_key_cache_capacity(8);
+        let limits = crate::ArchiveLimits {
+            max_aes_cycles_power: 4,
+            max_aes_kdf_rounds: 8 * 16,
+            ..Default::default()
+        };
+        for salt in 0..8 {
+            let properties = [0x84, 0, salt];
+            let (decoder_key, _) = get_aes_key(&properties, &password, 4, 8 * 16).unwrap();
+            let facts = AesProperties::parse(&properties).unwrap();
+            let public_key = facts.derive_key(&password, &limits).unwrap();
+            assert_eq!(public_key.as_bytes(), &*decoder_key);
+            assert_eq!(format!("{public_key:?}"), "AesKey([REDACTED])");
+        }
+        for salt in 0..8 {
+            AesProperties::parse(&[0x84, 0, salt])
+                .unwrap()
+                .derive_key(&password, &limits)
+                .unwrap();
+        }
+        assert_eq!(derivations(&password), 8);
+        assert_eq!(spent(&password), 128);
+        assert_eq!(
+            AesProperties::parse(&[0x84, 0, 8])
+                .unwrap()
+                .derive_key(&password, &limits)
+                .unwrap_err()
+                .limit_hit(),
+            Some(crate::Limit::AesKdfRounds)
+        );
+        assert_eq!(
+            AesProperties::parse(&[5])
+                .unwrap()
+                .derive_key(&password, &limits)
+                .unwrap_err()
+                .limit_hit(),
+            Some(crate::Limit::AesCyclesPower)
+        );
+        assert!(matches!(
+            AesProperties::parse(&[0])
+                .unwrap()
+                .derive_key(&Password::empty(), &limits),
+            Err(crate::Error::PasswordRequired)
+        ));
+        let raw = AesProperties::parse(&[0xBF, 0, 7])
+            .unwrap()
+            .derive_key(&password, &limits)
+            .unwrap();
+        assert_eq!(raw.as_bytes()[0], 7);
+        assert_eq!(&raw.as_bytes()[1..], &password.as_slice()[..31]);
+        assert_eq!(spent(&password), 128);
+    }
+
     fn spent(password: &Password) -> u64 {
         password
             .kdf_rounds
@@ -584,6 +922,40 @@ mod key_derivation_tests {
             .kdf_rounds
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         assert!(derive_key_with_budget(0, b"new", &password, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn public_cache_capacity_changes_preserve_keys_and_existing_budgets() {
+        let password = Password::new("cache-fixture");
+        for salt in 0..4 {
+            derive_key_with_budget(2, &[salt], &password, 16).unwrap();
+        }
+        let password = password.with_aes_key_cache_capacity(8);
+        for salt in 0..8 {
+            derive_key_with_budget(2, &[salt], &password, 32).unwrap();
+        }
+        assert_eq!(derivations(&password), 8);
+        assert_eq!(spent(&password), 32);
+        let copy = password.clone();
+        assert_eq!(spent(&copy), 0);
+        derive_key_with_budget(2, &[7], &copy, 0).unwrap();
+        assert_eq!(spent(&copy), 0);
+        assert_eq!(spent(&password), 32);
+        let password = password.with_aes_key_cache_capacity(2);
+        assert_eq!(spent(&password), 32);
+        derive_key_with_budget(2, &[7], &password, 32).unwrap();
+        assert_eq!(
+            derive_key_with_budget(2, &[0], &password, 32)
+                .unwrap_err()
+                .limit_hit(),
+            Some(crate::Limit::AesKdfRounds)
+        );
+        derive_key_with_budget(2, &[0], &copy, 4).unwrap();
+        assert_eq!(spent(&copy), 4);
+        assert_eq!(spent(&password), 32);
+        let password = password.with_aes_key_cache_capacity(0);
+        assert_eq!(password.key_cache.lock().unwrap().capacity(), 4);
+        assert_eq!(spent(&password), 32);
     }
 
     #[test]
@@ -943,6 +1315,117 @@ mod tests {
         let mut decoded = vec![];
         let _ = std::io::copy(&mut dec, &mut decoded).unwrap();
         assert_eq!(&decoded[..original.len()], original);
+    }
+
+    #[test]
+    fn bulk_aes_read_uses_the_copy_callers_buffer_without_plaintext_staging() {
+        let original = long_input();
+        let (encoded, options, password) = encode(&original);
+        let mut decoder = Aes256Sha256Decoder::new(
+            encoded.as_slice(),
+            &options.properties(),
+            &password,
+            MAX_AES_CYCLES_POWER,
+            u64::MAX,
+        )
+        .unwrap();
+        // COPY calls this Read path with its own push buffer. AES decrypts
+        // directly into it and retains only the partial cipher block.
+        let mut buffer = vec![0; crate::decoder::PUSH_BUFFER_BYTES];
+        let size = decoder.read(&mut buffer).unwrap();
+        assert_eq!(&buffer[..original.len()], original);
+        assert_eq!(size, encoded.len());
+        assert!(decoder.plain.is_empty());
+        assert_eq!(decoder.read(&mut buffer).unwrap(), 0);
+        assert!(decoder.plain.is_empty());
+    }
+
+    #[test]
+    fn failed_plaintext_growth_releases_spent_storage_without_consuming_input() {
+        let original = long_input();
+        let (encoded, options, password) = encode(&original);
+        let mut decoder = Aes256Sha256Decoder::new(
+            FragmentedReader::new(encoded.as_slice(), &[AES_CHUNK_LEN - 7]),
+            &options.properties(),
+            &password,
+            MAX_AES_CYCLES_POWER,
+            u64::MAX,
+        )
+        .unwrap();
+        let mut actual = Vec::new();
+        let mut prefix = [0; 13];
+        decoder.read_exact(&mut prefix).unwrap();
+        actual.extend_from_slice(&prefix);
+        decoder
+            .push(AES_CHUNK_LEN, &mut |bytes| actual.extend_from_slice(bytes))
+            .unwrap();
+        assert_eq!(decoder.plain_start, decoder.plain_end);
+        assert_eq!(decoder.plain.len(), AES_CHUNK_LEN);
+        let input_left = decoder.input.inner.len();
+        let position = decoder.pos;
+        assert_ne!(decoder.carry_len, 0);
+        let carry = decoder.carry;
+        let carry_len = decoder.carry_len;
+        let error = decoder.reserve_plain(usize::MAX).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
+        assert!(decoder.plain.is_empty());
+        assert_eq!(decoder.input.inner.len(), input_left);
+        assert_eq!(decoder.pos, position);
+        assert_eq!(decoder.carry, carry);
+        assert_eq!(decoder.carry_len, carry_len);
+        while decoder
+            .push(usize::MAX, &mut |bytes| actual.extend_from_slice(bytes))
+            .unwrap()
+            != 0
+        {}
+        assert_eq!(&actual[..original.len()], original);
+        assert!(actual[original.len()..].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn pushes_preserve_partial_blocks_across_interrupted_reads() {
+        struct Interrupted<R> {
+            inner: R,
+            interrupt: bool,
+        }
+        impl<R: Read> Read for Interrupted<R> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.interrupt = !self.interrupt;
+                if self.interrupt {
+                    Err(std::io::ErrorKind::Interrupted.into())
+                } else {
+                    self.inner.read(bytes)
+                }
+            }
+        }
+        let original = long_input();
+        let (encoded, options, password) = encode(&original);
+        let input = Interrupted {
+            inner: FragmentedReader::new(encoded.as_slice(), &[1, 7, 17, 4093]),
+            interrupt: false,
+        };
+        let mut decoder = Aes256Sha256Decoder::new(
+            input,
+            &options.properties(),
+            &password,
+            MAX_AES_CYCLES_POWER,
+            u64::MAX,
+        )
+        .unwrap();
+        assert_eq!(decoder.push(0, &mut |_| panic!("empty push")).unwrap(), 0);
+        assert!(decoder.plain.is_empty());
+        let mut actual = Vec::new();
+        let mut prefix = [0; 13];
+        decoder.read_exact(&mut prefix).unwrap();
+        actual.extend_from_slice(&prefix);
+        while decoder
+            .push(usize::MAX, &mut |bytes| actual.extend_from_slice(bytes))
+            .unwrap()
+            != 0
+        {}
+        assert_eq!(&actual[..original.len()], original);
+        assert!(actual[original.len()..].iter().all(|&byte| byte == 0));
+        assert_eq!(decoder.plain.len(), crate::decoder::PUSH_BUFFER_BYTES);
     }
 
     #[test]

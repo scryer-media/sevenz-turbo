@@ -119,7 +119,7 @@ impl<W: Write> Write for Encoder<W> {
                 true => {
                     let writer = w.take().unwrap();
                     let mut inner = writer.finish()?;
-                    let _ = inner.write(buf);
+                    inner.write(buf)?;
                     Ok(0)
                 }
                 false => w.as_mut().unwrap().write(buf),
@@ -128,7 +128,7 @@ impl<W: Write> Write for Encoder<W> {
                 true => {
                     let writer = w.take().unwrap();
                     let mut inner = writer.finish()?;
-                    let _ = inner.write(buf);
+                    inner.write(buf)?;
                     Ok(0)
                 }
                 false => w.as_mut().unwrap().write(buf),
@@ -141,7 +141,7 @@ impl<W: Write> Write for Encoder<W> {
                     let mut writer = w.take().unwrap();
                     writer.finish()?;
                     let mut inner = writer.into_inner();
-                    let _ = inner.write(buf);
+                    inner.write(buf)?;
                     Ok(0)
                 }
                 false => w.as_mut().unwrap().write(buf),
@@ -154,7 +154,7 @@ impl<W: Write> Write for Encoder<W> {
                 true => {
                     let writer = w.take().unwrap();
                     let mut inner = writer.finish()?;
-                    let _ = inner.write(buf);
+                    inner.write(buf)?;
                     Ok(0)
                 }
                 false => w.as_mut().unwrap().write(buf),
@@ -164,7 +164,7 @@ impl<W: Write> Write for Encoder<W> {
                 true => {
                     let writer = w.take().unwrap();
                     let mut inner = writer.finish()?;
-                    let _ = inner.write(buf);
+                    inner.write(buf)?;
                     Ok(0)
                 }
                 false => w.as_mut().unwrap().write(buf),
@@ -174,7 +174,7 @@ impl<W: Write> Write for Encoder<W> {
                 true => {
                     let writer = w.take().unwrap();
                     let mut inner = writer.finish()?;
-                    let _ = inner.write(buf);
+                    inner.write(buf)?;
                     Ok(0)
                 }
                 false => w.as_mut().unwrap().write(buf),
@@ -184,7 +184,7 @@ impl<W: Write> Write for Encoder<W> {
                 true => {
                     let writer = w.take().unwrap();
                     let mut inner = writer.finish()?;
-                    let _ = inner.write(buf);
+                    inner.write(buf)?;
                     Ok(0)
                 }
                 false => w.as_mut().unwrap().write(buf),
@@ -435,18 +435,12 @@ fn turbo_props(settings: &LzmaSettings, threads: u32) -> lzma_turbo::LzmaEncProp
 /// below 4 KiB to fit the input.
 const REDUCE_SIZE_FLOOR: u64 = 1 << 12;
 
-/// What one thread coding folder after folder keeps between them: the LZMA
-/// or LZMA2 coder the data meets first, when that coder runs on one thread,
-/// with its window, tables and state.
-///
-/// [`FolderCoder::plan`] says whether a folder's first coder is one; if it
-/// is, the caller hands that coder the folder's reader and the rest of the
-/// chain, built as [`add_encoder`] builds it, as its output. Nothing is
-/// started on another thread and nothing is copied on the way in: the
-/// encoder reads the input into its own window. Folders whose settings are
-/// the same - every folder under 4 KiB, and every folder at least the
-/// dictionary's size - share one encoder; any other folder builds its own,
-/// in place of the one kept.
+/// A folder's data-facing LZMA or LZMA2 encoder, retaining its window,
+/// tables and state between streams. `plan` accepts a local input;
+/// `plan_send` additionally permits scoped finder and block workers.
+/// Output and the rest of the coder chain stay on the caller. Each worker
+/// reads directly into its owned input window.
+/// Reconfiguration keeps reusable allocations; a failed stream is discarded.
 #[derive(Default)]
 pub(crate) struct FolderCoder {
     pull: PullCoder,
@@ -458,6 +452,23 @@ pub(crate) struct PulledCoder {
     coder: Coder,
 }
 
+// C++: CHandler::SetHeaderMethod. Header compression has its own settings;
+// it must not inherit the data coder's larger dictionary or BT4 hash tables.
+pub(crate) fn header_coder(size: u64) -> (EncoderConfiguration, PulledCoder) {
+    let mut options = LzmaOptions::from_level(5);
+    options.set_dictionary_size(1 << 20);
+    options.set_nice_len(273);
+    options.0.set_input_size(size);
+    let props = turbo_props(&options.0, 1).with_match_finder(lzma_turbo::MatchFinderKind::Bt2);
+    (
+        options.into(),
+        PulledCoder {
+            props,
+            coder: Coder::Lzma,
+        },
+    )
+}
+
 impl FolderCoder {
     /// The coder [`FolderCoder::encode`] would run for `mc`, if `mc` is LZMA
     /// or LZMA2 on one thread: one block thread and no match-finder thread.
@@ -466,6 +477,14 @@ impl FolderCoder {
     ///
     /// A dictionary size the encoder refuses, as [`add_encoder`] refuses it.
     pub(crate) fn plan(mc: &EncoderConfiguration) -> Result<Option<PulledCoder>, Error> {
+        Self::plan_input(mc, false)
+    }
+
+    pub(crate) fn plan_send(mc: &EncoderConfiguration) -> Result<Option<PulledCoder>, Error> {
+        Self::plan_input(mc, true)
+    }
+
+    fn plan_input(mc: &EncoderConfiguration, send: bool) -> Result<Option<PulledCoder>, Error> {
         let (props, coder) = match (mc.method.id(), &mc.options) {
             (EncoderMethod::ID_LZMA, options) => {
                 let options = match options {
@@ -492,7 +511,12 @@ impl FolderCoder {
             }
             _ => return Ok(None),
         };
-        Ok(PullCoder::drives(&props, coder).then_some(PulledCoder { props, coder }))
+        let drives = if send {
+            PullCoder::drives_send(&props, coder) || PullCoder::drives(&props, coder)
+        } else {
+            PullCoder::drives(&props, coder)
+        };
+        Ok(drives.then_some(PulledCoder { props, coder }))
     }
 
     /// Codes everything `input` yields with `coder` into `out`, on this
@@ -508,6 +532,19 @@ impl FolderCoder {
         out: &mut dyn Write,
     ) -> std::io::Result<()> {
         self.pull.encode(&coder.props, coder.coder, input, out)
+    }
+
+    pub(crate) fn encode_send(
+        &mut self,
+        coder: &PulledCoder,
+        input: &mut (dyn std::io::Read + Send),
+        out: &mut dyn Write,
+    ) -> std::io::Result<()> {
+        if PullCoder::drives_send(&coder.props, coder.coder) {
+            self.pull.encode_send(&coder.props, coder.coder, input, out)
+        } else {
+            self.pull.encode(&coder.props, coder.coder, input, out)
+        }
     }
 }
 
@@ -542,7 +579,14 @@ fn lzma2_block_plan(options: &Lzma2Options) -> (u64, usize) {
         (_, Some(block_size)) if lzma2_fits_one_block(options) => (block_size, 1),
         (threads, Some(block_size)) => {
             let per_block = options.settings.match_finder_threads(threads);
-            (block_size, (threads / per_block).max(1) as usize)
+            let mut blocks = u64::from((threads / per_block).max(1));
+            if let Some(size) = options.settings.input_size() {
+                // C: Lzma2Enc_Encode2 reduces block threads to the input's
+                // block count. Keep the hash-size hint unchanged: only the
+                // number of workers changes, not how each block is coded.
+                blocks = blocks.min(size.div_ceil(block_size).max(1));
+            }
+            (block_size, blocks as usize)
         }
     }
 }
@@ -878,6 +922,87 @@ mod tests {
     use crate::codec::lzma_turbo::lzma2_dictionary_size;
 
     #[test]
+    fn downstream_finalization_errors_are_returned_by_every_finishing_codec() {
+        use super::{CountingWriter, EncoderConfiguration, EncoderMethod, add_encoder};
+        use std::io::{self, Write};
+        struct RefuseFinish;
+        impl Write for RefuseFinish {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if bytes.is_empty() {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "downstream finish refused",
+                    ))
+                } else {
+                    Ok(bytes.len())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let methods = [
+            EncoderMethod::LZMA,
+            EncoderMethod::LZMA2,
+            #[cfg(feature = "ppmd")]
+            EncoderMethod::PPMD,
+            #[cfg(feature = "bzip2")]
+            EncoderMethod::BZIP2,
+            #[cfg(feature = "deflate")]
+            EncoderMethod::DEFLATE,
+            #[cfg(feature = "lz4")]
+            EncoderMethod::LZ4,
+            #[cfg(feature = "zstd")]
+            EncoderMethod::ZSTD,
+        ];
+        for method in methods {
+            let mut encoder = add_encoder(
+                CountingWriter::new(RefuseFinish),
+                &EncoderConfiguration::from(method),
+            )
+            .unwrap();
+            encoder
+                .write_all(b"a payload with a partial final block")
+                .unwrap();
+            encoder.flush().unwrap();
+            let error = encoder
+                .write(&[])
+                .expect_err("must retain downstream error");
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        }
+    }
+
+    #[test]
+    fn header_properties_describe_the_actual_coder_at_every_size_boundary() {
+        for size in [
+            0,
+            1,
+            4095,
+            4096,
+            4097,
+            65_537,
+            1 << 20,
+            (1 << 20) + 1,
+            8 << 20,
+        ] {
+            let (method, pulled) = super::header_coder(size);
+            let encoder = lzma_turbo::LzmaEncoder::new(&pulled.props).unwrap();
+            let mut storage = [0u8; 16];
+            let properties = super::get_options_as_properties(
+                method.method,
+                method.options.as_ref(),
+                &mut storage,
+            );
+            assert_eq!(properties[0], encoder.properties()[0], "header size {size}");
+            let dictionary = u32::from_le_bytes(properties[1..5].try_into().unwrap());
+            // LzmaEnc_WriteProperties rounds its serialized dictionary up;
+            // a 7z coder can name the exact dictionary the encoder uses.
+            assert_eq!(dictionary, encoder.dict_size(), "header size {size}");
+            assert_eq!(dictionary, size.clamp(4096, 1 << 20) as u32);
+        }
+    }
+
+    #[test]
     fn the_lzma2_property_never_names_a_smaller_dictionary() {
         for dict in [
             4096u32,
@@ -903,8 +1028,8 @@ mod tests {
         assert_eq!(lzma2_property_for(5 << 20), 21);
     }
 
-    /// A folder that fits one block skips the block-parallel coder; one that
-    /// does not, or whose size is unknown, keeps the threads it was given.
+    // A known folder uses no more block workers than its blocks need;
+    // an unknown one retains the requested concurrency.
     #[test]
     fn a_folder_that_fits_one_block_is_coded_on_one_thread() {
         use crate::{EncoderConfiguration, encoder_options::EncoderOptions};
@@ -921,11 +1046,52 @@ mod tests {
         assert_eq!(lzma2_block_plan(&options), (32 << 20, 4));
         assert_eq!(lzma2_block_plan(&sized(16 << 20)), (32 << 20, 1));
         assert_eq!(lzma2_block_plan(&sized(32 << 20)), (32 << 20, 1));
-        assert_eq!(lzma2_block_plan(&sized((32 << 20) + 1)), (32 << 20, 4));
+        assert_eq!(lzma2_block_plan(&sized((32 << 20) + 1)), (32 << 20, 2));
+        assert_eq!(lzma2_block_plan(&sized(64 << 20)), (32 << 20, 2));
+        assert_eq!(lzma2_block_plan(&sized((64 << 20) + 1)), (32 << 20, 3));
+        assert_eq!(lzma2_block_plan(&sized(u64::MAX)), (32 << 20, 4));
         // A small folder is one block of its own dictionary's size.
         assert_eq!(lzma2_block_plan(&sized(1000)), (32 << 20, 1));
         let solid = crate::encoder_options::Lzma2Options::from_level(5);
         assert_eq!(lzma2_block_plan(&solid), (lzma_turbo::BLOCK_SIZE_SOLID, 1));
+    }
+
+    #[test]
+    fn reducing_block_workers_preserves_stream_bytes_even_with_a_short_size_hint() {
+        use std::io::Write;
+
+        use crate::codec::lzma_turbo::writer::{Coder, LzmaTurboWriter};
+        use crate::encoder_options::Lzma2Options;
+
+        let block = 64 << 10;
+        let data: Vec<u8> = (0..4 * block + 17)
+            .map(|i| ((i * 37 + i / 19) % 251) as u8)
+            .collect();
+        for level in [1, 5] {
+            let mut options = Lzma2Options::from_level_mt(level, 8, block as u64);
+            options.set_dictionary_size(1 << 15);
+            let props = super::turbo_props(&options.settings, options.threads);
+            let encode = |options: &Lzma2Options, len: usize| {
+                let (block_size, threads) = lzma2_block_plan(options);
+                let mut writer = LzmaTurboWriter::new(
+                    Vec::new(),
+                    &props,
+                    Coder::Lzma2 {
+                        block_size,
+                        threads,
+                    },
+                )
+                .unwrap();
+                writer.write_all(&data[..len]).unwrap();
+                writer.finish().unwrap()
+            };
+            let mut sized = options.clone();
+            sized.settings.set_input_size((2 * block) as u64);
+            assert_eq!(lzma2_block_plan(&sized).1, 2);
+            for len in [block + 1, 2 * block, 2 * block + 1, data.len()] {
+                assert_eq!(encode(&sized, len), encode(&options, len), "{level}/{len}");
+            }
+        }
     }
 
     /// The LZMA2 options `config` holds once it is sized for a folder of

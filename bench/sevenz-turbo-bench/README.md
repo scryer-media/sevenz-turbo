@@ -22,6 +22,12 @@ a zero. The crate is driven through `tools/decode-bench op ...`, which does
 exactly one operation per process and prints one JSON line, so its peak RSS is
 that operation's alone and is measured the same way as `7zz`'s.
 
+Decode fixtures are complete local files. The driver enables
+`set_input_complete(true)`, matching file-backed `ArchiveReader::open`.
+The `stream` lane measures entry delivery from that complete source, not a
+progressive download; custom progressive sources keep the library's default
+of no framing pre-scan.
+
 Variants:
 
 | variant | role | binary |
@@ -74,6 +80,13 @@ Above 1.000 sevenz-turbo is faster, smaller or lower; below 1.000 it is
 slower, larger or higher. The peak RSS section lists the lowest ratio first.
 
 ### Parity at one thread
+
+For comparisons against the SDK's default T1 pipeline, run sevenz-turbo
+with two threads and record the actual `--threads 2` / `-mmt=1` settings.
+The library's T1 contract stays serial. This known difference must not be
+reopened as a missing optimization or fixed by silently starting workers.
+The existing strictly serial BCJ2 row below remains a separate control;
+see [SDK thread-count parity](../../docs/benchmarking.md#sdk-thread-count-parity).
 
 sevenz-turbo runs on exactly one thread when a caller asks for one, and the
 bench judges parity against 7zz at the same thread count. On the BCJ2 row,

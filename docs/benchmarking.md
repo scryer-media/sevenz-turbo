@@ -30,13 +30,36 @@ For each archive it runs, in one session on one machine:
 | Decoder | What it runs |
 | --- | --- |
 | `7zz t (all)` | the C reference with every thread it wants, full decode plus CRC check |
-| `7zz t -mmt=1` | the same, single-threaded |
+| `7zz t -mmt=1` | coder thread count one; auxiliary folder-pipeline threads may still run |
 | `sevenz-rust2 0.22.2` | the upstream release the fork was taken from, every entry to a sink |
 | `sevenz-turbo @N` | this fork at N threads, same code path |
 | `sevenz-turbo @N no crc` | the same with `set_verify_checksums(false)`, to price verification |
 
 `--threads 1,2,8,all` chooses the thread counts; `--only fork` and
 `--no-oracle` cut the run down to this crate while bisecting something.
+
+### SDK thread-count parity
+
+**Use sevenz-turbo T2 for parity with the SDK's T1 pipeline.** Our T1
+request keeps the coder chain serial; it does not silently start auxiliary
+pipeline workers. `7zz -mmt=1` sets the coder thread count but leaves its
+separate multithreaded folder mixer enabled. BCJ2 and other multi-coder
+archives can therefore use multiple cores under that reference setting.
+This is an intentional API-contract difference, not a missing T1 kernel.
+
+Record both actual settings in benchmark results: product `--threads 2`
+versus reference `-mmt=1`. Never relabel product T2 as T1 or change the
+library's T1 behavior to chase that comparison. A strictly serial diagnostic
+uses product `--threads 1` versus `7zz -mmt=1 -mmtf=off`; pinning both
+processes to the same core additionally controls hybrid-core placement.
+Historical literal T1/T1 rows are retained as evidence, but do not reopen
+this known discrepancy as a performance defect.
+
+The reference path is `CHandler::InitCommon` (`_useMultiThreadMixer = true`),
+the independent `mtf` property, and `CDecoder::Decode` selecting `CMixerMT`.
+Our corresponding guard lives in `pipeline::offload_plan`. The x86 controls
+in `docs/mac-fleet-evidence/x86-bcj2-thread-audit.*.json.zst` demonstrate the
+difference. Operator-confirmed comparison policy: 2026-10-13.
 
 `decode-bench op version|list|decode|encode` is the machine-facing mode
 `bench/sevenz-turbo-bench` drives: exactly one operation per process (a header

@@ -538,6 +538,9 @@ fn decode_turbo(opts: &Opts) -> Result<Fields, String> {
     )
     .map_err(|e| e.to_string())?;
     reader.set_positional_source(positional);
+    // Retained fixtures are complete local files, as with ArchiveReader::open.
+    // The stream flag changes entry delivery, not download availability.
+    reader.set_input_complete(true);
     let parse = started.elapsed().as_secs_f64();
     let ceiling = opts.threads.max(1);
     if opts.adaptive {
@@ -989,13 +992,13 @@ fn encode(opts: &Opts) -> Result<Fields, String> {
             };
             if member.size >= MAX_SOLID_BLOCK {
                 writer
-                    .push_archive_entry(entry(member), Some(lazy()))
+                    .push_archive_entry_send(entry(member), Some(lazy()))
                     .map_err(|e| e.to_string())?;
                 continue;
             }
             if block_bytes + member.size >= MAX_SOLID_BLOCK {
                 writer
-                    .push_archive_entries(
+                    .push_archive_entries_send(
                         std::mem::take(&mut entries),
                         std::mem::take(&mut sources),
                     )
@@ -1008,7 +1011,7 @@ fn encode(opts: &Opts) -> Result<Fields, String> {
         }
         if !entries.is_empty() {
             writer
-                .push_archive_entries(entries, sources)
+                .push_archive_entries_send(entries, sources)
                 .map_err(|e| e.to_string())?;
         }
     }

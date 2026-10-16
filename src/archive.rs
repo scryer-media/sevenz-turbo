@@ -77,7 +77,7 @@ impl Archive {
 pub(crate) struct SubStreamsInfo {
     pub(crate) unpack_sizes: Vec<u64>,
     pub(crate) has_crc: BitSet,
-    pub(crate) crcs: Vec<u64>,
+    pub(crate) crcs: Vec<u32>,
 }
 
 /// Represents a single file or directory entry within a 7z archive.
@@ -597,11 +597,52 @@ pub struct StreamMap {
     /// Index of the first sub-stream of each block into `SubStreamsInfo`
     /// (`unpack_sizes` / `has_crc` / `crcs`): the running sum of
     /// `num_unpack_sub_streams` over the preceding blocks.
-    pub(crate) block_first_sub_stream_index: Vec<usize>,
+    pub(crate) block_first_sub_stream_index: SubStreamOffsets,
     /// Index of first file for each block.
     pub block_first_file_index: Vec<usize>,
     /// Block index for each file (None if file has no data).
     pub file_block_index: Vec<Option<usize>>,
+}
+
+/// Snapshot of the parsed sub-stream prefix sums. Public block mutation must
+/// not change these offsets, just as it cannot change the stored CRCs.
+#[derive(Debug, Clone)]
+pub(crate) enum SubStreamOffsets {
+    Identity(usize),
+    Explicit(Vec<usize>),
+}
+
+impl Default for SubStreamOffsets {
+    fn default() -> Self {
+        Self::Identity(0)
+    }
+}
+
+impl SubStreamOffsets {
+    pub(crate) fn from_counts<I>(counts: I) -> Result<Self, crate::Error>
+    where
+        I: ExactSizeIterator<Item = usize> + Clone,
+    {
+        if counts.clone().all(|count| count == 1) {
+            return Ok(Self::Identity(counts.len()));
+        }
+        let mut offsets = Vec::with_capacity(counts.len());
+        let mut next = 0usize;
+        for count in counts {
+            offsets.push(next);
+            next = next
+                .checked_add(count)
+                .ok_or_else(|| crate::Error::other("sub-stream index overflow"))?;
+        }
+        Ok(Self::Explicit(offsets))
+    }
+
+    pub(crate) fn get(&self, index: usize) -> Option<usize> {
+        match self {
+            Self::Identity(len) => (index < *len).then_some(index),
+            Self::Explicit(offsets) => offsets.get(index).copied(),
+        }
+    }
 }
 
 impl StreamMap {
@@ -623,4 +664,71 @@ pub(crate) struct StartHeader {
     pub(crate) next_header_offset: u64,
     pub(crate) next_header_size: u64,
     pub(crate) next_header_crc: u64,
+}
+
+#[cfg(test)]
+mod metadata_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn substream_offsets_preserve_zero_mixed_and_overflow_contracts() {
+        for counts in [vec![], vec![1, 1, 1], vec![0, 2, 0, 1], vec![2, 1, 0]] {
+            let offsets = SubStreamOffsets::from_counts(counts.iter().copied()).unwrap();
+            let mut next = 0;
+            for (index, count) in counts.iter().enumerate() {
+                assert_eq!(offsets.get(index), Some(next));
+                next += count;
+            }
+            assert_eq!(offsets.get(counts.len()), None);
+            assert_eq!(offsets.get(usize::MAX), None);
+            assert_eq!(
+                matches!(offsets, SubStreamOffsets::Identity(_)),
+                counts.iter().all(|&n| n == 1)
+            );
+        }
+        assert!(SubStreamOffsets::from_counts([usize::MAX, 1].into_iter()).is_err());
+    }
+
+    #[test]
+    fn parsed_substreams_remain_snapshots_after_public_metadata_changes() {
+        let mut archive = Archive {
+            blocks: vec![Block::default(), Block::default()],
+            files: vec![ArchiveEntry::default(), ArchiveEntry::default()],
+            ..Archive::default()
+        };
+        for block in &mut archive.blocks {
+            block.num_unpack_sub_streams = 1;
+        }
+        let mut has_crc = BitSet::with_capacity(2);
+        has_crc.insert(0);
+        has_crc.insert(1);
+        archive.sub_streams_info = Some(SubStreamsInfo {
+            unpack_sizes: vec![17, u64::MAX],
+            has_crc,
+            crcs: vec![0x8000_0000, u32::MAX],
+        });
+        archive.stream_map.block_first_sub_stream_index =
+            SubStreamOffsets::from_counts([1, 1].into_iter()).unwrap();
+        let mut cloned = archive.clone();
+        cloned.files[0].size = 99;
+        cloned.files[0].crc = u64::MAX;
+        cloned.blocks.swap(0, 1);
+        cloned.blocks[0] = Block::default();
+        cloned.blocks[0].crc = 0;
+        let reader = crate::ArchiveReader::from_archive(
+            cloned,
+            std::io::Cursor::new(Vec::<u8>::new()),
+            crate::Password::empty(),
+        );
+        for current in [&archive, reader.archive()] {
+            assert_eq!(current.sub_stream(0).unwrap().size, 17);
+            assert_eq!(current.sub_stream(0).unwrap().crc, Some(0x8000_0000));
+            assert_eq!(current.block_sub_streams(1)[0].size, u64::MAX);
+            assert_eq!(current.block_sub_streams(1)[0].crc, Some(u32::MAX));
+            assert_eq!(
+                current.stream_map.block_first_sub_stream_index.get(1),
+                Some(1)
+            );
+        }
+    }
 }

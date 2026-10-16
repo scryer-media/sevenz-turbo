@@ -125,6 +125,13 @@ impl Encoder {
         }
     }
 
+    fn set_props(&mut self, props: &LzmaEncProps) -> Result<(), LzmaError> {
+        match self {
+            Encoder::Lzma(enc) => enc.set_props(&props.with_end_mark(false)),
+            Encoder::Lzma2(enc) => enc.set_props(props),
+        }
+    }
+
     /// Runs the whole stream on the calling thread, from an input that may
     /// not be sent anywhere. The same bytes as [`Encoder::run`] for a coder
     /// [`PullCoder::drives`]: with one block thread and the one-thread match
@@ -137,6 +144,19 @@ impl Encoder {
         match self {
             Encoder::Lzma(enc) => enc.encode(input, out),
             Encoder::Lzma2(enc) => enc.encode(input, out),
+        }
+    }
+
+    /// C: the single-block-thread stream path, with the finder reading
+    /// on its scoped producer and output remaining on the caller.
+    fn run_send(
+        &mut self,
+        input: &mut (dyn SeqInStream + Send),
+        out: &mut dyn SeqOutStream,
+    ) -> Result<(), LzmaError> {
+        match self {
+            Encoder::Lzma(enc) => enc.encode_send(input, out),
+            Encoder::Lzma2(enc) => enc.encode_send(input, out),
         }
     }
 
@@ -197,6 +217,14 @@ struct Bridge {
     changed: Condvar,
 }
 
+struct OutputChunk {
+    bytes: Vec<u8>,
+    written: usize,
+    // Whole blocks return to their SDK slot after delivery, so the bridge
+    // never needs another block-sized allocation outside the slot budget.
+    return_to: Option<Sender<Vec<u8>>>,
+}
+
 #[derive(Default)]
 struct Queues {
     /// At most `INPUT_DEPTH` chunks.
@@ -205,7 +233,7 @@ struct Queues {
     input_closed: bool,
     /// Held to at most `OUTPUT_CAP` bytes, except that one message larger
     /// than that - a whole block - may wait alone.
-    output: VecDeque<Vec<u8>>,
+    output: VecDeque<OutputChunk>,
     output_bytes: usize,
     /// The encoder thread has returned: no more output, no more reads.
     encoder_gone: bool,
@@ -230,17 +258,29 @@ impl Bridge {
 
     /// The encoder's side: queue `buf` for the writer, waiting while the
     /// output already held is at the cap.
-    fn put_output(&self, buf: Vec<u8>) -> Result<(), LzmaError> {
+    fn put_output(
+        &self,
+        buf: Vec<u8>,
+        written: usize,
+        return_to: Option<Sender<Vec<u8>>>,
+    ) -> Result<(), LzmaError> {
+        if written > buf.len() {
+            return Err(LzmaError::Param);
+        }
         let mut q = self.lock();
-        while !q.writer_gone && !q.output.is_empty() && q.output_bytes + buf.len() > OUTPUT_CAP {
+        while !q.writer_gone && !q.output.is_empty() && q.output_bytes + written > OUTPUT_CAP {
             q = self.wait(q);
         }
         if q.writer_gone {
             // The encoder has nowhere to put bytes and stops.
             return Err(LzmaError::Write);
         }
-        q.output_bytes += buf.len();
-        q.output.push_back(buf);
+        q.output_bytes += written;
+        q.output.push_back(OutputChunk {
+            bytes: buf,
+            written,
+            return_to,
+        });
         #[cfg(test)]
         {
             q.output_peak = q.output_peak.max(q.output_bytes);
@@ -320,21 +360,36 @@ struct ChannelSink {
 }
 
 impl SeqOutStream for ChannelSink {
+    fn supports_streamed_blocks(&self) -> bool {
+        // The bridge forwards an ordered byte stream, not block boundaries.
+        true
+    }
+
     fn write(&mut self, data: &[u8]) -> Result<(), LzmaError> {
         let mut buf = self.spare.try_recv().unwrap_or_default();
         buf.clear();
         buf.extend_from_slice(data);
-        self.bridge.put_output(buf)
+        self.bridge.put_output(buf, data.len(), None)
     }
 
     /// A block-parallel coder's finished block goes to the writer as the
     /// buffer it was written into, and the coder gets a written-out buffer
     /// back for its next block, so a block is never held twice.
     fn write_vec(&mut self, data: &mut Vec<u8>) -> Result<(), LzmaError> {
-        let mut next = self.spare.try_recv().unwrap_or_default();
-        next.clear();
-        let block = core::mem::replace(data, next);
-        self.bridge.put_output(block)
+        self.write_buffer(data, data.len())?;
+        data.clear();
+        Ok(())
+    }
+
+    fn write_buffer(&mut self, data: &mut Vec<u8>, written: usize) -> Result<(), LzmaError> {
+        // Lzma2Enc_MtCallback_Write retains this slot's buffer until its
+        // synchronous write completes. Preserve that ownership across the
+        // push bridge instead of allocating a replacement while it is queued.
+        let (return_to, returned) = mpsc::channel();
+        self.bridge
+            .put_output(core::mem::take(data), written, Some(return_to))?;
+        *data = returned.recv().map_err(|_| LzmaError::Write)?;
+        Ok(())
     }
 }
 
@@ -344,7 +399,13 @@ struct WriterEnd(Arc<Bridge>);
 
 impl Drop for WriterEnd {
     fn drop(&mut self) {
-        self.0.lock().writer_gone = true;
+        let mut queues = self.0.lock();
+        queues.writer_gone = true;
+        // Release return channels as well: a block writer may be waiting for
+        // delivery when the consumer abandons the stream.
+        queues.output.clear();
+        queues.output_bytes = 0;
+        drop(queues);
         self.0.changed.notify_all();
     }
 }
@@ -378,18 +439,22 @@ pub(crate) struct LzmaTurboWriter<W: Write> {
 }
 
 /// The oldest output waiting, if any, taken off the queue.
-fn take_output(q: &mut Queues) -> Option<Vec<u8>> {
+fn take_output(q: &mut Queues) -> Option<OutputChunk> {
     let chunk = q.output.pop_front()?;
-    q.output_bytes -= chunk.len();
+    q.output_bytes -= chunk.written;
     Some(chunk)
 }
 
 /// Writes `chunk` to `inner`, then gives it back to the encoder to fill
 /// again.
-fn write_out<W: Write>(inner: &mut W, spare: &Sender<Vec<u8>>, chunk: Vec<u8>) -> io::Result<()> {
-    inner.write_all(&chunk)?;
+fn write_out<W: Write>(
+    inner: &mut W,
+    spare: &Sender<Vec<u8>>,
+    chunk: OutputChunk,
+) -> io::Result<()> {
+    inner.write_all(&chunk.bytes[..chunk.written])?;
     // The encoder has gone only once it is done.
-    let _ = spare.send(chunk);
+    let _ = chunk.return_to.as_ref().unwrap_or(spare).send(chunk.bytes);
     Ok(())
 }
 
@@ -661,6 +726,34 @@ impl SeqInStream for ReadSource<'_> {
     }
 }
 
+/// A borrowed source for the scoped hash producer. Keep caller failures
+/// until the producers have joined, including the original panic payload.
+struct SendReadSource<'a> {
+    inner: &'a mut (dyn io::Read + Send),
+    error: Option<io::Error>,
+    panic: Option<Box<dyn std::any::Any + Send>>,
+}
+
+impl SeqInStream for SendReadSource<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, LzmaError> {
+        if self.error.is_some() || self.panic.is_some() {
+            return Err(LzmaError::Read);
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.inner.read(buf))) {
+            Ok(Ok(n)) => Ok(n),
+            Ok(Err(err)) => {
+                // As the archive's push loop: preserve Interrupted too.
+                self.error = Some(err);
+                Err(LzmaError::Read)
+            }
+            Err(payload) => {
+                self.panic = Some(payload);
+                Err(LzmaError::Read)
+            }
+        }
+    }
+}
+
 /// The encoder's view of a writer, keeping an I/O error as [`ReadSource`]
 /// does.
 struct WriteSink<'a> {
@@ -669,12 +762,121 @@ struct WriteSink<'a> {
 }
 
 impl SeqOutStream for WriteSink<'_> {
+    fn supports_streamed_blocks(&self) -> bool {
+        true
+    }
+
     fn write(&mut self, data: &[u8]) -> Result<(), LzmaError> {
         self.inner.write_all(data).map_err(|err| {
             self.error = Some(err);
             LzmaError::Write
         })
     }
+}
+
+/// C: `Lzma2Enc_Encode2` / `MtCoder_Code` pull directly into each worker's
+/// input window. Only output crosses the archive bridge: its actual writer
+/// and subsequent coders need not be Send. `start` permits the same fallback
+/// as a refused controller spawn to be exercised without exhausting threads.
+fn run_send_blocks(
+    encoder: &mut Encoder,
+    source: &mut SendReadSource<'_>,
+    sink: &mut WriteSink<'_>,
+    start: bool,
+) -> Result<bool, LzmaError> {
+    let result = std::thread::scope(|scope| {
+        if !start {
+            return None;
+        }
+        let bridge = Arc::new(Bridge {
+            queues: Mutex::new(Queues::default()),
+            changed: Condvar::new(),
+        });
+        // This guard must drop before the scope joins, including during an
+        // output unwind: a coder may be waiting for its exact Vec to return.
+        let end = WriterEnd(Arc::clone(&bridge));
+        let theirs = Arc::clone(&bridge);
+        let (spare, returned) = mpsc::channel();
+        let encoder = &mut *encoder;
+        let source = &mut *source;
+        let worker = std::thread::Builder::new()
+            .name("sevenz-turbo lzma controller".into())
+            .spawn_scoped(scope, move || {
+                let _end = EncoderEnd(Arc::clone(&theirs));
+                let mut output = ChannelSink {
+                    bridge: theirs,
+                    spare: returned,
+                };
+                encoder.run(source, &mut output)
+            });
+        let Ok(worker) = worker else {
+            return None;
+        };
+        let delivered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            loop {
+                let mut queues = bridge.lock();
+                let chunk = loop {
+                    if let Some(chunk) = take_output(&mut queues) {
+                        break Some(chunk);
+                    }
+                    if queues.encoder_gone {
+                        break None;
+                    }
+                    queues = bridge.wait(queues);
+                };
+                drop(queues);
+                let Some(chunk) = chunk else { return Ok(()) };
+                bridge.changed.notify_all();
+                if let Err(error) = write_out(&mut sink.inner, &spare, chunk) {
+                    sink.error = Some(error);
+                    return Err(LzmaError::Write);
+                }
+            }
+        }));
+        drop(end);
+        let encoded = worker.join();
+        // Keep a caller output panic intact, after all borrowed workers have
+        // stopped. A controller panic likewise retains its original payload.
+        let delivered = match delivered {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        let encoded = match encoded {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        Some(delivered.and(encoded))
+    });
+    if let Some(result) = result {
+        return result.map(|()| true);
+    }
+    Ok(false)
+}
+
+/// As LzmaTurboWriter's refused-spawn path: one solid push stream, not
+/// encode_mt with a different block plan. The unused encoder has already
+/// been dropped, so retained block coders cannot overlap this allocation.
+fn run_send_fallback(
+    source: &mut SendReadSource<'_>,
+    sink: &mut WriteSink<'_>,
+    props: &LzmaEncProps,
+    coder: Coder,
+) -> Result<(), LzmaError> {
+    let mut encoder = Pusher::new(props, coder)?;
+    let mut input = vec![0; CHUNK];
+    let mut output = Vec::new();
+    loop {
+        let n = source.read(&mut input)?;
+        if n == 0 {
+            break;
+        }
+        encoder.push(&input[..n], &mut output)?;
+        sink.write(&output)?;
+        output.clear();
+    }
+    encoder.finish(&mut output)?;
+    sink.write(&output)?;
+    Ok(())
 }
 
 /// An encoder kept between streams, with what it was built for.
@@ -684,13 +886,12 @@ struct Kept {
     encoder: Encoder,
 }
 
-/// An LZMA or LZMA2 coder that runs on the thread that calls it, pulling each
-/// stream's input from a reader, and keeps its encoder from one stream to the
-/// next.
+/// An LZMA or LZMA2 coder that pulls each stream's input directly from its
+/// reader and keeps its encoder from one stream to the next.
 ///
 /// [`LzmaTurboWriter`] is pushed bytes, so it puts the encoder on a thread of
 /// its own (or behind a queue where there are none) and builds it for one
-/// stream. A caller that has the whole input as a reader needs neither: the
+/// stream. A caller that has input as a reader needs no input queue: the
 /// encoder reads it straight into its window here. And a caller that codes
 /// many streams with the same settings - one folder after another - builds
 /// the encoder, its window and its tables once. Each stream re-initialises
@@ -698,8 +899,10 @@ struct Kept {
 /// as reusable on that footing), so a stream's bytes are the ones a fresh
 /// encoder writes; the tests below hold this to it.
 ///
-/// Only a coder on one thread is driven here: one block thread and the
-/// one-thread match finder (see [`PullCoder::drives`]).
+/// Local readers use the one-thread finder (see [`PullCoder::drives`]).
+/// A Send reader can instead be borrowed by the scoped finder or block
+/// workers through [`PullCoder::encode_send`]. Output remains on the caller;
+/// block workers transfer their output allocation and wait for its return.
 #[derive(Default)]
 pub(crate) struct PullCoder {
     kept: Option<Kept>,
@@ -736,8 +939,8 @@ impl PullCoder {
     }
 
     /// Codes everything `input` yields as one stream into `out`, with the
-    /// encoder kept from the last stream when it was built for the same
-    /// `props` and `coder`, and a new one otherwise.
+    /// encoder kept from the last stream for the same `coder`, reconfigured
+    /// for this stream's `props`, and a new one when the coder changes.
     ///
     /// # Errors
     ///
@@ -753,22 +956,7 @@ impl PullCoder {
         out: &mut dyn Write,
     ) -> io::Result<()> {
         debug_assert!(Self::drives(props, coder));
-        let coder = Self::as_written(coder);
-        let reuse = self
-            .kept
-            .as_ref()
-            .is_some_and(|kept| kept.props == *props && kept.coder == coder);
-        if !reuse {
-            // Free the last encoder before building the next, so the two are
-            // never held at once.
-            self.kept = None;
-            self.kept = Some(Kept {
-                props: *props,
-                coder,
-                encoder: Encoder::new(props, coder).map_err(io_error)?,
-            });
-        }
-        let kept = self.kept.as_mut().expect("built above");
+        let mut kept = self.take_encoder(props, coder)?;
         let mut source = ReadSource {
             inner: input,
             error: None,
@@ -778,12 +966,110 @@ impl PullCoder {
             error: None,
         };
         match kept.encoder.run_here(&mut source, &mut sink) {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                self.kept = None;
-                Err(source.error.or(sink.error).unwrap_or_else(|| io_error(err)))
+            Ok(()) => {
+                self.kept = Some(kept);
+                Ok(())
             }
+            Err(err) => Err(source.error.or(sink.error).unwrap_or_else(|| io_error(err))),
         }
+    }
+
+    /// The same block plan with a Send source; no output value leaves this
+    /// thread. Multiple block coders use only the output half of the bridge.
+    pub(crate) fn drives_send(props: &LzmaEncProps, coder: Coder) -> bool {
+        if cfg!(any(sevenz_turbo_unthreaded, target_family = "wasm")) {
+            return false;
+        }
+        Self::drives(props, coder) || matches!(coder, Coder::Lzma2 { .. })
+    }
+
+    pub(crate) fn encode_send(
+        &mut self,
+        props: &LzmaEncProps,
+        coder: Coder,
+        input: &mut (dyn io::Read + Send),
+        out: &mut dyn Write,
+    ) -> io::Result<()> {
+        self.encode_send_with_start(props, coder, input, out, true)
+    }
+
+    fn encode_send_with_start(
+        &mut self,
+        props: &LzmaEncProps,
+        coder: Coder,
+        input: &mut (dyn io::Read + Send),
+        out: &mut dyn Write,
+        start: bool,
+    ) -> io::Result<()> {
+        debug_assert!(Self::drives_send(props, coder));
+        let mut kept = self.take_encoder(props, coder)?;
+        let mut source = SendReadSource {
+            inner: input,
+            error: None,
+            panic: None,
+        };
+        let mut sink = WriteSink {
+            inner: out,
+            error: None,
+        };
+        let result = if matches!(coder, Coder::Lzma2 { threads, .. } if threads > 1) {
+            run_send_blocks(&mut kept.encoder, &mut source, &mut sink, start)
+        } else {
+            kept.encoder.run_send(&mut source, &mut sink).map(|()| true)
+        };
+        let kept = if matches!(result, Ok(false)) {
+            // A failed spawn drops its closure before returning. Match the
+            // owned-thread fallback: free even a populated reused encoder
+            // before allocating the push coder.
+            drop(kept);
+            None
+        } else {
+            Some(kept)
+        };
+        let result = if kept.is_none() {
+            run_send_fallback(&mut source, &mut sink, props, coder)
+        } else {
+            result.map(|_| ())
+        };
+        // Both routes have stopped and joined the producers before returning.
+        // Kept is local, so both an output panic and this resumed input
+        // panic discard the partially encoded stream.
+        if let Some(payload) = source.panic {
+            std::panic::resume_unwind(payload);
+        }
+        match result {
+            Ok(()) => {
+                self.kept = kept;
+                Ok(())
+            }
+            Err(err) => Err(source.error.or(sink.error).unwrap_or_else(|| io_error(err))),
+        }
+    }
+
+    fn take_encoder(&mut self, props: &LzmaEncProps, coder: Coder) -> io::Result<Kept> {
+        let coder = Self::as_written(coder);
+        let reuse = self.kept.as_ref().is_some_and(|kept| kept.coder == coder);
+        if !reuse {
+            // Free the last encoder before building the next, so the two are
+            // never held at once.
+            self.kept = None;
+            self.kept = Some(Kept {
+                props: *props,
+                coder,
+                encoder: Encoder::new(props, coder).map_err(io_error)?,
+            });
+        } else if let Some(kept) = self.kept.as_mut()
+            && kept.props != *props
+        {
+            // C: LzmaEnc_SetProps / Lzma2Enc_SetProps keep the window and
+            // tables across folders, including size-derived dictionary changes.
+            if let Err(err) = kept.encoder.set_props(props) {
+                self.kept = None;
+                return Err(io_error(err));
+            }
+            kept.props = *props;
+        }
+        Ok(self.kept.take().expect("built above"))
     }
 }
 
@@ -796,6 +1082,70 @@ mod tests {
     use super::{CHUNK, Coder, LzmaTurboWriter, PullCoder, SideCoder, State};
     #[cfg(not(any(sevenz_turbo_unthreaded, target_family = "wasm")))]
     use super::{INPUT_DEPTH, OUTPUT_CAP};
+
+    #[cfg(not(any(sevenz_turbo_unthreaded, target_family = "wasm")))]
+    #[test]
+    fn a_block_keeps_its_allocation_and_unblocks_on_failed_or_abandoned_delivery() {
+        use super::{Bridge, ChannelSink, Queues, SeqOutStream, WriterEnd, take_output, write_out};
+        use std::sync::{Arc, Condvar, Mutex, mpsc};
+
+        struct Refuse;
+        impl Write for Refuse {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("sink refused block"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for outcome in 0..3 {
+            let bridge = Arc::new(Bridge {
+                queues: Mutex::new(Queues::default()),
+                changed: Condvar::new(),
+            });
+            let end = WriterEnd(Arc::clone(&bridge));
+            let (spare, returned) = mpsc::channel();
+            let mut sink = ChannelSink {
+                bridge: Arc::clone(&bridge),
+                spare: returned,
+            };
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(move || {
+                    let mut block = vec![0x5a; 1 << 20];
+                    let address = block.as_ptr() as usize;
+                    let result = sink.write_buffer(&mut block, 17);
+                    if outcome == 0 {
+                        result.unwrap();
+                        assert_eq!(block, vec![0x5a; 1 << 20]);
+                        assert_eq!(block.as_ptr() as usize, address);
+                    } else {
+                        assert_eq!(result, Err(lzma_turbo::Error::Write));
+                    }
+                });
+                let mut queues = bridge.lock();
+                while queues.output.is_empty() {
+                    queues = bridge.wait(queues);
+                }
+                if outcome == 2 {
+                    drop(queues);
+                    drop(end);
+                } else {
+                    let chunk = take_output(&mut queues).unwrap();
+                    drop(queues);
+                    bridge.changed.notify_all();
+                    if outcome == 0 {
+                        let mut bytes = Vec::new();
+                        write_out(&mut bytes, &spare, chunk).unwrap();
+                        assert_eq!(bytes, vec![0x5a; 17]);
+                    } else {
+                        assert!(write_out(&mut Refuse, &spare, chunk).is_err());
+                    }
+                }
+                worker.join().unwrap();
+            });
+        }
+    }
 
     fn sample(len: usize) -> Vec<u8> {
         // Compressible but not trivial: a short period with a slow drift.
@@ -1162,15 +1512,21 @@ mod tests {
         };
         let level5 = LzmaEncProps::new().with_level(5).with_dict_size(1 << 16);
         let mut pull = PullCoder::default();
-        let streams: [(LzmaEncProps, Coder, usize); 10] = [
+        let streams = [
             (props(), solid, 2000),
             (props(), solid, 0),
             (props(), solid, 3 * CHUNK + 77),
             (props(), solid, 1),
             (level5, solid, 70_000),
             (level5, solid, 5000),
+            (level5.with_reduce_size(4096), solid, 4000),
+            (level5.with_reduce_size(50_000), solid, 50_000),
+            (level5.with_level(1).with_reduce_size(9000), solid, 9000),
+            (level5.with_lclppb(0, 2, 0), solid, 70_000),
             (props(), Coder::Lzma, CHUNK + 999),
             (props(), Coder::Lzma, 300),
+            (level5.with_reduce_size(4096), Coder::Lzma, 4000),
+            (level5.with_end_mark(true), Coder::Lzma, 70_000),
             (level5, one_block, CHUNK - 3),
             (props(), solid, 2000),
         ];
@@ -1235,6 +1591,30 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_pull_reconfiguration_drops_the_coder_and_recovers() {
+        let coder = Coder::Lzma2 {
+            block_size: BLOCK_SIZE_SOLID,
+            threads: 1,
+        };
+        let mut pull = PullCoder::default();
+        let data = sample(4000);
+        let expected = pulled(&mut pull, &props(), coder, &data);
+        let mut output = Vec::new();
+        let err = pull
+            .encode(
+                &props().with_lclppb(4, 1, 2),
+                coder,
+                &mut data.as_slice(),
+                &mut output,
+            )
+            .expect_err("invalid replacement settings are refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(output.is_empty());
+        assert!(pull.kept.is_none());
+        assert_eq!(pulled(&mut pull, &props(), coder, &data), expected);
+    }
+
+    #[test]
     fn a_bad_setting_is_refused_up_front() {
         let props = LzmaEncProps::new().with_lclppb(4, 4, 2);
         let err = LzmaTurboWriter::new(
@@ -1248,5 +1628,499 @@ mod tests {
         .err()
         .expect("lc + lp above 4 is refused");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+}
+
+#[cfg(all(test, not(any(sevenz_turbo_unthreaded, target_family = "wasm"))))]
+mod send_tests {
+    use super::*;
+    use std::{
+        cell::RefCell,
+        io::Read,
+        rc::Rc,
+        sync::{Arc, Mutex},
+    };
+
+    fn settings() -> (LzmaEncProps, Coder) {
+        (
+            LzmaEncProps::new()
+                .with_level(5)
+                .with_dict_size(1 << 16)
+                .with_num_threads(2),
+            Coder::Lzma2 {
+                block_size: 1 << 18,
+                threads: 1,
+            },
+        )
+    }
+
+    struct Source<'a> {
+        data: &'a [u8],
+        threads: Arc<Mutex<Vec<std::thread::ThreadId>>>,
+    }
+    impl Read for Source<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            self.threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+            let n = out.len().min(self.data.len()).min(997);
+            out[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    struct LocalSink {
+        bytes: Rc<RefCell<Vec<u8>>>,
+        caller: std::thread::ThreadId,
+    }
+    impl Write for LocalSink {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            assert_eq!(std::thread::current().id(), self.caller);
+            self.bytes.borrow_mut().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn reference(props: &LzmaEncProps, coder: Coder, data: &[u8]) -> Vec<u8> {
+        let mut writer = LzmaTurboWriter::new(Vec::new(), props, coder).unwrap();
+        writer.write_all(data).unwrap();
+        writer.finish().unwrap()
+    }
+
+    #[test]
+    fn send_pull_borrows_only_the_source_and_matches_the_push_stream() {
+        let (props, coder) = settings();
+        let mut pull = PullCoder::default();
+        for len in [0, 1, 90001, (1 << 19) + 31] {
+            let data: Vec<_> = (0..len).map(|i| (i % 251) as u8).collect();
+            let threads = Arc::new(Mutex::new(Vec::new()));
+            let mut source = Source {
+                data: &data,
+                threads: Arc::clone(&threads),
+            };
+            let bytes = Rc::new(RefCell::new(Vec::new()));
+            let caller = std::thread::current().id();
+            let mut sink = LocalSink {
+                bytes: Rc::clone(&bytes),
+                caller,
+            };
+            pull.encode_send(&props, coder, &mut source, &mut sink)
+                .unwrap();
+            assert_eq!(*bytes.borrow(), reference(&props, coder, &data));
+            let readers = threads.lock().unwrap();
+            assert!(!readers.is_empty());
+            assert!(readers.iter().all(|id| *id != caller));
+            assert!(pull.kept.is_some());
+        }
+        assert!(PullCoder::drives_send(
+            &props,
+            Coder::Lzma2 {
+                block_size: 1 << 18,
+                threads: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn send_pull_returns_source_errors_and_panics_then_rebuilds() {
+        struct Broken(u8);
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                match self.0 {
+                    0 => Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "source interrupted",
+                    )),
+                    1 => Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "source refused",
+                    )),
+                    _ => std::panic::panic_any(731usize),
+                }
+            }
+        }
+        let (props, coder) = settings();
+        let mut pull = PullCoder::default();
+        for fault in 0..3 {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pull.encode_send(&props, coder, &mut Broken(fault), &mut Vec::new())
+            }));
+            match fault {
+                0 => assert_eq!(
+                    result.unwrap().unwrap_err().kind(),
+                    io::ErrorKind::Interrupted
+                ),
+                1 => assert_eq!(
+                    result.unwrap().unwrap_err().kind(),
+                    io::ErrorKind::PermissionDenied
+                ),
+                _ => assert_eq!(*result.unwrap_err().downcast::<usize>().unwrap(), 731),
+            }
+            assert!(pull.kept.is_none());
+            let mut out = Vec::new();
+            pull.encode_send(&props, coder, &mut &b"recovered"[..], &mut out)
+                .unwrap();
+            assert_eq!(out, reference(&props, coder, b"recovered"));
+        }
+    }
+
+    #[test]
+    fn send_pull_discards_a_partly_coded_stream_after_a_reader_panic() {
+        struct PartialPanic {
+            read: usize,
+        }
+        impl Read for PartialPanic {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                const BEFORE_PANIC: usize = (2 << 20) + 31;
+                if out.is_empty() {
+                    return Ok(0);
+                }
+                if self.read == BEFORE_PANIC {
+                    std::panic::panic_any(953usize);
+                }
+                let n = out.len().min(997).min(BEFORE_PANIC - self.read);
+                for (i, byte) in out[..n].iter_mut().enumerate() {
+                    *byte = ((self.read + i) % 251) as u8;
+                }
+                self.read += n;
+                Ok(n)
+            }
+        }
+        let (props, coder) = settings();
+        let mut pull = PullCoder::default();
+        let mut source = PartialPanic { read: 0 };
+        let mut output = Vec::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pull.encode_send(&props, coder, &mut source, &mut output)
+        }));
+        assert_eq!(*result.unwrap_err().downcast::<usize>().unwrap(), 953);
+        assert_eq!(source.read, (2 << 20) + 31);
+        assert!(
+            !output.is_empty(),
+            "earlier blocks reached the caller before failure"
+        );
+        assert!(pull.kept.is_none());
+        let data = vec![83; (1 << 18) + 17];
+        let mut recovered = Vec::new();
+        pull.encode_send(&props, coder, &mut data.as_slice(), &mut recovered)
+            .unwrap();
+        assert_eq!(recovered, reference(&props, coder, &data));
+        assert!(pull.kept.is_some());
+    }
+
+    #[test]
+    fn send_pull_stops_producers_on_output_failure_or_unwind() {
+        struct Broken(bool);
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                if self.0 {
+                    std::panic::panic_any(947usize);
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "sink refused",
+                ))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (props, coder) = settings();
+        let data = vec![17; (1 << 19) + 31];
+        let mut pull = PullCoder::default();
+        for panic in [false, true] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pull.encode_send(&props, coder, &mut data.as_slice(), &mut Broken(panic))
+            }));
+            if panic {
+                assert_eq!(*result.unwrap_err().downcast::<usize>().unwrap(), 947);
+            } else {
+                assert_eq!(
+                    result.unwrap().unwrap_err().kind(),
+                    io::ErrorKind::PermissionDenied
+                );
+            }
+            assert!(pull.kept.is_none());
+            let mut out = Vec::new();
+            pull.encode_send(&props, coder, &mut data.as_slice(), &mut out)
+                .unwrap();
+            assert_eq!(out, reference(&props, coder, &data));
+        }
+    }
+
+    fn block_settings(fast: bool) -> (LzmaEncProps, Coder) {
+        (
+            LzmaEncProps::new()
+                .with_level(if fast { 1 } else { 5 })
+                .with_dict_size(1 << 16)
+                .with_num_threads(if fast { 1 } else { 2 }),
+            Coder::Lzma2 {
+                block_size: 1 << 17,
+                threads: if fast { 4 } else { 2 },
+            },
+        )
+    }
+
+    #[test]
+    fn send_pull_blocks_match_the_bridge_and_reuse_after_partial_writes() {
+        struct PartialSink(LocalSink);
+        impl Write for PartialSink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.write(&bytes[..bytes.len().min(23)])
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.0.flush()
+            }
+        }
+        let mut pull = PullCoder::default();
+        for fast in [false, true, false] {
+            let (props, coder) = block_settings(fast);
+            for len in [0, 1, 1 << 18, (1 << 20) + 53] {
+                let data: Vec<_> = (0..len).map(|i| ((i % 251) ^ (i / 997)) as u8).collect();
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let mut source = Source {
+                    data: &data,
+                    threads: Arc::clone(&calls),
+                };
+                let bytes = Rc::new(RefCell::new(Vec::new()));
+                let caller = std::thread::current().id();
+                let mut sink = PartialSink(LocalSink {
+                    bytes: Rc::clone(&bytes),
+                    caller,
+                });
+                pull.encode_send(&props, coder, &mut source, &mut sink)
+                    .unwrap();
+                assert_eq!(*bytes.borrow(), reference(&props, coder, &data));
+                assert!(calls.lock().unwrap().iter().all(|id| *id != caller));
+                assert!(pull.kept.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn send_pull_blocks_preserve_partial_source_failure_and_panic() {
+        struct Fault {
+            read: usize,
+            panic: bool,
+        }
+        impl Read for Fault {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                const LIMIT: usize = (2 << 20) + 31;
+                if self.read == LIMIT {
+                    if self.panic {
+                        std::panic::panic_any(982usize);
+                    }
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "partial source"));
+                }
+                let n = out.len().min(997).min(LIMIT - self.read);
+                out[..n].fill(83);
+                self.read += n;
+                Ok(n)
+            }
+        }
+        for fast in [false, true] {
+            let (props, coder) = block_settings(fast);
+            let mut pull = PullCoder::default();
+            for panic in [false, true] {
+                let mut source = Fault { read: 0, panic };
+                let mut output = Vec::new();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pull.encode_send(&props, coder, &mut source, &mut output)
+                }));
+                if panic {
+                    assert_eq!(*result.unwrap_err().downcast::<usize>().unwrap(), 982);
+                } else {
+                    assert_eq!(
+                        result.unwrap().unwrap_err().kind(),
+                        io::ErrorKind::Interrupted
+                    );
+                }
+                assert_eq!(source.read, (2 << 20) + 31);
+                assert!(!output.is_empty());
+                assert!(pull.kept.is_none());
+                let data = vec![71; (1 << 18) + 7];
+                let mut output = Vec::new();
+                pull.encode_send(&props, coder, &mut data.as_slice(), &mut output)
+                    .unwrap();
+                assert_eq!(output, reference(&props, coder, &data));
+            }
+        }
+    }
+
+    #[test]
+    fn send_pull_blocks_cancel_before_join_on_partial_output_error_or_panic() {
+        struct Fault {
+            written: usize,
+            panic: bool,
+        }
+        impl Write for Fault {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.written == 17 {
+                    if self.panic {
+                        std::panic::panic_any(983usize);
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "partial output",
+                    ));
+                }
+                let n = bytes.len().min(17 - self.written);
+                self.written += n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for fast in [false, true] {
+            let (props, coder) = block_settings(fast);
+            let data = vec![17; (1 << 20) + 53];
+            let mut pull = PullCoder::default();
+            for panic in [false, true] {
+                let mut sink = Fault { written: 0, panic };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pull.encode_send(&props, coder, &mut data.as_slice(), &mut sink)
+                }));
+                if panic {
+                    assert_eq!(*result.unwrap_err().downcast::<usize>().unwrap(), 983);
+                } else {
+                    assert_eq!(
+                        result.unwrap().unwrap_err().kind(),
+                        io::ErrorKind::PermissionDenied
+                    );
+                }
+                assert_eq!(sink.written, 17);
+                assert!(pull.kept.is_none());
+                let mut output = Vec::new();
+                pull.encode_send(&props, coder, &mut data.as_slice(), &mut output)
+                    .unwrap();
+                assert_eq!(output, reference(&props, coder, &data));
+            }
+        }
+    }
+
+    #[test]
+    fn send_pull_blocks_refused_controller_matches_the_inline_fallback() {
+        for fast in [false, true] {
+            let (props, coder) = block_settings(fast);
+            let data = vec![37; (1 << 19) + 71];
+            let mut expected = LzmaTurboWriter::inline(Vec::new(), &props, coder).unwrap();
+            expected.write_all(&data).unwrap();
+            let expected = expected.finish().unwrap();
+            let mut pull = PullCoder::default();
+            let mut populated = Vec::new();
+            pull.encode_send(&props, coder, &mut data.as_slice(), &mut populated)
+                .unwrap();
+            assert_eq!(populated, reference(&props, coder, &data));
+            assert!(pull.kept.is_some());
+            let mut input = data.as_slice();
+            let mut output = Vec::new();
+            pull.encode_send_with_start(&props, coder, &mut input, &mut output, false)
+                .unwrap();
+            assert_eq!(output, expected);
+            assert!(input.is_empty());
+            assert!(pull.kept.is_none());
+            let mut rebuilt = Vec::new();
+            pull.encode_send(&props, coder, &mut data.as_slice(), &mut rebuilt)
+                .unwrap();
+            assert_eq!(rebuilt, populated);
+            assert!(pull.kept.is_some());
+        }
+    }
+
+    #[test]
+    fn send_pull_blocks_keep_source_error_and_caller_panic_precedence() {
+        use std::time::Duration;
+        struct SourceFault {
+            left: usize,
+            output_started: Receiver<()>,
+            source_failed: Sender<()>,
+            panic: bool,
+        }
+        impl Read for SourceFault {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if self.left != 0 {
+                    let n = out.len().min(self.left);
+                    out[..n].fill(37);
+                    self.left -= n;
+                    return Ok(n);
+                }
+                // Block the second worker's read until the caller is writing
+                // block zero. No timing race or filled-slot-queue assumption.
+                self.output_started
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                self.source_failed.send(()).unwrap();
+                if self.panic {
+                    std::panic::panic_any(984usize);
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "source precedence",
+                ))
+            }
+        }
+        struct OutputFault {
+            output_started: Sender<()>,
+            source_failed: Receiver<()>,
+            panic: bool,
+        }
+        impl Write for OutputFault {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                self.output_started.send(()).unwrap();
+                self.source_failed
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                if self.panic {
+                    std::panic::panic_any(985usize);
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "output precedence",
+                ))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (props, coder) = block_settings(false);
+        for source_panic in [false, true] {
+            for output_panic in [false, true] {
+                let (output_started, start) = mpsc::channel();
+                let (source_failed, failed) = mpsc::channel();
+                let mut source = SourceFault {
+                    left: 1 << 17,
+                    output_started: start,
+                    source_failed,
+                    panic: source_panic,
+                };
+                let mut sink = OutputFault {
+                    output_started,
+                    source_failed: failed,
+                    panic: output_panic,
+                };
+                let mut pull = PullCoder::default();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pull.encode_send(&props, coder, &mut source, &mut sink)
+                }));
+                if output_panic || source_panic {
+                    assert_eq!(
+                        *result.unwrap_err().downcast::<usize>().unwrap(),
+                        if output_panic { 985 } else { 984 }
+                    );
+                } else {
+                    assert_eq!(
+                        result.unwrap().unwrap_err().kind(),
+                        io::ErrorKind::Interrupted
+                    );
+                }
+                assert!(pull.kept.is_none());
+            }
+        }
     }
 }

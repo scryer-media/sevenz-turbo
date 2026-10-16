@@ -131,15 +131,20 @@ use std::{
 
 pub use archive::*;
 pub use block::*;
-pub use codec::lzma_turbo::{Lzma2Handle, Lzma2Ledger, Lzma2Progress};
+pub use codec::lzma_turbo::{
+    Lzma2Handle, Lzma2Ledger, Lzma2Progress, Lzma2RunCompletion, Lzma2RunCrc,
+    PositionalLzma2Folder, PositionalLzma2Run, PositionalLzma2Scanner,
+};
 pub use container::{
     ArchiveLimits, BlockCompletion, CrcFolder, PackStreamRange, SubStream, SubStreamCompletion,
     UnsizedCoder, coder_memory_estimate, crc32_combine,
 };
 pub use encryption::Password;
+#[cfg(feature = "aes256")]
+pub use encryption::{AesKey, AesProperties};
 pub use error::{BlockErrorKind, Error, Limit};
 pub use positional::{ReadAt, ReadAtCursor, SerialReadAt};
-pub use reader::{ArchiveReader, BlockDecoder, EntryRead};
+pub use reader::{ArchiveReader, BlockDecoder, EntryRead, PositionalBlockDecoder};
 pub use time::NtTime;
 #[cfg(all(feature = "compress", feature = "util", not(target_arch = "wasm32")))]
 pub use util::compress::*;

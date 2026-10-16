@@ -10,6 +10,11 @@ use std::{
 
 use lzma_turbo::crc::{Crc32, crc32};
 
+mod positional_block;
+pub use positional_block::PositionalBlockDecoder;
+#[cfg(all(feature = "util", not(target_arch = "wasm32")))]
+mod extract;
+
 use crate::{
     ByteReader, Password,
     archive::*,
@@ -61,6 +66,33 @@ impl<R: Read> Read for BoundedReader<R> {
 }
 
 impl<R: DecodeRead> DecodeRead for BoundedReader<R> {
+    fn supports_borrowed(&self) -> bool {
+        self.inner.supports_borrowed()
+    }
+
+    fn read_borrowed(
+        &mut self,
+        max: usize,
+        sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+    ) -> Option<io::Result<usize>> {
+        if self.remain == 0 || max == 0 {
+            return Some(Ok(0));
+        }
+        let limit = max.min(self.remain);
+        let remain = &mut self.remain;
+        let read = self.inner.read_borrowed(limit, &mut |bytes| {
+            *remain -= bytes.len();
+            sink(bytes)
+        })?;
+        Some(read.and_then(|size| {
+            if size == 0 {
+                Err(ended_early())
+            } else {
+                Ok(size)
+            }
+        }))
+    }
+
     fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<io::Result<usize>> {
         if self.remain == 0 || max == 0 {
             return Some(Ok(0));
@@ -114,6 +146,32 @@ impl<R: Read> Read for DeclaredLength<R> {
 }
 
 impl<R: DecodeRead> DecodeRead for DeclaredLength<R> {
+    fn supports_borrowed(&self) -> bool {
+        self.inner.supports_borrowed()
+    }
+
+    fn read_borrowed(
+        &mut self,
+        max: usize,
+        sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+    ) -> Option<io::Result<usize>> {
+        if max == 0 {
+            return Some(Ok(0));
+        }
+        let owed = &mut self.owed;
+        let read = self.inner.read_borrowed(max, &mut |bytes| {
+            *owed = owed.saturating_sub(bytes.len() as u64);
+            sink(bytes)
+        })?;
+        Some(read.and_then(|size| {
+            if size == 0 && self.owed > 0 {
+                Err(ended_early())
+            } else {
+                Ok(size)
+            }
+        }))
+    }
+
     fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<io::Result<usize>> {
         if max == 0 {
             return Some(Ok(0));
@@ -213,6 +271,19 @@ impl<R: Read> Read for FaultRecordingReader<R> {
 }
 
 impl<R: DecodeRead> DecodeRead for FaultRecordingReader<R> {
+    fn supports_borrowed(&self) -> bool {
+        self.inner.supports_borrowed()
+    }
+
+    fn read_borrowed(
+        &mut self,
+        max: usize,
+        sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+    ) -> Option<io::Result<usize>> {
+        let read = self.inner.read_borrowed(max, sink)?;
+        Some(read.inspect_err(|_| self.faulted.set(true)))
+    }
+
     fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<io::Result<usize>> {
         let pushed = self.inner.push(max, sink)?;
         Some(pushed.inspect_err(|_| self.faulted.set(true)))
@@ -264,6 +335,23 @@ fn copy_rest<R: Read + ?Sized>(reader: &mut R, sink: &mut dyn Write) -> io::Resu
     }
 }
 
+/// Crosses one dictionary boundary with exactly the ordinary read request.
+/// Its complete successful chunk is verified before it reaches the sink.
+fn copy_once<R: Read + ?Sized>(reader: &mut R, sink: &mut dyn Write) -> io::Result<usize> {
+    let mut buf = [0u8; COPY_REST_BYTES];
+    let n = loop {
+        match reader.read(&mut buf) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            result => break result?,
+        }
+    };
+    if n == 0 {
+        return Ok(0);
+    }
+    sink.write_all(&buf[..n])?;
+    Ok(n)
+}
+
 /// Bytes one [`DecodeRead::push`] of [`write_pushed`] asks for: a block of
 /// the parallel decoder's output, after which the coder gets to read ahead
 /// again before the next.
@@ -279,16 +367,40 @@ const PUSH_STEP_BYTES: usize = 1 << 20;
 /// sees it.
 fn write_pushed<R: DecodeRead + ?Sized>(reader: &mut R, sink: &mut dyn Write) -> io::Result<u64> {
     let mut total = 0u64;
+    let borrowed_supported = reader.supports_borrowed();
     loop {
         let mut failed = None;
-        let pushed = reader.push(PUSH_STEP_BYTES, &mut |bytes| {
+        let mut deliver = |bytes: &[u8]| {
             if failed.is_none()
                 && let Err(e) = sink.write_all(bytes)
             {
                 failed = Some(e);
             }
-        });
+        };
+        let borrowed = if borrowed_supported {
+            reader.read_borrowed(COPY_REST_BYTES, &mut |bytes| {
+                deliver(bytes);
+                Ok(())
+            })
+        } else {
+            None
+        };
+        let pushed = match borrowed {
+            Some(Err(error)) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Some(result) => Some(result),
+            None if borrowed_supported => None,
+            None => reader.push(PUSH_STEP_BYTES, &mut deliver),
+        };
         let Some(pushed) = pushed else {
+            if borrowed_supported {
+                // A transient dictionary boundary is not a permanent barrier.
+                // Preserve this entire Read chunk, then try the next span.
+                match copy_once(reader, sink)? {
+                    0 => return Ok(total),
+                    n => total += n as u64,
+                }
+                continue;
+            }
             return copy_rest(reader, sink).map(|rest| total + rest);
         };
         if let Some(e) = failed {
@@ -367,6 +479,30 @@ impl<R: Read> Read for Crc32VerifyingReader<R> {
 }
 
 impl<R: DecodeRead> DecodeRead for Crc32VerifyingReader<R> {
+    fn supports_borrowed(&self) -> bool {
+        self.inner.supports_borrowed()
+    }
+
+    fn read_borrowed(
+        &mut self,
+        max: usize,
+        sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+    ) -> Option<io::Result<usize>> {
+        if self.remaining <= 0 {
+            return Some(Ok(0));
+        }
+        let digest = &mut self.crc_digest;
+        let remaining = &mut self.remaining;
+        let expected = self.expected_value;
+        let report = self.report.as_ref();
+        self.inner.read_borrowed(max, &mut |bytes| {
+            *remaining -= bytes.len() as i64;
+            digest.update(bytes);
+            Self::check_parts(digest, *remaining, expected, report)?;
+            sink(bytes)
+        })
+    }
+
     fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<io::Result<usize>> {
         if self.remaining <= 0 {
             return Some(Ok(0));
@@ -388,16 +524,495 @@ impl<R: DecodeRead> DecodeRead for Crc32VerifyingReader<R> {
 impl<R> Crc32VerifyingReader<R> {
     /// Compares the checksum once every byte it covers has been through.
     fn check_at_end(&mut self) -> io::Result<()> {
-        if self.remaining <= 0 {
-            let d = std::mem::replace(&mut self.crc_digest, Crc32::new()).finalize();
-            if d as u64 != self.expected_value {
+        Self::check_parts(
+            &mut self.crc_digest,
+            self.remaining,
+            self.expected_value,
+            self.report.as_ref(),
+        )
+    }
+
+    fn check_parts(
+        digest: &mut Crc32,
+        remaining: i64,
+        expected: u64,
+        report: Option<&Rc<Cell<Option<u32>>>>,
+    ) -> io::Result<()> {
+        if remaining <= 0 {
+            let d = std::mem::replace(digest, Crc32::new()).finalize();
+            if d as u64 != expected {
                 return Err(std::io::Error::other(Error::ChecksumVerificationFailed));
             }
-            if let Some(report) = self.report.as_ref() {
+            if let Some(report) = report {
                 report.set(Some(d));
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod borrowed_delivery_tests {
+    use super::*;
+    use crate::codec::lzma_turbo::{Lzma2Plan, lzma2_decoder};
+
+    fn packed(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (index, chunk) in data.chunks(65536).enumerate() {
+            out.push(if index == 0 { 1 } else { 2 });
+            out.extend_from_slice(&((chunk.len() - 1) as u16).to_be_bytes());
+            out.extend_from_slice(chunk);
+        }
+        out.push(0);
+        out
+    }
+
+    fn chain(
+        input: Vec<u8>,
+        len: usize,
+        expected: u32,
+        prop: u8,
+        fault: Rc<Cell<bool>>,
+        report: Rc<Cell<Option<u32>>>,
+    ) -> impl DecodeRead {
+        let decoder =
+            lzma2_decoder(io::Cursor::new(input), prop, Lzma2Plan::SingleThreaded).unwrap();
+        let inner: Box<dyn DecodeRead> = Box::new(DeclaredLength {
+            inner: decoder,
+            owed: len as u64,
+        });
+        FaultRecordingReader {
+            inner: Crc32VerifyingReader::reporting(
+                BoundedReader::new(inner, len),
+                len,
+                u64::from(expected),
+                report,
+            ),
+            faulted: fault,
+        }
+    }
+
+    #[derive(Default)]
+    struct Sink {
+        bytes: Vec<u8>,
+        fail_after: Option<usize>,
+        interrupted: bool,
+    }
+
+    impl Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let left = self
+                .fail_after
+                .map_or(usize::MAX, |n| n.saturating_sub(self.bytes.len()));
+            if left == 0 {
+                return Err(io::Error::other("output marker"));
+            }
+            let n = bytes.len().min(997).min(left);
+            self.bytes.extend_from_slice(&bytes[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Counted<R> {
+        inner: R,
+        borrowed_calls: usize,
+        declined: usize,
+        resumed: usize,
+        reads: usize,
+    }
+
+    impl<R: Read> Read for Counted<R> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            self.inner.read(out)
+        }
+    }
+
+    impl<R: DecodeRead> DecodeRead for Counted<R> {
+        fn supports_borrowed(&self) -> bool {
+            self.inner.supports_borrowed()
+        }
+        fn read_borrowed(
+            &mut self,
+            max: usize,
+            sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
+        ) -> Option<io::Result<usize>> {
+            self.borrowed_calls += 1;
+            let result = self.inner.read_borrowed(max, sink);
+            if result.is_none() {
+                self.declined += 1;
+            }
+            if matches!(result, Some(Ok(n)) if n > 0) && self.declined > 0 {
+                self.resumed += 1;
+            }
+            result
+        }
+    }
+
+    struct RecordedSink {
+        inner: Sink,
+        requests: Vec<usize>,
+    }
+
+    impl Write for RecordedSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.requests.push(bytes.len());
+            self.inner.write(bytes)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn borrowed_delivery_resumes_after_wrap_with_exact_read_visibility() {
+        let data: Vec<u8> = (0..600003).map(|i| (i * 31) as u8).collect();
+        let valid = packed(&data);
+        let mut damaged = valid.clone();
+        damaged[5 * 65539] = 3;
+        for (case, input) in [valid.clone(), damaged, valid[..350000].to_vec()]
+            .into_iter()
+            .enumerate()
+        {
+            for prop in [0, 12] {
+                for bad_crc in [false, true] {
+                    for fail_after in [None, Some(0), Some(300001)] {
+                        for prefix in [0, 7] {
+                            let mut observed = Vec::new();
+                            for direct in [false, true] {
+                                let fault = Rc::new(Cell::new(false));
+                                let report = Rc::new(Cell::new(None));
+                                let inner = chain(
+                                    input.clone(),
+                                    data.len(),
+                                    crc32(&data) ^ u32::from(bad_crc),
+                                    prop,
+                                    Rc::clone(&fault),
+                                    Rc::clone(&report),
+                                );
+                                let mut reader = Counted {
+                                    inner,
+                                    borrowed_calls: 0,
+                                    declined: 0,
+                                    resumed: 0,
+                                    reads: 0,
+                                };
+                                reader.read_exact(&mut vec![0; prefix]).unwrap();
+                                let mut sink = RecordedSink {
+                                    inner: Sink {
+                                        fail_after,
+                                        ..Sink::default()
+                                    },
+                                    requests: Vec::new(),
+                                };
+                                let result = if direct {
+                                    write_pushed(&mut reader, &mut sink)
+                                } else {
+                                    copy_rest(&mut reader, &mut sink)
+                                };
+                                if direct
+                                    && case == 0
+                                    && prop == 12
+                                    && !bad_crc
+                                    && fail_after.is_none()
+                                {
+                                    assert!(
+                                        reader.declined > 1 && reader.resumed > 1,
+                                        "the real decoder must resume across repeated wraps"
+                                    );
+                                }
+                                observed.push((
+                                    sink.inner.bytes,
+                                    sink.requests,
+                                    result.map_err(|e| (e.kind(), e.to_string())),
+                                    fault.get(),
+                                    report.get(),
+                                ));
+                            }
+                            assert_eq!(
+                                observed[0], observed[1],
+                                "case={case} prop={prop} bad_crc={bad_crc} fail={fail_after:?} prefix={prefix}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let inner = crate::decoder::ReadOnly(io::Cursor::new(data.clone()));
+        let mut reader = Counted {
+            inner,
+            borrowed_calls: 0,
+            declined: 0,
+            resumed: 0,
+            reads: 0,
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            write_pushed(&mut reader, &mut out).unwrap(),
+            data.len() as u64
+        );
+        assert_eq!(out, data);
+        assert_eq!(
+            reader.borrowed_calls, 0,
+            "a static barrier is never probed for a borrowed span"
+        );
+
+        struct Eof;
+        impl Read for Eof {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl DecodeRead for Eof {
+            fn supports_borrowed(&self) -> bool {
+                true
+            }
+        }
+        struct RejectEmptyWrite;
+        impl Write for RejectEmptyWrite {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                panic!("EOF must not write")
+            }
+            fn write_all(&mut self, _: &[u8]) -> io::Result<()> {
+                panic!("EOF must not invoke overridden write_all")
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert_eq!(write_pushed(&mut Eof, &mut RejectEmptyWrite).unwrap(), 0);
+        assert_eq!(copy_rest(&mut Eof, &mut RejectEmptyWrite).unwrap(), 0);
+    }
+
+    #[test]
+    fn borrowed_delivery_preserves_exact_crc_error_prefix_and_sink_precedence() {
+        for len in [0, 17003, 65536, 140003] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 31) as u8).collect();
+            for prop in [0, 16] {
+                for bad_crc in [false, true] {
+                    for fail_after in [None, Some(0), Some(70001)] {
+                        for prefix in [0, len.min(7)] {
+                            let checksum = crc32(&data) ^ u32::from(bad_crc);
+                            let mut observed = Vec::new();
+                            for direct in [false, true] {
+                                let fault = Rc::new(Cell::new(false));
+                                let report = Rc::new(Cell::new(None));
+                                let mut reader = chain(
+                                    packed(&data),
+                                    len,
+                                    checksum,
+                                    prop,
+                                    Rc::clone(&fault),
+                                    Rc::clone(&report),
+                                );
+                                let mut head = vec![0; prefix];
+                                reader.read_exact(&mut head).unwrap();
+                                let mut sink = Sink {
+                                    fail_after,
+                                    ..Sink::default()
+                                };
+                                let result = if direct {
+                                    write_pushed(&mut reader, &mut sink)
+                                } else {
+                                    copy_rest(&mut reader, &mut sink)
+                                };
+                                observed.push((
+                                    sink.bytes,
+                                    result.map_err(|e| (e.kind(), e.to_string())),
+                                    fault.get(),
+                                    report.get(),
+                                ));
+                            }
+                            assert_eq!(
+                                observed[0], observed[1],
+                                "len={len} prop={prop} bad_crc={bad_crc} prefix={prefix} fail={fail_after:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_delivery_withholds_failed_decode_and_unwinds_borrowed_sink() {
+        let data = vec![42; 140003];
+        let mut damaged = packed(&data);
+        damaged[65539] = 3; // Invalid control after the first stored chunk.
+        let truncated = packed(&data)[..70000].to_vec();
+        for input in [damaged, truncated] {
+            let mut observed = Vec::new();
+            for direct in [false, true] {
+                let fault = Rc::new(Cell::new(false));
+                let mut reader = chain(
+                    input.clone(),
+                    data.len(),
+                    crc32(&data),
+                    16,
+                    Rc::clone(&fault),
+                    Rc::new(Cell::new(None)),
+                );
+                let mut sink = Vec::new();
+                let result = if direct {
+                    write_pushed(&mut reader, &mut sink)
+                } else {
+                    copy_rest(&mut reader, &mut sink)
+                };
+                observed.push((
+                    sink,
+                    result.map_err(|e| (e.kind(), e.to_string())),
+                    fault.get(),
+                ));
+            }
+            assert_eq!(observed[0], observed[1]);
+        }
+        struct Panics;
+        impl Write for Panics {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                panic!("output panic marker")
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let bytes = b"borrowed output";
+        let fault = Rc::new(Cell::new(false));
+        let mut reader = chain(
+            packed(bytes),
+            bytes.len(),
+            crc32(bytes),
+            0,
+            Rc::clone(&fault),
+            Rc::new(Cell::new(None)),
+        );
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            write_pushed(&mut reader, &mut Panics)
+        }));
+        assert!(panic.is_err());
+        assert!(!fault.get());
+    }
+
+    #[cfg(feature = "compress")]
+    #[test]
+    fn borrowed_archive_delivery_preserves_filters_crc_hooks_and_partial_stop() {
+        use crate::encoder_options::{DeltaOptions, Lzma2Options};
+        use crate::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, SourceReader};
+        use std::sync::Mutex;
+        let data = [
+            Vec::new(),
+            (0..17003)
+                .map(|i| ((i / 97 + i % 19) % 251) as u8)
+                .collect(),
+            vec![91; 70003],
+        ];
+        let mut options = Lzma2Options::from_level(1);
+        options.set_dictionary_size(1 << 16);
+        let plain: Vec<EncoderConfiguration> = vec![options.into()];
+        let mut filtered = plain.clone();
+        filtered.push(DeltaOptions::from_distance(1).into());
+        let modes = vec![
+            (plain.clone(), Password::empty()),
+            (filtered, Password::empty()),
+        ];
+        #[cfg(feature = "aes256")]
+        let modes = {
+            let mut modes = modes;
+            let password = Password::new("fixture-key");
+            let mut encrypted = plain;
+            encrypted.insert(
+                0,
+                crate::encoder_options::AesEncoderOptions::new(password.clone()).into(),
+            );
+            modes.push((encrypted, password));
+            modes
+        };
+        for (methods, password) in modes {
+            for solid in [false, true] {
+                let mut writer = ArchiveWriter::new(io::Cursor::new(Vec::new())).unwrap();
+                writer.set_content_methods(methods.clone());
+                writer.set_encrypt_header(false);
+                let entries: Vec<_> = (0..data.len())
+                    .map(|i| ArchiveEntry::new_file(&format!("member-{i}")))
+                    .collect();
+                if solid {
+                    writer
+                        .push_archive_entries(
+                            entries,
+                            data.iter()
+                                .map(|bytes| SourceReader::new(bytes.as_slice()))
+                                .collect(),
+                        )
+                        .unwrap();
+                } else {
+                    for (entry, bytes) in entries.into_iter().zip(&data) {
+                        writer
+                            .push_archive_entry(entry, Some(bytes.as_slice()))
+                            .unwrap();
+                    }
+                }
+                let bytes = writer.finish().unwrap().into_inner();
+                for bad_crc in [false, true] {
+                    for stop_early in [false, true] {
+                        let mut outcomes = Vec::new();
+                        for direct in [false, true] {
+                            let mut source = io::Cursor::new(bytes.clone());
+                            let mut archive = Archive::read(&mut source, &password).unwrap();
+                            if bad_crc {
+                                archive
+                                    .files
+                                    .iter_mut()
+                                    .find(|file| file.size > 0)
+                                    .unwrap()
+                                    .crc ^= 1;
+                            }
+                            let mut reader =
+                                ArchiveReader::from_archive(archive, source, password.clone());
+                            reader.set_threads(1);
+                            let reports = Arc::new(Mutex::new(Vec::new()));
+                            let hook = Arc::clone(&reports);
+                            reader.set_sub_stream_complete_hook(move |event| {
+                                hook.lock().unwrap().push((event.file_index, event.crc32));
+                            });
+                            let mut output = Vec::new();
+                            let result = reader.for_each_entries_direct(|file, input| {
+                                if file.size == 0 {
+                                    return Ok(true);
+                                }
+                                let mut prefix = [0; 7];
+                                input.read_exact(&mut prefix)?;
+                                output.extend_from_slice(&prefix);
+                                if stop_early {
+                                    return Ok(false);
+                                }
+                                if direct {
+                                    input.write_rest(&mut output)?;
+                                } else {
+                                    copy_rest(input, &mut output)?;
+                                }
+                                Ok(true)
+                            });
+                            let checks = reports.lock().unwrap().clone();
+                            outcomes.push((
+                                output,
+                                result.map_err(|error| error.to_string()),
+                                checks,
+                            ));
+                        }
+                        assert_eq!(outcomes[0], outcomes[1]);
+                        if !bad_crc && !stop_early {
+                            assert_eq!(outcomes[1].0, data.concat());
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -565,13 +1180,6 @@ impl Archive {
         if nid == K_FILES_INFO {
             Self::read_files_info(header, archive, bounds)?;
             nid = header.read_u8()?;
-        } else {
-            // A header with blocks but no files info: legal enough to parse,
-            // and `read_files_info` is where the stream map is normally built.
-            // Without this the map stays empty while `blocks` is not, and the
-            // first decode indexes a zero-length `block_first_pack_stream_index`
-            // — a panic from a header of a dozen bytes.
-            Self::calculate_stream_map(archive)?;
         }
         if nid != K_END {
             return Err(Error::BadTerminatedHeader(nid));
@@ -739,6 +1347,13 @@ impl Archive {
             return Err(Error::other("Broken or unsupported archive: no Header"));
         }
 
+        // Like CDbEx::FillLinks, stream maps depend only on parsed metadata.
+        // Release the decoded or plain header before allocating those final
+        // maps, rather than keeping both complete representations live.
+        // This also validates blocks in headers without a FilesInfo section.
+        drop(buf);
+        Self::calculate_stream_map(&mut archive)?;
+
         // Every packed byte the header describes has to be inside the file. The
         // pack streams are laid out end to end from `pack_pos`, so they cannot
         // overlap or run backwards by construction; what is not implied is that
@@ -871,7 +1486,7 @@ impl Archive {
         let mut decoder: Box<dyn Read> = Box::new(input_reader);
         let mut decoder = if coder_len > 0 {
             for (index, coder) in block.ordered_coder_iter() {
-                if coder.num_in_streams != 1 || coder.num_out_streams != 1 {
+                if coder.num_in_streams() != 1 || coder.num_out_streams() != 1 {
                     return Err(Error::other(
                         "Multi input/output stream coders are not yet supported",
                     ));
@@ -918,12 +1533,34 @@ impl Archive {
         } else {
             archive.blocks.clear();
         }
-        if nid == K_SUB_STREAMS_INFO {
+        let explicit_sub_streams = nid == K_SUB_STREAMS_INFO;
+        if explicit_sub_streams {
             Self::read_sub_streams_info(header, archive, bounds)?;
             nid = header.read_u8()?;
         }
         if nid != K_END {
             return Err(Error::BadTerminatedStreamsInfo(nid));
+        }
+        if !explicit_sub_streams {
+            // C: SzReadStreamsInfo defaults to one sub-stream per folder;
+            // SzReadHeader2 derives its size and inherits its folder CRC.
+            let count = bounds.count(archive.blocks.len() as u64, Limit::Entries)?;
+            let mut info = SubStreamsInfo {
+                unpack_sizes: Vec::with_capacity(count),
+                has_crc: BitSet::with_capacity(count),
+                crcs: Vec::with_capacity(count),
+            };
+            for (index, block) in archive.blocks.iter_mut().enumerate() {
+                block.num_unpack_sub_streams = 1;
+                info.unpack_sizes.push(block.get_unpack_size());
+                if block.has_crc {
+                    info.has_crc.insert(index);
+                }
+                // The parser read the folder CRC from a 32-bit wire field.
+                info.crcs
+                    .push(if block.has_crc { block.crc as u32 } else { 0 });
+            }
+            archive.sub_streams_info = Some(info);
         }
 
         Ok(())
@@ -1107,7 +1744,7 @@ impl Archive {
                     ));
                 };
                 file.has_crc = sub_stream_info.has_crc.contains(non_empty_file_counter);
-                file.crc = crc;
+                file.crc = u64::from(crc);
                 file.size = size;
                 non_empty_file_counter += 1;
             } else {
@@ -1127,7 +1764,6 @@ impl Archive {
         }
         archive.files = files;
 
-        Self::calculate_stream_map(archive)?;
         Ok(())
     }
 
@@ -1144,7 +1780,7 @@ impl Archive {
             // Reject a block whose span runs past the available pack streams instead of
             // panicking there.
             next_block_pack_stream_index = next_block_pack_stream_index
-                .checked_add(archive.blocks[i].packed_streams.len())
+                .checked_add(archive.blocks[i].packed_streams().len())
                 .ok_or_else(|| Error::other("pack stream index overflow"))?;
             if next_block_pack_stream_index > archive.pack_sizes.len() {
                 return Err(Error::other(
@@ -1157,14 +1793,12 @@ impl Archive {
         // blocks. Record each block's first index here so `build_decode_stack`
         // does not re-sum the preceding blocks every time it opens one, which
         // made extracting an archive of many non-solid blocks quadratic.
-        let mut next_sub_stream_index: usize = 0;
-        stream_map.block_first_sub_stream_index = vec![0; num_blocks];
-        for i in 0..num_blocks {
-            stream_map.block_first_sub_stream_index[i] = next_sub_stream_index;
-            next_sub_stream_index = next_sub_stream_index
-                .checked_add(archive.blocks[i].num_unpack_sub_streams)
-                .ok_or_else(|| Error::other("sub-stream index overflow"))?;
-        }
+        stream_map.block_first_sub_stream_index = SubStreamOffsets::from_counts(
+            archive
+                .blocks
+                .iter()
+                .map(|block| block.num_unpack_sub_streams),
+        )?;
 
         let mut next_pack_stream_offset: u64 = 0;
         let num_pack_sizes = archive.pack_sizes.len();
@@ -1209,7 +1843,7 @@ impl Archive {
                 let first_pack_stream_index =
                     stream_map.block_first_pack_stream_index[next_block_index];
                 let pack_sizes = first_pack_stream_index
-                    .checked_add(archive.blocks[next_block_index].packed_streams.len())
+                    .checked_add(archive.blocks[next_block_index].packed_streams().len())
                     .and_then(|end| archive.pack_sizes.get(first_pack_stream_index..end))
                     .ok_or_else(|| {
                         Error::other("block references a pack stream index beyond pack_sizes")
@@ -1328,12 +1962,11 @@ impl Archive {
         }
 
         for block in archive.blocks.iter_mut() {
-            // `total_output_streams` is bounded in `read_block`, but clamp the eager
-            // reservation to `limit` as well so it can never over-allocate.
-            let tos = block.total_output_streams;
-            block.unpack_sizes.reserve_exact(tos.min(bounds.bytes));
-            for _ in 0..tos {
-                block.unpack_sizes.push(read_variable_u64(header)?);
+            // The stream count was checked against header and policy bounds
+            // in read_block before sizing this table.
+            block.prepare_unpack_sizes();
+            for size in block.unpack_sizes_mut() {
+                *size = read_variable_u64(header)?;
             }
         }
 
@@ -1434,15 +2067,13 @@ impl Archive {
             let mut missing_crcs = vec![0; num_digests];
             for (i, missing_crc) in missing_crcs.iter_mut().enumerate() {
                 if has_missing_crc.contains(i) {
-                    *missing_crc = header.read_u32()? as u64;
+                    *missing_crc = header.read_u32()?;
                 }
             }
             let mut next_crc = 0;
             let mut next_missing_crc = 0;
             for block in archive.blocks.iter() {
                 if block.num_unpack_sub_streams == 1 && block.has_crc {
-                    sub_streams_info.has_crc.insert(next_crc);
-                    sub_streams_info.crcs[next_crc] = block.crc;
                     next_crc += 1;
                 } else {
                     for _i in 0..block.num_unpack_sub_streams {
@@ -1465,61 +2096,70 @@ impl Archive {
             return Err(Error::BadTerminatedSubStreamsInfo);
         }
 
+        // C: SzReadHeader2 inherits the folder CRC independently of the
+        // optional sub-stream CRC property, for exactly one sub-stream.
+        let mut first_sub_stream = 0;
+        for block in &archive.blocks {
+            if block.num_unpack_sub_streams == 1 && block.has_crc {
+                sub_streams_info.has_crc.insert(first_sub_stream);
+                // Parsing established that this is a 32-bit wire CRC.
+                sub_streams_info.crcs[first_sub_stream] = block.crc as u32;
+            }
+            first_sub_stream += block.num_unpack_sub_streams;
+        }
+
         archive.sub_streams_info = Some(sub_streams_info);
         Ok(())
     }
 
     fn read_block<R: Read>(header: &mut R, bounds: HeaderBounds<'_>) -> Result<Block, Error> {
-        let mut block = Block::default();
-
         let num_coders = bounds.count(read_variable_u64(header)?, Limit::CodersPerBlock)?;
         let mut coders = Vec::with_capacity(num_coders);
         let mut total_in_streams: u64 = 0;
         let mut total_out_streams: u64 = 0;
         for _i in 0..num_coders {
-            let mut coder = Coder::default();
+            let mut coder = Coder::single_stream();
             let bits = header.read_u8()?;
             let id_size = bits & 0xF;
             let is_simple = (bits & 0x10) == 0;
             let has_attributes = (bits & 0x20) != 0;
             let more_alternative_methods = (bits & 0x80) != 0;
 
-            coder.id_size = id_size as usize;
+            coder.set_id_size(id_size);
 
             header.read_exact(coder.decompression_method_id_mut())?;
-            if is_simple {
-                coder.num_in_streams = 1;
-                coder.num_out_streams = 1;
+            let (input_streams, output_streams) = if is_simple {
+                (1, 1)
             } else {
-                coder.num_in_streams = read_variable_u64(header)?;
-                coder.num_out_streams = read_variable_u64(header)?;
-            }
+                (read_variable_u64(header)?, read_variable_u64(header)?)
+            };
             // Each stream is referenced by a bind-pair/packed-stream entry that consumes
             // header bytes, so the totals cannot legitimately exceed `limit`. The counts are
             // unbounded attacker-controlled varints, so the sums are checked: an overflowing
             // addition must be rejected rather than wrap past the bound below.
             total_in_streams = total_in_streams
-                .checked_add(coder.num_in_streams)
+                .checked_add(input_streams)
                 .ok_or_else(|| Error::other("coder stream counts exceed available input"))?;
             total_out_streams = total_out_streams
-                .checked_add(coder.num_out_streams)
+                .checked_add(output_streams)
                 .ok_or_else(|| Error::other("coder stream counts exceed available input"))?;
-            if coder.num_in_streams > bounds.limits.max_streams_per_coder
-                || coder.num_out_streams > bounds.limits.max_streams_per_coder
+            if input_streams > bounds.limits.max_streams_per_coder
+                || output_streams > bounds.limits.max_streams_per_coder
             {
                 return Err(Error::limit(
                     Limit::StreamsPerCoder,
                     bounds.limits.max_streams_per_coder,
-                    coder.num_in_streams.max(coder.num_out_streams),
+                    input_streams.max(output_streams),
                 ));
             }
             bounds.count(total_in_streams, Limit::Entries)?;
             bounds.count(total_out_streams, Limit::Entries)?;
+            coder.set_stream_counts(input_streams, output_streams);
             if has_attributes {
                 let properties_size = bounds.size(read_variable_u64(header)?)?;
-                let mut props = vec![0u8; properties_size];
+                let mut props = SmallSlice::with_len(properties_size);
                 header.read_exact(&mut props)?;
-                coder.properties = props;
+                coder.set_properties(props);
             }
             coders.push(coder);
             // would need to keep looping as above:
@@ -1529,11 +2169,9 @@ impl Archive {
                 ));
             }
         }
-        block.coders = coders;
+        let mut block = Block::with_coders(coders);
         let total_in_streams = total_in_streams as usize;
         let total_out_streams = total_out_streams as usize;
-        block.total_input_streams = total_in_streams;
-        block.total_output_streams = total_out_streams;
 
         if total_out_streams == 0 {
             return Err(Error::other("Total output streams can't be 0"));
@@ -1553,7 +2191,6 @@ impl Archive {
             }
             bind_pairs.push(bp);
         }
-        block.bind_pairs = bind_pairs;
 
         if total_in_streams < num_bind_pairs {
             return Err(Error::other(
@@ -1561,11 +2198,11 @@ impl Archive {
             ));
         }
         let num_packed_streams = total_in_streams - num_bind_pairs;
-        let mut packed_streams = vec![0; num_packed_streams];
+        let mut packed_streams = SmallSlice::with_len(num_packed_streams);
         if num_packed_streams == 1 {
             let mut index = u64::MAX;
             for i in 0..total_in_streams {
-                if block.find_bind_pair_for_in_stream(i as u64).is_none() {
+                if !bind_pairs.iter().any(|pair| pair.in_index == i as u64) {
                     index = i as u64;
                     break;
                 }
@@ -1579,7 +2216,13 @@ impl Archive {
                 *packed_stream = read_variable_u64(header)?;
             }
         }
-        block.packed_streams = packed_streams;
+        block.set_streams(
+            total_in_streams,
+            total_out_streams,
+            bind_pairs.into_boxed_slice(),
+            packed_streams,
+            SmallSlice::default(),
+        );
 
         Self::validate_coder_graph(&block)?;
 
@@ -1601,12 +2244,25 @@ impl Archive {
     ///   coders forever, which is an unbounded stack of decoders built from a
     ///   handful of header bytes.
     fn validate_coder_graph(block: &Block) -> Result<(), Error> {
-        let total_in = block.total_input_streams;
-        let total_out = block.total_output_streams;
+        let total_in = block.total_input_streams();
+        let total_out = block.total_output_streams();
+
+        // ReadUnpackInfo's simple-folder case: one packed input, one final
+        // output and no edges satisfy every graph invariant directly.
+        if total_in == 1
+            && total_out == 1
+            && block.bind_pairs().is_empty()
+            && block.packed_streams()[..] == [0]
+            && let [coder] = block.coders.as_slice()
+            && coder.num_in_streams() == 1
+            && coder.num_out_streams() == 1
+        {
+            return Ok(());
+        }
 
         let mut in_bound = vec![false; total_in];
         let mut out_bound = vec![false; total_out];
-        for bp in &block.bind_pairs {
+        for bp in block.bind_pairs() {
             // Ranges were checked as the pairs were read; this is the duplicate check.
             let (i, o) = (bp.in_index as usize, bp.out_index as usize);
             if in_bound[i] || out_bound[o] {
@@ -1616,7 +2272,7 @@ impl Archive {
             out_bound[o] = true;
         }
 
-        for &ps in &block.packed_streams {
+        for &ps in block.packed_streams() {
             let i = usize::try_from(ps)
                 .ok()
                 .filter(|i| *i < total_in)
@@ -1642,10 +2298,10 @@ impl Archive {
         let mut coder_of_in = Vec::with_capacity(total_in);
         let mut coder_of_out = Vec::with_capacity(total_out);
         for (ci, coder) in block.coders.iter().enumerate() {
-            for _ in 0..coder.num_in_streams {
+            for _ in 0..coder.num_in_streams() {
                 coder_of_in.push(ci);
             }
-            for _ in 0..coder.num_out_streams {
+            for _ in 0..coder.num_out_streams() {
                 coder_of_out.push(ci);
             }
         }
@@ -1675,9 +2331,9 @@ impl Archive {
             // This coder's input streams, in order; `step` is how many have been walked.
             let first_in = block.coders[..coder_index]
                 .iter()
-                .map(|c| c.num_in_streams as usize)
+                .map(|c| c.num_in_streams() as usize)
                 .sum::<usize>();
-            let num_in = block.coders[coder_index].num_in_streams as usize;
+            let num_in = block.coders[coder_index].num_in_streams() as usize;
             if step < num_in {
                 stack.push((coder_index, step + 1));
                 if let Some(bp) = block.find_bind_pair_for_in_stream((first_in + step) as u64) {
@@ -1863,6 +2519,7 @@ pub struct ArchiveReader<R: Read + Seek> {
     password: Password,
     thread_count: u32,
     adaptive_lzma2: bool,
+    input_complete: bool,
     verify_checksums: bool,
     lzma2: Arc<Lzma2Control>,
     /// Where each name's entry is, built by the first call that looks a name
@@ -1893,6 +2550,7 @@ impl ArchiveReader<File> {
             .map_err(|e| Error::file_open(e, path.as_ref().to_string_lossy().to_string()))?;
         let positional = file.try_clone().ok();
         let mut reader = Self::new(file, password)?;
+        reader.set_input_complete(true);
         #[cfg(any(unix, windows))]
         if let Some(positional) = positional {
             reader.set_positional_source(positional);
@@ -1991,6 +2649,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             // not quietly hold the memory that decoding in parallel needs.
             thread_count: 1,
             adaptive_lzma2: false,
+            input_complete: false,
             verify_checksums: true,
             lzma2: Arc::new(Lzma2Control::new(1)),
             index: OnceLock::new(),
@@ -1999,6 +2658,19 @@ impl<R: Read + Seek> ArchiveReader<R> {
             on_sub_stream_complete: None,
             positional: None,
         })
+    }
+
+    /// Allows bounded framing inspection anywhere in a complete input.
+    ///
+    /// This can reduce LZMA2 buffering, enable positional ring extraction,
+    /// and let graph workers read complete positional inputs directly.
+    /// It defaults to false for custom sources: a seekable source may still
+    /// be downloading, and inspection could wait for bytes beyond its ready
+    /// prefix. [`Self::open`] enables it for its local file. Set it only when
+    /// reads throughout the archive can proceed without waiting for delivery;
+    /// it does not bypass payload or checksum verification.
+    pub fn set_input_complete(&mut self, complete: bool) {
+        self.input_complete = complete;
     }
 
     /// Gives the reader a positional view of its source, so that the folders
@@ -2123,6 +2795,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
         Ok(BlockDecoder {
             thread_count: self.thread_count,
             adaptive_lzma2: self.adaptive_lzma2,
+            input_complete: self.input_complete,
+            positional: self.positional.as_ref(),
             verify_checksums: self.verify_checksums,
             lzma2: Arc::clone(&self.lzma2),
             block_index,
@@ -2169,6 +2843,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             password,
             thread_count: 1,
             adaptive_lzma2: false,
+            input_complete: false,
             verify_checksums: true,
             lzma2: Arc::new(Lzma2Control::new(1)),
             index: OnceLock::new(),
@@ -2325,7 +3000,9 @@ impl<R: Read + Seek> ArchiveReader<R> {
         // this never refuses anything, because `decoder_memory_estimate` has
         // already bounded the same sum from above; it is what bounds a
         // `BlockDecoder` built with limits of its own.
-        let (reserved_kb, unsized_kb) = if block.total_input_streams > block.total_output_streams {
+        let (reserved_kb, unsized_kb) = if block.total_input_streams()
+            > block.total_output_streams()
+        {
             // Every coder of a multi-stream graph is built.
             let graph = || {
                 block
@@ -2351,7 +3028,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             )
         };
         let mut opts = opts.reserving(reserved_kb, unsized_kb);
-        if block.total_input_streams > block.total_output_streams {
+        if block.total_input_streams() > block.total_output_streams() {
             return Self::build_decode_stack2(source, archive, block_index, password, &opts);
         }
         let first_pack_stream_index = archive.stream_map.block_first_pack_stream_index[block_index];
@@ -2373,16 +3050,43 @@ impl<R: Read + Seek> ArchiveReader<R> {
             && block.num_unpack_sub_streams == 1
             && let Some(sub_streams_info) = archive.sub_streams_info.as_ref()
         {
-            let substream_index = archive.stream_map.block_first_sub_stream_index[block_index];
+            let substream_index = archive
+                .stream_map
+                .block_first_sub_stream_index
+                .get(block_index)
+                .expect("validated sub-stream mapping");
 
             // Only when there is a single stream, we can use it's CRC to verify the compressed block data.
             // Multiple streams would contain the CRC of the compressed data for each file in the block.
             if sub_streams_info.has_crc.contains(substream_index) {
                 has_crc = true;
-                crc = sub_streams_info.crcs[substream_index];
+                crc = u64::from(sub_streams_info.crcs[substream_index]);
             }
         }
 
+        // A complete lone run has no parallel work to discover. Prove it
+        // from framing before allocating the read-ahead queue, then use the
+        // controlled decoder's ring immediately. Keep progress, ledger and
+        // checksum folding; adaptive sources retain their ordinary scanner.
+        // At most 4 MiB of header snippets (65,536 reads): a GiB-scale lone
+        // run can contain over 16,000 compressed chunks. Packed payload is
+        // skipped; smaller BCJ2 side-stream probes keep their separate cap.
+        opts.single_run_lzma2 = opts.input_complete
+            && opts.threads > 1
+            && !opts.adaptive_lzma2
+            && block.coders.len() == 1
+            && block.coders[0].encoder_method_id() == EncoderMethod::ID_LZMA2
+            && block.coders[0].properties().len() == 1
+            && block.coders[0].properties()[0] <= 40
+            && block.get_unpack_size() > crate::codec::lzma_turbo::MT_MIN_BLOCK_BYTES
+            && crate::codec::lzma_turbo::is_single_run_with_limit(
+                source,
+                block_offset,
+                archive.pack_sizes[first_pack_stream_index],
+                block.get_unpack_size(),
+                65_536,
+            );
+        // Always restore the cursor, including a declined or failed probe.
         source.seek(SeekFrom::Start(block_offset))?;
         let pack_size = archive.pack_sizes[first_pack_stream_index] as usize;
 
@@ -2399,7 +3103,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let opts = &opts;
         let mut stage = Stage::Leaf(Box::new(BoundedReader::new(source, pack_size)));
         for (index, coder) in block.ordered_coder_iter() {
-            if coder.num_in_streams != 1 || coder.num_out_streams != 1 {
+            if coder.num_in_streams() != 1 || coder.num_out_streams() != 1 {
                 return Err(Error::unsupported(
                     "Multi input/output stream coders are not supported",
                 ));
@@ -2448,7 +3152,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             )));
         }
 
-        assert!(block.total_input_streams > block.total_output_streams);
+        assert!(block.total_input_streams() > block.total_output_streams());
         let shared_source = Rc::new(RefCell::new(source));
         let first_pack_stream_index = archive.stream_map.block_first_pack_stream_index[block_index];
         let start_pos = SIGNATURE_HEADER_SIZE
@@ -2456,9 +3160,54 @@ impl<R: Read + Seek> ArchiveReader<R> {
             .ok_or_else(|| Error::other("pack position out of range"))?;
         let offsets = &archive.stream_map.pack_stream_offsets[first_pack_stream_index..];
 
-        let mut sources = Vec::with_capacity(block.packed_streams.len());
+        // A direct pack stream can be inspected by seeking over payload.
+        // Unlike the adaptive reader's initial scan, this keeps no packed
+        // input alongside the dictionary. Only a proven complete lone run
+        // changes the plan; filters/encryption below LZMA2 and additional
+        // resets retain their existing worker path. An adaptive chase may
+        // expose only a downloaded prefix, so it must not probe ahead.
+        // SharedBoundedReader
+        // re-seeks before every read, including after an unsuccessful probe.
+        let serial_coder = (|| {
+            if !opts.input_complete
+                || opts.threads < 2
+                || opts.adaptive_lzma2
+                || !block
+                    .coders
+                    .iter()
+                    .any(|coder| coder.encoder_method_id() == EncoderMethod::ID_BCJ2)
+            {
+                return None;
+            }
+            let index = crate::pipeline::parallel_lzma2_coder(block)?;
+            let coder = &block.coders[index];
+            let unpacked = block.get_unpack_size_at_index(index);
+            if coder.num_in_streams() != 1
+                || coder.num_out_streams() != 1
+                || coder.properties().len() != 1
+                || coder.properties()[0] > 40
+                || unpacked <= crate::codec::lzma_turbo::MT_MIN_BLOCK_BYTES
+            {
+                return None;
+            }
+            let input = block.coders[..index]
+                .iter()
+                .try_fold(0u64, |sum, coder| sum.checked_add(coder.num_in_streams()))?;
+            let pack = block.packed_streams().iter().position(|&s| s == input)?;
+            let offset = start_pos.checked_add(*offsets.get(pack)?)?;
+            let packed = *archive.pack_sizes.get(first_pack_stream_index + pack)?;
+            crate::codec::lzma_turbo::is_single_run(
+                &mut **shared_source.borrow_mut(),
+                offset,
+                packed,
+                unpacked,
+            )
+            .then_some(index)
+        })();
 
-        for (i, offset) in offsets[..block.packed_streams.len()].iter().enumerate() {
+        let mut sources = Vec::with_capacity(block.packed_streams().len());
+
+        for (i, offset) in offsets[..block.packed_streams().len()].iter().enumerate() {
             let pack_pos = start_pos
                 .checked_add(*offset)
                 .ok_or_else(|| Error::other("pack stream offset out of range"))?;
@@ -2478,12 +3227,12 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let mut si = 0;
         for (i, coder) in block.coders.iter().enumerate() {
             coder_to_stream_map[i] = si;
-            si += coder.num_in_streams as usize;
+            si += coder.num_in_streams() as usize;
         }
 
         let main_coder_index = {
             let mut coder_used = [false; MAX_CODER_COUNT];
-            for bp in block.bind_pairs.iter() {
+            for bp in block.bind_pairs() {
                 // `out_index` is validated `< total_output_streams` at parse time, but the
                 // `coder_used` array indexes coders (max `MAX_CODER_COUNT`); reject an
                 // index that would fall outside it instead of panicking.
@@ -2508,7 +3257,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         // so this also handles single-input filters (e.g. Delta) layered on top of a
         // BCJ2 coder's output, not just a bare BCJ2 main coder.
         let mut opts = *opts;
-        let mut chain = Chain::new(block, &mut opts);
+        let mut chain = Chain::with_serial_coder(block, &mut opts, serial_coder);
         let opts = &opts;
         let stage = Self::get_in_stream2(
             block,
@@ -2558,10 +3307,25 @@ impl<R: Read + Seek> ArchiveReader<R> {
         R: 'r,
     {
         let index = block
-            .packed_streams
+            .packed_streams()
             .iter()
             .position(|&i| i == in_stream_index as u64);
         if let Some(index) = index {
+            if opts.input_complete
+                && opts.threads > 1
+                && !opts.adaptive_lzma2
+                && let Some(positional) = opts.positional
+            {
+                // Every pack stream gets an independent cursor, including
+                // those consumed inline. Never mix positional worker reads
+                // with the caller's shared seek/read cursor on this graph.
+                let (start, end) = sources[index].bounds;
+                let size = usize::try_from(end - start)
+                    .map_err(|_| Error::other("pack stream size exceeds address space"))?;
+                let mut cursor = ReadAtCursor::new(Arc::clone(positional));
+                cursor.seek(SeekFrom::Start(start))?;
+                return Ok(Stage::OwnedLeaf(Box::new(BoundedReader::new(cursor, size))));
+            }
             return Ok(Stage::Leaf(Box::new(sources[index].clone())));
         }
 
@@ -2620,11 +3384,11 @@ impl<R: Read + Seek> ArchiveReader<R> {
             return Err(Error::other("in_stream_index out of range"));
         }
         let uncompressed_len = *block
-            .unpack_sizes
+            .unpack_sizes()
             .get(in_stream_index)
             .ok_or_else(|| Error::other("in_stream_index out of range"))?
             as usize;
-        if coder.num_in_streams == 1 {
+        if coder.num_in_streams() == 1 {
             let input = Self::get_in_stream(
                 block,
                 sources,
@@ -2641,7 +3405,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         // BCJ2 is the only multi-input coder we support. It takes four input streams
         // (main, call, jump and range-coder) and produces a single output stream.
         if coder.encoder_method_id() == EncoderMethod::ID_BCJ2 {
-            let num_in_streams = coder.num_in_streams as usize;
+            let num_in_streams = coder.num_in_streams() as usize;
             // The BCJ2 decoder indexes exactly four input streams; reject a malformed count
             // up front instead of handing a short/long input list to the upstream decoder.
             if num_in_streams != 4 {
@@ -2649,7 +3413,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     "BCJ2 coder must declare exactly four input streams",
                 ));
             }
-            let mut inputs: Vec<Box<dyn Read>> = Vec::with_capacity(num_in_streams);
+            let mut inputs: Vec<Box<dyn DecodeRead>> = Vec::with_capacity(num_in_streams);
             for i in start_index..start_index + num_in_streams {
                 let input = Self::get_in_stream(
                     block,
@@ -2661,10 +3425,12 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     opts,
                     chain,
                 )?;
-                inputs.push(chain.pipeline.here(input));
+                inputs.push(chain.pipeline.top(input));
             }
             return Ok(Stage::Here(Box::new(crate::decoder::ReadOnly(
-                Bcj2Reader::new(inputs, uncompressed_len as u64),
+                Bcj2Reader::with_chunks(inputs, uncompressed_len as u64, |input, max, spare| {
+                    input.take_chunk(max, spare)
+                }),
             ))));
         }
 
@@ -2728,9 +3494,9 @@ impl<R: Read + Seek> ArchiveReader<R> {
     /// How [`ArchiveReader::for_each_entries`] walks the folders: every one
     /// alone on the calling thread, unless there is a positional source and
     /// more than one thread to share among runs of small folders.
-    fn folder_phases(&self) -> Vec<FolderPhase> {
+    fn folder_phases(&self) -> impl Iterator<Item = FolderPhase> + use<R> {
         #[cfg(not(target_arch = "wasm32"))]
-        if self.positional.is_some() && self.thread_count > 1 {
+        let planned = if self.positional.is_some() && self.thread_count > 1 {
             let folders = self.archive.blocks.iter().map(|block| {
                 let estimate = block.coders.iter().try_fold(0u64, |sum, coder| {
                     crate::container::coder_memory_estimate(coder)
@@ -2739,11 +3505,28 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 });
                 (block.get_unpack_size(), estimate.unwrap_or(u64::MAX))
             });
-            return plan_folders(folders, self.thread_count, self.limits.memory_limit_bytes);
-        }
-        (0..self.archive.blocks.len())
-            .map(|block| FolderPhase::Alone { block })
-            .collect()
+            Some(plan_folders(
+                folders,
+                self.thread_count,
+                self.limits.memory_limit_bytes,
+            ))
+        } else {
+            None
+        };
+        #[cfg(target_arch = "wasm32")]
+        let planned: Option<Vec<FolderPhase>> = None;
+        // Sequential decoding needs only a cursor, not one scheduling record
+        // per folder. The returned iterator owns its plan and never borrows
+        // the reader while callbacks decode the next block.
+        let sequential_end = if planned.is_some() {
+            0
+        } else {
+            self.archive.blocks.len()
+        };
+        planned
+            .into_iter()
+            .flatten()
+            .chain((0..sequential_end).map(|block| FolderPhase::Alone { block }))
     }
 
     /// One folder, decoded on the calling thread with the reader's own thread
@@ -2755,6 +3538,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let block_decoder = BlockDecoder {
             thread_count: self.thread_count,
             adaptive_lzma2: self.adaptive_lzma2,
+            input_complete: self.input_complete,
+            positional: self.positional.as_ref(),
             verify_checksums: self.verify_checksums,
             lzma2: Arc::clone(&self.lzma2),
             block_index,
@@ -2919,6 +3704,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 BlockDecoder {
                     thread_count: self.thread_count,
                     adaptive_lzma2: self.adaptive_lzma2,
+                    input_complete: self.input_complete,
+                    positional: self.positional.as_ref(),
                     verify_checksums: self.verify_checksums,
                     lzma2: Arc::clone(&self.lzma2),
                     block_index,
@@ -2959,6 +3746,9 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     limits: &self.limits,
                     threads: self.thread_count,
                     adaptive_lzma2: self.adaptive_lzma2,
+                    input_complete: self.input_complete,
+                    positional: self.positional.as_ref(),
+                    single_run_lzma2: false,
                     verify_checksums: self.verify_checksums,
                     lzma2_control: Some(&self.lzma2),
                     // One file is read here and its checksum is verified as it
@@ -3169,6 +3959,8 @@ fn read_to_stream_end<R: Read>(reader: &mut R, mut left: u64) -> io::Result<()> 
 pub struct BlockDecoder<'a, R: Read + Seek> {
     thread_count: u32,
     adaptive_lzma2: bool,
+    input_complete: bool,
+    positional: Option<&'a Arc<dyn ReadAt>>,
     verify_checksums: bool,
     lzma2: Arc<Lzma2Control>,
     block_index: usize,
@@ -3226,6 +4018,8 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         Self {
             thread_count,
             adaptive_lzma2: false,
+            input_complete: false,
+            positional: None,
             verify_checksums: true,
             lzma2: Arc::new(Lzma2Control::new(thread_count)),
             block_index,
@@ -3235,6 +4029,12 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
             limits,
             on_sub_stream_complete: None,
         }
+    }
+
+    /// Allows complete-input framing inspection, as
+    /// [`ArchiveReader::set_input_complete`]. Defaults to false.
+    pub fn set_input_complete(&mut self, complete: bool) {
+        self.input_complete = complete;
     }
 
     /// Sets how many threads this block's LZMA2 coder may decode on, clamped
@@ -3317,6 +4117,8 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         let Self {
             thread_count,
             adaptive_lzma2,
+            input_complete,
+            positional,
             verify_checksums,
             lzma2,
             block_index,
@@ -3339,8 +4141,11 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
             limits: &limits,
             threads: thread_count,
             adaptive_lzma2,
+            input_complete,
+            positional,
             verify_checksums,
             lzma2_control: Some(&lzma2),
+            single_run_lzma2: false,
             checksum_splits: &splits,
             // Every file below is checked against its CRC as it is read, on
             // this thread or folded from the workers'.
@@ -3371,7 +4176,11 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         let start = archive.stream_map.block_first_file_index[block_index];
         let file_count = archive.blocks[block_index].num_unpack_sub_streams;
 
-        let first_sub_stream = archive.stream_map.block_first_sub_stream_index[block_index];
+        let first_sub_stream = archive
+            .stream_map
+            .block_first_sub_stream_index
+            .get(block_index)
+            .expect("validated sub-stream mapping");
         // Where each file starts inside the block's uncompressed stream: the
         // coordinate the parallel decoder's output blocks carry, so a folded
         // checksum and a file are in the same space.
@@ -4295,6 +5104,260 @@ mod count_limit_tests {
     }
 }
 
+#[cfg(test)]
+mod metadata_wire_tests {
+    use super::*;
+
+    fn parse_substreams(archive: &mut Archive, mut wire: &[u8]) -> Result<(), Error> {
+        let len = wire.len();
+        Archive::read_sub_streams_info(
+            &mut wire,
+            archive,
+            HeaderBounds::new(len, &ArchiveLimits::default()),
+        )
+    }
+
+    #[test]
+    fn omitted_substream_crcs_inherit_only_single_stream_folders() {
+        for crc in [0, 0x8000_0000u32, u32::MAX] {
+            for defined in [false, true] {
+                let mut archive = Archive::default();
+                let mut block = Block::default();
+                block.has_crc = defined;
+                block.crc = u64::from(crc);
+                archive.blocks.push(block);
+                parse_substreams(&mut archive, &[K_END]).unwrap();
+                assert_eq!(archive.sub_stream(0).unwrap().crc, defined.then_some(crc));
+                archive.blocks[0].has_crc = !defined;
+                archive.blocks[0].crc ^= u64::MAX;
+                assert_eq!(archive.sub_stream(0).unwrap().crc, defined.then_some(crc));
+            }
+        }
+
+        for explicit in [false, true] {
+            let mut archive = Archive::default();
+            for crc in [7u32, 0x8000_0000, 9, u32::MAX] {
+                let mut block = Block::default();
+                block.has_crc = true;
+                block.crc = u64::from(crc);
+                archive.blocks.push(block);
+            }
+            let mut wire = vec![K_NUM_UNPACK_STREAM, 0, 1, 2, 1, K_SIZE, 0];
+            if explicit {
+                // Only the two-stream folder consumes digest bits/values.
+                wire.extend_from_slice(&[K_CRC, 0, 0x80]);
+                wire.extend_from_slice(&0xfedc_ba98u32.to_le_bytes());
+            }
+            wire.push(K_END);
+            parse_substreams(&mut archive, &wire).unwrap();
+            let crcs: Vec<_> = (0..4).map(|i| archive.sub_stream(i).unwrap().crc).collect();
+            assert_eq!(
+                crcs,
+                [
+                    Some(0x8000_0000),
+                    explicit.then_some(0xfedc_ba98),
+                    None,
+                    Some(u32::MAX)
+                ]
+            );
+            assert!(archive.sub_stream(4).is_none());
+        }
+    }
+
+    #[test]
+    fn malformed_substream_crcs_do_not_publish_a_partial_snapshot() {
+        let mut archive = Archive::default();
+        let mut block = Block::default();
+        block.has_crc = true;
+        block.crc = 0x8000_0000;
+        archive.blocks.push(block);
+        parse_substreams(&mut archive, &[K_END]).unwrap();
+        for wire in [vec![], vec![K_CRC], vec![K_CRC, 1], vec![K_NAME]] {
+            let error = parse_substreams(&mut archive, &wire).unwrap_err();
+            if wire == [K_NAME] {
+                assert!(matches!(error, Error::BadTerminatedSubStreamsInfo));
+            } else {
+                assert!(
+                    matches!(error, Error::Io(ref e, _) if e.kind() == io::ErrorKind::UnexpectedEof)
+                );
+            }
+            assert_eq!(archive.sub_stream(0).unwrap().crc, Some(0x8000_0000));
+        }
+        // An explicitly required digest must still be fully present.
+        archive.blocks[0].has_crc = false;
+        let error = parse_substreams(&mut archive, &[K_CRC, 1, 0, 0, 0]).unwrap_err();
+        assert!(matches!(error, Error::Io(ref e, _) if e.kind() == io::ErrorKind::UnexpectedEof));
+        assert_eq!(archive.sub_stream(0).unwrap().crc, Some(0x8000_0000));
+    }
+
+    fn archive_with_inherited_crc(data: &[u8]) -> Vec<u8> {
+        assert!(!data.is_empty() && data.len() < 120);
+        // One uncompressed LZMA2 chunk, with a dictionary reset and end marker.
+        let mut packed = vec![1, 0, (data.len() - 1) as u8];
+        packed.extend_from_slice(data);
+        packed.push(0);
+        let mut header = vec![
+            K_HEADER,
+            K_MAIN_STREAMS_INFO,
+            K_PACK_INFO,
+            0,
+            1,
+            K_SIZE,
+            packed.len() as u8,
+            K_END,
+            K_UNPACK_INFO,
+            K_FOLDER,
+            1,
+            0,
+            1,
+            0x21,
+            0x21,
+            1,
+            0,
+            K_CODERS_UNPACK_SIZE,
+            data.len() as u8,
+            K_CRC,
+            1,
+        ];
+        header.extend_from_slice(&crc32(data).to_le_bytes());
+        header.extend_from_slice(&[
+            K_END,
+            K_SUB_STREAMS_INFO,
+            K_END,
+            K_END,
+            K_FILES_INFO,
+            1,
+            K_END,
+            K_END,
+        ]);
+        let mut start = Vec::new();
+        start.extend_from_slice(&(packed.len() as u64).to_le_bytes());
+        start.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        start.extend_from_slice(&crc32(&header).to_le_bytes());
+        let mut bytes = vec![0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c, 0, 4];
+        bytes.extend_from_slice(&crc32(&start).to_le_bytes());
+        bytes.extend_from_slice(&start);
+        bytes.extend_from_slice(&packed);
+        bytes.extend_from_slice(&header);
+        bytes
+    }
+
+    #[test]
+    fn inherited_crc_reaches_entry_and_positional_completion_paths() {
+        use std::sync::{Mutex, atomic::AtomicBool};
+        let data = b"folder checksum without a substream CRC property";
+        for damaged in [false, true] {
+            let mut bytes = archive_with_inherited_crc(data);
+            if damaged {
+                bytes[35] ^= 1;
+            }
+            for direct in [false, true] {
+                let mut reader =
+                    ArchiveReader::new(io::Cursor::new(bytes.clone()), Password::empty()).unwrap();
+                assert!(reader.archive().files[0].has_crc);
+                assert_eq!(reader.archive().files[0].crc, u64::from(crc32(data)));
+                assert_eq!(
+                    reader.archive().sub_stream(0).unwrap().crc,
+                    Some(crc32(data))
+                );
+                let reports = Arc::new(Mutex::new(Vec::new()));
+                let hook = reports.clone();
+                reader.set_sub_stream_complete_hook(move |event| {
+                    hook.lock().unwrap().push(event.crc32)
+                });
+                let mut output = Vec::new();
+                let result = if direct {
+                    reader.for_each_entries_direct(|_, input| {
+                        input.write_rest(&mut output)?;
+                        Ok(true)
+                    })
+                } else {
+                    reader.for_each_entries(|_, input| {
+                        io::copy(input, &mut output)?;
+                        Ok(true)
+                    })
+                };
+                if damaged {
+                    assert!(matches!(
+                        result,
+                        Err(Error::BlockDecode {
+                            kind: crate::BlockErrorKind::ChecksumMismatch,
+                            ..
+                        })
+                    ));
+                    assert!(reports.lock().unwrap().is_empty());
+                } else {
+                    result.unwrap();
+                    assert_eq!(output, data);
+                    assert_eq!(*reports.lock().unwrap(), [crc32(data)]);
+                }
+            }
+            let bytes = Arc::new(bytes);
+            let archive =
+                Archive::read(&mut io::Cursor::new(bytes.as_slice()), &Password::empty()).unwrap();
+            let folder = crate::PositionalLzma2Folder::new(
+                Arc::new(archive),
+                bytes.clone(),
+                0,
+                ArchiveLimits::default(),
+            )
+            .unwrap()
+            .unwrap();
+            let pack = folder.packed_range();
+            let mut scanner = folder.scanner();
+            scanner
+                .feed(&bytes[pack.offset as usize..pack.end() as usize])
+                .unwrap();
+            let run = scanner.next_run().unwrap();
+            scanner.finish().unwrap();
+            let completion = run
+                .decode(&AtomicBool::new(false), &mut |_, bytes: &[u8]| {
+                    Ok(bytes.len())
+                })
+                .unwrap();
+            let result = folder.verify_runs(&[completion]);
+            if damaged {
+                assert!(matches!(
+                    result,
+                    Err(Error::BlockDecode {
+                        kind: crate::BlockErrorKind::ChecksumMismatch,
+                        ..
+                    })
+                ));
+            } else {
+                let events = result.unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].crc32, crc32(data));
+            }
+        }
+    }
+
+    #[test]
+    fn substream_crc_keeps_all_wire_bits_for_explicit_and_inherited_values() {
+        for crc in [0x8000_0000u32, u32::MAX] {
+            for inherited in [false, true] {
+                let mut block = Block::default();
+                block.has_crc = inherited;
+                block.crc = u64::from(crc);
+                let mut archive = Archive::default();
+                archive.blocks.push(block);
+                let mut wire = vec![K_CRC, 1];
+                if !inherited {
+                    wire.extend_from_slice(&crc.to_le_bytes());
+                }
+                wire.push(K_END);
+                Archive::read_sub_streams_info(
+                    &mut wire.as_slice(),
+                    &mut archive,
+                    HeaderBounds::new(wire.len(), &ArchiveLimits::default()),
+                )
+                .unwrap();
+                assert_eq!(archive.sub_stream(0).unwrap().crc, Some(crc));
+            }
+        }
+    }
+}
+
 #[cfg(all(test, feature = "compress"))]
 mod block_checksum_tests {
     use std::io::Cursor;
@@ -4351,6 +5414,47 @@ mod block_checksum_tests {
         )
         .expect("stack");
         let err = io::copy(&mut rd, &mut io::sink()).expect_err("the borrowed CRC is checked");
+        assert!(Error::from(err).is_checksum_failure());
+    }
+
+    #[test]
+    fn public_file_and_block_crc_values_are_not_narrowed() {
+        let (mut source, mut archive) = one_file_with_a_wrong_borrowed_crc();
+        archive.files[0].crc |= 1u64 << 32;
+        let password = Password::empty();
+        let err = BlockDecoder::new(1, 0, &archive, &password, &mut source)
+            .for_each_entries(&mut |_, rd| {
+                io::copy(rd, &mut io::sink())?;
+                Ok(true)
+            })
+            .expect_err("public file CRC retains its high bits");
+        // Entry iteration locates decode failures after the verifier has
+        // compared the full public CRC value.
+        assert!(matches!(
+            err,
+            Error::BlockDecode {
+                block_index: 0,
+                packed_offset,
+                kind: crate::BlockErrorKind::ChecksumMismatch,
+                ..
+            } if packed_offset == archive.block_pack_streams(0)[0].offset
+        ));
+
+        let (mut source, mut archive) = one_file_with_a_wrong_borrowed_crc();
+        archive.blocks[0].has_crc = true;
+        archive.blocks[0].crc = archive.files[0].crc | (1u64 << 32);
+        let limits = ArchiveLimits::default();
+        let opts = DecodeOptions::header(&limits);
+        let (mut rd, _) = ArchiveReader::<Cursor<Vec<u8>>>::build_decode_stack(
+            &mut source,
+            &archive,
+            0,
+            &password,
+            &opts,
+        )
+        .expect("stack");
+        let err =
+            io::copy(&mut rd, &mut io::sink()).expect_err("public block CRC retains its high bits");
         assert!(Error::from(err).is_checksum_failure());
     }
 }
@@ -4446,7 +5550,7 @@ mod header_damage_tests {
     #[test]
     fn a_store_block_that_declares_more_than_was_packed_ends_early() {
         let (mut source, mut archive) = one_file(EncoderMethod::COPY);
-        archive.blocks[0].unpack_sizes[0] += 64;
+        archive.blocks[0].unpack_sizes_mut()[0] += 64;
         archive.files[0].size += 64;
         archive.files[0].has_crc = false;
         for verify in [true, false] {
@@ -4468,7 +5572,7 @@ mod header_damage_tests {
     fn coder_properties_that_cannot_be_read_are_not_a_password_error() {
         let (mut source, mut archive) = one_file(EncoderMethod::LZMA);
         // No `lc`, `lp` and `pb` encode to this.
-        archive.blocks[0].coders[0].properties[0] = 0xFF;
+        archive.blocks[0].coders[0].properties_mut()[0] = 0xFF;
         for password in [Password::empty(), Password::from("the password of the job")] {
             match read_all(&archive, &password, &mut source, true) {
                 Err(Error::BlockDecode {

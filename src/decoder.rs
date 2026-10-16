@@ -51,6 +51,14 @@ pub(crate) struct DecodeOptions<'a> {
     pub(crate) threads: u32,
     /// Build the LZMA2 coder so it can widen later even at one thread.
     pub(crate) adaptive_lzma2: bool,
+    /// The caller permits framing reads anywhere in the complete input.
+    pub(crate) input_complete: bool,
+    /// The same packed bytes with independent cursors. Only complete-input
+    /// graph decoding may hand these cursors to pipeline workers.
+    pub(crate) positional: Option<&'a Arc<dyn crate::positional::ReadAt>>,
+    /// Complete seekable framing proved a lone unfiltered LZMA2 run.
+    /// Keep its control/CRC plan, but enter the ring without read-ahead.
+    pub(crate) single_run_lzma2: bool,
     /// Whether the header's checksums are to be checked at all. False only
     /// when the caller has said it verifies the bytes by other means.
     pub(crate) verify_checksums: bool,
@@ -98,6 +106,9 @@ impl<'a> DecodeOptions<'a> {
             limits,
             threads: 1,
             adaptive_lzma2: false,
+            input_complete: false,
+            positional: None,
+            single_run_lzma2: false,
             verify_checksums: true,
             lzma2_control: None,
             checksum_splits: &[],
@@ -148,6 +159,25 @@ impl<'a> DecodeOptions<'a> {
 /// writes them on has paid for a buffer and a copy it did not need. Every
 /// other stage keeps the default and is read.
 pub(crate) trait DecodeRead: Read {
+    /// Whether this fixed chain supports borrowed delivery. A supported
+    /// reader may decline one span at a dictionary boundary and resume after
+    /// an ordinary read; unsupported chains keep their existing push/copy path.
+    fn supports_borrowed(&self) -> bool {
+        false
+    }
+
+    /// One complete Read-equivalent span, validated by outer wrappers before
+    /// delivery. Unsupported must leave input and state untouched. Unlike
+    /// push, this preserves the copying Read path's error-side visibility.
+    fn read_borrowed(
+        &mut self,
+        max: usize,
+        sink: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> Option<std::io::Result<usize>> {
+        let _ = (max, sink);
+        None
+    }
+
     /// Hands up to `max` of the next bytes to `sink`, in order and straight
     /// from this stage's own output, and says how many that was. `Ok(0)` is
     /// the end of the stream, as it is from `read`.
@@ -158,17 +188,58 @@ pub(crate) trait DecodeRead: Read {
         let _ = (max, sink);
         None
     }
+
+    /// Exchanges `spare` for an owned piece of at most `max` bytes. On
+    /// success its length equals the returned count; zero means EOF. `None`
+    /// leaves both the stream position and `spare` unchanged for a Read
+    /// fallback. Only queued pipeline output currently implements this.
+    fn take_chunk(&mut self, max: usize, spare: &mut Vec<u8>) -> Option<std::io::Result<usize>> {
+        let _ = (max, spare);
+        None
+    }
 }
 
 impl<T: DecodeRead + ?Sized> DecodeRead for Box<T> {
+    fn supports_borrowed(&self) -> bool {
+        (**self).supports_borrowed()
+    }
+
+    fn read_borrowed(
+        &mut self,
+        max: usize,
+        sink: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> Option<std::io::Result<usize>> {
+        (**self).read_borrowed(max, sink)
+    }
+
     fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<std::io::Result<usize>> {
         (**self).push(max, sink)
+    }
+
+    fn take_chunk(&mut self, max: usize, spare: &mut Vec<u8>) -> Option<std::io::Result<usize>> {
+        (**self).take_chunk(max, spare)
     }
 }
 
 impl<T: DecodeRead + ?Sized> DecodeRead for &mut T {
+    fn supports_borrowed(&self) -> bool {
+        (**self).supports_borrowed()
+    }
+
+    fn read_borrowed(
+        &mut self,
+        max: usize,
+        sink: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> Option<std::io::Result<usize>> {
+        (**self).read_borrowed(max, sink)
+    }
+
     fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<std::io::Result<usize>> {
         (**self).push(max, sink)
+    }
+
+    fn take_chunk(&mut self, max: usize, spare: &mut Vec<u8>) -> Option<std::io::Result<usize>> {
+        (**self).take_chunk(max, spare)
     }
 }
 
@@ -184,10 +255,104 @@ impl<R: Read> Read for ReadOnly<R> {
 
 impl<R: Read> DecodeRead for ReadOnly<R> {}
 
+/// Pushes from the pack buffer already charged by the chain's input estimate.
+/// COPY needs no second output allocation when this is its source.
+pub(crate) struct BufferedInput<R>(pub(crate) std::io::BufReader<R>);
+
+impl<R: Read> Read for BufferedInput<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl<R: Read> DecodeRead for BufferedInput<R> {
+    fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<std::io::Result<usize>> {
+        use std::io::BufRead;
+
+        if max == 0 {
+            return Some(Ok(0));
+        }
+        let size = loop {
+            match self.0.fill_buf() {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Some(Err(error)),
+                Ok(bytes) => {
+                    let size = bytes.len().min(max);
+                    if size != 0 {
+                        sink(&bytes[..size]);
+                    }
+                    break size;
+                }
+            }
+        };
+        self.0.consume(size);
+        Some(Ok(size))
+    }
+}
+
+/// Maximum owned output for a COPY or AES push. Allocated only on demand.
+pub(crate) const PUSH_BUFFER_BYTES: usize = 1 << 20;
+
+/// COPY's push buffer belongs to the coder; ordinary reads use the caller's.
+pub(crate) struct CopyReader<R> {
+    input: R,
+    buffer: Vec<u8>,
+    push_enabled: bool,
+}
+
+impl<R: Read> Read for CopyReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.input.read(buffer)
+    }
+}
+
+impl<R: Read> CopyReader<R> {
+    fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> std::io::Result<usize> {
+        let want = max.min(PUSH_BUFFER_BYTES);
+        if want == 0 {
+            return Ok(0);
+        }
+        if self.buffer.len() < want {
+            self.buffer
+                .try_reserve_exact(want - self.buffer.len())
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
+            self.buffer.resize(want, 0);
+        }
+        let read = loop {
+            match self.input.read(&mut self.buffer[..want]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => break result?,
+            }
+        };
+        if read != 0 {
+            sink(&self.buffer[..read]);
+        }
+        Ok(read)
+    }
+}
+
 impl<R: Read> DecodeRead for Decoder<R> {
+    fn supports_borrowed(&self) -> bool {
+        matches!(self, Decoder::Lzma2(r) if r.supports_borrowed())
+    }
+
+    fn read_borrowed(
+        &mut self,
+        max: usize,
+        sink: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> Option<std::io::Result<usize>> {
+        match self {
+            Decoder::Lzma2(r) => r.read_borrowed(max, sink),
+            _ => None,
+        }
+    }
+
     fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<std::io::Result<usize>> {
         match self {
             Decoder::Lzma2(r) => r.push(max, sink),
+            Decoder::Copy(r) if r.push_enabled => Some(r.push(max, sink)),
+            #[cfg(feature = "aes256")]
+            Decoder::Aes256Sha256(r) => Some(r.push(max, sink)),
             _ => None,
         }
     }
@@ -202,7 +367,7 @@ thread_local! {
 }
 
 pub enum Decoder<R: Read> {
-    Copy(R),
+    Copy(CopyReader<R>),
     Lzma(Box<LzmaReader<R>>),
     Lzma2(Box<Lzma2Coder<R>>),
     #[cfg(feature = "ppmd")]
@@ -264,17 +429,17 @@ fn sized_coder_memory_kb(coder: &Coder, uncompressed_len: usize) -> Option<usize
     let method_id = coder.encoder_method_id();
     if method_id == EncoderMethod::ID_LZMA {
         let dict_size = crate::codec::lzma_turbo::clamp_dictionary(
-            crate::codec::lzma_turbo::lzma_dictionary_size(&coder.properties).ok()?,
+            crate::codec::lzma_turbo::lzma_dictionary_size(coder.properties()).ok()?,
             uncompressed_len as u64,
         );
         Some(lzma2_memory_usage_kb(dict_size))
     } else if method_id == EncoderMethod::ID_LZMA2 {
-        let dict_prop = lzma2_clamped_prop(*coder.properties.first()?, uncompressed_len as u64);
+        let dict_prop = lzma2_clamped_prop(*coder.properties().first()?, uncompressed_len as u64);
         Some(lzma2_memory_usage_kb(
             lzma2_dictionary_size(&[dict_prop]).ok()?,
         ))
     } else if cfg!(feature = "ppmd") && method_id == EncoderMethod::ID_PPMD {
-        let size = coder.properties.get(1..5)?;
+        let size = coder.properties().get(1..5)?;
         let memory_size = u32::from_le_bytes([size[0], size[1], size[2], size[3]]);
         Some(ppmd_memory_kb(memory_size))
     } else {
@@ -406,17 +571,24 @@ pub fn add_decoder<I: Read>(
         )));
     };
     match method.id() {
-        EncoderMethod::ID_COPY => Ok(Decoder::Copy(input)),
+        EncoderMethod::ID_COPY => Ok(Decoder::Copy(CopyReader {
+            input,
+            buffer: Vec::new(),
+            // COPY has always required no coder allocation in the admission
+            // model. Finite-budget chains preserve their upstream push
+            // stage instead; read-only header decoding needs no output here.
+            push_enabled: opts.limits.memory_limit_bytes == u64::MAX,
+        })),
         EncoderMethod::ID_LZMA => {
             // Validate the length before touching the properties: the decoder
             // slices `[1..5]`, which would panic on an attacker-supplied short field.
-            if coder.properties.len() < 5 {
+            if coder.properties().len() < 5 {
                 return Err(Error::Other("LZMA properties too short".into()));
             }
             // Clamp before the budget check, so a coder that declares a huge
             // dictionary for a small stream is decoded rather than refused.
             let dict_size = crate::codec::lzma_turbo::clamp_dictionary(
-                crate::codec::lzma_turbo::lzma_dictionary_size(&coder.properties)?,
+                crate::codec::lzma_turbo::lzma_dictionary_size(coder.properties())?,
                 uncompressed_len as u64,
             );
             let mem_size = lzma2_memory_usage_kb(dict_size);
@@ -429,7 +601,7 @@ pub fn add_decoder<I: Read>(
             let lz = crate::codec::lzma_turbo::lzma_decoder(
                 input,
                 uncompressed_len,
-                &coder.properties,
+                coder.properties(),
                 dict_size,
             )
             .map_err(|e| Error::bad_password(e, opts.encrypted))?;
@@ -439,7 +611,7 @@ pub fn add_decoder<I: Read>(
             // The dictionary is a table index rather than a number here, so the
             // clamp comes back as the property byte the decoders are built from.
             let dict_prop = coder
-                .properties
+                .properties()
                 .first()
                 .copied()
                 .ok_or_else(|| Error::other("LZMA2 properties too short"))?;
@@ -474,8 +646,11 @@ pub fn add_decoder<I: Read>(
             if !matches!(plan, Lzma2Plan::SingleThreaded) {
                 PARALLEL_LZMA2_PLANS.with(|plans| plans.set(plans.get() + 1));
             }
-            let lz = lzma2_decoder(input, dict_prop, plan)
+            let mut lz = lzma2_decoder(input, dict_prop, plan)
                 .map_err(|e| Error::bad_password(e, opts.encrypted))?;
+            if opts.single_run_lzma2 {
+                lz.use_single_run_ring();
+            }
             Ok(Decoder::Lzma2(Box::new(lz)))
         }
         #[cfg(feature = "ppmd")]
@@ -577,7 +752,7 @@ pub fn add_decoder<I: Read>(
             // The distance is `properties[0] + 1` in the range 1..=256. Widen to `usize`
             // before the `+1` so a property byte of `0xFF` yields 256, not 0 (a `u8`
             // `wrapping_add` would wrap to a zero distance and mis-decode / divide by zero).
-            let d = coder.properties.first().map_or(1, |b| *b as usize + 1);
+            let d = coder.properties().first().map_or(1, |b| *b as usize + 1);
             let de = DeltaReader::new(input, d);
             Ok(Decoder::Delta(Box::new(de)))
         }
@@ -586,13 +761,16 @@ pub fn add_decoder<I: Read>(
             if password.is_empty() {
                 return Err(Error::PasswordRequired);
             }
-            let de = Aes256Sha256Decoder::new(
+            let mut de = Aes256Sha256Decoder::new(
                 input,
-                &coder.properties,
+                coder.properties(),
                 password,
                 opts.limits.max_aes_cycles_power,
                 opts.limits.max_aes_kdf_rounds,
             )?;
+            if opts.limits.memory_limit_bytes != u64::MAX {
+                de.keep_push_buffer_small();
+            }
             Ok(Decoder::Aes256Sha256(Box::new(de)))
         }
         _ => Err(Error::UnsupportedCompressionMethod(
@@ -605,7 +783,7 @@ pub fn add_decoder<I: Read>(
 fn get_ppmd_params(coder: &Coder, max_mem_limit_kb: usize) -> Result<PpmdParams, Error> {
     // 7-Zip reads the first five property bytes and ignores any after them.
     let props = coder
-        .properties
+        .properties()
         .get(..5)
         .ok_or_else(|| Error::other("PPMD properties too short"))?;
     let params = PpmdParams::from_7z_props(props).map_err(|_| {
@@ -658,5 +836,112 @@ mod budget_tests {
         assert_eq!(lzma2_plan_budget(1 << 20, 4 << 20, 0, 0), 0);
         assert_eq!(lzma2_plan_budget(1 << 20, 0, 4 << 20, 0), 0);
         assert_eq!(lzma2_plan_budget(u64::MAX, 4 << 20, 4 << 20, 0), u64::MAX);
+    }
+}
+
+#[cfg(test)]
+mod copy_push_tests {
+    use super::{BufferedInput, CopyReader, DecodeRead, PUSH_BUFFER_BYTES};
+    use std::io::{self, BufReader, Read};
+
+    #[test]
+    fn buffered_copy_push_uses_the_charged_input_buffer_and_one_cursor() {
+        struct Input {
+            bytes: io::Cursor<Vec<u8>>,
+            interrupt: bool,
+            destination: usize,
+        }
+        impl Read for Input {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                if std::mem::take(&mut self.interrupt) {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                self.destination = bytes.as_ptr() as usize;
+                self.bytes.read(bytes)
+            }
+        }
+        let payload: Vec<_> = (0..173).collect();
+        let mut reader = BufferedInput(BufReader::with_capacity(
+            64,
+            Input {
+                bytes: io::Cursor::new(payload.clone()),
+                interrupt: true,
+                destination: 0,
+            },
+        ));
+        assert_eq!(
+            reader
+                .push(0, &mut |_| panic!("empty push"))
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(reader.0.get_ref().interrupt);
+        let mut actual = Vec::new();
+        let mut address = 0;
+        assert_eq!(
+            reader
+                .push(13, &mut |bytes| {
+                    address = bytes.as_ptr() as usize;
+                    actual.extend_from_slice(bytes);
+                })
+                .unwrap()
+                .unwrap(),
+            13
+        );
+        assert_eq!(address, reader.0.get_ref().destination);
+        let mut middle = [0; 7];
+        reader.read_exact(&mut middle).unwrap();
+        actual.extend_from_slice(&middle);
+        while reader
+            .push(usize::MAX, &mut |bytes| {
+                assert!(bytes.len() <= 64);
+                actual.extend_from_slice(bytes);
+            })
+            .unwrap()
+            .unwrap()
+            != 0
+        {}
+        assert_eq!(actual, payload);
+        assert_eq!(reader.0.capacity(), 64);
+        assert_eq!(reader.read(&mut middle).unwrap(), 0);
+    }
+
+    #[test]
+    fn copy_push_allocates_only_the_requested_bounded_buffer() {
+        struct Input {
+            interrupt: bool,
+        }
+        impl Read for Input {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                if std::mem::take(&mut self.interrupt) {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                bytes.fill(37);
+                Ok(bytes.len())
+            }
+        }
+        let mut reader = CopyReader {
+            input: Input { interrupt: false },
+            buffer: Vec::new(),
+            push_enabled: true,
+        };
+        assert_eq!(reader.read(&mut [0; 13]).unwrap(), 13);
+        assert!(reader.buffer.is_empty());
+        assert_eq!(reader.push(0, &mut |_| panic!("empty push")).unwrap(), 0);
+        assert!(reader.buffer.is_empty());
+        reader.input.interrupt = true;
+        assert_eq!(
+            reader.push(19, &mut |b| assert_eq!(b, &[37; 19])).unwrap(),
+            19
+        );
+        assert_eq!(reader.buffer.len(), 19);
+        assert_eq!(
+            reader
+                .push(usize::MAX, &mut |b| assert_eq!(b.len(), PUSH_BUFFER_BYTES))
+                .unwrap(),
+            PUSH_BUFFER_BYTES
+        );
+        assert_eq!(reader.buffer.len(), PUSH_BUFFER_BYTES);
     }
 }

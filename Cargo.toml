@@ -9,9 +9,9 @@ readme = "README.md"
 repository = "https://github.com/scryer-media/sevenz-turbo"
 # Raised from upstream's 1.93: `lzma-turbo` requires 1.97.1.
 rust-version = "1.97.1"
-version = "0.27.0"
+version = "0.27.1"
 # Repository scaffolding that has no business in the crate archive.
-exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml"]
+exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml", "docs/**/*.json.zst"]
 
 # `tools/decode-bench` is a workspace member rather than an example because it
 # depends on upstream `sevenz-rust2` to time the fork against it, and that
@@ -24,6 +24,8 @@ resolver = "3"
 crate-type = ["cdylib", "rlib"]
 
 [features]
+# Diagnostic kernel comparisons; never enabled by default.
+kernel-ab = ["lzma-turbo/kernel-ab"]
 default = ["aes256", "aws-lc-crypto", "bzip2", "compress", "ppmd", "util"]
 # wasm has no C toolchain, so it takes the RustCrypto backend.
 default_wasm = ["aes256_wasm", "native-crypto", "bzip2", "compress", "ppmd", "util"]
@@ -82,10 +84,8 @@ bzip2 = { version = "0.6", optional = true }
 cbc = { version = "0.2", optional = true }
 flate2 = { version = "1", optional = true, features = ["zlib-rs"] }
 getrandom = { version = "0.4", optional = true }
-# From crates.io. While the two crates are developed together a `path` to the
-# sibling checkout is added here and dropped again before release
-# (`cargo xtask release` refuses to tag while it is here).
-lzma-turbo = { version = "=0.9.0", default-features = false, features = ["std", "asm", "crc", "filters"] }
+# Use the published version of the validated library checkpoint.
+lzma-turbo = { version = "=0.9.1", default-features = false, features = ["std", "asm", "crc", "filters"] }
 ppmd-turbo = { version = "0.1.1", optional = true }
 lz4_flex = { version = "0.14", optional = true }
 nt-time = { version = "0.15", optional = true }

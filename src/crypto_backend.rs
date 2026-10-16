@@ -672,7 +672,7 @@ mod tests {
         fn backends_agree_on_aes256_cbc() {
             let key = sample(32, 11);
             let iv = sample(AES_BLOCK_LEN, 12);
-            for blocks in [1usize, 2, 3, 7, 64] {
+            for blocks in [1usize, 2, 3, 7, 8, 9, 15, 16, 17, 4095, 4096, 4097] {
                 let data = sample(blocks * AES_BLOCK_LEN, 100 + blocks as u64);
 
                 let mut a = data.clone();
@@ -699,7 +699,7 @@ mod tests {
         fn backends_agree_when_driven_in_chunks() {
             let key = sample(32, 21);
             let iv = sample(AES_BLOCK_LEN, 22);
-            let data = sample(64 * AES_BLOCK_LEN, 23);
+            let data = sample(4097 * AES_BLOCK_LEN, 23);
 
             let mut oneshot = data.clone();
             AwsLcAes256Cbc::new(&key, &iv)
@@ -707,7 +707,7 @@ mod tests {
                 .decrypt(&mut oneshot)
                 .expect("aligned");
 
-            for chunk_blocks in [1usize, 2, 3, 5, 13] {
+            for chunk_blocks in [1usize, 2, 3, 5, 13, 63, 64, 65, 4096] {
                 let chunk = chunk_blocks * AES_BLOCK_LEN;
 
                 let mut aws = AwsLcAes256Cbc::new(&key, &iv).expect("sized");

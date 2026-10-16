@@ -61,11 +61,16 @@ struct State<M> {
     /// Workers that have not yet exited, so that a caller waiting on a job no
     /// worker is left to claim is told rather than left waiting.
     live: usize,
+    /// Producers sleeping because a byte queue is full, not for admission.
+    sending: usize,
 }
 
 struct Shared<M> {
     state: Mutex<State<M>>,
     changed: Condvar,
+    ready: Condvar,
+    admission: Condvar,
+    paced: bool,
     jobs: usize,
     window: usize,
     cap: usize,
@@ -124,10 +129,15 @@ impl<M> Sender<'_, M> {
                 slot.messages.push_back((message, weight));
                 slot.weight += weight;
                 drop(state);
-                self.shared.changed.notify_all();
+                self.shared.ready.notify_one();
+                if self.shared.paced {
+                    self.shared.admission.notify_all();
+                }
                 return Ok(());
             }
+            state.sending += 1;
             state = self.shared.wait(state);
+            state.sending -= 1;
         }
     }
 }
@@ -140,7 +150,10 @@ impl<M> Drop for Sender<'_, M> {
             slot.closed = true;
         }
         drop(state);
-        self.shared.changed.notify_all();
+        self.shared.ready.notify_one();
+        if self.shared.paced {
+            self.shared.admission.notify_all();
+        }
     }
 }
 
@@ -161,14 +174,24 @@ impl<M> Receiver<'_, M> {
             let slot = Shared::slot_mut(&mut state, self.job)?;
             if let Some((message, weight)) = slot.messages.pop_front() {
                 slot.weight -= weight;
+                let wake_workers = state.sending != 0;
                 drop(state);
-                self.shared.changed.notify_all();
+                if wake_workers {
+                    self.shared.changed.notify_all();
+                }
+                if self.shared.paced {
+                    self.shared.admission.notify_all();
+                }
                 return Some(message);
             }
             if slot.closed || (!slot.claimed && live == 0) {
                 return None;
             }
-            state = self.shared.wait(state);
+            state = self
+                .shared
+                .ready
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 }
@@ -184,6 +207,8 @@ impl<M> Drop for CancelGuard<'_, M> {
         state.cancelled = true;
         drop(state);
         self.0.changed.notify_all();
+        self.0.ready.notify_one();
+        self.0.admission.notify_all();
     }
 }
 
@@ -196,14 +221,19 @@ impl<M> Drop for LiveGuard<'_, M> {
         state.live -= 1;
         drop(state);
         self.0.changed.notify_all();
+        self.0.ready.notify_one();
+        self.0.admission.notify_all();
     }
 }
 
-fn worker<M, P>(shared: &Shared<M>, width: &(dyn Fn() -> usize + Sync), produce: &P)
-where
-    P: Fn(usize, &mut Sender<'_, M>),
+fn worker<M, P, S>(
+    shared: &Shared<M>,
+    width: Option<&(dyn Fn() -> usize + Sync)>,
+    produce: &P,
+    local: &mut S,
+) where
+    P: Fn(usize, &mut S, &mut Sender<'_, M>),
 {
-    let _live = LiveGuard(shared);
     loop {
         let job = {
             let mut state = shared.lock();
@@ -214,7 +244,9 @@ where
                 // One job is always let through, whatever the pace: a worker
                 // waiting here is woken by a job ending, and with none in
                 // hand there would be nothing left to wake it.
-                if state.busy < width().max(1) && state.next < state.current + shared.window {
+                if state.busy < width.map_or(usize::MAX, |pace| pace().max(1))
+                    && state.next < state.current + shared.window
+                {
                     let job = state.next;
                     state.next += 1;
                     state.busy += 1;
@@ -223,11 +255,14 @@ where
                     }
                     break job;
                 }
-                state = shared.wait(state);
+                state = shared
+                    .admission
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner);
             }
         };
         let mut sender = Sender { shared, job };
-        produce(job, &mut sender);
+        produce(job, local, &mut sender);
     }
 }
 
@@ -243,7 +278,7 @@ where
 ///
 /// Returns `None`, having run nothing, when not one worker thread could be
 /// started: the caller then does the work itself.
-#[cfg(any(feature = "compress", test))]
+#[cfg(test)]
 pub(crate) fn run<M, E, P, C>(
     jobs: usize,
     workers: usize,
@@ -257,10 +292,47 @@ where
     P: Fn(usize, &mut Sender<'_, M>) + Sync,
     C: FnMut(usize, &mut Receiver<'_, M>) -> Result<(), E>,
 {
-    run_paced(jobs, workers, window, cap, &|| usize::MAX, produce, consume)
+    run_inner(
+        jobs,
+        workers,
+        window,
+        cap,
+        None,
+        (|| (), |job, _, tx| produce(job, tx)),
+        consume,
+    )
 }
 
-/// [`run`], with the jobs in hand at once held to what `width` answers.
+/// Runs ordered jobs with one reusable state object owned by each worker.
+/// State is constructed on its worker and need not be Send or Sync.
+#[cfg(any(feature = "compress", test))]
+pub(crate) fn run_with_state<M, E, S, I, P, C>(
+    jobs: usize,
+    workers: usize,
+    window: usize,
+    cap: usize,
+    initialize: I,
+    produce: P,
+    consume: C,
+) -> Option<Result<(), E>>
+where
+    M: Send,
+    I: Fn() -> S + Sync,
+    P: Fn(usize, &mut S, &mut Sender<'_, M>) + Sync,
+    C: FnMut(usize, &mut Receiver<'_, M>) -> Result<(), E>,
+{
+    run_inner(
+        jobs,
+        workers,
+        window,
+        cap,
+        None,
+        (initialize, produce),
+        consume,
+    )
+}
+
+/// Runs ordered jobs with the jobs in hand held to what `width` answers.
 ///
 /// `width` is asked each time a worker is free to start a job, so its answer
 /// may change while the run goes on. A job already started is finished at any
@@ -276,13 +348,40 @@ pub(crate) fn run_paced<M, E, P, C>(
     cap: usize,
     width: &(dyn Fn() -> usize + Sync),
     produce: P,
-    mut consume: C,
+    consume: C,
 ) -> Option<Result<(), E>>
 where
     M: Send,
     P: Fn(usize, &mut Sender<'_, M>) + Sync,
     C: FnMut(usize, &mut Receiver<'_, M>) -> Result<(), E>,
 {
+    run_inner(
+        jobs,
+        workers,
+        window,
+        cap,
+        Some(width),
+        (|| (), |job, _, tx| produce(job, tx)),
+        consume,
+    )
+}
+
+fn run_inner<M, E, S, I, P, C>(
+    jobs: usize,
+    workers: usize,
+    window: usize,
+    cap: usize,
+    width: Option<&(dyn Fn() -> usize + Sync)>,
+    work: (I, P),
+    mut consume: C,
+) -> Option<Result<(), E>>
+where
+    M: Send,
+    I: Fn() -> S + Sync,
+    P: Fn(usize, &mut S, &mut Sender<'_, M>) + Sync,
+    C: FnMut(usize, &mut Receiver<'_, M>) -> Result<(), E>,
+{
+    let (initialize, produce) = work;
     let shared = Shared {
         state: Mutex::new(State {
             next: 0,
@@ -291,8 +390,12 @@ where
             slots: VecDeque::new(),
             cancelled: false,
             live: 0,
+            sending: 0,
         }),
         changed: Condvar::new(),
+        ready: Condvar::new(),
+        admission: Condvar::new(),
+        paced: width.is_some(),
         jobs,
         window: window.max(1),
         cap: cap.max(1),
@@ -305,7 +408,12 @@ where
             shared.lock().live += 1;
             let spawned = std::thread::Builder::new()
                 .name(format!("sevenz-folder-{index}"))
-                .spawn_scoped(scope, || worker(&shared, width, &produce));
+                .spawn_scoped(scope, || {
+                    // Count this worker out even if state construction panics.
+                    let _live = LiveGuard(&shared);
+                    let mut local = initialize();
+                    worker(&shared, width, &produce, &mut local);
+                });
             if spawned.is_ok() {
                 started += 1;
             } else {
@@ -336,6 +444,13 @@ where
             }
             drop(state);
             shared.changed.notify_all();
+            if shared.paced || result.is_err() {
+                shared.admission.notify_all();
+            } else {
+                // Advancing one job opens exactly one place in the fixed
+                // window. A byte-queue waiter cannot consume this wakeup.
+                shared.admission.notify_one();
+            }
             if let Err(error) = result {
                 outcome = Err(error);
                 break;
@@ -353,6 +468,78 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn worker_local_state_is_reused_and_dropped_after_cancellation() {
+        use std::{cell::Cell, rc::Rc};
+        struct Local<'a> {
+            owner: std::thread::ThreadId,
+            calls: Rc<Cell<usize>>,
+            dropped: &'a AtomicUsize,
+        }
+        impl Drop for Local<'_> {
+            fn drop(&mut self) {
+                assert_eq!(self.owner, std::thread::current().id());
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let created = AtomicUsize::new(0);
+        let dropped = AtomicUsize::new(0);
+        let mut seen = std::collections::HashMap::new();
+        let result = run_with_state::<_, (), _, _, _, _>(
+            64,
+            4,
+            8,
+            1,
+            || {
+                created.fetch_add(1, Ordering::SeqCst);
+                Local {
+                    owner: std::thread::current().id(),
+                    calls: Rc::new(Cell::new(0)),
+                    dropped: &dropped,
+                }
+            },
+            |job, local, tx| {
+                assert_eq!(local.owner, std::thread::current().id());
+                local.calls.set(local.calls.get() + 1);
+                let _ = tx.send((job, local.owner, local.calls.get()), 1);
+            },
+            |job, rx| {
+                let (from, owner, call) = rx.recv().unwrap();
+                assert_eq!(from, job);
+                let previous = seen.entry(owner).or_insert(0);
+                assert_eq!(call, *previous + 1);
+                *previous = call;
+                if job == 15 { Err(()) } else { Ok(()) }
+            },
+        );
+        assert!(matches!(result, Some(Err(()))));
+        assert!(seen.values().any(|&calls| calls > 1));
+        assert!(created.load(Ordering::SeqCst) <= 4);
+        assert_eq!(
+            created.load(Ordering::SeqCst),
+            dropped.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn a_panicking_state_constructor_does_not_leave_the_caller_waiting() {
+        let result = std::panic::catch_unwind(|| {
+            run_with_state::<(), (), (), _, _, _>(
+                4,
+                1,
+                2,
+                1,
+                || panic!("state construction failed"),
+                |_, _, _| unreachable!(),
+                |_, rx| {
+                    assert!(rx.recv().is_none());
+                    Ok(())
+                },
+            )
+        });
+        assert!(result.is_err());
+    }
 
     #[test]
     fn output_arrives_in_job_order() {

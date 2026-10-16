@@ -244,7 +244,7 @@ fn decompress_impl<R: Read + Seek>(
 /// Both `/` and `\` are treated as separators so Windows-style names are validated on
 /// every platform, and any `..`, root, or drive-prefix component causes rejection.
 #[cfg(not(target_arch = "wasm32"))]
-fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf, Error> {
+pub(crate) fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf, Error> {
     use std::path::Component;
 
     if let Some(reason) = crate::archive::unsafe_path_reason(entry_name) {
@@ -318,7 +318,7 @@ pub fn default_entry_extract_fn(
     extract_in_root(&root, entry, reader, &relative)
 }
 
-fn open_extract_root(dest: &Path) -> Result<cap_std::fs::Dir, Error> {
+pub(crate) fn open_extract_root(dest: &Path) -> Result<cap_std::fs::Dir, Error> {
     let dest = if dest.as_os_str().is_empty() {
         Path::new(".")
     } else {
@@ -340,20 +340,33 @@ fn decompress_default<R: Read + Seek>(
     limits: ArchiveLimits,
 ) -> Result<(), Error> {
     let mut seven = ArchiveReader::with_limits(src_reader, password, limits)?;
-    let root = open_extract_root(dest.as_ref())?;
-    seven.for_each_entries(|entry, reader| {
-        let relative = safe_join(Path::new(""), entry.name())?;
-        extract_in_root(&root, entry, reader, &relative)
-    })
+    seven.extract_to(dest)
 }
 
-fn extract_in_root(
+pub(crate) fn extract_in_root(
     root: &cap_std::fs::Dir,
     entry: &ArchiveEntry,
     reader: &mut dyn Read,
     relative: &Path,
 ) -> Result<bool, Error> {
-    use std::io::{BufWriter, ErrorKind, Write};
+    use std::io::{BufWriter, Write};
+
+    let Some(file) = create_extract_entry(root, entry, relative)? else {
+        return Ok(true);
+    };
+    let mut writer = BufWriter::new(file);
+    std::io::copy(reader, &mut writer)?;
+    writer.flush()?;
+    set_extract_times(writer.get_ref(), entry);
+    Ok(true)
+}
+
+pub(crate) fn create_extract_entry(
+    root: &cap_std::fs::Dir,
+    entry: &ArchiveEntry,
+    relative: &Path,
+) -> Result<Option<std::fs::File>, Error> {
+    use std::io::ErrorKind;
 
     // Reject existing links, including links to locations within the root.
     // This check sets policy; cap-std provides confinement if the tree changes
@@ -372,7 +385,7 @@ fn extract_in_root(
     }
     if entry.is_directory() {
         root.create_dir_all(relative)?;
-        return Ok(true);
+        return Ok(None);
     }
     if let Some(parent) = relative.parent().filter(|p| !p.as_os_str().is_empty()) {
         root.create_dir_all(parent)?;
@@ -390,16 +403,16 @@ fn extract_in_root(
             cap_std::fs::OpenOptions::new().write(true).create_new(true),
         )?
         .into_std();
-    let mut writer = BufWriter::new(file);
-    std::io::copy(reader, &mut writer)?;
-    writer.flush()?;
+    Ok(Some(file))
+}
+
+pub(crate) fn set_extract_times(file: &std::fs::File, entry: &ArchiveEntry) {
     let file_times = FileTimes::new()
         .set_accessed(entry.access_date().into())
         .set_modified(entry.last_modified_date().into());
     #[cfg(any(windows, target_os = "macos"))]
     let file_times = file_times.set_created(entry.creation_date().into());
-    let _ = writer.get_ref().set_times(file_times);
-    Ok(true)
+    let _ = file.set_times(file_times);
 }
 
 #[cfg(test)]

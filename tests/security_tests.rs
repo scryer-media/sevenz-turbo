@@ -996,8 +996,8 @@ fn a_coder_declaring_absurdly_many_streams_is_refused() {
     );
 }
 
-/// A header with blocks but no files info. The stream map is built while the
-/// files info is read, so without one it stayed empty while `blocks` did not —
+/// A header with blocks but no files info. The stream map used to be built while
+/// files info was read, so without one it stayed empty while `blocks` did not —
 /// and the first decode indexed a zero-length `block_first_pack_stream_index`.
 /// Found by the `folder_graph` fuzz target; this is its input.
 #[test]
@@ -1015,6 +1015,82 @@ fn a_header_with_blocks_but_no_files_does_not_panic() {
             let _ = std::io::copy(rd, &mut std::io::sink());
             Ok(true)
         });
+    }
+}
+
+#[test]
+fn plain_and_encoded_headers_finish_maps_without_files_info() {
+    let mut header = vec![
+        K_HEADER,
+        K_MAIN_STREAMS_INFO,
+        K_PACK_INFO,
+        0,
+        1,
+        K_SIZE,
+        1,
+        K_END,
+        K_UNPACK_INFO,
+        K_FOLDER,
+        1,
+        0,
+        1,
+        1,
+        0,
+        K_CODERS_UNPACK_SIZE,
+        1,
+        K_END,
+        K_SUB_STREAMS_INFO,
+        K_NUM_UNPACK_STREAM,
+        0,
+        K_END,
+        K_END,
+        K_END,
+    ];
+    // One COPY folder with no sub-streams or FilesInfo. The final maps must
+    // exist even though the file parser was never called.
+    let wrap = |header: &[u8], encoded: bool| {
+        if encoded {
+            let (mut info, packed_header) = chained_lzma2_streams_info(header, 1);
+            info[1] = 1; // encoded header follows the one-byte data pack stream
+            let mut packed = vec![0xAA];
+            packed.extend_from_slice(&packed_header);
+            let mut next = vec![0x17]; // K_ENCODED_HEADER
+            next.extend_from_slice(&info);
+            next.push(K_END); // streams info end
+            raw_7z_with_packed(&packed, &next)
+        } else {
+            raw_7z_with_packed(&[0xAA], header)
+        }
+    };
+    for encoded in [false, true] {
+        let reader =
+            ArchiveReader::new(Cursor::new(wrap(&header, encoded)), Password::empty()).unwrap();
+        let archive = reader.archive();
+        assert!(archive.files.is_empty());
+        assert_eq!(archive.stream_map.block_first_pack_stream_index(), &[0]);
+        assert_eq!(archive.stream_map.pack_stream_offsets(), &[0]);
+        assert_eq!(archive.stream_map.block_first_file_index, [0]);
+        let ranges = archive.block_pack_streams(0);
+        assert_eq!((ranges[0].offset, ranges[0].size), (32, 1));
+
+        let mut invalid_map = header.clone();
+        invalid_map[20] = 1; // a sub-stream without a file
+        let error = ArchiveReader::with_limits(
+            Cursor::new(wrap(&invalid_map, encoded)),
+            Password::empty(),
+            ArchiveLimits::default().with_max_unpack_bytes(0),
+        )
+        .err()
+        .expect("map validation precedes output admission");
+        assert!(error.to_string().contains("more sub-streams"), "{error}");
+
+        let last = header.len() - 1;
+        header[last] = K_DUMMY;
+        let error = ArchiveReader::new(Cursor::new(wrap(&header, encoded)), Password::empty())
+            .err()
+            .expect("the header terminator is still checked");
+        assert!(matches!(error, Error::BadTerminatedHeader(K_DUMMY)));
+        header[last] = K_END;
     }
 }
 
