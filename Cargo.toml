@@ -151,6 +151,36 @@ all-features = true
 lto = "fat"
 codegen-units = 1
 
+# Tests need no debuginfo: a cold `cargo test --all-features --no-run` is
+# 20.7 s instead of 25.1 s (99 CPU-s instead of 132) without it, and the test
+# run is unchanged.
+[profile.test]
+debug = 0
+split-debuginfo = "off"
+incremental = false
+
+# Dev and test builds optimise only the crates that dominate test time; debug
+# assertions and overflow checks stay on. Each comment gives the measured cost
+# of leaving that crate at opt-level 0 with the other override in place (local
+# runs of `cargo test --all-features` on an Apple M5 Max). AWS-LC, crc-fast,
+# zlib-rs, libbz2-rs-sys, zstd-sys, lz4_flex and brotli were measured too and
+# left out: optimising them saved nothing measurable in the test run.
+
+# LZMA/LZMA2 coding, BCJ/delta filters and CRC: the test run takes 121 s instead
+# of 50 s, folder_parallel_tests 56 s instead of 17 s; it costs under 1 s of
+# cold compile and nothing warm.
+[profile.dev.package.lzma-turbo]
+opt-level = 3
+
+# PPMd: the test run takes 65 s instead of 50 s (190 CPU-s instead of 132),
+# differential_7zz_tests 6.7 s instead of 0.9 s; no measurable compile cost.
+[profile.dev.package.ppmd-turbo]
+opt-level = 3
+
+# sevenz-turbo itself stays at opt-level 0: optimising it would build all 29
+# test binaries optimised too, so a cold build takes 47 s instead of 21 s and an
+# incremental one 29 s instead of 4 s, against 17 s saved in the test run.
+
 # `--cfg sevenz_turbo_unthreaded` (through RUSTFLAGS) makes the LZMA and LZMA2
 # writers take the path a target without threads takes, so that it can be
 # tested and measured on a host that has them. Never set for a build that ships.
