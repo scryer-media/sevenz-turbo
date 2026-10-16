@@ -1290,6 +1290,20 @@ impl Archive {
             return Err(Error::NextHeaderCrcMismatch);
         }
 
+        // C/7zArcIn.c: SzArEx_Open2 accepts an empty archive without a next
+        // header only when the header is where an empty archive puts it:
+        // `nextHeaderOffset == 0 && nextHeaderCRC == 0`. The CRC half is the
+        // check above, since crc32("") is zero; an empty header anywhere else
+        // says there are packed bytes nothing describes.
+        if buf.is_empty() {
+            if start_header.next_header_offset != 0 {
+                return Err(Error::other(
+                    "empty next header at a non-zero offset: the archive is corrupt",
+                ));
+            }
+            return Ok(Archive::default());
+        }
+
         let mut archive = Archive::default();
         let mut buf_reader = buf.as_slice();
         let mut nid = buf_reader.read_u8()?;
@@ -1762,6 +1776,18 @@ impl Archive {
                 empty_file_counter += 1;
             }
         }
+        // C/7zArcIn.c: `numFiles - numEmptyStreams != ssi.NumTotalSubStreams`
+        // is SZ_ERROR_ARCHIVE. A sub-stream no file claims would leave its
+        // block mapped to files that are not its own.
+        let sub_streams = archive
+            .sub_streams_info
+            .as_ref()
+            .map_or(0, |s| s.unpack_sizes.len());
+        if non_empty_file_counter != sub_streams {
+            return Err(Error::other(
+                "Archive declares fewer streamed files than sub-streams",
+            ));
+        }
         archive.files = files;
 
         Ok(())
@@ -1863,6 +1889,13 @@ impl Archive {
                 next_block_index += 1;
                 next_block_unpack_stream_index = 0;
             }
+        }
+        // CPP/7zip/Archive/7z/7zIn.cpp: a folder no file reached starts after
+        // the last file, not at the first. A block the loop stopped inside of
+        // keeps the start it was given.
+        let unreached = next_block_index + usize::from(next_block_unpack_stream_index != 0);
+        for first in stream_map.block_first_file_index.iter_mut().skip(unreached) {
+            *first = archive.files.len();
         }
 
         // Each block's file span `[first_file .. first_file + num_unpack_sub_streams)` is
@@ -2964,7 +2997,13 @@ impl<R: Read + Seek> ArchiveReader<R> {
             let files = &self.archive.files;
             let mut index = HashMap::with_capacity(files.len());
             for (file_index, file) in files.iter().enumerate() {
-                let block_index = self.archive.stream_map.file_block_index[file_index];
+                let block_index = self
+                    .archive
+                    .stream_map
+                    .file_block_index
+                    .get(file_index)
+                    .copied()
+                    .flatten();
                 index.insert(
                     file.name.clone(),
                     IndexEntry {
@@ -3459,6 +3498,21 @@ impl<R: Read + Seek> ArchiveReader<R> {
     where
         F: FnMut(&ArchiveEntry, &mut dyn EntryRead) -> Result<bool, Error>,
     {
+        // `Archive` is public and `ArchiveReader::from_archive` takes one as
+        // it is: a map that does not cover the archive is refused here,
+        // before anything is decoded, and each block's own entries are
+        // checked as it is opened.
+        let map = &self.archive.stream_map;
+        if map.file_block_index.len() != self.archive.files.len()
+            || map.block_first_file_index.len() != self.archive.blocks.len()
+            || map
+                .file_block_index
+                .iter()
+                .flatten()
+                .any(|&block| block >= self.archive.blocks.len())
+        {
+            return Err(Error::other("the archive's stream map does not match it"));
+        }
         for phase in self.folder_phases() {
             match phase {
                 FolderPhase::Alone { block } => self.decode_block_alone(block, &mut each)?,
@@ -3482,6 +3536,10 @@ impl<R: Read + Seek> ArchiveReader<R> {
             let block_index = self.archive.stream_map.file_block_index[file_index];
             if block_index.is_none() {
                 let file = &self.archive.files[file_index];
+                // The parser gives such a file no CRC; a caller's archive can.
+                if empty_file_crc_mismatch(file, self.verify_checksums) {
+                    return Err(Error::ChecksumVerificationFailed);
+                }
                 let empty_reader: &mut dyn EntryRead = &mut ([0u8; 0].as_slice());
                 if !each(file, empty_reader)? {
                     return Ok(());
@@ -3552,7 +3610,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 .as_mut()
                 .map(|hook| &mut **hook as &mut (dyn FnMut(SubStreamCompletion) + Send + '_)),
         };
-        let finished = block_decoder.for_each_entries_direct(each)?;
+        let outcome = block_decoder.walk_entries(each)?;
         // Upstream moves on to the next block when a callback returns
         // `false`, and consumers rely on that; only the hook treats it as
         // "this block was not decoded in full".
@@ -3562,7 +3620,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 .as_mut()
                 .map(|hook| &mut **hook as &mut (dyn FnMut(BlockCompletion) + Send)),
             block_index,
-            finished,
+            outcome,
         );
         Ok(())
     }
@@ -3572,13 +3630,15 @@ impl<R: Read + Seek> ArchiveReader<R> {
         archive: &Archive,
         hook: Option<&mut (dyn FnMut(BlockCompletion) + Send)>,
         block_index: usize,
-        finished: bool,
+        outcome: BlockOutcome,
     ) {
-        // Only a block the caller let run to the end has been decoded and
-        // checked in full; a callback that stopped early leaves the rest of
-        // the block unread, and saying otherwise would be a completion claim
+        // Only a block the caller let run to the end, and whose every byte
+        // went through the callbacks' readers, has been decoded and checked
+        // in full; a callback that stopped early, or went on with bytes of
+        // the block's last file unread, leaves the block's own checksum
+        // uncompared, and saying otherwise would be a completion claim
         // nobody verified.
-        let (Some(hook), true) = (hook, finished) else {
+        let (Some(hook), true) = (hook, outcome.finished && outcome.read_in_full) else {
             return;
         };
         let block = &archive.blocks[block_index];
@@ -3645,7 +3705,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             |job, tx| worker_side.decode(first + job, tx),
             |job, rx| {
                 let block_index = first + job;
-                let finished = replay_folder(
+                let outcome = replay_folder(
                     archive,
                     archive.blocks[block_index].is_encrypted(),
                     verify_checksums,
@@ -3662,7 +3722,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                         .as_mut()
                         .map(|hook| &mut **hook as &mut (dyn FnMut(BlockCompletion) + Send)),
                     block_index,
-                    finished,
+                    outcome,
                 );
                 Ok(())
             },
@@ -3733,6 +3793,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 result.ok_or(Error::FileNotFound)
             }
             false => {
+                check_block_mapping(&self.archive, block_index)?;
                 let pack_index = self.archive.stream_map.block_first_pack_stream_index[block_index];
                 let pack_offset = self.archive.stream_map.pack_stream_offsets[pack_index];
                 let block_offset = SIGNATURE_HEADER_SIZE
@@ -3919,6 +3980,97 @@ impl OwedCompletions<'_> {
 /// How much of a block's stream is read at once to reach its end.
 const STREAM_END_CHUNK: usize = 64 << 10;
 
+/// The files of `block_index`, always a range inside `archive.files`.
+///
+/// `Archive` and its `StreamMap` are public, so a caller can hand in a map
+/// the parser would never have built: whatever it says, the range is
+/// clamped to the files that exist and never runs backwards, and a block
+/// the map does not cover has no files.
+fn block_file_range(archive: &Archive, block_index: usize) -> std::ops::Range<usize> {
+    let map = &archive.stream_map;
+    let len = archive.files.len();
+    let (Some(block), Some(&start)) = (
+        archive.blocks.get(block_index),
+        map.block_first_file_index.get(block_index),
+    ) else {
+        return len..len;
+    };
+    let start = start.min(len);
+    if block.num_unpack_sub_streams == 0 {
+        return start..start;
+    }
+    let end = archive
+        .blocks
+        .iter()
+        .enumerate()
+        .skip(block_index.saturating_add(1))
+        .find(|(_, block)| block.num_unpack_sub_streams != 0)
+        .and_then(|(index, _)| map.block_first_file_index.get(index).copied())
+        .unwrap_or(len);
+    let mut end = end.clamp(start, len);
+    // SzReadHeader2: empty entries between a folder's streams still belong
+    // to that folder. Its substream count alone is not its file span.
+    // Empty entries after the final stream are delivered separately.
+    while end > start && map.file_block_index.get(end - 1) != Some(&Some(block_index)) {
+        end -= 1;
+    }
+    start..end
+}
+
+/// Refuses a block that `archive`'s stream map does not describe: no such
+/// block, or a first pack stream, packed span, sub-stream or file index the
+/// map does not have. The parser never builds such a map, but `Archive` and
+/// `StreamMap` are public, so a caller can, and decoding indexes by these.
+fn check_block_mapping(archive: &Archive, block_index: usize) -> Result<(), Error> {
+    let map = &archive.stream_map;
+    let block = archive
+        .blocks
+        .get(block_index)
+        .ok_or_else(|| Error::other("block index out of range"))?;
+    let pack_streams = map
+        .block_first_pack_stream_index
+        .get(block_index)
+        .and_then(|first| first.checked_add(block.packed_streams().len()))
+        .filter(|&end| end <= map.pack_stream_offsets.len() && end <= archive.pack_sizes.len());
+    if pack_streams.is_none()
+        || map.block_first_sub_stream_index.get(block_index).is_none()
+        || map.block_first_file_index.get(block_index).is_none()
+    {
+        return Err(Error::other(
+            "the archive's stream map does not describe this block",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a file with no bytes declares a CRC that is not the CRC of no
+/// bytes, which is zero. Never when checksums are not being verified.
+fn empty_file_crc_mismatch(file: &ArchiveEntry, verify_checksums: bool) -> bool {
+    verify_checksums && file.has_crc && file.crc != 0
+}
+
+/// Reads what a callback that asked to go on (`go_on`) left of its file,
+/// when `drain` says a later file needs the stream lined up. It goes through
+/// the reader the callback was handed, so a checksum over the file and the
+/// recording of the block's faults see the bytes as if the callback had read
+/// them. Returns `go_on`.
+fn drain_unread(reader: &mut dyn EntryRead, go_on: bool, drain: bool) -> Result<bool, Error> {
+    if go_on && drain {
+        reader.write_rest(&mut io::sink())?;
+    }
+    Ok(go_on)
+}
+
+/// How [`BlockDecoder::walk_entries`] ended.
+#[derive(Debug, Clone, Copy)]
+struct BlockOutcome {
+    /// No callback asked to stop.
+    finished: bool,
+    /// Every byte of the block's decoded stream went through the readers the
+    /// callbacks were handed, so every checksum over it has been compared.
+    read_in_full: bool,
+}
+
 /// Reads and discards `left` more bytes of a block's decoded stream, then
 /// makes the read that sees the stream's end.
 ///
@@ -4084,14 +4236,12 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
     ///
     /// The entries are returned in the order they appear in the block.
     pub fn entries(&self) -> &[ArchiveEntry] {
-        let start = self.archive.stream_map.block_first_file_index[self.block_index];
-        let file_count = self.archive.blocks[self.block_index].num_unpack_sub_streams;
-        &self.archive.files[start..(file_count + start)]
+        &self.archive.files[block_file_range(self.archive, self.block_index)]
     }
 
     /// Returns the number of entries contained in this block.
     pub fn entry_count(&self) -> usize {
-        self.archive.blocks[self.block_index].num_unpack_sub_streams
+        self.entries().len()
     }
 
     /// Takes a closure to decode each files in this block.
@@ -4114,6 +4264,19 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
     where
         F: FnMut(&ArchiveEntry, &mut dyn EntryRead) -> Result<bool, Error>,
     {
+        self.walk_entries(each).map(|outcome| outcome.finished)
+    }
+
+    /// [`BlockDecoder::for_each_entries_direct`], saying also whether every
+    /// byte of the block went through the callbacks' readers, which is what
+    /// the block hook needs to know before it calls the block checked.
+    fn walk_entries<F>(self, each: &mut F) -> Result<BlockOutcome, Error>
+    where
+        F: FnMut(&ArchiveEntry, &mut dyn EntryRead) -> Result<bool, Error>,
+    {
+        // `Archive` is public, and so is this constructor: a block the archive
+        // does not have is an error, not a panic.
+        check_block_mapping(self.archive, self.block_index)?;
         let Self {
             thread_count,
             adaptive_lzma2,
@@ -4173,14 +4336,23 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
             inner: block_reader,
             faulted: Rc::clone(&faulted),
         };
-        let start = archive.stream_map.block_first_file_index[block_index];
-        let file_count = archive.blocks[block_index].num_unpack_sub_streams;
+        let files = block_file_range(archive, block_index);
+        // The last file of the block with bytes in it. A callback that asks to
+        // go on having read only part of a file before it leaves the rest in
+        // the stream, and the next file would begin inside it: the rest is
+        // read for it, through the reader it was handed, so that the file's
+        // checksum still sees every byte. After the last such file there is
+        // nothing to line up, and nothing is decoded that nobody asked for.
+        let last_sized = files.clone().rev().find(|&index| {
+            let file = &archive.files[index];
+            file.has_stream && file.size > 0
+        });
 
         let first_sub_stream = archive
             .stream_map
             .block_first_sub_stream_index
             .get(block_index)
-            .expect("validated sub-stream mapping");
+            .ok_or_else(|| Error::other("block has no sub-stream mapping"))?;
         // Where each file starts inside the block's uncompressed stream: the
         // coordinate the parallel decoder's output blocks carry, so a folded
         // checksum and a file are in the same space.
@@ -4201,10 +4373,11 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         };
         let mut finished = true;
 
-        for file_index in start..(file_count + start) {
+        for file_index in files {
             let file = &archive.files[file_index];
             if file.has_stream && file.size > 0 {
                 let bound = file.size as usize;
+                let drain = last_sized.is_some_and(|last| file_index < last);
                 let mut bounded = BoundedReader::new(&mut block_reader, bound);
                 let outcome = if file.has_crc && verify_checksums && !folding {
                     crc_report.set(None);
@@ -4222,6 +4395,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                         faulted: Rc::clone(&faulted),
                     };
                     each(file, &mut verifying)
+                        .and_then(|go_on| drain_unread(&mut verifying, go_on, drain))
                 } else {
                     // The bounded reader fails a file the block's stream ends
                     // inside of, and that is the block's fault as well.
@@ -4230,6 +4404,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                         faulted: Rc::clone(&faulted),
                     };
                     each(file, &mut recording)
+                        .and_then(|go_on| drain_unread(&mut recording, go_on, drain))
                 };
                 // What the callback took of the file, and whether that was all
                 // of it.
@@ -4313,6 +4488,13 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                 if file.has_stream {
                     sub_stream += 1;
                 }
+                // C/7zArcIn.c compares a zero-length file's CRC too, against
+                // the CRC of no bytes, which is zero.
+                if empty_file_crc_mismatch(file, verify_checksums) {
+                    return Err(
+                        Error::ChecksumVerificationFailed.in_block(block_index, packed_offset)
+                    );
+                }
                 let empty_reader: &mut dyn EntryRead = &mut ([0u8; 0].as_slice());
                 if !each(file, empty_reader)? {
                     finished = false;
@@ -4335,8 +4517,12 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         // sequential path compares it on the read that hands the last byte
         // over, before the callback can answer.
         let read_in_full = unpack_size != 0 && consumed == unpack_size;
+        let outcome = BlockOutcome {
+            finished,
+            read_in_full: consumed == unpack_size,
+        };
         if !finished && !read_in_full {
-            return Ok(false);
+            return Ok(outcome);
         }
         if folding && archive.blocks[block_index].has_crc {
             // The block's own checksum, folded from the same segments: the
@@ -4361,7 +4547,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                 None => {}
             }
         }
-        Ok(finished)
+        Ok(outcome)
     }
 
     /// The offsets this block's files start at in its decoded stream, without
@@ -4383,12 +4569,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         if block.coders.len() != 1 {
             return Vec::new();
         }
-        let start = archive.stream_map.block_first_file_index[block_index];
-        let files = archive
-            .files
-            .iter()
-            .skip(start)
-            .take(block.num_unpack_sub_streams);
+        let files = &archive.files[block_file_range(archive, block_index)];
         let mut offsets = Vec::new();
         let mut at = 0u64;
         let mut wanted = block.has_crc;
@@ -4611,8 +4792,7 @@ impl FolderWorker<'_> {
         .with_verify_checksums(self.verify_checksums);
         decoder.on_sub_stream_complete = Some(&mut hook);
 
-        let first_file = self.archive.stream_map.block_first_file_index[block_index];
-        let mut next_file = first_file;
+        let mut next_file = block_file_range(self.archive, block_index).start;
         let mut stopped = false;
         let mut cancelled = false;
         // The hook fires after the callback returns for a file, so what it
@@ -4703,7 +4883,7 @@ fn replay_folder<F>(
     rx: &mut crate::ordered::Receiver<'_, FolderMessage>,
     each: &mut F,
     mut on_sub_stream_complete: Option<&mut (dyn FnMut(SubStreamCompletion) + Send)>,
-) -> Result<bool, Error>
+) -> Result<BlockOutcome, Error>
 where
     F: FnMut(&ArchiveEntry, &mut dyn EntryRead) -> Result<bool, Error>,
 {
@@ -4727,6 +4907,15 @@ where
     let folder_owed = |delivered: u64| {
         verify_checksums && block.has_crc && unpack_size != 0 && delivered == unpack_size
     };
+    let ended = |finished: bool, delivered: u64| BlockOutcome {
+        finished,
+        read_in_full: delivered == unpack_size,
+    };
+    // As on the sequential path: the last file of the folder with bytes in it,
+    // before which a file the callback went on from is read to its end for it.
+    let last_sized = block_file_range(archive, block_index)
+        .rev()
+        .find(|&index| archive.files[index].has_stream && archive.files[index].size > 0);
     loop {
         match rx.recv() {
             None => return Err(lost()),
@@ -4742,12 +4931,19 @@ where
                         Some(FolderMessage::End) => {}
                         _ => return Err(lost()),
                     }
+                    // The worker compares it before it sends the file, and
+                    // so does this, as the sequential path does.
+                    if empty_file_crc_mismatch(file, verify_checksums) {
+                        return Err(
+                            Error::ChecksumVerificationFailed.in_block(block_index, packed_offset)
+                        );
+                    }
                     let empty_reader: &mut dyn EntryRead = &mut ([0u8; 0].as_slice());
                     if each(file, empty_reader)? {
                         continue;
                     }
                     if !folder_owed(delivered) {
-                        return Ok(false);
+                        return Ok(ended(false, delivered));
                     }
                     owed_file = false;
                 } else {
@@ -4771,7 +4967,14 @@ where
                             }
                         })?;
                     let unseen = entry.finish();
-                    delivered += entry.delivered;
+                    // The sequential path reads the rest of a file the
+                    // callback went on from, when a file with bytes follows
+                    // it in the folder, so it counts as handed over there;
+                    // the worker read it here.
+                    let lined_up = outcome
+                        && entry.state == ReplayState::Ended
+                        && last_sized.is_some_and(|last| file_index < last);
+                    delivered += if lined_up { file.size } else { entry.delivered };
                     if outcome {
                         if let Some(error) = unseen {
                             // The worker read the whole file; the callback
@@ -4787,7 +4990,7 @@ where
                         continue;
                     }
                     if entry.state != ReplayState::Ended {
-                        return Ok(false);
+                        return Ok(ended(false, delivered));
                     }
                     owed_file = verify_checksums && file.has_crc && entry.delivered == file.size;
                 }
@@ -4813,7 +5016,7 @@ where
                                 hook(completion);
                             }
                             if !owed_folder && (verdict || !owed_file) {
-                                return Ok(false);
+                                return Ok(ended(false, delivered));
                             }
                         }
                         Some(
@@ -4832,7 +5035,7 @@ where
                         Some(FolderMessage::Done(FolderEnd::Stopped)) | None if owed => {
                             return Err(lost());
                         }
-                        _ => return Ok(false),
+                        _ => return Ok(ended(false, delivered)),
                     }
                 }
             }
@@ -4841,7 +5044,7 @@ where
                     hook(completion);
                 }
             }
-            Some(FolderMessage::Done(FolderEnd::Finished)) => return Ok(true),
+            Some(FolderMessage::Done(FolderEnd::Finished)) => return Ok(ended(true, delivered)),
             Some(FolderMessage::Done(FolderEnd::Failed(error))) => return Err(error),
             Some(FolderMessage::Done(FolderEnd::Stopped)) => {
                 let (kind, message) = swallowed

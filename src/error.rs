@@ -128,6 +128,12 @@ pub enum Error {
         /// The underlying error, already rendered.
         message: String,
     },
+    /// An earlier push on this `ArchiveWriter` failed after it had put bytes
+    /// in the output that the archive's header does not account for, so no
+    /// header it could still write would describe the file. Every later push
+    /// and `finish` returns this instead of writing; the string is the
+    /// earlier failure, rendered.
+    WriterPoisoned(String),
 }
 
 /// Which bound an [`Error::LimitExceeded`] hit.

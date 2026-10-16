@@ -81,6 +81,24 @@ macro_rules! write_times {
 type Result<T> = std::result::Result<T, Error>;
 
 /// Writes a 7z archive file.
+///
+/// # Errors and poisoning
+///
+/// A push that fails part way through a folder - its source fails, a coder
+/// fails, or the output refuses a write - may already have put some of that
+/// folder's bytes in the output. Those bytes are not in the archive's
+/// bookkeeping, so the pack offsets of every later folder, and the header
+/// [`finish`](Self::finish) would write, would no longer match the file.
+///
+/// When a push fails, the writer checks whether the output still ends where
+/// its bookkeeping says. If it does, nothing of the failed push was kept and
+/// the writer stays usable: a caller may skip that entry and go on. If it
+/// does not, or the output's position cannot be read, the writer is
+/// *poisoned*: every later `push_*` call and `finish` return
+/// [`Error::WriterPoisoned`] naming the original failure (from `finish`,
+/// wrapped in an [`std::io::Error`] of kind `Other`), and nothing more is
+/// written. Dropping a poisoned writer, or one inside
+/// [`AutoFinisher`], is fine; the archive it was writing is incomplete.
 pub struct ArchiveWriter<W: Write> {
     output: W,
     files: Vec<ArchiveEntry>,
@@ -88,6 +106,9 @@ pub struct ArchiveWriter<W: Write> {
     pack_info: PackInfo,
     unpack_info: UnpackInfo,
     encrypt_header: bool,
+    /// The failure that left bytes in `output` the header cannot describe;
+    /// see the type's documentation.
+    poisoned: Option<String>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -244,7 +265,47 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             pack_info: Default::default(),
             unpack_info: Default::default(),
             encrypt_header: true,
+            poisoned: None,
         })
+    }
+
+    /// [`Error::WriterPoisoned`], if an earlier push poisoned the writer.
+    fn check_poisoned(&self) -> Result<()> {
+        match &self.poisoned {
+            Some(cause) => Err(Error::WriterPoisoned(cause.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Takes the error a push failed with, poisons the writer unless the
+    /// output still ends exactly where the recorded pack streams do, and
+    /// hands the error back.
+    fn poison_unless_consistent(&mut self, error: Error) -> Error {
+        if !self.output_matches_records() {
+            self.poisoned = Some(error.to_string());
+        }
+        error
+    }
+
+    /// Whether every byte after the signature header is a recorded pack
+    /// stream of a recorded block, and nothing else: the state a header
+    /// written now would describe correctly.
+    fn output_matches_records(&mut self) -> bool {
+        if self.pack_info.len() != self.unpack_info.pack_streams() {
+            return false;
+        }
+        let recorded = self
+            .pack_info
+            .sizes
+            .iter()
+            .try_fold(SIGNATURE_HEADER_SIZE + self.pack_info.pos, |end, &len| {
+                end.checked_add(len)
+            });
+        // A position that cannot be read is treated as a mismatch.
+        matches!(
+            (recorded, self.output.stream_position()),
+            (Some(recorded), Ok(at)) if recorded == at
+        )
     }
 
     /// Returns a wrapper around `self` that will finish the stream on drop.
@@ -290,7 +351,29 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         entry: ArchiveEntry,
         reader: Option<R>,
     ) -> Result<&ArchiveEntry> {
-        self.push_entry(entry, reader, &mut encoder::FolderCoder::default())
+        self.check_poisoned()?;
+        let pushed = self
+            .push_entry(entry, reader, &mut encoder::FolderCoder::default())
+            .map(|_| ());
+        self.pushed_entry(pushed)
+    }
+
+    /// The last entry, after a push of one entry that returned `pushed`; or
+    /// its error, the writer poisoned if it has to be.
+    fn pushed_entry(&mut self, pushed: Result<()>) -> Result<&ArchiveEntry> {
+        match pushed {
+            Ok(()) => Ok(self.files.last().expect("a pushed entry is recorded")),
+            Err(error) => Err(self.poison_unless_consistent(error)),
+        }
+    }
+
+    /// `pushed`, or its error with the writer poisoned if it has to be, for
+    /// the pushes that return the writer.
+    fn pushed_self(&mut self, pushed: Result<()>) -> Result<&mut Self> {
+        match pushed {
+            Ok(()) => Ok(self),
+            Err(error) => Err(self.poison_unless_consistent(error)),
+        }
     }
 
     /// Adds an entry whose reader may run on scoped finder or block workers.
@@ -313,11 +396,15 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         entry: ArchiveEntry,
         mut reader: Option<R>,
     ) -> Result<&ArchiveEntry> {
-        self.push_entry_input(
-            entry,
-            reader.as_mut().map(|r| FolderInput::Send(r)),
-            &mut encoder::FolderCoder::default(),
-        )
+        self.check_poisoned()?;
+        let pushed = self
+            .push_entry_input(
+                entry,
+                reader.as_mut().map(|r| FolderInput::Send(r)),
+                &mut encoder::FolderCoder::default(),
+            )
+            .map(|_| ());
+        self.pushed_entry(pushed)
     }
 
     /// [`ArchiveWriter::push_archive_entry`], with `coder` kept by the caller
@@ -472,13 +559,32 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     ///
     /// The first failure in entry order: what `open` returned, or what
     /// `push_archive_entry` would have returned for that entry. Folders before
-    /// it have been written; none after it are.
+    /// it have been written; none after it are. If the failing folder had
+    /// already put bytes in the output, the writer is poisoned: see
+    /// [`ArchiveWriter`].
     pub fn push_archive_entries_non_solid<R, F>(
         &mut self,
         entries: Vec<ArchiveEntry>,
         open: F,
         threads: u32,
     ) -> Result<&mut Self>
+    where
+        R: Read,
+        F: Fn(usize, &ArchiveEntry) -> std::io::Result<Option<R>> + Sync,
+    {
+        self.check_poisoned()?;
+        let pushed = self.push_non_solid(entries, open, threads);
+        self.pushed_self(pushed)
+    }
+
+    /// [`ArchiveWriter::push_archive_entries_non_solid`], without the
+    /// poisoning.
+    fn push_non_solid<R, F>(
+        &mut self,
+        entries: Vec<ArchiveEntry>,
+        open: F,
+        threads: u32,
+    ) -> Result<()>
     where
         R: Read,
         F: Fn(usize, &ArchiveEntry) -> std::io::Result<Option<R>> + Sync,
@@ -497,7 +603,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             for (index, entry) in entries.into_iter().enumerate() {
                 self.push_owned(entry, index, &open, &mut coder)?;
             }
-            return Ok(self);
+            return Ok(());
         }
         let parallel = |entry: &ArchiveEntry| {
             entry.is_directory
@@ -513,7 +619,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             while index < entries.len() && eligible[index] {
                 index += 1;
             }
-            if workers > 1 && index - start > 1 {
+            // `workers` is above one here: one or fewer took the serial route.
+            if index - start > 1 {
                 self.push_non_solid_parallel(&entries, start..index, &open, workers, &mut coder)?;
             } else {
                 for at in start..index {
@@ -525,7 +632,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 index += 1;
             }
         }
-        Ok(self)
+        Ok(())
     }
 
     /// One entry of [`ArchiveWriter::push_archive_entries_non_solid`], here.
@@ -728,9 +835,21 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     ///
     /// A block holding no entries is dropped rather than written, so an empty batch does not put a
     /// junk pack stream and a zero-substream block into the archive.
+    ///
+    /// # Errors
+    ///
+    /// A failed write to the output. If it left part of the block in the
+    /// output, the writer is poisoned: see [`ArchiveWriter`].
     pub fn push_prepared_block(&mut self, block: PreparedBlock) -> Result<&mut Self> {
+        self.check_poisoned()?;
+        let pushed = self.push_prepared(block);
+        self.pushed_self(pushed)
+    }
+
+    /// [`ArchiveWriter::push_prepared_block`], without the poisoning.
+    fn push_prepared(&mut self, block: PreparedBlock) -> Result<()> {
         if block.is_empty() {
-            return Ok(self);
+            return Ok(());
         }
 
         let PreparedBlock {
@@ -765,7 +884,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             )
             .set_bcj2(bcj2.map(|b| b.sizes));
         self.files.extend(entries);
-        Ok(self)
+        Ok(())
     }
 
     /// Solid compression - packs `entries` into one pack.
@@ -777,7 +896,9 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         entries: Vec<ArchiveEntry>,
         reader: Vec<SourceReader<R>>,
     ) -> Result<&mut Self> {
-        self.push_entries_input(entries, reader, |r| FolderInput::Local(r))
+        self.check_poisoned()?;
+        let pushed = self.push_entries_input(entries, reader, |r| FolderInput::Local(r));
+        self.pushed_self(pushed)
     }
 
     /// Solid compression with readers that may run on scoped finder or block
@@ -799,7 +920,9 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         entries: Vec<ArchiveEntry>,
         reader: Vec<SourceReader<R>>,
     ) -> Result<&mut Self> {
-        self.push_entries_input(entries, reader, |r| FolderInput::Send(r))
+        self.check_poisoned()?;
+        let pushed = self.push_entries_input(entries, reader, |r| FolderInput::Send(r));
+        self.pushed_self(pushed)
     }
 
     fn push_entries_input<R: Read>(
@@ -807,7 +930,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         entries: Vec<ArchiveEntry>,
         reader: Vec<SourceReader<R>>,
         wrap: for<'a> fn(&'a mut SeqReader<SourceReader<R>>) -> FolderInput<'a>,
-    ) -> Result<&mut Self> {
+    ) -> Result<()> {
         let mut entries = entries;
         let mut r = SeqReader::new(reader);
         assert_eq!(r.reader_len(), entries.len());
@@ -874,18 +997,10 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 }
             }
             w.flush().map_err(|e| {
-                let mut names = String::with_capacity(512);
-                for ele in entries.iter() {
-                    names.push_str(&ele.name);
-                    names.push(';');
-                    if names.len() > 512 {
-                        break;
-                    }
-                }
-                Error::io_msg(e, format!("Encode entry:{names}"))
+                Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries)))
             })?;
             w.write(&[]).map_err(|e| {
-                Error::io_msg(e, format!("Encode entry:{}", entries_names(&entries)))
+                Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries)))
             })?;
 
             (0, w.counting().get())
@@ -931,7 +1046,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             .set_bcj2(bcj2.map(|b| b.sizes));
 
         self.files.extend(entries);
-        Ok(self)
+        Ok(())
     }
 
     /// Builds the coder chain for `methods` over `out`.
@@ -1014,7 +1129,17 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     }
 
     /// Finishes the compression.
+    ///
+    /// # Errors
+    ///
+    /// A failed write or seek on the output, or, if the writer was poisoned by
+    /// an earlier push, an error of kind `Other` carrying
+    /// [`Error::WriterPoisoned`]; nothing is written then. See
+    /// [`ArchiveWriter`].
     pub fn finish(mut self) -> std::io::Result<W> {
+        if let Err(poisoned) = self.check_poisoned() {
+            return Err(std::io::Error::other(poisoned));
+        }
         let mut header: Vec<u8> = Vec::with_capacity(64 * 1024);
         self.write_encoded_header(&mut header)?;
         let header_pos = self.output.stream_position()?;
@@ -1033,7 +1158,10 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
             // start header
             hhw.write_u64(header_pos - SIGNATURE_HEADER_SIZE)?;
-            hhw.write_u64(0xFFFFFFFF & header.len() as u64)?;
+            // The next header's size is a full UINT64 in the start header
+            // (7-Zip's `WriteStartHeader`); masking it to 32 bits would
+            // record the wrong size for a header past 4 GiB.
+            hhw.write_u64(header.len() as u64)?;
             hhw.write_u32(crc32)?;
         }
         let crc32 = crc32_of(&hh[12..]);

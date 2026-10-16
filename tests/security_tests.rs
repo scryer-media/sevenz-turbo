@@ -1475,3 +1475,253 @@ fn a_ppmd_model_over_the_memory_limit_is_refused() {
     }
     assert_eq!(decode(2048 * MIB).unwrap(), data);
 }
+
+// ---------------------------------------------------------------------------
+// Sub-stream and file counts, the stream map, empty headers, empty files
+// ---------------------------------------------------------------------------
+
+const K_CRC: u8 = 0x0A;
+
+/// `names` as a kName property: external = 0, then each UTF-16LE name and its
+/// terminator.
+fn names_property(names: &[&str]) -> Vec<u8> {
+    let mut blob = vec![0u8];
+    for name in names {
+        for unit in name.encode_utf16().chain([0]) {
+            blob.extend_from_slice(&unit.to_le_bytes());
+        }
+    }
+    let mut out = vec![K_NAME];
+    write_number(&mut out, blob.len() as u64);
+    out.extend_from_slice(&blob);
+    out
+}
+
+/// One COPY coder per folder, the unpack size of each, and the folder CRCs
+/// when `crcs` is given, as a kUnpackInfo body up to and including its kEnd.
+fn copy_unpack_info(sizes: &[u64], crcs: Option<&[u32]>) -> Vec<u8> {
+    let mut h = vec![K_UNPACK_INFO, K_FOLDER];
+    write_number(&mut h, sizes.len() as u64);
+    h.push(0); // external
+    for _ in sizes {
+        h.extend_from_slice(&[1, 1, 0]); // one coder, id size 1, COPY
+    }
+    h.push(K_CODERS_UNPACK_SIZE);
+    for &size in sizes {
+        write_number(&mut h, size);
+    }
+    if let Some(crcs) = crcs {
+        h.extend_from_slice(&[K_CRC, 1]);
+        for crc in crcs {
+            h.extend_from_slice(&crc.to_le_bytes());
+        }
+    }
+    h.push(K_END);
+    h
+}
+
+fn pack_info(sizes: &[u64]) -> Vec<u8> {
+    let mut h = vec![K_PACK_INFO, 0];
+    write_number(&mut h, sizes.len() as u64);
+    h.push(K_SIZE);
+    for &size in sizes {
+        write_number(&mut h, size);
+    }
+    h.push(K_END);
+    h
+}
+
+/// Three COPY folders and so three sub-streams, but only two files: the third
+/// folder's stream belongs to no file. 7-Zip refuses this
+/// (`numFiles - numEmptyStreams != NumTotalSubStreams`); it used to open, map
+/// the third folder to file 0, and panic slicing its files in `file_range`.
+#[test]
+fn fewer_streamed_files_than_substreams_is_rejected() {
+    let folders: [&[u8]; 3] = [b"aaaa", b"bbbb", b"cccc"];
+    let packed = folders.concat();
+    let crcs: Vec<u32> = folders.iter().map(|f| crc32(f)).collect();
+    let mut h = vec![K_HEADER, K_MAIN_STREAMS_INFO];
+    h.extend(pack_info(&[4, 4, 4]));
+    h.extend(copy_unpack_info(&[4, 4, 4], Some(&crcs)));
+    h.push(K_END); // streams info
+    h.push(K_FILES_INFO);
+    write_number(&mut h, 2);
+    h.extend(names_property(&["one", "two"]));
+    h.extend_from_slice(&[K_END, K_END]);
+    let bytes = raw_7z_with_packed(&packed, &h);
+
+    let error = open_err(&bytes).expect_err("an unclaimed sub-stream must be refused at open");
+    assert!(error.contains("fewer streamed files"), "{error}");
+}
+
+/// A trailing folder with no sub-streams starts after the last file, as
+/// 7-Zip's `7zIn.cpp` maps it, not at file 0; and `BlockDecoder` over it has
+/// no entries and decodes to nothing.
+#[test]
+fn a_trailing_folder_without_substreams_starts_after_the_last_file() {
+    let mut h = vec![K_HEADER, K_MAIN_STREAMS_INFO];
+    h.extend(pack_info(&[4, 4]));
+    h.extend(copy_unpack_info(&[4, 4], None));
+    h.extend_from_slice(&[K_SUB_STREAMS_INFO, K_NUM_UNPACK_STREAM, 1, 0, K_END]);
+    h.push(K_END); // streams info
+    h.push(K_FILES_INFO);
+    write_number(&mut h, 1);
+    h.extend(names_property(&["one"]));
+    h.extend_from_slice(&[K_END, K_END]);
+    let bytes = raw_7z_with_packed(b"aaaabbbb", &h);
+
+    let archive = sevenz_turbo::Archive::read(&mut Cursor::new(&bytes), &Password::empty())
+        .expect("a folder with no sub-streams is not an error");
+    assert_eq!(archive.stream_map.block_first_file_index, [0, 1]);
+    let password = Password::empty();
+    let mut source = Cursor::new(&bytes);
+    let decoder = sevenz_turbo::BlockDecoder::new(1, 1, &archive, &password, &mut source);
+    assert!(decoder.entries().is_empty());
+    let mut seen = 0;
+    decoder
+        .for_each_entries(&mut |_: &ArchiveEntry, _: &mut dyn std::io::Read| {
+            seen += 1;
+            Ok(true)
+        })
+        .unwrap();
+    assert_eq!(seen, 0);
+}
+
+/// `Archive` and `StreamMap` are public, and `ArchiveReader::from_archive` and
+/// `BlockDecoder::new` take one as given. A map the parser would never build
+/// is an error or an empty span, never a panic.
+#[test]
+fn a_caller_supplied_stream_map_never_panics() {
+    let mut bytes = Vec::new();
+    {
+        let mut writer = ArchiveWriter::new(Cursor::new(&mut bytes)).unwrap();
+        for (name, data) in [("a", b"first file" as &[u8]), ("b", b"second file")] {
+            writer
+                .push_archive_entry(ArchiveEntry::new_file(name), Some(data))
+                .unwrap();
+        }
+        writer.finish().unwrap();
+    }
+    let parsed = sevenz_turbo::Archive::read(&mut Cursor::new(&bytes), &Password::empty()).unwrap();
+    assert_eq!(parsed.blocks.len(), 2);
+
+    let read_all = |reader: &mut ArchiveReader<Cursor<&Vec<u8>>>| {
+        reader.for_each_entries(|_, rd| {
+            std::io::copy(rd, &mut std::io::sink())?;
+            Ok(true)
+        })
+    };
+    let password = Password::empty();
+
+    // No map at all.
+    let mut blank = parsed.clone();
+    blank.stream_map = sevenz_turbo::StreamMap::default();
+    let mut reader =
+        ArchiveReader::from_archive(blank.clone(), Cursor::new(&bytes), password.clone());
+    assert!(read_all(&mut reader).is_err());
+    for block in 0..3 {
+        let mut source = Cursor::new(&bytes);
+        let decoder = sevenz_turbo::BlockDecoder::new(1, block, &blank, &password, &mut source);
+        assert!(decoder.entries().is_empty());
+        let result =
+            decoder.for_each_entries(&mut |_: &ArchiveEntry, _: &mut dyn std::io::Read| Ok(true));
+        assert!(result.is_err(), "block {block}");
+    }
+
+    // File spans that run backwards, past the files, or into another block.
+    for firsts in [vec![1, 0], vec![5, 9], vec![usize::MAX, 0], vec![2, 2]] {
+        let mut skewed = parsed.clone();
+        skewed.stream_map.block_first_file_index = firsts.clone();
+        for block in 0..2 {
+            let mut source = Cursor::new(&bytes);
+            let decoder =
+                sevenz_turbo::BlockDecoder::new(1, block, &skewed, &password, &mut source);
+            assert!(decoder.entries().len() <= skewed.files.len(), "{firsts:?}");
+            let _ =
+                decoder.for_each_entries(&mut |_: &ArchiveEntry, rd: &mut dyn std::io::Read| {
+                    std::io::copy(rd, &mut std::io::sink())?;
+                    Ok(true)
+                });
+        }
+        let mut reader = ArchiveReader::from_archive(skewed, Cursor::new(&bytes), password.clone());
+        let _ = read_all(&mut reader);
+    }
+
+    // A file mapped to a block the archive does not have.
+    let mut stray = parsed.clone();
+    stray.stream_map.file_block_index[0] = Some(7);
+    let mut reader = ArchiveReader::from_archive(stray, Cursor::new(&bytes), password.clone());
+    assert!(read_all(&mut reader).is_err());
+
+    // The map as parsed still decodes.
+    let mut reader = ArchiveReader::from_archive(parsed, Cursor::new(&bytes), password);
+    read_all(&mut reader).unwrap();
+}
+
+/// An empty next header is an empty archive only where an empty archive puts
+/// it, right after the start header: 7-Zip requires `nextHeaderOffset == 0`
+/// (and a zero CRC, which crc32 of no bytes already is). Anywhere else there
+/// are packed bytes no header describes.
+#[test]
+fn an_empty_header_must_sit_at_offset_zero() {
+    let empty = raw_7z_exact(&[]);
+    let reader = ArchiveReader::new(Cursor::new(empty), Password::empty())
+        .expect("an empty archive still opens");
+    assert!(reader.archive().files.is_empty());
+
+    let displaced = raw_7z_with_packed(&[0u8; 4], &[]);
+    let error = open_err(&displaced).expect_err("an empty header after packed bytes is corrupt");
+    assert!(error.contains("non-zero offset"), "{error}");
+}
+
+/// A COPY folder of two sub-streams, the first of them zero bytes long with
+/// the CRC `empty_crc`, and two files over them.
+fn archive_with_zero_length_substream(empty_crc: u32) -> Vec<u8> {
+    let data = b"payload";
+    let mut h = vec![K_HEADER, K_MAIN_STREAMS_INFO];
+    h.extend(pack_info(&[data.len() as u64]));
+    h.extend(copy_unpack_info(&[data.len() as u64], None));
+    h.extend_from_slice(&[K_SUB_STREAMS_INFO, K_NUM_UNPACK_STREAM, 2, K_SIZE, 0]);
+    h.extend_from_slice(&[K_CRC, 1]);
+    h.extend_from_slice(&empty_crc.to_le_bytes());
+    h.extend_from_slice(&crc32(data).to_le_bytes());
+    h.push(K_END); // sub-streams info
+    h.push(K_END); // streams info
+    h.push(K_FILES_INFO);
+    write_number(&mut h, 2);
+    h.extend(names_property(&["empty", "data"]));
+    h.extend_from_slice(&[K_END, K_END]);
+    raw_7z_with_packed(data, &h)
+}
+
+/// 7-Zip checks a zero-length file's CRC too, against crc32 of no bytes, which
+/// is zero; a non-zero one is a checksum failure, located in the block, unless
+/// verification is off.
+#[test]
+fn a_zero_length_file_with_a_non_zero_crc_fails_verification() {
+    let extract = |bytes: &[u8], verify: bool| {
+        let mut reader = ArchiveReader::new(Cursor::new(bytes.to_vec()), Password::empty())?;
+        reader.set_verify_checksums(verify);
+        let mut out = Vec::new();
+        reader
+            .for_each_entries(|_, rd| {
+                rd.read_to_end(&mut out)?;
+                Ok(true)
+            })
+            .map(|()| out)
+    };
+
+    let good = archive_with_zero_length_substream(0);
+    assert_eq!(extract(&good, true).unwrap(), b"payload");
+
+    let bad = archive_with_zero_length_substream(0xDEAD_BEEF);
+    match extract(&bad, true) {
+        Err(Error::BlockDecode {
+            block_index: 0,
+            kind: sevenz_turbo::BlockErrorKind::ChecksumMismatch,
+            ..
+        }) => {}
+        other => panic!("expected a located checksum mismatch, got {other:?}"),
+    }
+    assert_eq!(extract(&bad, false).unwrap(), b"payload");
+}

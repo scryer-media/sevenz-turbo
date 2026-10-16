@@ -1,7 +1,29 @@
 //! Branch/call/jump filters, over `lzma-turbo`'s converters.
 //!
-//! The readers and writers below are this crate's, ported from the SDK's.
-//! What sat under them was a second port of the same
+//! `BcjReader` and `BcjWriter` come from `lzma-rust2` 0.20.1
+//! (`src/filter/bcj.rs`) by Nils Hasenbanck, Apache-2.0, itself a port of XZ
+//! for Java (public domain); see the provenance note in `mod.rs`. The
+//! converters under them are `lzma-turbo`'s port of the public-domain LZMA
+//! SDK branch filters.
+//!
+//! Modified from the `lzma-rust2` file (Apache-2.0 section 4(b)):
+//!
+//! - `BcjFilter` is a handle on `lzma_turbo::filters::bcj::Bcj` instead of
+//!   `lzma-rust2`'s per-architecture converter functions and their `pos` /
+//!   `prev_mask` state (see below), and its constructor rounds the start
+//!   offset to the converter's alignment;
+//! - the reader's buffer is `crate::decoder::INPUT_BUF_SIZE` bytes instead
+//!   of 4096;
+//! - when the reader's buffer fills, it moves only the bytes still to be
+//!   delivered or filtered to the front with `copy_within`, instead of
+//!   rotating the whole buffer with `rotate_left`;
+//! - `crate::Result` is `std::io::Result`, and the `encoder` feature is
+//!   `compress`;
+//! - the round-trip tests run over a generated buffer instead of the `wget`
+//!   binaries in `lzma-rust2`'s `tests/data/`, and a test of the reader's
+//!   buffer compaction at several read sizes was added.
+//!
+//! What sat under the wrappers was a second port of the same
 //! eight converters from the same public-domain C, and `lzma-turbo` already
 //! carries one that is tested byte for byte against the SDK's own harness and
 //! is where this crate's LZMA comes from. Two ports of one filter is one too

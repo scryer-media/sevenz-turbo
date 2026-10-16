@@ -6,8 +6,9 @@
 //! - **`aws-lc-crypto`** (on by default) — `aws-lc-rs` over AWS-LC. It is the
 //!   scryer-media house default, shared with `lzma-turbo` and `rarpar`, and it
 //!   is what the numbers in `docs/benchmarking.md` were taken with.
-//! - **`native-crypto`** — RustCrypto's `sha2`, for consumers who cannot have
-//!   a C toolchain in their build.
+//! - **`native-crypto`** — `lzma-turbo`'s RustCrypto-backed hash (its own
+//!   `native-crypto` feature), for consumers who cannot have a C toolchain in
+//!   their build.
 //!
 //! Cargo features are additive, so `native-crypto` cannot be expressed as
 //! "turns `aws-lc-crypto` off". Instead **`native-crypto` takes precedence**:
@@ -43,11 +44,13 @@
 //! buffers a partial tail block either way.
 //!
 //! The encoder (`compress` + `aes256`) follows the same switch, over the
-//! same unpadded CBC: [`Aes256CbcEnc`] is AWS-LC's `EncryptingKey::cbc` when
-//! AWS-LC is selected, and RustCrypto's `cbc::Encryptor` otherwise (which
-//! `compress` always carries, so a wasm build encrypts in the guest). Both are
-//! handed whole buffers of blocks, and the next chunk's IV is this chunk's
-//! last *ciphertext* block, so it is copied out after the encrypt.
+//! same unpadded CBC: [`Aes256CbcEnc`] is RustCrypto's `cbc::Encryptor` when
+//! `native-crypto` is on and AWS-LC's `EncryptingKey::cbc` otherwise. The
+//! RustCrypto encryptor, like the decryptor, exists only in a build that
+//! enables `native-crypto`: `compress` pulls in neither `aes` nor `cbc`, so a
+//! default (AWS-LC) build carries no RustCrypto AES at all. Both are handed
+//! whole buffers of blocks, and the next chunk's IV is this chunk's last
+//! *ciphertext* block, so it is copied out after the encrypt.
 //!
 //! # The host-delegated backend (`crypto-host`, wasm only)
 //!
@@ -66,7 +69,10 @@
 //! backend stays selected and no hook is ever called, so feature unification
 //! in a mixed workspace cannot silently turn a native build into a delegating
 //! one. `crypto-host` pulls in neither `aes` nor `cbc` — a delegating wasm
-//! build carries no in-guest AES at all. `lzma-turbo/crypto-host` implies
+//! build carries no in-guest AES at all. Only the decrypt is delegated, so a
+//! wasm `crypto-host` build that also writes encrypted archives (`compress`)
+//! needs `native-crypto` for its encryptor; without it the build is a compile
+//! error rather than an encoder with no cipher. `lzma-turbo/crypto-host` implies
 //! `lzma-turbo/native-crypto`, so the RustCrypto SHA-256 is compiled beside
 //! the host one (see the feature comment in `Cargo.toml`).
 //!
@@ -235,6 +241,9 @@ impl Aes256CbcLike for AwsLcAes256Cbc {
 /// AES-256-CBC over RustCrypto's `aes`/`cbc`, for builds without a C
 /// toolchain. `cbc::Decryptor` carries the chaining state itself.
 #[cfg(feature = "native-crypto")]
+// On wasm with `crypto-host` the host decrypts; this lane is then only the
+// encryptor's sibling and the tests' reference.
+#[cfg_attr(all(target_arch = "wasm32", feature = "crypto-host"), allow(dead_code))]
 pub(crate) struct RustCryptoAes256Cbc(cbc::Decryptor<Aes256>);
 
 #[cfg(feature = "native-crypto")]
@@ -411,20 +420,12 @@ impl Aes256CbcEncLike for AwsLcAes256CbcEnc {
     }
 }
 
-/// AES-256-CBC encryption over RustCrypto, which `compress` always carries.
-/// `cbc::Encryptor` holds the chaining state itself.
-#[cfg(feature = "compress")]
-#[cfg_attr(
-    all(
-        feature = "aws-lc-crypto",
-        not(feature = "native-crypto"),
-        not(all(target_arch = "wasm32", feature = "crypto-host"))
-    ),
-    allow(dead_code)
-)]
-pub(crate) struct RustCryptoAes256CbcEnc(cbc::Encryptor<aes::Aes256>);
+/// AES-256-CBC encryption over RustCrypto, compiled only when `native-crypto`
+/// selects it. `cbc::Encryptor` holds the chaining state itself.
+#[cfg(all(feature = "compress", feature = "native-crypto"))]
+pub(crate) struct RustCryptoAes256CbcEnc(cbc::Encryptor<Aes256>);
 
-#[cfg(feature = "compress")]
+#[cfg(all(feature = "compress", feature = "native-crypto"))]
 impl std::fmt::Debug for RustCryptoAes256CbcEnc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never print key or chaining state.
@@ -432,16 +433,12 @@ impl std::fmt::Debug for RustCryptoAes256CbcEnc {
     }
 }
 
-#[cfg(feature = "compress")]
+#[cfg(all(feature = "compress", feature = "native-crypto"))]
 impl Aes256CbcEncLike for RustCryptoAes256CbcEnc {
     fn new(key: &[u8], iv: &[u8]) -> Result<Self, AesError> {
-        use aes::cipher::KeyIvInit;
         let key: &[u8; AES256_KEY_LEN] = key.try_into().map_err(|_| AesError::KeyLength)?;
         let iv: &[u8; AES_BLOCK_LEN] = iv.try_into().map_err(|_| AesError::IvLength)?;
-        Ok(Self(cbc::Encryptor::<aes::Aes256>::new(
-            key.into(),
-            iv.into(),
-        )))
+        Ok(Self(cbc::Encryptor::<Aes256>::new(key.into(), iv.into())))
     }
 
     fn encrypt(&mut self, data: &mut [u8]) -> Result<(), AesError> {
@@ -457,24 +454,29 @@ impl Aes256CbcEncLike for RustCryptoAes256CbcEnc {
     }
 }
 
-/// The encryptor this build selected: AWS-LC when it is the selected backend,
-/// RustCrypto otherwise (including every wasm build).
+/// The encryptor this build selected. The host hook delegates decryption
+/// only, so the encryptor's precedence is `native-crypto` > AWS-LC on every
+/// target, `crypto-host` or not.
+#[cfg(all(feature = "compress", feature = "native-crypto"))]
+pub(crate) type Aes256CbcEnc = RustCryptoAes256CbcEnc;
 #[cfg(all(
     feature = "compress",
     feature = "aws-lc-crypto",
-    not(feature = "native-crypto"),
-    not(all(target_arch = "wasm32", feature = "crypto-host"))
+    not(feature = "native-crypto")
 ))]
 pub(crate) type Aes256CbcEnc = AwsLcAes256CbcEnc;
+
+// Only reachable as `wasm32` + `crypto-host` + `compress` with no in-process
+// backend (every other build without one already fails above): the host
+// decrypts, but nothing would encrypt.
 #[cfg(all(
     feature = "compress",
-    not(all(
-        feature = "aws-lc-crypto",
-        not(feature = "native-crypto"),
-        not(all(target_arch = "wasm32", feature = "crypto-host"))
-    ))
+    not(feature = "native-crypto"),
+    not(feature = "aws-lc-crypto")
 ))]
-pub(crate) type Aes256CbcEnc = RustCryptoAes256CbcEnc;
+compile_error!(
+    "`aes256` with `compress` needs an in-process AES-256-CBC encryptor:      `crypto-host` delegates decryption only, so enable `native-crypto`      (RustCrypto) alongside it to write encrypted archives, or drop `compress`"
+);
 
 /// The shape both backends' SHA-256 share, so the key derivation can be
 /// written once and run against either one. `lzma-turbo` exposes two concrete
@@ -519,7 +521,7 @@ impl_sha256_like!(lzma_turbo::crypto::host::Sha256);
 mod tests {
     use super::*;
 
-    #[cfg(any(feature = "native-crypto", feature = "compress"))]
+    #[cfg(feature = "native-crypto")]
     #[test]
     fn aes_key_schedules_are_cleared_on_drop() {
         fn requires_clearing<T: zeroize::ZeroizeOnDrop>() {}

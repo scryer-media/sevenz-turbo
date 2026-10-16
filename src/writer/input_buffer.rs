@@ -65,10 +65,14 @@ fn advise(data: *mut u8, len: usize) {
     unsafe extern "C" {
         fn madvise(addr: *mut core::ffi::c_void, length: usize, advice: i32) -> i32;
     }
+    /// `MADV_HUGEPAGE`, as `<asm-generic/mman-common.h>` defines it.
+    const MADV_HUGEPAGE: i32 = 14;
     // SAFETY: huge_with_advice supplies the complete owned, 2 MiB-aligned
     // allocation. MADV_HUGEPAGE changes page policy, never bytes or ownership.
-    // Advice is best effort: unsupported/denied advice leaves ordinary pages.
-    let _ = unsafe { madvise(data.cast(), len, 14) };
+    // The result is deliberately ignored: advice is best effort, and a kernel
+    // without transparent huge pages, or one that denies the advice, leaves
+    // ordinary pages, which hold the same bytes.
+    let _ = unsafe { madvise(data.cast(), len, MADV_HUGEPAGE) };
 }
 
 #[cfg(all(target_os = "linux", miri))]
@@ -135,6 +139,36 @@ mod tests {
         buffer[0] = 1;
         buffer[HUGE_PAGE - 1] = 2;
         assert_eq!((buffer[0], buffer[HUGE_PAGE - 1]), (1, 2));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn panicking_advice_releases_the_uninitialized_allocation() {
+        // In its own Miri process this also checks that unwinding drops the
+        // Box with its original aligned allocation layout, without a leak.
+        let result = std::panic::catch_unwind(|| {
+            InputBuffer::huge_with_advice(|_, _| panic!("advice interrupted"))
+        });
+        assert!(result.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn aligned_storage_keeps_ownership_when_moved_between_threads() {
+        let mut first = InputBuffer::huge_with_advice(|_, _| {});
+        let mut second = InputBuffer::huge_with_advice(|_, _| {});
+        assert_ne!(first.as_ptr(), second.as_ptr());
+        first[0] = 7;
+        second[HUGE_PAGE - 1] = 11;
+        let first = std::thread::spawn(move || {
+            assert_eq!((first[0], first[HUGE_PAGE - 1]), (7, 0));
+            first[HUGE_PAGE - 1] = 13;
+            first
+        })
+        .join()
+        .unwrap();
+        assert_eq!((first[0], first[HUGE_PAGE - 1]), (7, 13));
+        assert_eq!((second[0], second[HUGE_PAGE - 1]), (0, 11));
     }
 
     #[cfg(target_os = "linux")]

@@ -18,14 +18,21 @@ use std::process::Command;
 use sevenz_turbo::encoder_options::*;
 use sevenz_turbo::*;
 
-/// The first of `7zz`, `7z` that runs, if any.
+/// The first of `7zz`, `7z` that runs, if any. With
+/// `SEVENZ_TURBO_7ZZ_REQUIRED` set, a missing 7-Zip fails the test instead of
+/// skipping it, as `SEVENZ_TURBO_SDK_REQUIRED` does in `sdk_functional.rs`.
 fn seven_zip() -> Option<&'static str> {
-    ["7zz", "7z"].into_iter().find(|bin| {
+    let found = ["7zz", "7z"].into_iter().find(|bin| {
         Command::new(bin)
             .arg("i")
             .output()
             .is_ok_and(|o| o.status.success())
-    })
+    });
+    assert!(
+        found.is_some() || std::env::var_os("SEVENZ_TURBO_7ZZ_REQUIRED").is_none(),
+        "SEVENZ_TURBO_7ZZ_REQUIRED is set but neither 7zz nor 7z runs"
+    );
+    found
 }
 
 /// Text-like bytes that every coder compresses, and some that none does.

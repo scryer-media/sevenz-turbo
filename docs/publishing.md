@@ -11,9 +11,11 @@ ways:
   dependencies, so it runs wherever `cargo` does) runs every check the
   workflow runs, so a tag that reaches GitHub is one the workflow will accept.
 
-`sevenz-turbo` is published after the `lzma-turbo` version it pins, never
-before: the manifest reaches `lzma-turbo` through crates.io, and the release
-task refuses to tag while a `path` is still on that dependency.
+`sevenz-turbo` is published after the `lzma-turbo` version its lockfile was
+tested with, never before: the manifest names a caret floor on `lzma-turbo`
+(the oldest version this crate needs, not a pin) and reaches it through
+crates.io, `Cargo.lock` fixes the exact version CI built with `--locked`, and
+the release task refuses to tag while a `path` is still on that dependency.
 
 ## One-time setup, before the first release
 

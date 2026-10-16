@@ -9,9 +9,9 @@ readme = "README.md"
 repository = "https://github.com/scryer-media/sevenz-turbo"
 # Raised from upstream's 1.93: `lzma-turbo` requires 1.97.1.
 rust-version = "1.97.1"
-version = "0.27.1"
+version = "0.27.2"
 # Repository scaffolding that has no business in the crate archive.
-exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml", "docs/**/*.json.zst"]
+exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml"]
 
 # `tools/decode-bench` is a workspace member rather than an example because it
 # depends on upstream `sevenz-rust2` to time the fork against it, and that
@@ -37,8 +37,8 @@ aes256_wasm = ["aes256", "getrandom/wasm_js"]
 # not turn `aws-lc-crypto` off — it takes precedence over it. A build that
 # wants no AWS-LC asks for `default-features = false` plus `native-crypto`.
 # Enabling `aes256` with neither is a compile error, not a silent choice. The
-# encoder's AES follows the same choice; `compress` still pulls `aes`/`cbc`
-# in regardless, as the encryptor of every build that does not select AWS-LC.
+# encoder's AES follows the same choice: `aes`/`cbc` come in only through
+# `native-crypto`, so `compress` adds no RustCrypto AES to an AWS-LC build.
 aws-lc-crypto = ["dep:aws-lc-rs", "lzma-turbo/crypto"]
 native-crypto = ["dep:aes", "dep:cbc", "lzma-turbo/native-crypto"]
 # Delegate the 7z `aes256` cryptography to the embedding host (see the `hooks`
@@ -62,9 +62,12 @@ crc-host = ["lzma-turbo/crc-host"]
 brotli = ["dep:brotli"]
 bzip2 = ["dep:bzip2"]
 # Writing archives. LZMA and LZMA2 are encoded by `lzma-turbo`'s port of the
-# SDK encoder (see `src/codec/lzma_turbo/writer.rs`); the AES-256 encryptor
-# is RustCrypto's unless AWS-LC is the selected backend.
-compress = ["lzma-turbo/enc", "dep:aes", "dep:cbc"]
+# SDK encoder (see `src/codec/lzma_turbo/writer.rs`); with `aes256`, the
+# AES-256 encryptor is the selected backend's (RustCrypto under
+# `native-crypto`, AWS-LC otherwise). `crypto-host` delegates decryption only,
+# so a wasm `crypto-host` build with `compress` and `aes256` also needs
+# `native-crypto`; without it the build is a compile error.
+compress = ["lzma-turbo/enc"]
 deflate = ["dep:flate2"]
 lz4 = ["dep:lz4_flex"]
 # PPMd decodes and encodes through `ppmd-turbo`.
@@ -84,8 +87,10 @@ bzip2 = { version = "0.6", optional = true }
 cbc = { version = "0.2", optional = true }
 flate2 = { version = "1", optional = true, features = ["zlib-rs"] }
 getrandom = { version = "0.4", optional = true }
-# Use the published version of the validated library checkpoint.
-lzma-turbo = { version = "=0.9.1", default-features = false, features = ["std", "asm", "crc", "filters"] }
+# A caret requirement: the floor this crate is known to need, not a pin.
+# `Cargo.lock` fixes the exact version that was tested, and CI builds with
+# `--locked`.
+lzma-turbo = { version = "0.9.2", default-features = false, features = ["std", "asm", "crc", "filters"] }
 ppmd-turbo = { version = "0.1.1", optional = true }
 lz4_flex = { version = "0.14", optional = true }
 nt-time = { version = "0.15", optional = true }
@@ -145,6 +150,36 @@ all-features = true
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# Tests need no debuginfo: a cold `cargo test --all-features --no-run` is
+# 20.7 s instead of 25.1 s (99 CPU-s instead of 132) without it, and the test
+# run is unchanged.
+[profile.test]
+debug = 0
+split-debuginfo = "off"
+incremental = false
+
+# Dev and test builds optimise only the crates that dominate test time; debug
+# assertions and overflow checks stay on. Each comment gives the measured cost
+# of leaving that crate at opt-level 0 with the other override in place (local
+# runs of `cargo test --all-features` on an Apple M5 Max). AWS-LC, crc-fast,
+# zlib-rs, libbz2-rs-sys, zstd-sys, lz4_flex and brotli were measured too and
+# left out: optimising them saved nothing measurable in the test run.
+
+# LZMA/LZMA2 coding, BCJ/delta filters and CRC: the test run takes 121 s instead
+# of 50 s, folder_parallel_tests 56 s instead of 17 s; it costs under 1 s of
+# cold compile and nothing warm.
+[profile.dev.package.lzma-turbo]
+opt-level = 3
+
+# PPMd: the test run takes 65 s instead of 50 s (190 CPU-s instead of 132),
+# differential_7zz_tests 6.7 s instead of 0.9 s; no measurable compile cost.
+[profile.dev.package.ppmd-turbo]
+opt-level = 3
+
+# sevenz-turbo itself stays at opt-level 0: optimising it would build all 29
+# test binaries optimised too, so a cold build takes 47 s instead of 21 s and an
+# incremental one 29 s instead of 4 s, against 17 s saved in the test run.
 
 # `--cfg sevenz_turbo_unthreaded` (through RUSTFLAGS) makes the LZMA and LZMA2
 # writers take the path a target without threads takes, so that it can be

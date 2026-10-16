@@ -798,7 +798,10 @@ impl EncoderOptions {
             EncoderOptions::Lzma(o) => o.0.dict_size(),
             #[cfg(feature = "compress")]
             EncoderOptions::Lzma2(o) => o.settings.dict_size(),
-            #[allow(unused)]
+            // Every other codec. A wildcard rather than one arm per feature:
+            // with no codec feature on, the enum has no variants at all, and
+            // this arm is what keeps that build's `match` well formed. No
+            // lint fires on it in any feature set, so it needs no `allow`.
             _ => 0,
         }
     }
