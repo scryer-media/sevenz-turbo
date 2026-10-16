@@ -622,6 +622,7 @@ impl AesEncoderOptions {
 
 /// Encoder-specific options for various compression and encryption methods.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum EncoderOptions {
     #[cfg(feature = "compress")]
     /// Delta filter options.

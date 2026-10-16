@@ -45,7 +45,7 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   hooks, renovate, issue templates, `AGENTS.md`, `SECURITY.md`,
   `CONTRIBUTORS.md`. Upstream's `.github/workflows/rust.yml` and
   `.github/dependabot.yml` were removed as duplicates of these.
-- `lzma-turbo` is a caret requirement on a published version (since 0.27.2;
+- `lzma-turbo` is a caret requirement on a published version (since 0.28.0;
   0.27.1 pinned `=0.9.1`): the manifest states the floor this crate needs,
   `Cargo.lock` fixes the version CI tested with `--locked`, and no Git
   dependency or machine-specific checkout is involved.
@@ -168,10 +168,10 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
 - The LZMA coder's properties are length-checked before being sliced, instead
   of panicking on a short field.
 - A callback that reads part of a file and asks to go on has the rest of that
-  file read and CRC-checked for it (0.27.2). Upstream leaves the unread bytes
+  file read and CRC-checked for it (0.28.0). Upstream leaves the unread bytes
   in the stream, so the next file begins at the wrong offset.
 - A zero-length file's CRC is checked against the CRC of no bytes, as 7-Zip
-  checks it (0.27.2); upstream does not compare it.
+  checks it (0.28.0); upstream does not compare it.
 - A stored folder of 8 MiB or more, decoded with two threads or more from a
   complete positional source, is read ahead and checksummed on a stage
   thread, and an AES one is decrypted on a second, while the caller writes
@@ -401,7 +401,7 @@ arm, and this crate can add a variant without a breaking release.
   encoder (`compress`) follows the same switch over the same unpadded CBC:
   AWS-LC's `EncryptingKey::cbc` by default, RustCrypto's `cbc::Encryptor`
   under `native-crypto` (a wasm build encrypts in the guest). The host hook
-  decrypts only, so since 0.27.2 a wasm `crypto-host` build with `compress`
+  decrypts only, so since 0.28.0 a wasm `crypto-host` build with `compress`
   and `aes256` must also enable `native-crypto`; without it the build is a
   compile error.
   `aws-lc-rs` is a direct optional dependency on the pin and features
@@ -434,7 +434,7 @@ arm, and this crate can add a variant without a breaking release.
   wasm build), for consumers who want to assert on it.
 - The `aes` and `cbc` dependencies are enabled by `native-crypto` alone, and
   the RustCrypto encryptor is compiled only with `compress`, `aes256` and
-  `native-crypto` together (since 0.27.2; before it, `compress` pulled them
+  `native-crypto` together (since 0.28.0; before it, `compress` pulled them
   in as well). The AWS-LC lane, the default, compiles neither. The direct
   `sha2` dependency is gone.
 - When both backends are compiled, a differential test checks they agree on
@@ -491,6 +491,9 @@ before 1.0. Nothing else differs from what 0.27.2 would have shipped.
 - `Error` is `#[non_exhaustive]`, as `Limit`, `BlockErrorKind` and `lzma-turbo`'s
   `Error` already are: a consumer that matched every variant needs a
   wildcard arm, and a variant added later is no longer a breaking change.
+  `EncoderOptions` (`compress`) and `hooks::HostAesError` (`crypto-host`),
+  the other two public enums, are marked the same way in this release, so
+  every public enum of the crate can grow without a breaking release.
 - Accept SDK-valid empty archives without a next header (a zero
   next-header size).
 - Preserve empty entries interleaved with solid substreams in block iteration

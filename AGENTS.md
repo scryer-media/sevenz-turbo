@@ -155,8 +155,10 @@ with a version bump and a changelog entry like any other.
 - Any code change bumps the crate version, `Cargo.lock` and `CHANGELOG.md` in
   the same change. The bump is what `cargo semver-checks` says it is: the
   release workflow runs it against the published version and refuses a
-  patch bump that carries a breaking change. Public enums are
-  `#[non_exhaustive]` so that a new variant is not one.
+  patch bump that carries a breaking change. Every public enum (`Error`,
+  `Limit`, `BlockErrorKind`, `EncoderOptions`, `hooks::HostAesError`) is
+  `#[non_exhaustive]` so that a new variant is not one; a new public enum is
+  too.
 - `tools/wasm-conformance` is the only place `wasmtime` is allowed: it is a
   workspace member, not a test of this crate, and every workspace-wide
   `cargo nextest run`/`cargo clippy` in CI and the release path excludes it. Do not
