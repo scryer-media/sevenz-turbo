@@ -1,5 +1,8 @@
 # Archive source-buffer huge-page audit
 
+Machine-readable evidence named below is stored outside the repository.
+See [Benchmark data archive](benchmark-data.md) for the archive layout and checksums.
+
 This change applies Linux `MADV_HUGEPAGE` in the archive writer, before
 initializing its reusable source buffer. It covers `push_archive_entry`,
 `push_archive_entries`, and `prepare_block`. The allocation and its

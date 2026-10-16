@@ -122,15 +122,20 @@ with a version bump and a changelog entry like any other.
   `examples/data/`. Every tracked file in that differential corpus is capped
   at 1 MiB by the `hygiene` CI lane. This is a repository fixture rule, not
   a limit on archives the library can process.
-- Sanitized benchmark evidence under `docs/**/*.json.zst` is explicitly
-  allowed and is not subject to the fixture size cap. CI must decompress it
-  and validate strict UTF-8 JSON. Preserve the measurements and source
-  identities; do not discard evidence to satisfy a fixture-only size limit.
 - `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`
-  and `cargo test --all-features` must pass before a commit is proposed.
+  and `cargo nextest run --all-features --no-fail-fast` plus
+  `cargo test --doc --all-features --no-fail-fast` must pass before a commit
+  is proposed.
 - Any code change bumps the crate version, `Cargo.lock` and `CHANGELOG.md` in
   the same change.
 - `tools/wasm-conformance` is the only place `wasmtime` is allowed: it is a
   workspace member, not a test of this crate, and every workspace-wide
-  `cargo test`/`cargo clippy` in CI and the release path excludes it. Do not
+  `cargo nextest run`/`cargo clippy` in CI and the release path excludes it. Do not
   add `wasmtime` (or any wasm host) to this crate's dev-dependencies.
+- Use `cargo nextest run --no-fail-fast` for native test sweeps. Install
+  `cargo-nextest` 0.9.143 as in CI. Run doctests separately with `cargo test --doc`;
+  keep `cargo miri test` for interpreter checks. Exclude `wasm-conformance`
+  from ordinary workspace sweeps; its dedicated CI job runs it.
+- Keep raw benchmark data, machine-readable reports and profiling bundles
+  outside the repository. Commit Markdown summaries and source identities.
+  Existing evidence is preserved as described in `docs/benchmark-data.md`.

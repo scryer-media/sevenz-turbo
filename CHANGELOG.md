@@ -452,7 +452,7 @@ Everything here is new surface; no upstream signature changed meaning.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
-## 0.27.1 - Unreleased
+## 0.27.1 - 2026-10-15
 
 - Enforce aggregate coder limits when admitting positional LZMA2 work from
   previously parsed metadata. Keep backend access behind the codec facade.

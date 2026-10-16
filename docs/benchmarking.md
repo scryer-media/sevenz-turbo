@@ -1,5 +1,8 @@
 # Benchmarking
 
+Machine-readable evidence named below is stored outside the repository.
+See [Benchmark data archive](benchmark-data.md) for the archive layout and checksums.
+
 The reason this fork exists is decode throughput, so the swap is only done when
 it is measured. This page records how to measure it and what the numbers were
 when the codec swap landed.
