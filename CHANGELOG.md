@@ -172,6 +172,11 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
   in the stream, so the next file begins at the wrong offset.
 - A zero-length file's CRC is checked against the CRC of no bytes, as 7-Zip
   checks it (0.27.2); upstream does not compare it.
+- A stored folder of 8 MiB or more, decoded with two threads or more from a
+  complete positional source, is read ahead and checksummed on a stage
+  thread, and an AES one is decrypted on a second, while the caller writes
+  (0.28.0). Upstream reads, decrypts, checksums and copies stored data on
+  the calling thread, one after the other.
 
 ### Safety against hostile archives
 
@@ -579,6 +584,32 @@ before 1.0. Nothing else differs from what 0.27.2 would have shipped.
   builds compile `aes`/`cbc`, and where `lzma_turbo::` is used.
 - Drop a crate-archive `exclude` pattern (`docs/**/*.json.zst`) that matched
   no file.
+- Stored folders overlap reading with writing. A stored (COPY) folder of
+  8 MiB or more on the calling thread's path, decoded with `set_threads(2)`
+  or more from a complete positional source, is read by a stage thread in
+  1 MiB spans, two queued, and each file's CRC-32 is taken on that thread
+  and folded as the parallel LZMA2 coder's are; the caller hands the spans
+  to its sink. On 1 GiB stored in one folder (macOS arm64, median of 9) a
+  hashing sink went from 0.117 s to 0.082 s at two threads and 0.083 s at
+  four and eight; a sink that does nothing went from 0.064-0.066 s to
+  0.068-0.070 s, 5-9% slower, which no thread or size gate can tell apart
+  from a sink that writes. Peak RSS rises by the spans, 3.6 to 6.8 MiB.
+  One thread is unchanged.
+- AES over stored data (`7zz a -mx0 -p`) of 8 MiB or more decrypts on a
+  stage thread of its own, through the same `Aes256Sha256Decoder`, behind a
+  fetch stage, and checksums the plaintext there: 0.182 s to 0.106 s at two,
+  four and eight threads into a hashing sink, 0.139 s to 0.104 s into one
+  that does nothing, peak RSS 3.9 to 9.9 MiB. A checksum mismatch is the
+  same `MaybeBadPassword`, kind `Password`, at the same folder as one
+  thread gives.
+- The spans in flight (4 MiB per stage) are charged against
+  `ArchiveLimits::memory`; a limit that cannot afford them, or a thread the
+  system refuses, leaves the folder on the serial path. A read error reaches
+  the sink after every byte before it; a callback that stops early or a sink
+  that fails stops the stage threads before the call returns.
+- A stored folder's push buffer is no larger than what is left of the
+  folder, so a small stored member no longer allocates and zeroes 1 MiB;
+  the stage spans follow the same rule.
 
 ## 0.27.1 - 2026-10-15
 
