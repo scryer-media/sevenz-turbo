@@ -150,18 +150,33 @@ pub(crate) fn spawn<R: Read + Send + 'static>(
     })
 }
 
-/// A span to fill: a spare the consumer handed back, a new one while the
-/// stage has made fewer than [`SPANS_PER_STAGE`], or the next spare to come
-/// back. `None` once the consumer is gone.
-fn next_spare(spares: &Receiver<Vec<u8>>, made: &mut usize) -> Option<io::Result<Vec<u8>>> {
+/// How long a stage's spans are, and how many it makes at most, for a stage
+/// of `limit` bytes: [`SPAN_BYTES`] and [`SPANS_PER_STAGE`], or no more than
+/// the stage can fill, so a short stream neither zeroes a whole span nor
+/// makes spans it will never fill.
+fn span_shape(limit: u64) -> (usize, usize) {
+    let size = usize::try_from(limit).map_or(SPAN_BYTES, |limit| limit.min(SPAN_BYTES));
+    let needed = usize::try_from(limit.div_ceil(size.max(1) as u64)).unwrap_or(usize::MAX);
+    (size, needed.clamp(1, SPANS_PER_STAGE))
+}
+
+/// A span to fill: a spare the consumer handed back, a new one of `size`
+/// bytes while the stage has made fewer than `cap`, or the next spare to
+/// come back. `None` once the consumer is gone.
+fn next_spare(
+    spares: &Receiver<Vec<u8>>,
+    made: &mut usize,
+    size: usize,
+    cap: usize,
+) -> Option<io::Result<Vec<u8>>> {
     match spares.try_recv() {
         Ok(span) => Some(Ok(span)),
-        Err(TryRecvError::Empty) if *made < SPANS_PER_STAGE => {
+        Err(TryRecvError::Empty) if *made < cap => {
             let mut span = Vec::new();
-            if let Err(error) = span.try_reserve_exact(SPAN_BYTES) {
+            if let Err(error) = span.try_reserve_exact(size) {
                 return Some(Err(io::Error::new(io::ErrorKind::OutOfMemory, error)));
             }
-            span.resize(SPAN_BYTES, 0);
+            span.resize(size, 0);
             *made += 1;
             Some(Ok(span))
         }
@@ -178,8 +193,9 @@ fn produce<R: Read>(
     spares: &Receiver<Vec<u8>>,
 ) {
     let mut made = 0;
+    let (size, cap) = span_shape(left);
     loop {
-        let mut span = match next_spare(spares, &mut made) {
+        let mut span = match next_spare(spares, &mut made, size, cap) {
             None => return,
             Some(Ok(span)) => span,
             Some(Err(error)) => {
@@ -187,7 +203,7 @@ fn produce<R: Read>(
                 return;
             }
         };
-        let want = (SPAN_BYTES as u64).min(left) as usize;
+        let want = (span.len() as u64).min(left) as usize;
         let mut filled = 0;
         let mut outcome = Ok(left != 0);
         while filled < want {
@@ -372,6 +388,27 @@ mod tests {
             self.pos += n;
             Ok(n)
         }
+    }
+
+    /// A stage shorter than a span fills one span its own size; a longer one
+    /// makes no more spans than it can fill, up to the per-stage bound.
+    #[test]
+    fn spans_are_sized_to_the_stage() {
+        assert_eq!(span_shape(0), (0, 1));
+        assert_eq!(span_shape(4_097), (4_097, 1));
+        assert_eq!(span_shape(SPAN_BYTES as u64), (SPAN_BYTES, 1));
+        assert_eq!(span_shape(2 * SPAN_BYTES as u64 + 1), (SPAN_BYTES, 3));
+        assert_eq!(span_shape(u64::MAX), (SPAN_BYTES, SPANS_PER_STAGE));
+
+        let input = data(4_097);
+        let mut reader = spawn(io::Cursor::new(input.clone()), 4_097, None).unwrap();
+        let mut first = [0u8; 1];
+        assert_eq!(reader.read(&mut first).unwrap(), 1);
+        assert_eq!(reader.span.len(), 4_097);
+        assert_eq!(reader.span.capacity(), 4_097);
+        let mut out = first.to_vec();
+        reader.read_to_end(&mut out).unwrap();
+        assert!(out == input);
     }
 
     #[test]

@@ -300,17 +300,25 @@ pub(crate) struct CopyReader<R> {
     input: R,
     buffer: Vec<u8>,
     push_enabled: bool,
+    /// What is left of the coder's declared output. The push buffer is never
+    /// grown past it, so a small stored member allocates and zeroes a buffer
+    /// its own size rather than [`PUSH_BUFFER_BYTES`]; on an archive of many
+    /// small stored folders that zeroing was a measurable share of the decode.
+    remaining: u64,
 }
 
 impl<R: Read> Read for CopyReader<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.input.read(buffer)
+        let read = self.input.read(buffer)?;
+        self.remaining = self.remaining.saturating_sub(read as u64);
+        Ok(read)
     }
 }
 
 impl<R: Read> CopyReader<R> {
     fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> std::io::Result<usize> {
-        let want = max.min(PUSH_BUFFER_BYTES);
+        let left = usize::try_from(self.remaining).unwrap_or(usize::MAX);
+        let want = max.min(PUSH_BUFFER_BYTES).min(left);
         if want == 0 {
             return Ok(0);
         }
@@ -327,6 +335,7 @@ impl<R: Read> CopyReader<R> {
             }
         };
         if read != 0 {
+            self.remaining = self.remaining.saturating_sub(read as u64);
             sink(&self.buffer[..read]);
         }
         Ok(read)
@@ -576,6 +585,7 @@ pub fn add_decoder<I: Read>(
         EncoderMethod::ID_COPY => Ok(Decoder::Copy(CopyReader {
             input,
             buffer: Vec::new(),
+            remaining: uncompressed_len as u64,
             // COPY has always required no coder allocation in the admission
             // model. Finite-budget chains preserve their upstream push
             // stage instead; read-only header decoding needs no output here.
@@ -927,6 +937,7 @@ mod copy_push_tests {
             input: Input { interrupt: false },
             buffer: Vec::new(),
             push_enabled: true,
+            remaining: u64::MAX,
         };
         assert_eq!(reader.read(&mut [0; 13]).unwrap(), 13);
         assert!(reader.buffer.is_empty());
@@ -945,5 +956,50 @@ mod copy_push_tests {
             PUSH_BUFFER_BYTES
         );
         assert_eq!(reader.buffer.len(), PUSH_BUFFER_BYTES);
+    }
+
+    /// A stored member smaller than the push step gets a buffer its own size,
+    /// not [`PUSH_BUFFER_BYTES`], and its end is where its declared size says.
+    #[test]
+    fn copy_push_buffer_is_sized_to_the_folder() {
+        let member = vec![42u8; 4_097];
+        let mut reader = CopyReader {
+            input: io::Cursor::new(member.clone()),
+            buffer: Vec::new(),
+            push_enabled: true,
+            remaining: member.len() as u64,
+        };
+        let mut out = Vec::new();
+        assert_eq!(
+            reader
+                .push(PUSH_BUFFER_BYTES, &mut |b| out.extend_from_slice(b))
+                .unwrap(),
+            member.len()
+        );
+        assert_eq!(reader.buffer.len(), member.len());
+        assert_eq!(reader.buffer.capacity(), member.len());
+        assert_eq!(
+            reader
+                .push(PUSH_BUFFER_BYTES, &mut |_| panic!("past the end"))
+                .unwrap(),
+            0
+        );
+        assert_eq!(out, member);
+
+        // Reads through the caller's buffer count against the same size.
+        let mut reader = CopyReader {
+            input: io::Cursor::new(member.clone()),
+            buffer: Vec::new(),
+            push_enabled: true,
+            remaining: member.len() as u64,
+        };
+        assert_eq!(reader.read(&mut [0; 4_000]).unwrap(), 4_000);
+        assert_eq!(
+            reader
+                .push(PUSH_BUFFER_BYTES, &mut |b| assert_eq!(b, &[42; 97]))
+                .unwrap(),
+            97
+        );
+        assert_eq!(reader.buffer.len(), 97);
     }
 }
