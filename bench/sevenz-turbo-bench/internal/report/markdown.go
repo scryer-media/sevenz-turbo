@@ -308,7 +308,7 @@ func Merge(reports []*Report) (string, error) {
 	fmt.Fprintln(&b, "# sevenz-turbo bench: cross-host summary")
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, Orientation)
-	fmt.Fprintln(&b, "Each host is compared with its own 7zz; cells are `sevenz-turbo median wall s / wall ratio / RSS ratio` (encode rows add `/ size ratio`).")
+	fmt.Fprintln(&b, "Each host's ratios are taken on that host, against its own 7zz unless the line's label names another reference; cells are `sevenz-turbo median wall s / wall ratio / RSS ratio` (encode rows add `/ size ratio`).")
 	fmt.Fprintln(&b)
 	fmt.Fprintln(&b, "## Hosts")
 	fmt.Fprintln(&b)

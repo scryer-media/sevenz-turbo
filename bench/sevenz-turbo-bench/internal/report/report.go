@@ -22,7 +22,7 @@ import (
 const Schema = "sevenz-turbo-bench/report/1"
 
 // Orientation is stated in every report header.
-const Orientation = "ratio = 7zz / sevenz-turbo, >1 = sevenz-turbo better. Every ratio is reference over candidate (oracle/ours) of the medians: above 1.000 sevenz-turbo is faster (wall, CPU), smaller (archive size) or lower (peak RSS); below 1.000 it is slower, larger or higher."
+const Orientation = "Every ratio is reference over candidate of the medians, against the reference its label names. The default reference is the host's own 7zz: ratio = 7zz / sevenz-turbo, >1 = sevenz-turbo better. A budget row's `vs sevenz-turbo unbudgeted` line is self-referenced: sevenz-turbo unbudgeted / sevenz-turbo budgeted, the cost of the budget alone. Above 1.000 the candidate is faster (wall, CPU), smaller (archive size) or lower (peak RSS) than its reference; below 1.000 it is slower, larger or higher."
 
 // Stat is a median with its range.
 type Stat struct {
