@@ -4,226 +4,92 @@
 [![crates.io](https://img.shields.io/crates/v/sevenz-turbo.svg)](https://crates.io/crates/sevenz-turbo)
 [![docs.rs](https://docs.rs/sevenz-turbo/badge.svg)](https://docs.rs/sevenz-turbo)
 
-A 7z compressor/decompressor in Rust. The default build links AWS-LC (C and
-assembly) for its cryptography and `lzma-turbo`'s ports of the LZMA SDK's
-assembly decode loops; `default-features = false` with `native-crypto` builds
-without a C toolchain, as the WASM build does (the optional `zstd` codec
-aside, which links the C `zstd`).
-
-## This is a fork
-
-`sevenz-turbo` is a fork of
-**[sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2)** by Nils
-Hasenbanck (Apache-2.0), taken at upstream `12ed7c8`, just after v0.22.2. It
-is a hard fork: it is not rebased onto sevenz-rust2, nothing is sent back, and
-the two have diverged for good. The public API and the Rust module paths
-started as upstream's and are kept compatible while that costs nothing, so
-migrating is `sevenz_rust2::` → `sevenz_turbo::` plus whatever new calls you
-want; an API the container work needs to change will change, with a version
-bump and a changelog entry. One such change is in place: every public enum,
-`Error` included, is `#[non_exhaustive]`, so a `match` on `Error` that
-named every upstream variant needs a wildcard arm here.
-
-Two things are the reason the fork exists; the default thread count, the
-cryptography backends, the PPMd engine (`ppmd-turbo`) and the limits on
-hostile archives below also differ from upstream.
-
-### 1. LZMA and LZMA2 decode and encode with `lzma-turbo`
-
-Upstream decodes LZMA/LZMA2 with a pure-Rust decoder. This fork routes those
-two coders to [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo), a
-port of Igor Pavlov's reference decoder (including the LZMA SDK's assembly
-loops). Archives are written with `lzma-turbo`'s port of the SDK encoder.
-
-LZMA2 also decodes on several threads, by cutting the stream at the dictionary
-resets that make a run independently decodable. **The default is one thread**,
-unlike upstream, which defaults to `available_parallelism()`: a library should
-not decide on its own to occupy every core, or to hold the memory that costs.
-
-```rust
-let mut reader = ArchiveReader::new(file, Password::empty())?.with_threads(8);
-```
-
-Decoding is at parity with `7zz t` in time and peak memory on the measured
-rows, at two to eight threads (see [Speed](#speed)). An archive written
-`-mmt=1` is one run from beginning to end and cannot be split at all, so a
-thread count above one neither helps it nor — as of the read-ahead rule —
-hurts it: see [docs/benchmarking.md](docs/benchmarking.md).
-
-The count can also be changed *while* a block is decoding, from the decoding
-thread or from another one, through a handle taken before the decode starts:
-
-```rust
-let mut reader = ArchiveReader::new(file, Password::empty())?.with_adaptive_lzma2();
-let lzma2 = reader.lzma2_handle();
-// … on whatever thread is watching the download:
-if let Some(progress) = lzma2.progress() {
-    // `pending_runs` is the backlog of complete, not-yet-claimed runs, and
-    // `runs_claimed` the run index of the block being decoded.
-    lzma2.set_threads(if progress.pending_runs > 1 { 8 } else { 1 });
-}
-```
-
-A change lands at the next run boundary, which is a dictionary reset, so
-switching is lossless: a run decoded inline and the same run decoded on a
-worker are the same decode, and the output bytes cannot tell you which
-happened. `set_threads(1)` decodes inline on the calling thread, spawning
-nothing.
-
-A thread count above one is a request, not a promise. A stream with no
-dictionary resets — what `7zz -mmt=1` writes — decodes single-threaded because
-there is nothing to cut, and so does a block whose memory budget has no room
-for runs in flight: a limit says what the caller can afford, not that the
-archive must be refused. Measured numbers live in
-[docs/benchmarking.md](docs/benchmarking.md).
-
-Parallel decoding buys its speed with memory: each thread holds a run's input
-and output. It holds what `7zz` holds; the 2 GiB `-mx5` archive at four
-threads peaks at 1035.8 MiB against 1035.7 MiB (see [Speed](#speed)). A
-caller who would rather have the memory than the speed says so with
-`ArchiveLimits::memory`, which bounds the read-ahead along with everything
-else; a caller who wants neither leaves the thread count at
-one, where a block costs its dictionary and nothing else.
-
-### 2. Container API a streaming consumer needs
-
-A consumer that feeds this reader from a download, under a memory budget it has
-to honour before it allocates, needs to ask the archive a few things first:
-
-- `ArchiveReader::with_limits` refuses an archive over an `ArchiveLimits`
-  before the allocation it bounds — the declared end-header size before the
-  header is buffered, and `Archive::decoder_memory_estimate()` before a
-  decoder is built.
-- `Archive::block_pack_streams(block)` gives absolute `(offset, size)` ranges,
-  `Archive::block_sub_streams(block)` the per-entry sizes and CRC-32s.
-- `ArchiveReader::block_decoder(block)` borrows the reader rather than
-  consuming it, so the header is parsed once and blocks are decoded from the
-  same source.
-- `ArchiveReader::set_block_complete_hook` reports each block once it is
-  decoded and verified, and `set_sub_stream_complete_hook` reports each *file*
-  as its CRC-32 becomes final, with the value — the decoder computed it to
-  check the header, so a consumer reporting per-file integrity never has to
-  read the bytes a second time.
-- `crc32_combine(a, b, len_b)` folds two checksums into the checksum of the
-  two pieces joined, and `CrcFolder` folds a heap of `(offset, len, crc32)`
-  pieces into any range they cover — for a consumer stitching across
-  boundaries this crate does not know about, such as across blocks. Both are
-  re-exported from `lzma-turbo`, so a consumer folds with the same
-  implementation the decoder's workers checksummed with.
-- `Error::BlockDecode` names the block and the packed offset for a corrupt
-  archive, distinctly from I/O and unsupported-method failures.
-
-### Where the checksums come from
-
-When a block's coder is LZMA2 and it is decoding in parallel, no CRC-32 is
-computed on the thread delivering the bytes. The block's file boundaries go to
-the decoder as split points, each worker checksums the pieces of the block it
-produced before handing it on, and this crate folds those pieces into each
-file's CRC-32 and compares it with the header. Verification is unchanged — a
-corrupt block is refused exactly as before — but the cost has moved off the
-one section that does not get faster with more cores.
-
-Two cases keep the streaming checksum, because for them it is the right place:
-a block decoded single-threaded, where the consuming thread is the decoding
-thread; and a block whose LZMA2 output passes through a filter (BCJ, delta,
-BCJ2), where the bytes a worker saw are not the bytes the file is made of and
-the filter runs on the consuming thread anyway.
-
-The container API was added rather than altered so far, which keeps the
-migration a rename; the one change of behaviour behind an unchanged name is
-the default LZMA2 thread count, one rather than `available_parallelism()`. See
-[CHANGELOG.md](CHANGELOG.md), section `## Fork`, for the record of
-divergences, and [AGENTS.md](AGENTS.md) for the rules of a crate that has
-left its origin behind.
-
-### Encoders
-
-Writing archives (`compress`) encodes LZMA and LZMA2 with `lzma-turbo`'s port
-of the SDK encoder. A compression level means the same dictionary as in
-every earlier version: 256 KiB at level 0, rising to 64 MiB at level 9.
-
-### Crypto backends
-
-The 7z `aes256` coder needs AES-256-CBC and SHA-256, and **both** follow the
-backend feature. The default is `aws-lc-rs` — `DecryptingKey::cbc`, AWS-LC's
-unpadded CBC mode, plus its SHA-256, which this crate reaches through
-`lzma-turbo`'s `crypto` module. Enabling `native-crypto` switches both to
-RustCrypto (`aes`/`cbc` and `sha2`) and takes precedence, so a consumer that
-cannot build C can use `default-features = false` with `aes256, native-crypto`;
-that lane compiles to AES-NI on x86-64 and to the ARMv8 cryptography extensions
-on aarch64. Decrypting a 7z stream in pieces needs no streaming API on either
-lane: each chunk is decrypted with the current IV and its last ciphertext block
-becomes the next chunk's. Writing archives (`compress`) encrypts through the
-same backend switch. CRC-32 is `crc-fast`. On wasm, `crypto-host` and
-`crc-host` hand both to the embedding host instead (see
-[WASM support](#wasm-support)).
-
-Because Cargo features are additive, `native-crypto` cannot mean "turn AWS-LC
-off"; it means "win when both are compiled". So `aes256` does not pull a
-backend in by itself: with `default-features = false` you pick one explicitly,
-and asking for `aes256` with neither is a compile error rather than a silent
-choice about what cryptography is in your binary. `sevenz_turbo::crypto_backend()`
-reports which one a build selected.
-
-## Speed
-
-Fleet measurements of 0.27.0 against 7-Zip 26.03 and sevenz-rust2 0.22.2 on
-five CPUs, 2026-10-13. Each cell is the geometric mean over the default-build
-rows of reference / sevenz-turbo, so above 1.00 means sevenz-turbo took less
-wall time or less peak memory. Decode covers 1 to every thread, solid and
-non-solid, encrypted and filtered archives; encode covers levels 1 to 9 at
-1 to every thread.
-
-| CPU | threads | vs 7-Zip: decode wall | encode wall | peak RSS | vs sevenz-rust2: decode wall | peak RSS |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Zen 4 | 16 | 1.16 | 1.54 | 0.97 | 2.42 | 1.16 |
-| Graviton4 | 16 | 1.12 | 1.45 | 0.97 | 1.95 | 1.16 |
-| Alder Lake | 16 | 1.13 | 1.42 | 0.96 | 1.88 | 1.11 |
-| Zen 2 | 12 | 1.10 | 1.33 | 0.98 | 2.51 | 1.19 |
-| M5 Max | 18 | 1.13 | 1.38 | 0.93 | 2.44 | 1.24 |
-
-Single-threaded LZMA2 decode is at parity with `7zz -mmt=1` on every CPU,
-and parallel decode is at parity with `7zz` at every thread count on every
-CPU; the decode average covers the `decode/*` rows only and is above 1.0
-because of AES, PPMd and non-solid extract. The largest gaps are
-near-incompressible archives decoded on every hardware thread (0.88 to
-0.99, plain and AES), single-thread `bcj_arm64` filter decode on Zen 4,
-Graviton4 and M5 Max (0.91 to 0.94), the peak memory of single-thread
-decode with a tall window, and the encoder's peak memory; every cell below
-0.970 is in bold on the benchmarks page. Every row on every host, with CPU
-time, the memory-budget and adaptive rows, the `native-crypto` build and
-the runs without the decode ledger, is in
-[docs/benchmarks.md](docs/benchmarks.md). How to reproduce a measurement is
-in [docs/benchmarking.md](docs/benchmarking.md).
-
-## Usage
+Fast 7z archives for Rust: read them, write them, encrypt and decrypt them.
+LZMA and LZMA2 go through [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo),
+a port of 7-Zip's own code and assembly, so decoding keeps pace with 7-Zip
+and can use several threads.
 
 ```toml
 [dependencies]
 sevenz-turbo = "0.29"
 ```
 
-The minimum supported Rust version is 1.97.1, which `lzma-turbo` requires.
+It needs Rust 1.97.1 or newer. The default build uses AWS-LC for encryption,
+which needs a C compiler; [Encryption](#encryption) shows the pure-Rust build.
 
-Decompress "data/sample.7z" to "data/sample":
+## Why a fork?
+
+`sevenz-turbo` is a fork of
+**[sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2)** by Nils
+Hasenbanck (Apache-2.0), taken at upstream `12ed7c8`, just after v0.22.2. It
+is a hard fork: it is not rebased onto sevenz-rust2, nothing is sent back, and
+the two have diverged for good.
+
+Outreach was made to Hasenbanck to collaborate, but the core ethos of the `-turbo` line of crates was not something he was interested in engaging with. His crates focus more on pure Rust implementations with no unsafe and more readable code where the `-turbo` crates are performance driven.
+
+Given that `sevenz-turbo` uses unsafe Rust and assembly, the CI pipeline is incredibly robust. Every bit of unsafe code is tested with every possible method of ensuring it is safe and secure. This ranges from valgrind to fuzz testing, miri and ASan. All assembly receives provenance checks with its sourced upstream code, which means any later fixes/changes to upstream will be found quickly in CI. Also the repo is checked every morning against upstream CVE reported to `7z` so that those fixes can be ported quickly if they apply to `sevenz-turbo`.
+
+All reasonable methods of creating `7z` archives are also differentially tested against the upstream tooling to ensure interoperability.
+
+`sevenz-turbo` does have pure Rust fallbacks for every algorithm and the crate can be compiled as pure Rust. The performance degrades but is still fantastic. However optimization time and benchmarking efforts go toward the default features rather than pure Rust. 
+
+### Moving from sevenz-rust2
+
+The API started as sevenz-rust2's, so most code moves over by renaming
+`sevenz_rust2::` to `sevenz_turbo::`. Every difference, such as the default
+of one decode thread, is listed in [CHANGELOG.md](CHANGELOG.md) under
+`## Fork`.
+
+## Reading an archive
 
 ```rust
 sevenz_turbo::decompress_file("data/sample.7z", "data/sample").expect("complete");
 ```
 
-### Decompress an encrypted 7z file
+With a password:
 
 ```rust
 sevenz_turbo::decompress_file_with_password("path/to/encrypted.7z", "data/sample", "password".into()).expect("complete");
 ```
 
+### Using several threads
+
+LZMA2 can decode on several threads. It uses one unless asked, because a
+library should not take every core on its own:
+
+```rust
+let mut reader = ArchiveReader::new(file, Password::empty())?.with_threads(8);
+```
+
+Only an archive written in independent pieces can be split, which is what
+7-Zip writes when it compresses on several threads. One written on a single
+thread (`7zz -mmt=1`) decodes on one thread whatever you ask for, and asking
+costs nothing. Each extra thread holds a piece of the archive in memory,
+about as much as 7-Zip holds for the same archive. `ArchiveLimits::memory`
+caps it.
+
+The thread count can also change while a block is decoding, from any thread:
+
+```rust
+let mut reader = ArchiveReader::new(file, Password::empty())?.with_adaptive_lzma2();
+let lzma2 = reader.lzma2_handle();
+// … on whatever thread is watching the download:
+if let Some(progress) = lzma2.progress() {
+    // `pending_runs` is how many pieces have arrived and wait to be decoded.
+    lzma2.set_threads(if progress.pending_runs > 1 { 8 } else { 1 });
+}
+```
+
+The change takes effect at the next piece, and the output is the same either
+way. `set_threads(1)` decodes on the calling thread and starts no others.
+
 ### Archives from strangers
 
-Every number in a 7z header is chosen by whoever wrote the file, and this crate
-bounds each one before the allocation or the work it sizes — counts, names,
-dictionaries, nesting, the key-derivation factor, the declared output. The
-defaults are in force whether or not a caller passes limits, and no archive a
-mainstream 7-Zip writes reaches them.
+Every number in a 7z header is chosen by whoever wrote the file. This crate
+checks each one before it allocates or works on it: counts, names,
+dictionaries, nesting, the password's key-derivation cost, the output size.
+The default limits apply even when you pass none, and no archive a normal
+7-Zip writes reaches them.
 
 ```rust
 use sevenz_turbo::{ArchiveLimits, ArchiveReader, Password};
@@ -234,32 +100,59 @@ let limits = ArchiveLimits::memory(512 << 20)   // what a decode may allocate
 let reader = ArchiveReader::with_limits(file, Password::empty(), limits)?;
 ```
 
-`Error::LimitExceeded { what, limit, requested }` says which bound stopped a
-read, so a consumer can report "this archive wants more memory than we give it"
-rather than "corrupt archive". Per entry, `ArchiveEntry::is_unsafe_path()` and
-`is_symlink()` say what a name would do before anything is written.
+`Error::LimitExceeded { what, limit, requested }` says which limit stopped
+the read, so you can tell "too big for us" from "corrupt". Before anything is
+written, `ArchiveEntry::is_unsafe_path()` and `is_symlink()` say what an
+entry's name would do.
 
-[`docs/security.md`](docs/security.md) is the threat model, every limit with its
-default and rationale, and what happens when each is hit.
+[docs/security.md](docs/security.md) lists every limit, its default and what
+happens when it is hit.
 
-## Compression
+### Reading from a download
+
+A program that streams an archive in, under a memory budget, can ask it what
+it needs first:
+
+- `ArchiveReader::with_limits` refuses an archive over its limits before
+  allocating for it, and `Archive::decoder_memory_estimate()` says what a
+  decode will allocate.
+- `Archive::block_pack_streams(block)` gives the byte ranges a block is
+  stored in, and `Archive::block_sub_streams(block)` the size and CRC-32 of
+  each file in it.
+- `ArchiveReader::block_decoder(block)` decodes one block without using up
+  the reader, so the header is read once.
+- `set_block_complete_hook` reports each block once it is decoded and
+  checked, and `set_sub_stream_complete_hook` each file with its CRC-32, so
+  nothing has to be read twice to report integrity.
+- `crc32_combine` and `CrcFolder` join the CRC-32s of adjacent pieces, for a
+  check that crosses blocks.
+- `Error::BlockDecode` names the block and offset of corrupt data, apart from
+  I/O errors and unsupported methods.
+
+When an LZMA2 block decodes on several threads, each thread checksums the
+part it decoded and the parts are joined, so checking costs the reading
+thread nothing. A block decoded on one thread, or passed through a filter, is
+checked as it streams.
+
+## Writing an archive
 
 ```rust
 sevenz_turbo::compress_to_path("examples/data/sample", "examples/data/sample.7z").expect("compress ok");
 ```
 
-### Compress with AES encryption
+With a password:
 
 ```rust
 sevenz_turbo::compress_to_path_encrypted("examples/data/sample", "examples/data/sample.7z", "password".into()).expect("compress ok");
 ```
 
-### Advanced usage
+LZMA and LZMA2 are compressed by `lzma-turbo`'s port of 7-Zip's encoder.
+Level 0 uses a 256 KiB dictionary and level 9 a 64 MiB one.
 
-#### Solid compression
+### Solid archives
 
-Solid archives can compress better, but decompressing one file needs all the
-data in front of it decompressed too.
+A solid archive compresses better, but reading one file means decompressing
+everything stored before it.
 
 ```rust
 use sevenz_turbo::*;
@@ -269,7 +162,7 @@ writer.push_source_path("path/to/compress", |_| true).expect("pack ok");
 writer.finish().expect("compress ok");
 ```
 
-#### Configure the compression methods
+### Choosing the methods
 
 ```rust
 use sevenz_turbo::*;
@@ -283,21 +176,21 @@ writer.push_source_path("path/to/compress", |_| true).expect("pack ok");
 writer.finish().expect("compress ok");
 ```
 
-### Supported codecs and filters
+## Codecs and filters
 
 | Codec       | Decompression | Compression | Implemented by |
 |-------------|---------------|-------------|----------------|
 | COPY        | ✓            | ✓          | this crate |
-| LZMA        | ✓            | ✓          | `lzma-turbo`, decoder and encoder |
-| LZMA2       | ✓            | ✓          | `lzma-turbo`, decoder, parallel decoder and encoder |
+| LZMA        | ✓            | ✓          | `lzma-turbo` |
+| LZMA2       | ✓            | ✓          | `lzma-turbo`, on one thread or several |
 | BROTLI (*)  | ✓            | ✓          | `brotli` crate |
 | BZIP2       | ✓            | ✓          | `bzip2` crate |
 | DEFLATE (*) | ✓            | ✓          | `flate2` crate (`zlib-rs`) |
 | PPMD        | ✓            | ✓          | `ppmd-turbo` crate |
 | LZ4 (*)     | ✓            | ✓          | `lz4_flex` crate |
-| ZSTD (*)    | ✓            | ✓          | `zstd` crate |
+| ZSTD (*)    | ✓            | ✓          | `zstd` crate, which builds C code |
 
-(*) Require optional cargo feature.
+(*) Needs its cargo feature.
 
 | Filter        | Decompression | Compression |
 |---------------|---------------|-------------|
@@ -312,53 +205,83 @@ writer.finish().expect("compress ok");
 | BCJ2          | ✓            | ✓          |
 | DELTA         | ✓            | ✓          |
 
-Every branch converter, BCJ2 and the delta filter are `lzma-turbo`'s
-(`lzma_turbo::filters`). The `Read`/`Write` wrappers around the BCJ and delta
-converters are this crate's, ported from the SDK's (`src/codec/filter/`), as
-is the BCJ2 reader. CRC-32 everywhere is `crc-fast`, through
-`lzma-turbo`'s `crc` module (the host's, on a wasm build with `crc-host`).
+The filters themselves are `lzma-turbo`'s; this crate wraps them as readers
+and writers. CRC-32 comes from `crc-fast`, through `lzma-turbo`.
 
-### WASM support
+## Speed
 
-WASM is supported, but not with the default features: `aws-lc-rs` does not
-build for `wasm32`, so the WASM feature set uses the RustCrypto backend.
+Measured with sevenz-turbo 0.27.0 against 7-Zip 26.03 and sevenz-rust2
+0.22.2 on five idle machines, 2026-10-13. Each number is the reference's
+time or memory divided by sevenz-turbo's, averaged (geometric mean) over the
+tests, so above 1.00 means sevenz-turbo was faster or used less memory.
+Decoding covers one thread to all of them, solid and non-solid, encrypted
+and filtered archives; encoding covers levels 1 to 9.
+
+| CPU | threads | vs 7-Zip: decode | encode | peak memory | vs sevenz-rust2: decode | peak memory |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Zen 4 | 16 | 1.16 | 1.54 | 0.97 | 2.42 | 1.16 |
+| Graviton4 | 16 | 1.12 | 1.45 | 0.97 | 1.95 | 1.16 |
+| Alder Lake | 16 | 1.13 | 1.42 | 0.96 | 1.88 | 1.11 |
+| Zen 2 | 12 | 1.10 | 1.33 | 0.98 | 2.51 | 1.19 |
+| M5 Max | 18 | 1.13 | 1.38 | 0.93 | 2.44 | 1.24 |
+
+- LZMA2 decoding matches 7-Zip at every thread count on every machine. The
+  decode average is above 1.00 because of encrypted, PPMd and non-solid
+  archives.
+- Slower than 7-Zip: nearly incompressible archives decoded on every thread
+  (0.88 to 0.99), single-thread decoding through the ARM64 filter on Zen 4,
+  Graviton4 and M5 Max (0.91 to 0.94), the peak memory of single-thread
+  decoding with a large dictionary, and the encoder's peak memory.
+
+Every test on every machine is in [docs/benchmarks.md](docs/benchmarks.md),
+and how to measure your own is in [docs/benchmarking.md](docs/benchmarking.md).
+
+## Encryption
+
+7z encryption is AES-256, with a SHA-256 key derivation. Both come from one
+backend, chosen by feature:
+
+- `aws-lc-crypto`, the default: AWS-LC, which needs a C compiler.
+- `native-crypto`: RustCrypto, pure Rust, using AES-NI on x86-64 and the ARMv8
+  crypto instructions on aarch64. It wins when both are on.
+
+A build with no C at all:
+
+```toml
+sevenz-turbo = { version = "0.29", default-features = false, features = [
+    "aes256", "native-crypto", "bzip2", "compress", "ppmd", "util",
+] }
+```
+
+`aes256` with neither backend is a compile error rather than a silent
+choice, and `sevenz_turbo::crypto_backend()` says which one a build uses.
+
+## WebAssembly
+
+The `default_wasm` feature set builds for `wasm32-unknown-unknown`, with
+RustCrypto in place of AWS-LC:
 
 ```bash
 RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --target wasm32-unknown-unknown --no-default-features --features=default_wasm
 ```
 
-The `util` feature's `wasm-bindgen` exports follow the feature set: `decompress`
-is there whenever `util` is, and `compress` only when the `compress` feature is
-on as well, so a decode-only guest builds without the writer half of the crate.
+With `util`, the module exports `decompress`, and `compress` as well when
+the `compress` feature is on.
 
-#### Letting the host do the cryptography and checksums (`crypto-host`, `crc-host`)
+The program that embeds the module can usually decrypt and checksum much
+faster than code inside it. Two features hand that work over, on `wasm32`
+only; on native targets they change nothing:
 
-A wasm guest has neither AES-NI, the SHA extensions, carry-less multiply nor
-their ARMv8 counterparts, so the block cipher, the key derivation's SHA-256 and
-the CRC-32 are the parts of decoding a 7z archive that the embedding program
-can do several times faster than the guest. Two features move them there, on a
-`wasm32` target only:
-
-- `crypto-host`: the bulk AES-256-CBC **decrypt** leaves the guest through this
-  crate's own hook, and the 7z key derivation's SHA-256 through `lzma-turbo`'s
-  (the feature forwards `lzma-turbo/crypto-host`).
-- `crc-host`: every CRC-32 the archive carries — start header, header, members
-  — leaves the guest through `lzma-turbo`'s hooks (the feature forwards
-  `lzma-turbo/crc-host`).
+- `crypto-host`: AES-256 decryption and the key derivation's SHA-256.
+- `crc-host`: every CRC-32 in the archive.
 
 ```bash
 RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --target wasm32-unknown-unknown --no-default-features --features=aes256_wasm,crc-host,crypto-host,bzip2,ppmd
 ```
 
-Nothing else changes: the LZMA/LZMA2 decode stays in the guest, the public API
-is untouched, and the encoder keeps its own in-guest AES. Checksums inside a
-bzip2 or zstd stream are those codecs' own and stay in the guest too.
-`crypto-host` adds no AES dependency at all — a delegating build that does not
-also ask for `compress` carries no block cipher of its own.
-
-The embedder installs the hooks before opening an archive. Both seams are
-reachable from `sevenz_turbo::hooks`, so no direct dependency on `lzma-turbo`
-is needed:
+LZMA and LZMA2 still decode inside the module, and encrypting a new archive
+still happens there too. The host installs its functions before opening an
+archive, all through `sevenz_turbo::hooks`:
 
 ```rust,ignore
 use sevenz_turbo::hooks::{
@@ -367,8 +290,7 @@ use sevenz_turbo::hooks::{
 };
 
 fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Result<Vec<u8>, HostAesError> {
-    // forward to the embedder's AES-256-CBC (a raw wasm import, a component
-    // import, a host SDK call — `sevenz-turbo` never sees which)
+    // forward to the embedder's AES-256-CBC
 }
 
 install_host_crypto_hooks(HostCryptoHooks { aes_cbc_decrypt });
@@ -377,39 +299,19 @@ install_host_hash_hooks(HostHashHooks::new(
 ));
 ```
 
-The contract the AES hook must satisfy:
+- `aes_cbc_decrypt` returns `data` decrypted with AES-256-CBC under `key`
+  and `iv`, with no padding, as exactly `data.len()` bytes. `key` is 32
+  bytes, `iv` 16, and `data` a whole number of 16-byte blocks, possibly none.
+- Each call stands alone: this crate carries the IV from one call to the
+  next.
+- The hash functions follow `lzma-turbo`'s contract, in `lzma_turbo::hooks`.
+  7z has no CRC-64, so `crc64_xz` is never called.
+- A function that is missing, fails or returns the wrong length panics. There
+  is no fallback inside the module.
 
-- It returns the AES-256-CBC decryption of `data` under `key`/`iv`, **no
-  padding**, as a fresh buffer of exactly `data.len()` bytes.
-- `key` is 32 bytes, `iv` is 16, `data` is a whole number of 16-byte blocks and
-  may be empty.
-- It is **stateless per call**: this crate threads the CBC IV across chunks
-  itself, so a host never carries cipher state between calls.
-
-The hash hooks are `lzma-turbo`'s, and so is their contract (see
-`lzma_turbo::hooks`): the CRCs resume from a seed in the finalized domain,
-SHA-256 is a streaming state behind an opaque handle, and every handle is
-finalized or dropped exactly once. `HostHashHooks` takes every hook whichever
-feature is on, and only the ones a feature consumes are called; 7z has no
-CRC-64, so `crc64_xz` is never called by this crate.
-
-A hook that errors, answers with the wrong length, or was never installed is an
-embedder contract violation and panics. There is no silent in-guest fallback,
-because a fallback would quietly undo the delegation.
-
-`examples/wasm_host_extract_conformance.rs` is a complete reference embedding —
-a `wasm32-wasip1` guest that declares its raw imports in a `host` namespace and
-forwards the hooks to them — and `tools/wasm-conformance` is the native
-`wasmtime` harness that runs it: it writes an encrypted fixture archive,
-extracts it inside the guest through a reference host AES, SHA-256 and CRC-32,
-asserts the guest's bytes equal the native decoder's and that each import was
-actually called, and checks that a guest missing either set of hooks panics
-with that set's message. `wasmtime` is a dev-dependency of that harness only and
-never enters the crate's dependency graph.
-
-On native targets both features are accepted but inert: AWS-LC or RustCrypto
-and `crc-fast` stay selected and no hook is ever called, so feature unification
-in a mixed workspace cannot turn a native build into a delegating one.
+[`examples/wasm_host_extract_conformance.rs`](examples/wasm_host_extract_conformance.rs)
+is a complete guest, and [`tools/wasm-conformance`](tools/wasm-conformance) is
+the host that runs it in CI.
 
 ## Acknowledgements
 
@@ -426,10 +328,9 @@ named before the licence is.
   [`sevenz-rust`](https://github.com/dyz1990/sevenz-rust) that `sevenz-rust2`
   continued, and with it the first 7z implementation in pure Rust.
 - **Igor Pavlov** designed the 7z format, LZMA and LZMA2, and wrote
-  [7-Zip](https://www.7-zip.org/), whose public-domain decoders are what
+  [7-Zip](https://www.7-zip.org/), whose public-domain code is what
   [`lzma-turbo`](https://github.com/scryer-media/lzma-turbo) ports and whose
-  `7zz` is the oracle every differential test in this crate is checked
-  against.
+  `7zz` this crate's differential tests compare against.
 - Everyone in [CONTRIBUTORS.md](CONTRIBUTORS.md), which lists the upstream
   authors by name.
 
@@ -438,8 +339,5 @@ named before the licence is.
 This crate is licensed under the
 [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0),
 the same as upstream, and upstream's copyright notices are unchanged.
-
-`lzma-turbo`, which this crate depends on for LZMA/LZMA2 decoding and
-encoding, the BCJ/BCJ2/delta filters and CRC-32, is licensed under Apache-2.0
-as well, from its 0.7.0 release, which is the version this crate requires.
-Its releases before 0.7.0 were published under GPL-3.0-or-later.
+`lzma-turbo` is Apache-2.0 too, from its 0.7.0 release on; its earlier
+releases were published under GPL-3.0-or-later.

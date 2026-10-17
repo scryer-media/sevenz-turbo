@@ -1,5 +1,5 @@
 [package]
-description = "A 7z decompressor/compressor in pure Rust; a fork of sevenz-rust2 that decodes LZMA and LZMA2 with lzma-turbo"
+description = "A Rust based 7z decompressor/compressor; a fork of sevenz-rust2 that focuses on raw speed and streaming consumers"
 edition = "2024"
 homepage = "https://github.com/scryer-media/sevenz-turbo"
 keywords = ["7z", "7zip", "sevenz", "decompress"]
