@@ -1254,9 +1254,9 @@ fn block_coders_over_the_memory_limit_together_are_refused() {
     match decode(MIB + MIB / 2) {
         Err(Error::BlockDecode {
             block_index: 0,
-            ref message,
+            ref cause,
             ..
-        }) if message.starts_with("MaxMemLimited") => {}
+        }) if matches!(**cause, Error::MaxMemLimited { .. }) => {}
         other => panic!("a block chain over the limit in total must be refused, got {other:?}"),
     }
 }
@@ -1394,8 +1394,12 @@ fn a_truncated_ppmd_stream_is_refused_like_a_truncated_lzma_stream() {
         let cut = single_coder_archive(&packed[..packed.len() / 2], *id, props, data.len() as u64);
         let err = extract_all(&cut).expect_err(name);
         let kind = match &err {
-            Error::BlockDecode { kind, message, .. } => {
-                assert!(message.contains("UnexpectedEof"), "{name}: {message}");
+            Error::BlockDecode { kind, .. } => {
+                assert_eq!(
+                    err.io_error().map(std::io::Error::kind),
+                    Some(std::io::ErrorKind::UnexpectedEof),
+                    "{name}: {err:?}"
+                );
                 *kind
             }
             other => panic!("{name}: a cut stream gave {other:?}"),
@@ -1418,13 +1422,16 @@ fn a_ppmd_stream_with_a_bad_first_byte_is_refused() {
     let packed = [0x01u8, 0, 0, 0, 0, 0, 0, 0];
     let bytes = single_coder_archive(&packed, [0x03, 0x04, 0x01], &[6, 0, 0, 0, 1], 16);
     match extract_all(&bytes).expect_err("a corrupt PPMd stream") {
-        Error::BlockDecode {
+        error @ Error::BlockDecode {
             block_index: 0,
             kind: sevenz_turbo::BlockErrorKind::Io,
-            message,
             ..
         } => {
-            assert!(message.contains("InvalidData"), "{message}")
+            assert_eq!(
+                error.io_error().map(std::io::Error::kind),
+                Some(std::io::ErrorKind::InvalidData),
+                "{error:?}"
+            )
         }
         other => panic!("a corrupt PPMd stream gave {other:?}"),
     }
@@ -1468,9 +1475,9 @@ fn a_ppmd_model_over_the_memory_limit_is_refused() {
     match decode(64 * MIB) {
         Err(Error::BlockDecode {
             block_index: 0,
-            ref message,
+            ref cause,
             ..
-        }) if message.starts_with("MaxMemLimited") => {}
+        }) if matches!(**cause, Error::MaxMemLimited { .. }) => {}
         other => panic!("a PPMd model over the limit must be refused, got {other:?}"),
     }
     assert_eq!(decode(2048 * MIB).unwrap(), data);

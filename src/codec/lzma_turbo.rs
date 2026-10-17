@@ -43,6 +43,38 @@ pub use positional::{
     PositionalLzma2Scanner,
 };
 
+/// How this crate reports an error `lzma-turbo` raised that is not damage in
+/// a stream: a cancellation, or a failed invariant. Anything else is `None`.
+pub(crate) fn fault(error: &LzmaError) -> Option<Error> {
+    match error {
+        LzmaError::Cancelled => Some(Error::Cancelled),
+        LzmaError::InternalFailure => Some(Error::internal(error.to_string())),
+        _ => None,
+    }
+}
+
+/// [`fault`] for the `lzma-turbo` error an I/O error carries, if it carries
+/// one.
+pub(crate) fn io_fault(io: &std::io::Error) -> Option<Error> {
+    fault(io.get_ref()?.downcast_ref::<LzmaError>()?)
+}
+
+/// A copy of the `lzma-turbo` error an I/O error carries, as the payload of a
+/// new one of `kind`; `None` if it carries none.
+pub(crate) fn copy_io(
+    kind: std::io::ErrorKind,
+    inner: &(dyn std::error::Error + Send + Sync + 'static),
+) -> Option<std::io::Error> {
+    let error = *inner.downcast_ref::<LzmaError>()?;
+    Some(std::io::Error::new(kind, error))
+}
+
+/// An error the run scanner raised over a folder's packed bytes. Those bytes
+/// are the archive's contents, so what the scanner rejects is corruption.
+pub(crate) fn scan_error(error: LzmaError) -> Error {
+    fault(&error).unwrap_or_else(|| Error::corrupted(error.to_string()))
+}
+
 /// Bytes an LZMA or LZMA2 decoder holds beyond its dictionary: the range
 /// decoder's input buffer, the probability tables and the chunk buffer. The
 /// reference decoder's own accounting is tens of kilobytes; a megabyte covers
@@ -51,11 +83,15 @@ pub(crate) const LZ_STATE_BYTES: u64 = 1 << 20;
 
 /// Decodes the dictionary size an LZMA coder's five property bytes declare.
 ///
-/// The properties are `lc/lp/pb` packed into byte 0, then the dictionary size
-/// as a little-endian `u32`.
+/// The properties are `lc/lp/pb` packed into byte 0 as `(pb * 5 + lp) * 9 +
+/// lc`, then the dictionary size as a little-endian `u32`. A byte 0 of 225 or
+/// more encodes no `lc/lp/pb` and is a malformed archive.
 pub(crate) fn lzma_dictionary_size(properties: &[u8]) -> Result<u32, Error> {
     if properties.len() < 5 {
-        return Err(Error::other("LZMA properties too short"));
+        return Err(Error::corrupted("LZMA properties too short"));
+    }
+    if properties[0] >= 9 * 5 * 5 {
+        return Err(Error::corrupted("invalid LZMA lc/lp/pb byte"));
     }
     Ok(u32::from_le_bytes([
         properties[1],
@@ -71,14 +107,16 @@ pub(crate) fn lzma_dictionary_size(properties: &[u8]) -> Result<u32, Error> {
 /// maximum; anything else, or any reserved bit, is a malformed archive.
 pub(crate) fn lzma2_dictionary_size(properties: &[u8]) -> Result<u32, Error> {
     let Some(&bits) = properties.first() else {
-        return Err(Error::other("LZMA2 properties too short"));
+        return Err(Error::corrupted("LZMA2 properties too short"));
     };
     let bits = u32::from(bits);
     if (bits & !0x3F) != 0 {
-        return Err(Error::other("Unsupported LZMA2 property bits"));
+        return Err(Error::corrupted("reserved LZMA2 property bits set"));
     }
     if bits > 40 {
-        return Err(Error::other("Dictionary larger than 4GiB maximum size"));
+        return Err(Error::corrupted(
+            "LZMA2 dictionary larger than the 4 GiB maximum",
+        ));
     }
     if bits == 40 {
         return Ok(0xFFFF_FFFF);
@@ -1185,7 +1223,8 @@ impl<R: Read> Lzma2MtReader<R> {
             threads: threads as usize,
             memory_limit,
         };
-        let mut decoder = Lzma2AdaptiveDecoder::new(dict_prop, &options).map_err(decode_error)?;
+        let mut decoder =
+            Lzma2AdaptiveDecoder::new(dict_prop, &options).map_err(std::io::Error::from)?;
         decoder.set_threads(Self::decoder_threads(threads));
         // The property was accepted by the decoder just now, so this cannot
         // fail; a cap of "never" would only cost the early give-up.
@@ -2182,7 +2221,7 @@ impl<R: Read> Lzma2MtReader<R> {
             // against a limit drawn in by the difference: the room it is
             // taken into is the room it is charged for.
             self.charge_queue_and(seg.capacity().saturating_sub(seg.len()) as u64);
-            match self.decoder.feed_owned(seg).map_err(decode_error)? {
+            match self.decoder.feed_owned(seg).map_err(std::io::Error::from)? {
                 None => {
                     self.decoder_refusing = false;
                     self.fed_to += take as u64;
@@ -2353,7 +2392,7 @@ impl<R: Read> Lzma2MtReader<R> {
         let took = self
             .decoder
             .feed(&front[..offer])
-            .map_err(decode_error)?
+            .map_err(std::io::Error::from)?
             .min(offer);
         if took == 0 {
             self.charge_queue();
@@ -2627,7 +2666,7 @@ impl<R: Read> Lzma2MtReader<R> {
             {
                 self.decoder
                     .drain_upto(0, |_, _| {})
-                    .map_err(decode_error)?;
+                    .map_err(std::io::Error::from)?;
             }
             if taken < offered {
                 // The decoder is holding all it is allowed to.
@@ -2830,7 +2869,7 @@ impl<R: Read> Lzma2MtReader<R> {
                 Ok(status) => status,
                 Err(err) => {
                     self.control.finish();
-                    return Err(decode_error(err));
+                    return Err(std::io::Error::from(err));
                 }
             };
             self.collect_checks();
@@ -2919,9 +2958,10 @@ impl<R: Read> Lzma2MtReader<R> {
                         idle_turns += 1;
                         if idle_turns >= MT_IDLE_TURNS_BEFORE_STALLED {
                             self.control.finish();
-                            return Err(std::io::Error::other(
+                            return Err(crate::Error::corrupted(
                                 "LZMA2 decode stopped making progress",
-                            ));
+                            )
+                            .into_io());
                         }
                     }
                 } else {
@@ -2930,10 +2970,6 @@ impl<R: Read> Lzma2MtReader<R> {
             }
         }
     }
-}
-
-fn decode_error(err: lzma_turbo::Error) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, err)
 }
 
 /// Builds the LZMA2 decoder for a 7z coder.
@@ -2966,6 +3002,75 @@ pub(crate) fn lzma2_decoder<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BlockErrorKind;
+
+    fn block_kind(error: Error) -> Option<BlockErrorKind> {
+        match error.in_block(0, 0) {
+            Error::BlockDecode { kind, .. } => Some(kind),
+            _ => None,
+        }
+    }
+
+    /// LZMA2 property bytes past 40 are malformed archives, not a codec this
+    /// crate lacks.
+    #[test]
+    fn an_invalid_lzma2_property_is_corruption() {
+        for prop in [41u8, 63, 0x40, 0xFF] {
+            let error = lzma2_dictionary_size(&[prop]).unwrap_err();
+            assert!(matches!(error, Error::Corrupted(_)), "{prop}: {error:?}");
+            assert_eq!(block_kind(error), Some(BlockErrorKind::Corrupted), "{prop}");
+        }
+    }
+
+    /// What the run scanner rejects is in the archive's bytes, and is blamed
+    /// on them rather than on the source that read them.
+    #[test]
+    fn a_scanner_error_is_corruption_unless_it_is_a_fault() {
+        let error = scan_error(LzmaError::CorruptData);
+        assert!(matches!(error, Error::Corrupted(_)), "{error:?}");
+        assert_eq!(block_kind(error), Some(BlockErrorKind::Corrupted));
+        assert!(matches!(scan_error(LzmaError::Cancelled), Error::Cancelled));
+        assert!(matches!(
+            scan_error(LzmaError::InternalFailure),
+            Error::Internal(_)
+        ));
+    }
+
+    /// A copied coder failure is still the coder's error, of the same kind.
+    #[test]
+    fn a_copied_coder_error_keeps_its_payload() {
+        let original = std::io::Error::from(LzmaError::Truncated);
+        let copy = crate::error::copy_io(&original);
+        assert_eq!(copy.kind(), original.kind());
+        assert_eq!(
+            copy.downcast::<LzmaError>().ok(),
+            Some(LzmaError::Truncated)
+        );
+    }
+
+    /// No password cancels a decode or breaks an invariant, so an encrypted
+    /// block's coder fault is returned as itself. Its damage stays a possibly
+    /// wrong password.
+    #[test]
+    fn an_encrypted_blocks_coder_fault_is_not_the_password() {
+        let wrapped = |e: LzmaError| Error::MaybeBadPassword(std::io::Error::from(e));
+        assert!(matches!(
+            wrapped(LzmaError::Cancelled).in_block(0, 0),
+            Error::Cancelled
+        ));
+        assert!(matches!(
+            wrapped(LzmaError::InternalFailure).in_block(0, 0),
+            Error::Internal(_)
+        ));
+        assert!(matches!(
+            Error::MaybeBadPassword(std::io::Error::other(Error::Cancelled)).in_block(0, 0),
+            Error::Cancelled
+        ));
+        assert_eq!(
+            block_kind(wrapped(LzmaError::CorruptData)),
+            Some(BlockErrorKind::Password)
+        );
+    }
 
     /// A dictionary is only ever as big as the output it could be read from.
     #[test]
@@ -3170,6 +3275,22 @@ mod tests {
         props.extend_from_slice(&(8u32 << 20).to_le_bytes());
         assert_eq!(lzma_dictionary_size(&props).unwrap(), 8 << 20);
         assert!(lzma_dictionary_size(&[0x5D, 0, 0]).is_err());
+    }
+
+    /// A first property byte that encodes no `lc/lp/pb` is a malformed
+    /// archive, refused before a decoder is built.
+    #[test]
+    fn an_invalid_lzma_property_byte_is_corruption() {
+        assert!(lzma_dictionary_size(&[224, 0, 0, 1, 0]).is_ok());
+        for first in [225u8, 0xFF] {
+            let error = lzma_dictionary_size(&[first, 0, 0, 1, 0]).unwrap_err();
+            assert!(matches!(error, Error::Corrupted(_)), "{first}: {error:?}");
+            assert_eq!(
+                block_kind(error),
+                Some(BlockErrorKind::Corrupted),
+                "{first}"
+            );
+        }
     }
 }
 

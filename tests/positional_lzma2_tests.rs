@@ -188,11 +188,7 @@ fn positional_run_limits_and_sink_errors_preserve_their_identity() {
             Ok(data.len())
         })
         .unwrap_err();
-    assert!(matches!(
-        error,
-        Error::BlockDecode { kind: sevenz_turbo::BlockErrorKind::Io, ref message, .. }
-            if message.contains("Interrupted")
-    ));
+    assert!(matches!(error, Error::Cancelled), "{error:?}");
 }
 
 #[test]

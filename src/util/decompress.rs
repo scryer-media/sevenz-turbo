@@ -262,14 +262,18 @@ pub(crate) fn safe_join(dest: &Path, entry_name: &str) -> Result<PathBuf, Error>
             Component::Normal(part) => result.push(part),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(Error::other(format!(
-                    "unsafe entry path escapes destination: {entry_name}"
-                )));
+                return Err(Error::UnsafeEntryName {
+                    name: entry_name.to_owned(),
+                    reason: "the name walks out of the extraction directory",
+                });
             }
         }
     }
     if result == dest {
-        return Err(Error::other("entry path has no normal components"));
+        return Err(Error::UnsafeEntryName {
+            name: entry_name.to_owned(),
+            reason: "the name names no file",
+        });
     }
     Ok(result)
 }
@@ -298,7 +302,7 @@ pub fn default_entry_extract_fn(
         .components()
         .any(|part| part == std::path::Component::ParentDir)
     {
-        return Err(Error::other(
+        return Err(Error::invalid_argument(
             "unsafe destination contains a parent-directory component",
         ));
     }
@@ -306,7 +310,7 @@ pub fn default_entry_extract_fn(
     // validated archive name. Custom renaming should use a custom callback.
     let relative = safe_join(Path::new(""), entry.name())?;
     if !dest.ends_with(&relative) {
-        return Err(Error::other(
+        return Err(Error::invalid_argument(
             "destination does not end in the archive entry path",
         ));
     }
@@ -376,7 +380,7 @@ pub(crate) fn create_extract_entry(
         prefix.push(part);
         match root.symlink_metadata(&prefix) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(Error::other("symbolic link in extraction path"));
+                return Err(Error::invalid_argument("symbolic link in extraction path"));
             }
             Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => {}

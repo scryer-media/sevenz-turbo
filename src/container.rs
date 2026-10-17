@@ -431,7 +431,7 @@ pub(crate) fn check_aes_coders<'a>(
         let power = coder
             .properties()
             .first()
-            .ok_or_else(|| crate::Error::other("AES256 properties too short"))?
+            .ok_or_else(|| crate::Error::corrupted("AES256 properties too short"))?
             & 63;
         let cap = limits
             .max_aes_cycles_power

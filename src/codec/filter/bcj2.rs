@@ -291,9 +291,10 @@ impl<W: std::io::Write, S: std::io::Write> Bcj2Writer<W, S> {
             if finishing {
                 // Under `EndStream` the encoder stops only for a full window
                 // or a flushed range coder; anything else would loop forever.
-                return Err(std::io::Error::other(
+                return Err(crate::Error::internal(
                     "bcj2 encoder stopped before flushing its range coder",
-                ));
+                )
+                .into_io());
             }
             // It wants more source, and it has taken all of this: what it
             // could not decide about yet is held back inside it.
@@ -327,9 +328,10 @@ fn check_consumed(src_pos: usize, src_len: usize) -> std::io::Result<()> {
     if src_pos == src_len {
         Ok(())
     } else {
-        Err(std::io::Error::other(format!(
+        Err(crate::Error::internal(format!(
             "bcj2 encoder asked for more input after taking {src_pos} of {src_len} bytes"
-        )))
+        ))
+        .into_io())
     }
 }
 

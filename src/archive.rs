@@ -637,7 +637,7 @@ impl SubStreamOffsets {
             offsets.push(next);
             next = next
                 .checked_add(count)
-                .ok_or_else(|| crate::Error::other("sub-stream index overflow"))?;
+                .ok_or_else(|| crate::Error::corrupted("sub-stream index overflow"))?;
         }
         Ok(Self::Explicit(offsets))
     }
