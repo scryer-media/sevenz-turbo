@@ -508,6 +508,13 @@ arm, and this crate can add a variant without a breaking release.
   first coder is anything but LZMA2 stream as before, with no read-ahead.
   On Linux, where a window over 1 MiB is advised to use huge pages, this
   removes the 2 MiB page each worker faulted in for a small folder.
+- Requires `lzma-turbo` 0.10.1, published to crates.io on 2026-10-17. It
+  pads and advises a match finder for huge pages only when the data limit
+  is 8 MiB or more or unset, so the folder-sized window above stays off a
+  2 MiB page; a memory-budgeted decode no longer charges parked buffers
+  against the budget, which had admitted fewer runs than the budget
+  afforded; and the parallel xz reader costs the serial reader's memory at
+  one thread.
 
 ## 0.29.0 - 2026-10-16
 
