@@ -539,8 +539,18 @@ it, destructures it, or reads its `Display` rendering.
 - A failure that is reported again is the same failure. This covers a
   folder decoded in parallel whose callback went on past it, and a read
   after a failure, there or in a stored folder read ahead. It keeps its
-  OS code, this crate's error inside it, or a coder's, instead of being
-  rebuilt from its kind and message.
+  OS code, this crate's error inside it, or a coder's (an LZ4 frame error
+  included), or a refused reservation, instead of being rebuilt from its
+  kind and message.
+- A callback handed a file's failure that returns `Ok(true)` gets the
+  failure back as the block's error on every path. A folder decoded on the
+  calling thread, by `for_each_entries` or `for_each_entries_direct`, used
+  to forget it, hand out the files after it and return `Ok`, and the block
+  hook reported the block checked; a folder a worker decoded and replayed
+  already stopped there. No file after the failure is handed out.
+- A positional LZMA2 run whose source returns `Interrupted` once the
+  cancel flag is set returns `Error::Cancelled`, not a block error of kind
+  `Io`.
 - `Error::Other`, `Corrupted`, `InvalidArgument`, `Cancelled` and
   `Internal` render as text (`internal error: ...`) rather than as their
   `Debug` form.

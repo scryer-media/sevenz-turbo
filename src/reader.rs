@@ -266,12 +266,47 @@ impl<'a, R: Read + Seek> SharedBoundedReader<'a, R> {
 /// reported as a block failure.
 struct FaultRecordingReader<R> {
     inner: R,
-    faulted: Rc<Cell<bool>>,
+    faulted: Fault,
+}
+
+/// The first failure out of a block's decode chain, kept by the readers that
+/// hand it to the callbacks: a callback that goes on from it has not made the
+/// block whole, and the block still fails with it.
+#[derive(Clone, Default)]
+struct Fault(Rc<RefCell<Option<io::Error>>>);
+
+impl Fault {
+    fn record(&self, error: &io::Error) {
+        let mut first = self.0.borrow_mut();
+        // An interrupted read is retried, not failed: a failure after it is
+        // the one kept.
+        if first.as_ref().is_none_or(interrupted) {
+            *first = Some(crate::error::copy_io(error));
+        }
+    }
+
+    /// Whether the decode chain raised anything, which locates an error the
+    /// callback then returns in this block.
+    fn happened(&self) -> bool {
+        self.0.borrow().is_some()
+    }
+
+    /// The failure kept, if the chain raised one that was not a retry.
+    fn take(&self) -> Option<io::Error> {
+        self.0
+            .borrow_mut()
+            .take()
+            .filter(|error| !interrupted(error))
+    }
+}
+
+fn interrupted(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Interrupted
 }
 
 impl<R: Read> Read for FaultRecordingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf).inspect_err(|_| self.faulted.set(true))
+        self.inner.read(buf).inspect_err(|e| self.faulted.record(e))
     }
 }
 
@@ -286,12 +321,12 @@ impl<R: DecodeRead> DecodeRead for FaultRecordingReader<R> {
         sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
     ) -> Option<io::Result<usize>> {
         let read = self.inner.read_borrowed(max, sink)?;
-        Some(read.inspect_err(|_| self.faulted.set(true)))
+        Some(read.inspect_err(|e| self.faulted.record(e)))
     }
 
     fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<io::Result<usize>> {
         let pushed = self.inner.push(max, sink)?;
-        Some(pushed.inspect_err(|_| self.faulted.set(true)))
+        Some(pushed.inspect_err(|e| self.faulted.record(e)))
     }
 }
 
@@ -577,7 +612,7 @@ mod borrowed_delivery_tests {
         len: usize,
         expected: u32,
         prop: u8,
-        fault: Rc<Cell<bool>>,
+        fault: Fault,
         report: Rc<Cell<Option<u32>>>,
     ) -> impl DecodeRead {
         let decoder =
@@ -692,14 +727,14 @@ mod borrowed_delivery_tests {
                         for prefix in [0, 7] {
                             let mut observed = Vec::new();
                             for direct in [false, true] {
-                                let fault = Rc::new(Cell::new(false));
+                                let fault = Fault::default();
                                 let report = Rc::new(Cell::new(None));
                                 let inner = chain(
                                     input.clone(),
                                     data.len(),
                                     crc32(&data) ^ u32::from(bad_crc),
                                     prop,
-                                    Rc::clone(&fault),
+                                    fault.clone(),
                                     Rc::clone(&report),
                                 );
                                 let mut reader = Counted {
@@ -737,7 +772,7 @@ mod borrowed_delivery_tests {
                                     sink.inner.bytes,
                                     sink.requests,
                                     result.map_err(|e| (e.kind(), e.to_string())),
-                                    fault.get(),
+                                    fault.happened(),
                                     report.get(),
                                 ));
                             }
@@ -807,14 +842,14 @@ mod borrowed_delivery_tests {
                             let checksum = crc32(&data) ^ u32::from(bad_crc);
                             let mut observed = Vec::new();
                             for direct in [false, true] {
-                                let fault = Rc::new(Cell::new(false));
+                                let fault = Fault::default();
                                 let report = Rc::new(Cell::new(None));
                                 let mut reader = chain(
                                     packed(&data),
                                     len,
                                     checksum,
                                     prop,
-                                    Rc::clone(&fault),
+                                    fault.clone(),
                                     Rc::clone(&report),
                                 );
                                 let mut head = vec![0; prefix];
@@ -831,7 +866,7 @@ mod borrowed_delivery_tests {
                                 observed.push((
                                     sink.bytes,
                                     result.map_err(|e| (e.kind(), e.to_string())),
-                                    fault.get(),
+                                    fault.happened(),
                                     report.get(),
                                 ));
                             }
@@ -855,13 +890,13 @@ mod borrowed_delivery_tests {
         for input in [damaged, truncated] {
             let mut observed = Vec::new();
             for direct in [false, true] {
-                let fault = Rc::new(Cell::new(false));
+                let fault = Fault::default();
                 let mut reader = chain(
                     input.clone(),
                     data.len(),
                     crc32(&data),
                     16,
-                    Rc::clone(&fault),
+                    fault.clone(),
                     Rc::new(Cell::new(None)),
                 );
                 let mut sink = Vec::new();
@@ -873,7 +908,7 @@ mod borrowed_delivery_tests {
                 observed.push((
                     sink,
                     result.map_err(|e| (e.kind(), e.to_string())),
-                    fault.get(),
+                    fault.happened(),
                 ));
             }
             assert_eq!(observed[0], observed[1]);
@@ -888,20 +923,20 @@ mod borrowed_delivery_tests {
             }
         }
         let bytes = b"borrowed output";
-        let fault = Rc::new(Cell::new(false));
+        let fault = Fault::default();
         let mut reader = chain(
             packed(bytes),
             bytes.len(),
             crc32(bytes),
             0,
-            Rc::clone(&fault),
+            fault.clone(),
             Rc::new(Cell::new(None)),
         );
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             write_pushed(&mut reader, &mut Panics)
         }));
         assert!(panic.is_err());
-        assert!(!fault.get());
+        assert!(!fault.happened());
     }
 
     #[cfg(feature = "compress")]
@@ -4462,10 +4497,10 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         // parallel path or degraded to the single-threaded one, and it stops
         // reporting as soon as the block finishes.
         let folding = opts.folding_checksums();
-        let faulted = Rc::new(Cell::new(false));
+        let faulted = Fault::default();
         let mut block_reader = FaultRecordingReader {
             inner: block_reader,
-            faulted: Rc::clone(&faulted),
+            faulted: faulted.clone(),
         };
         let files = block_file_range(archive, block_index);
         // The last file of the block with bytes in it. A callback that asks to
@@ -4523,7 +4558,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                             file.crc,
                             Rc::clone(&crc_report),
                         ),
-                        faulted: Rc::clone(&faulted),
+                        faulted: faulted.clone(),
                     };
                     each(file, &mut verifying)
                         .and_then(|go_on| drain_unread(&mut verifying, go_on, drain))
@@ -4532,7 +4567,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                     // inside of, and that is the block's fault as well.
                     let mut recording = FaultRecordingReader {
                         inner: &mut bounded,
-                        faulted: Rc::clone(&faulted),
+                        faulted: faulted.clone(),
                     };
                     each(file, &mut recording)
                         .and_then(|go_on| drain_unread(&mut recording, go_on, drain))
@@ -4547,12 +4582,20 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                         // Only a failure that came out of the decode chain is
                         // this block's fault; the caller's own errors pass
                         // through as they were raised.
-                        if faulted.get() {
+                        if faulted.happened() {
                             e.in_block(block_index, packed_offset)
                         } else {
                             e
                         }
                     })?;
+                if outcome && let Some(fault) = faulted.take() {
+                    // The callback went on from a failure it was handed. That
+                    // does not make the block whole: it fails with that
+                    // failure, as it does when a worker decoded the folder.
+                    return Err(Error::from(fault)
+                        .maybe_bad_password(opts.encrypted)
+                        .in_block(block_index, packed_offset));
+                }
                 consumed += taken;
                 if folding {
                     // The files before this one first, so completions are
