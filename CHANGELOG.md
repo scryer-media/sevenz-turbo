@@ -503,9 +503,13 @@ arm, and this crate can add a variant without a breaking release.
   coding 2 KiB members. The bytes written are the same. A size declared by
   the entry is not passed on, since a file can grow after it is measured;
   the folder is coded from what was read, and the source is not read again
-  after its end was seen. A folder of exactly 1 MiB is sized too: the
+  after its end was seen. The dictionary is still fitted to a declared size,
+  as it is in a folder that is not read ahead, so a folder whose declaration
+  is wrong codes to the same bytes either way. A folder of exactly 1 MiB is sized too: the
   read-ahead takes one byte more to tell it from a longer one. Folders whose
-  first coder is anything but LZMA2 stream as before, with no read-ahead.
+  first coder is anything but LZMA2 stream as before, with no read-ahead,
+  and so does a folder whose threaded LZMA2 coder is pushed a local reader's
+  bytes rather than pulling them, since that coder is never told the length.
   On Linux, where a window over 1 MiB is advised to use huge pages, this
   removes the 2 MiB page each worker faulted in for a small folder.
 - Requires `lzma-turbo` 0.10.1, published to crates.io on 2026-10-17. It

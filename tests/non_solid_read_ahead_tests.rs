@@ -12,6 +12,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use sevenz_turbo::{
@@ -166,7 +167,7 @@ impl Seek for CountedOutput {
 }
 
 /// A source that notes how much of the archive had been written when it
-/// first reported its end.
+/// first reported its end, waiting a while at the end for the first write.
 struct Watched<'a> {
     data: &'a [u8],
     written: Arc<AtomicUsize>,
@@ -177,6 +178,13 @@ impl Read for Watched<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         let n = out.len().min(self.data.len()).min(64 << 10);
         if n == 0 && self.at_end.is_none() {
+            // A coder on a thread of its own may lag its input: give it time
+            // to write. A folder read ahead writes nothing however long the
+            // source holds its end back, since its coder has not started.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.written.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
             self.at_end = Some(self.written.load(Ordering::Relaxed));
         }
         out[..n].copy_from_slice(&self.data[..n]);
@@ -218,4 +226,37 @@ fn only_an_lzma2_folder_reads_ahead() {
     assert!(written_before_end(lzma) > 0, "LZMA");
     // The control: the LZMA2 folder is read whole before anything is coded.
     assert_eq!(written_before_end(lzma2()), 0, "LZMA2");
+}
+
+fn threaded_lzma2() -> EncoderConfiguration {
+    Lzma2Options::from_level_mt(5, 4, 4 << 20).into()
+}
+
+/// The same threaded LZMA2 folder written from a local reader (pushed, no
+/// read-ahead) and from a `Send` one (pulled, read ahead and limited) is the
+/// same archive. Which of the two reads ahead is asserted by the writer's own
+/// `only_a_pulled_lzma2_folder_reads_ahead`: a threaded coder holds its input
+/// too long before writing for the archive's writes to tell.
+#[test]
+fn a_threaded_lzma2_folder_is_the_same_bytes_pushed_or_pulled() {
+    let data = noise(600 << 10);
+    let archive = |send: bool| {
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        writer.set_content_methods(vec![threaded_lzma2()]);
+        let mut entry = ArchiveEntry::new_file("f");
+        entry.size = data.len() as u64;
+        if send {
+            writer
+                .push_archive_entry_send(entry, Some(data.as_slice()))
+                .unwrap();
+        } else {
+            writer
+                .push_archive_entry(entry, Some(data.as_slice()))
+                .unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    };
+    let pushed = archive(false);
+    assert_eq!(pushed, archive(true));
+    assert_eq!(decoded(pushed), [data]);
 }
