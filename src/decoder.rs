@@ -595,7 +595,7 @@ pub fn add_decoder<I: Read>(
             // Validate the length before touching the properties: the decoder
             // slices `[1..5]`, which would panic on an attacker-supplied short field.
             if coder.properties().len() < 5 {
-                return Err(Error::Other("LZMA properties too short".into()));
+                return Err(Error::corrupted("LZMA properties too short"));
             }
             // Clamp before the budget check, so a coder that declares a huge
             // dictionary for a small stream is decoded rather than refused.
@@ -626,7 +626,7 @@ pub fn add_decoder<I: Read>(
                 .properties()
                 .first()
                 .copied()
-                .ok_or_else(|| Error::other("LZMA2 properties too short"))?;
+                .ok_or_else(|| Error::corrupted("LZMA2 properties too short"))?;
             let dict_prop = lzma2_clamped_prop(dict_prop, uncompressed_len as u64);
             let dic_size = lzma2_dictionary_size(&[dict_prop])?;
             let mem_size = lzma2_memory_usage_kb(dic_size);
@@ -797,9 +797,9 @@ fn get_ppmd_params(coder: &Coder, max_mem_limit_kb: usize) -> Result<PpmdParams,
     let props = coder
         .properties()
         .get(..5)
-        .ok_or_else(|| Error::other("PPMD properties too short"))?;
+        .ok_or_else(|| Error::corrupted("PPMD properties too short"))?;
     let params = PpmdParams::from_7z_props(props).map_err(|_| {
-        Error::other(format!(
+        Error::corrupted(format!(
             "PPMD order {} or memory size {} out of range",
             props[0],
             u32::from_le_bytes([props[1], props[2], props[3], props[4]])

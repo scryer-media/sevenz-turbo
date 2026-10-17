@@ -24,7 +24,7 @@ impl<R: Read> Lz4Decoder<R> {
         let mut header = [0u8; 12];
         let header_read = match Read::read(&mut input, &mut header) {
             Ok(n) if n >= 4 => n,
-            Ok(_) => return Err(Error::other("Input too short")),
+            Ok(_) => return Err(Error::corrupted("Input too short")),
             Err(e) => return Err(e.into()),
         };
 
@@ -33,7 +33,7 @@ impl<R: Read> Lz4Decoder<R> {
         let inner_reader = if magic_value == SKIPPABLE_FRAME_MAGIC && header_read >= 12 {
             let skippable_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
             if skippable_size != 4 {
-                return Err(Error::other("Invalid lz4 skippable frame size"));
+                return Err(Error::corrupted("Invalid lz4 skippable frame size"));
             }
 
             let compressed_size =
@@ -196,6 +196,54 @@ impl<R: Read> Read for InnerReader<R> {
             }
         }
     }
+}
+
+/// A copy of the `lz4_flex` error an I/O error carries, as the payload of a
+/// new one of `kind`; `None` if it carries none, or a variant this crate does
+/// not know.
+pub(crate) fn copy_io(
+    kind: std::io::ErrorKind,
+    inner: &(dyn std::error::Error + Send + Sync + 'static),
+) -> Option<std::io::Error> {
+    use lz4_flex::block::{CompressError, DecompressError};
+    use lz4_flex::frame::Error as Lz4Error;
+
+    let copy = match inner.downcast_ref::<Lz4Error>()? {
+        Lz4Error::CompressionError(CompressError::OutputTooSmall) => {
+            Lz4Error::CompressionError(CompressError::OutputTooSmall)
+        }
+        Lz4Error::DecompressionError(error) => Lz4Error::DecompressionError(match error {
+            DecompressError::OutputTooSmall { expected, actual } => {
+                DecompressError::OutputTooSmall {
+                    expected: *expected,
+                    actual: *actual,
+                }
+            }
+            DecompressError::LiteralOutOfBounds => DecompressError::LiteralOutOfBounds,
+            DecompressError::ExpectedAnotherByte => DecompressError::ExpectedAnotherByte,
+            DecompressError::OffsetZero => DecompressError::OffsetZero,
+            DecompressError::OffsetOutOfBounds => DecompressError::OffsetOutOfBounds,
+            _ => return None,
+        }),
+        Lz4Error::IoError(error) => Lz4Error::IoError(crate::error::copy_io(error)),
+        Lz4Error::UnsupportedBlocksize(size) => Lz4Error::UnsupportedBlocksize(*size),
+        Lz4Error::UnsupportedVersion(version) => Lz4Error::UnsupportedVersion(*version),
+        Lz4Error::WrongMagicNumber => Lz4Error::WrongMagicNumber,
+        Lz4Error::ReservedBitsSet => Lz4Error::ReservedBitsSet,
+        Lz4Error::InvalidBlockInfo => Lz4Error::InvalidBlockInfo,
+        Lz4Error::BlockTooBig => Lz4Error::BlockTooBig,
+        Lz4Error::HeaderChecksumError => Lz4Error::HeaderChecksumError,
+        Lz4Error::BlockChecksumError => Lz4Error::BlockChecksumError,
+        Lz4Error::ContentChecksumError => Lz4Error::ContentChecksumError,
+        Lz4Error::SkippableFrame(size) => Lz4Error::SkippableFrame(*size),
+        Lz4Error::DictionaryNotSupported => Lz4Error::DictionaryNotSupported,
+        Lz4Error::ContentLengthError { expected, actual } => Lz4Error::ContentLengthError {
+            expected: *expected,
+            actual: *actual,
+        },
+        _ => return None,
+    };
+    Some(std::io::Error::new(kind, copy))
 }
 
 /// Custom encoder to support the custom format first implemented by zstdmt, which allows to have

@@ -315,3 +315,52 @@ fn zero_length_files_in_a_solid_block_are_checked() {
             .unwrap_or_else(|e| panic!("at {threads} threads with verification off: {e}"));
     }
 }
+
+/// A callback handed a file's failure that goes on as if nothing happened
+/// gets it back as the block's error, on every path: no file after it is
+/// handed out, and the block is never reported checked. The sequential paths
+/// used to forget the failure, hand out the rest and finish `Ok`, with the
+/// block hook claiming a verified block; a replayed folder's worker stops at
+/// the failure. The failure keeps its payload, so a checksum mismatch comes
+/// back as one and not as a bare I/O error.
+#[test]
+fn a_failure_the_callback_goes_on_from_fails_the_block_on_every_path() {
+    let blocks = two_blocks();
+    let bytes = solid_archive(Lzma2Options::from_level(1), &blocks);
+    for path in PATHS {
+        let mut reader = open(&bytes, path, |archive| archive.files[1].crc ^= 1);
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let hook = Arc::clone(&completed);
+        reader.set_block_complete_hook(move |event| {
+            hook.lock().unwrap().push(event.block_index);
+        });
+        let mut handed = None;
+        let mut after = Vec::new();
+        let result = walk(&mut reader, path, &mut |entry, rd| {
+            if handed.is_some() {
+                after.push(entry.name().to_string());
+            }
+            let mut data = Vec::new();
+            if let Err(error) = rd.read_to_end(&mut data) {
+                handed.get_or_insert(error);
+            }
+            Ok(true)
+        });
+        let handed =
+            handed.unwrap_or_else(|| panic!("{path:?}: the callback was handed the failure"));
+        assert!(
+            handed
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<Error>())
+                .is_some_and(Error::has_checksum_mismatch),
+            "{path:?}: {handed:?}"
+        );
+        assert_checksum_mismatch(result, 0, &format!("{path:?}"));
+        assert_eq!(after, Vec::<String>::new(), "{path:?}: handed out after");
+        assert_eq!(
+            *completed.lock().unwrap(),
+            Vec::<usize>::new(),
+            "{path:?}: a block was reported checked"
+        );
+    }
+}

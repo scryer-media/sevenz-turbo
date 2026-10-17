@@ -310,6 +310,9 @@ arm, and this crate can add a variant without a breaking release.
   from an I/O failure on the source or a method this build cannot decode. An
   error raised by the *caller's* own callback is passed through untouched — the
   decode chain is wrapped so the two can be told apart.
+  Since 0.29.0 it keeps the error it locates as `cause` in place of `message`,
+  answered by `Error::io_error`, `Error::is_password_required` and
+  `Error::has_checksum_mismatch` and returned by `std::error::Error::source`.
 
 ### Documentation
 
@@ -479,6 +482,84 @@ arm, and this crate can add a variant without a breaking release.
 - The vendored BCJ round-trip tests generate their sample data instead of
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
+
+## 0.29.0 - 2026-10-16
+
+This release changes `Error::BlockDecode` in ways that break code that builds
+it, destructures it, or reads its `Display` rendering.
+
+- `Error::BlockDecode` keeps the error it locates as `cause: Box<Error>`, in
+  place of `message: String`, its rendering. A caller reads the I/O kind, OS
+  code and payload of a failed read, whether the archive wanted a password,
+  and whether a checksum disagreed, from the error rather than its wording.
+- `std::error::Error::source` returns a block error's cause, and the block
+  error's `Display` leaves it out, so a reporter that walks the chain prints
+  it once: `BlockDecode { block_index: 2, packed_offset: 32, kind: Io }`, then
+  the cause. A consumer that printed only the block error's `Display` prints
+  the chain, or `cause`, to keep the cause in its message. `Io`, `FileOpen`
+  and `MaybeBadPassword` render their I/O error, as before, and so return no
+  source.
+- `Error::BlockDecode` is `#[non_exhaustive]`: it is matched with `..` and
+  built by `Error::in_block`, which is now public and derives `kind` from the
+  cause.
+- New `Error::io_error`, `Error::is_password_required` and
+  `Error::has_checksum_mismatch`. Each looks through a block error to its
+  cause. `has_checksum_mismatch` also recognises a CRC-32 carried inside an
+  I/O error from a `Read` chain, one behind `MaybeBadPassword`, the next
+  header's CRC, and an LZ4 frame's header, block or content checksum.
+- The crate's own failures that used to be `Error::Other(text)` each land in
+  a class a caller can decide on: `Error::Corrupted` for a malformed
+  archive, `Error::Unsupported` for a feature this crate does not decode,
+  the new `Error::InvalidArgument` for a request this call cannot serve
+  (a block index out of range, an unsafe destination), the new
+  `Error::Cancelled` when the cancel flag is set or the output's receiver
+  has gone, and the new `Error::Internal` for a worker that panicked or
+  stopped and a broken invariant. The text inside each says which, for
+  people. `Error::Other` is now only a caller's own error, such as one a
+  callback returns, passed through as it is.
+- An entry name that leaves the extraction directory or names no file is
+  `Error::UnsafeEntryName`, which the extraction helpers raise whatever
+  `reject_unsafe_paths` is set to.
+- These errors travel inside an `io::Error` from a `Read` chain as
+  themselves, with a kind that matches (`InvalidData` for corruption,
+  `InvalidInput` for a bad argument, and `Other` for a cancellation, which
+  std's read helpers would retry as `Interrupted`), and `Error::in_block`
+  takes them back out. A cancellation, a caller's bad argument or an
+  internal failure is returned as itself rather than blamed on the block it
+  happened in. So is an LZMA decoder's cancellation or internal failure,
+  and a PPMd codec's internal failure, inside an encrypted folder too, where
+  `MaybeBadPassword` used to blame it on the password.
+- An LZMA2 property byte above 40, or with a reserved bit set, is
+  `Error::Corrupted` rather than `Error::Unsupported`. A block error over
+  it is `BlockErrorKind::Corrupted`, not `UnsupportedMethod`: no codec
+  decodes it. An LZMA coder whose first property byte encodes no
+  `lc/lp/pb` (225 or more) is `Error::Corrupted` before a decoder is
+  built. It was an `InvalidData` I/O error, a block of kind `Io`, or a
+  possibly wrong password in an encrypted folder.
+- A failure that is reported again is the same failure. This covers a
+  folder decoded in parallel whose callback went on past it, and a read
+  after a failure, there or in a stored folder read ahead. It keeps its
+  OS code, this crate's error inside it, or a coder's (an LZ4 frame error
+  included), or a refused reservation, instead of being rebuilt from its
+  kind and message.
+- A callback handed a file's failure that returns `Ok(true)` gets the
+  failure back as the block's error on every path. A folder decoded on the
+  calling thread, by `for_each_entries` or `for_each_entries_direct`, used
+  to forget it, hand out the files after it and return `Ok`, and the block
+  hook reported the block checked; a folder a worker decoded and replayed
+  already stopped there. No file after the failure is handed out.
+- A positional LZMA2 run whose source returns `Interrupted` once the
+  cancel flag is set returns `Error::Cancelled`, not a block error of kind
+  `Io`.
+- `Error::Other`, `Corrupted`, `InvalidArgument`, `Cancelled` and
+  `Internal` render as text (`internal error: ...`) rather than as their
+  `Debug` form.
+- Requires `lzma-turbo` 0.10 and, with the `ppmd` feature, `ppmd-turbo`
+  0.2. An LZMA or LZMA2 failure, streaming or in a positional block walk,
+  keeps the `lzma-turbo` error inside its `io::Error` with the I/O kind of
+  its class (`UnexpectedEof` for a truncated stream, `OutOfMemory` for a
+  memory limit), where 0.28 made every one `InvalidData` and a positional
+  walk kept only its rendering.
 
 ## 0.28.0 - 2026-10-16
 

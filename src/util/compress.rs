@@ -113,7 +113,7 @@ fn compress_path<W: Write + Seek, P: AsRef<Path>>(
     let entry_name = src
         .as_ref()
         .strip_prefix(root)
-        .map_err(|e| Error::other(e.to_string()))?
+        .map_err(|e| Error::invalid_argument(e.to_string()))?
         .to_string_lossy()
         .to_string();
     let entry = ArchiveEntry::from_path(src.as_ref(), entry_name);

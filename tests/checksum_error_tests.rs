@@ -71,11 +71,14 @@ fn assert_checksum_mismatch(result: Result<(), Error>, block: usize) {
         Err(Error::BlockDecode {
             block_index,
             kind: BlockErrorKind::ChecksumMismatch,
-            message,
+            cause,
             ..
         }) => {
             assert_eq!(block_index, block);
-            assert_eq!(message, Error::ChecksumVerificationFailed.to_string());
+            assert!(
+                matches!(*cause, Error::ChecksumVerificationFailed),
+                "{cause:?}"
+            );
         }
         other => panic!("expected a located checksum mismatch, got {other:?}"),
     }

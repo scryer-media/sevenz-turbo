@@ -170,7 +170,7 @@ fn folder_methods(
             for mc in Arc::make_mut(&mut fresh) {
                 if let Some(EncoderOptions::Aes(options)) = &mut mc.options {
                     getrandom::fill(&mut options.iv)
-                        .map_err(|e| Error::other(format!("AES IV: {e}")))?;
+                        .map_err(|e| Error::io_msg(std::io::Error::other(e), "AES IV"))?;
                 }
             }
             return Ok(fresh);
@@ -774,7 +774,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                                         Some(shipped) => Some(shipped.written(tail_lens)),
                                         None if tail_lens == [0; 3] => None,
                                         None => {
-                                            return Err(Error::other(
+                                            return Err(Error::internal(
                                                 "a folder sent BCJ2 streams it did not declare",
                                             ));
                                         }
@@ -788,7 +788,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                             return Ok(());
                         }
                         None => {
-                            return Err(Error::other(
+                            return Err(Error::internal(
                                 "the worker coding this folder stopped before finishing it",
                             ));
                         }
@@ -1778,7 +1778,7 @@ impl Write for StageSink<'_, '_> {
             .is_err()
         {
             self.cancelled = true;
-            return Err(std::io::Error::other("folder encode cancelled"));
+            return Err(Error::Cancelled.into_io());
         }
         Ok(buf.len())
     }
@@ -1942,13 +1942,15 @@ pub fn prepare_block<R: Read>(
     reader: Vec<SourceReader<R>>,
 ) -> Result<PreparedBlock> {
     if methods.is_empty() {
-        return Err(Error::other("prepare_block: `methods` must not be empty"));
+        return Err(Error::invalid_argument(
+            "prepare_block: `methods` must not be empty",
+        ));
     }
 
     let mut entries = entries;
     let mut r = SeqReader::new(reader);
     if r.reader_len() != entries.len() {
-        return Err(Error::other(format!(
+        return Err(Error::invalid_argument(format!(
             "prepare_block: {} entries against {} readers",
             entries.len(),
             r.reader_len()

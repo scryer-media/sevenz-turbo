@@ -458,15 +458,6 @@ fn write_out<W: Write>(
     Ok(())
 }
 
-fn io_error(err: LzmaError) -> io::Error {
-    let kind = match err {
-        LzmaError::Param => io::ErrorKind::InvalidInput,
-        LzmaError::Alloc => io::ErrorKind::OutOfMemory,
-        _ => io::ErrorKind::Other,
-    };
-    io::Error::new(kind, err)
-}
-
 impl<W: Write> LzmaTurboWriter<W> {
     /// A writer that will compress everything pushed into it with `props`,
     /// as the coder `coder`.
@@ -476,7 +467,7 @@ impl<W: Write> LzmaTurboWriter<W> {
     /// `InvalidInput` if `lzma-turbo` refuses a setting, `OutOfMemory` if it
     /// could not allocate the encoder.
     pub(crate) fn new(inner: W, props: &LzmaEncProps, coder: Coder) -> io::Result<Self> {
-        let mut encoder = Encoder::new(props, coder).map_err(io_error)?;
+        let mut encoder = Encoder::new(props, coder).map_err(io::Error::from)?;
         let bridge = Arc::new(Bridge {
             queues: Mutex::new(Queues::default()),
             changed: Condvar::new(),
@@ -523,7 +514,7 @@ impl<W: Write> LzmaTurboWriter<W> {
                 // No threads on this target: run the encoder inside `write`.
                 // The same settings were accepted a moment ago.
                 State::Pushed {
-                    encoder: Pusher::new(props, coder).map_err(io_error)?,
+                    encoder: Pusher::new(props, coder).map_err(io::Error::from)?,
                     out: Vec::new(),
                 }
             }
@@ -545,7 +536,7 @@ impl<W: Write> LzmaTurboWriter<W> {
         Ok(LzmaTurboWriter {
             inner: Some(inner),
             state: State::Pushed {
-                encoder: Pusher::new(props, coder).map_err(io_error)?,
+                encoder: Pusher::new(props, coder).map_err(io::Error::from)?,
                 out: Vec::new(),
             },
         })
@@ -571,12 +562,14 @@ impl<W: Write> LzmaTurboWriter<W> {
     /// The error a worker that has stopped early holds.
     fn worker_error(worker: &mut Option<JoinHandle<Result<(), LzmaError>>>) -> io::Error {
         match worker.take().map(JoinHandle::join) {
-            Some(Ok(Err(err))) => io_error(err),
-            Some(Err(_)) => io::Error::other("the LZMA encoder thread panicked"),
+            Some(Ok(Err(err))) => io::Error::from(err),
+            Some(Err(_)) => crate::Error::internal("the LZMA encoder thread panicked").into_io(),
             // The worker finished cleanly, yet the channel to it is closed:
             // it read an end of input this writer never sent. Not reachable
             // while `input` is held, so report it rather than reason about it.
-            Some(Ok(Ok(()))) | None => io::Error::other("the LZMA encoder stopped early"),
+            Some(Ok(Ok(()))) | None => {
+                crate::Error::internal("the LZMA encoder stopped early").into_io()
+            }
         }
     }
 
@@ -613,12 +606,16 @@ impl<W: Write> LzmaTurboWriter<W> {
                 }
                 match worker.take().expect("joined once").join() {
                     Ok(Ok(())) => {}
-                    Ok(Err(err)) => return Err(io_error(err)),
-                    Err(_) => return Err(io::Error::other("the LZMA encoder thread panicked")),
+                    Ok(Err(err)) => return Err(io::Error::from(err)),
+                    Err(_) => {
+                        return Err(
+                            crate::Error::internal("the LZMA encoder thread panicked").into_io()
+                        );
+                    }
                 }
             }
             State::Pushed { encoder, out } => {
-                encoder.finish(out).map_err(io_error)?;
+                encoder.finish(out).map_err(io::Error::from)?;
                 inner.write_all(out)?;
             }
         }
@@ -687,7 +684,7 @@ impl<W: Write> Write for LzmaTurboWriter<W> {
                 // Cut as the threaded path cuts, so that what one call leaves
                 // in `out` is bounded too.
                 for chunk in buf.chunks(CHUNK) {
-                    encoder.push(chunk, out).map_err(io_error)?;
+                    encoder.push(chunk, out).map_err(io::Error::from)?;
                     if !out.is_empty() {
                         inner.write_all(out)?;
                         out.clear();
@@ -970,7 +967,10 @@ impl PullCoder {
                 self.kept = Some(kept);
                 Ok(())
             }
-            Err(err) => Err(source.error.or(sink.error).unwrap_or_else(|| io_error(err))),
+            Err(err) => Err(source
+                .error
+                .or(sink.error)
+                .unwrap_or_else(|| io::Error::from(err))),
         }
     }
 
@@ -1042,7 +1042,10 @@ impl PullCoder {
                 self.kept = kept;
                 Ok(())
             }
-            Err(err) => Err(source.error.or(sink.error).unwrap_or_else(|| io_error(err))),
+            Err(err) => Err(source
+                .error
+                .or(sink.error)
+                .unwrap_or_else(|| io::Error::from(err))),
         }
     }
 
@@ -1056,7 +1059,7 @@ impl PullCoder {
             self.kept = Some(Kept {
                 props: *props,
                 coder,
-                encoder: Encoder::new(props, coder).map_err(io_error)?,
+                encoder: Encoder::new(props, coder).map_err(io::Error::from)?,
             });
         } else if let Some(kept) = self.kept.as_mut()
             && kept.props != *props
@@ -1065,7 +1068,7 @@ impl PullCoder {
             // tables across folders, including size-derived dictionary changes.
             if let Err(err) = kept.encoder.set_props(props) {
                 self.kept = None;
-                return Err(io_error(err));
+                return Err(io::Error::from(err));
             }
             kept.props = *props;
         }

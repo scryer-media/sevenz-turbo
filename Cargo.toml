@@ -1,5 +1,5 @@
 [package]
-description = "A 7z decompressor/compressor in pure Rust; a fork of sevenz-rust2 that decodes LZMA and LZMA2 with lzma-turbo"
+description = "A Rust based 7z decompressor/compressor; a fork of sevenz-rust2 that focuses on raw speed and streaming consumers"
 edition = "2024"
 homepage = "https://github.com/scryer-media/sevenz-turbo"
 keywords = ["7z", "7zip", "sevenz", "decompress"]
@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/scryer-media/sevenz-turbo"
 # Raised from upstream's 1.93: `lzma-turbo` requires 1.97.1.
 rust-version = "1.97.1"
-version = "0.28.0"
+version = "0.29.0"
 # Repository scaffolding that has no business in the crate archive.
 exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml"]
 
@@ -90,8 +90,8 @@ getrandom = { version = "0.4", optional = true }
 # A caret requirement: the floor this crate is known to need, not a pin.
 # `Cargo.lock` fixes the exact version that was tested, and CI builds with
 # `--locked`.
-lzma-turbo = { version = "0.9.2", default-features = false, features = ["std", "asm", "crc", "filters"] }
-ppmd-turbo = { version = "0.1.1", optional = true }
+lzma-turbo = { version = "0.10.0", default-features = false, features = ["std", "asm", "crc", "filters"] }
+ppmd-turbo = { version = "0.2.0", optional = true }
 lz4_flex = { version = "0.14", optional = true }
 nt-time = { version = "0.15", optional = true }
 zstd = { version = "0.14", optional = true }

@@ -166,18 +166,17 @@ fn asks_for_a_password(error: &Error) -> bool {
     )
 }
 
-/// The failure is damage, located in `block`: its kind and its message.
+/// The failure is damage, located in `block`: its kind and the error.
 #[track_caller]
-fn located_damage(result: Result<(), Error>, block: usize, run: Run) -> (BlockErrorKind, String) {
+fn located_damage(result: Result<(), Error>, block: usize, run: Run) -> (BlockErrorKind, Error) {
     match result {
-        Err(Error::BlockDecode {
-            block_index,
-            kind,
-            message,
-            ..
-        }) if kind != BlockErrorKind::Password => {
+        Err(
+            error @ Error::BlockDecode {
+                block_index, kind, ..
+            },
+        ) if kind != BlockErrorKind::Password => {
             assert_eq!(block_index, block, "{run:?}");
-            (kind, message)
+            (kind, error)
         }
         other => panic!("{run:?}: expected damage located in block {block}, got {other:?}"),
     }
@@ -190,12 +189,16 @@ fn checksum_mismatch(result: Result<(), Error>, block: usize, run: Run) {
 }
 
 /// The failure is the stream ending early, located in `block`, with the I/O
-/// kind a consumer reads out of the message.
+/// kind a consumer reads off the error.
 #[track_caller]
 fn ended_early(result: Result<(), Error>, block: usize, run: Run) {
-    let (kind, message) = located_damage(result, block, run);
-    assert_eq!(kind, BlockErrorKind::Io, "{run:?}: {message}");
-    assert!(message.contains("UnexpectedEof"), "{run:?}: {message}");
+    let (kind, error) = located_damage(result, block, run);
+    assert_eq!(kind, BlockErrorKind::Io, "{run:?}: {error:?}");
+    assert_eq!(
+        error.io_error().map(io::Error::kind),
+        Some(io::ErrorKind::UnexpectedEof),
+        "{run:?}: {error:?}"
+    );
 }
 
 #[track_caller]

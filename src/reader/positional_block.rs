@@ -64,24 +64,24 @@ impl PositionalBlockDecoder {
         limits: ArchiveLimits,
     ) -> Result<Self, Error> {
         if block_index >= archive.blocks.len() {
-            return Err(Error::other("block index out of range"));
+            return Err(Error::invalid_argument("block index out of range"));
         }
         let start = *archive
             .stream_map
             .block_first_file_index
             .get(block_index)
-            .ok_or_else(|| Error::other("missing block file mapping"))?;
+            .ok_or_else(|| Error::corrupted("missing block file mapping"))?;
         let count = archive.blocks[block_index].num_unpack_sub_streams;
         let entries = start
             .checked_add(count)
             .and_then(|end| archive.files.get(start..end))
-            .ok_or_else(|| Error::other("invalid block file mapping"))?;
+            .ok_or_else(|| Error::corrupted("invalid block file mapping"))?;
         if entries.iter().enumerate().any(|(offset, entry)| {
             !entry.has_stream
                 || archive.stream_map.file_block_index.get(start + offset)
                     != Some(&Some(block_index))
         }) {
-            return Err(Error::other(
+            return Err(Error::unsupported(
                 "positional block walk requires contiguous data members",
             ));
         }

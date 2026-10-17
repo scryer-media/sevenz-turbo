@@ -69,7 +69,7 @@ impl<R: Read> Aes256Sha256Decoder<R> {
     ) -> Result<Self, crate::Error> {
         let (aes_key, iv) = get_aes_key(properties, password, max_cycles_power, max_kdf_rounds)?;
         let cipher = Aes256Cbc::new(aes_key.as_ref(), &iv)
-            .map_err(|err| crate::Error::other(err.to_string()))?;
+            .map_err(|err| crate::Error::internal(err.to_string()))?;
         Ok(Self {
             input,
             cipher,
@@ -285,14 +285,14 @@ impl AesProperties {
     /// Parses the coder's properties without deriving a key or allocating.
     pub fn parse(properties: &[u8]) -> Result<Self, crate::Error> {
         let Some(&b0) = properties.first() else {
-            return Err(crate::Error::other("AES256 properties too short"));
+            return Err(crate::Error::corrupted("AES256 properties too short"));
         };
         // Preserve the decoder's one-byte property compatibility.
         let b1 = properties.get(1).copied().unwrap_or(0);
         let iv_len = usize::from(((b0 >> 6) & 1) + (b1 & 15));
         let salt_len = usize::from(((b0 >> 7) & 1) + (b1 >> 4));
         if salt_len + iv_len != 0 && 2 + salt_len + iv_len > properties.len() {
-            return Err(crate::Error::other("Salt size + IV size too long"));
+            return Err(crate::Error::corrupted("Salt size + IV size too long"));
         }
         let mut salt = [0; 16];
         let mut iv = [0; 16];
@@ -424,7 +424,7 @@ impl crate::Archive {
         let block = self
             .blocks
             .get(block)
-            .ok_or_else(|| crate::Error::other("AES block index out of range"))?;
+            .ok_or_else(|| crate::Error::invalid_argument("AES block index out of range"))?;
         block
             .coders
             .iter()
@@ -623,7 +623,7 @@ fn derive_key_with_budget(
         .kdf_rounds
         .load(Relaxed)
         .checked_add(1u64 << num_cycles_power)
-        .ok_or_else(|| crate::Error::other("AES KDF work total overflow"))?;
+        .ok_or_else(|| crate::Error::corrupted("AES KDF work total overflow"))?;
     if rounds > max_rounds {
         return Err(crate::Error::limit(
             crate::Limit::AesKdfRounds,
@@ -695,7 +695,7 @@ impl<W> Aes256Sha256Encoder<W> {
         Ok(Self {
             output,
             enc: Aes256CbcEnc::new(key.as_ref(), &iv)
-                .map_err(|e| crate::Error::other(e.to_string()))?,
+                .map_err(|e| crate::Error::internal(e.to_string()))?,
             buffer: Vec::new(),
             finished: false,
         })

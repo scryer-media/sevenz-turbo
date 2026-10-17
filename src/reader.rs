@@ -217,7 +217,10 @@ impl<'a, R: Read + Seek> Seek for SharedBoundedReader<'a, R> {
             SeekFrom::Current(pos) => self.cur as i64 + pos,
         };
         if new_pos < 0 {
-            return Err(io::Error::other("SeekBeforeStart"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before the start",
+            ));
         }
         self.cur = new_pos as u64;
         self.inner.borrow_mut().seek(SeekFrom::Start(self.cur))
@@ -263,12 +266,47 @@ impl<'a, R: Read + Seek> SharedBoundedReader<'a, R> {
 /// reported as a block failure.
 struct FaultRecordingReader<R> {
     inner: R,
-    faulted: Rc<Cell<bool>>,
+    faulted: Fault,
+}
+
+/// The first failure out of a block's decode chain, kept by the readers that
+/// hand it to the callbacks: a callback that goes on from it has not made the
+/// block whole, and the block still fails with it.
+#[derive(Clone, Default)]
+struct Fault(Rc<RefCell<Option<io::Error>>>);
+
+impl Fault {
+    fn record(&self, error: &io::Error) {
+        let mut first = self.0.borrow_mut();
+        // An interrupted read is retried, not failed: a failure after it is
+        // the one kept.
+        if first.as_ref().is_none_or(interrupted) {
+            *first = Some(crate::error::copy_io(error));
+        }
+    }
+
+    /// Whether the decode chain raised anything, which locates an error the
+    /// callback then returns in this block.
+    fn happened(&self) -> bool {
+        self.0.borrow().is_some()
+    }
+
+    /// The failure kept, if the chain raised one that was not a retry.
+    fn take(&self) -> Option<io::Error> {
+        self.0
+            .borrow_mut()
+            .take()
+            .filter(|error| !interrupted(error))
+    }
+}
+
+fn interrupted(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::Interrupted
 }
 
 impl<R: Read> Read for FaultRecordingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf).inspect_err(|_| self.faulted.set(true))
+        self.inner.read(buf).inspect_err(|e| self.faulted.record(e))
     }
 }
 
@@ -283,12 +321,12 @@ impl<R: DecodeRead> DecodeRead for FaultRecordingReader<R> {
         sink: &mut dyn FnMut(&[u8]) -> io::Result<()>,
     ) -> Option<io::Result<usize>> {
         let read = self.inner.read_borrowed(max, sink)?;
-        Some(read.inspect_err(|_| self.faulted.set(true)))
+        Some(read.inspect_err(|e| self.faulted.record(e)))
     }
 
     fn push(&mut self, max: usize, sink: &mut dyn FnMut(&[u8])) -> Option<io::Result<usize>> {
         let pushed = self.inner.push(max, sink)?;
-        Some(pushed.inspect_err(|_| self.faulted.set(true)))
+        Some(pushed.inspect_err(|e| self.faulted.record(e)))
     }
 }
 
@@ -574,7 +612,7 @@ mod borrowed_delivery_tests {
         len: usize,
         expected: u32,
         prop: u8,
-        fault: Rc<Cell<bool>>,
+        fault: Fault,
         report: Rc<Cell<Option<u32>>>,
     ) -> impl DecodeRead {
         let decoder =
@@ -689,14 +727,14 @@ mod borrowed_delivery_tests {
                         for prefix in [0, 7] {
                             let mut observed = Vec::new();
                             for direct in [false, true] {
-                                let fault = Rc::new(Cell::new(false));
+                                let fault = Fault::default();
                                 let report = Rc::new(Cell::new(None));
                                 let inner = chain(
                                     input.clone(),
                                     data.len(),
                                     crc32(&data) ^ u32::from(bad_crc),
                                     prop,
-                                    Rc::clone(&fault),
+                                    fault.clone(),
                                     Rc::clone(&report),
                                 );
                                 let mut reader = Counted {
@@ -734,7 +772,7 @@ mod borrowed_delivery_tests {
                                     sink.inner.bytes,
                                     sink.requests,
                                     result.map_err(|e| (e.kind(), e.to_string())),
-                                    fault.get(),
+                                    fault.happened(),
                                     report.get(),
                                 ));
                             }
@@ -804,14 +842,14 @@ mod borrowed_delivery_tests {
                             let checksum = crc32(&data) ^ u32::from(bad_crc);
                             let mut observed = Vec::new();
                             for direct in [false, true] {
-                                let fault = Rc::new(Cell::new(false));
+                                let fault = Fault::default();
                                 let report = Rc::new(Cell::new(None));
                                 let mut reader = chain(
                                     packed(&data),
                                     len,
                                     checksum,
                                     prop,
-                                    Rc::clone(&fault),
+                                    fault.clone(),
                                     Rc::clone(&report),
                                 );
                                 let mut head = vec![0; prefix];
@@ -828,7 +866,7 @@ mod borrowed_delivery_tests {
                                 observed.push((
                                     sink.bytes,
                                     result.map_err(|e| (e.kind(), e.to_string())),
-                                    fault.get(),
+                                    fault.happened(),
                                     report.get(),
                                 ));
                             }
@@ -852,13 +890,13 @@ mod borrowed_delivery_tests {
         for input in [damaged, truncated] {
             let mut observed = Vec::new();
             for direct in [false, true] {
-                let fault = Rc::new(Cell::new(false));
+                let fault = Fault::default();
                 let mut reader = chain(
                     input.clone(),
                     data.len(),
                     crc32(&data),
                     16,
-                    Rc::clone(&fault),
+                    fault.clone(),
                     Rc::new(Cell::new(None)),
                 );
                 let mut sink = Vec::new();
@@ -870,7 +908,7 @@ mod borrowed_delivery_tests {
                 observed.push((
                     sink,
                     result.map_err(|e| (e.kind(), e.to_string())),
-                    fault.get(),
+                    fault.happened(),
                 ));
             }
             assert_eq!(observed[0], observed[1]);
@@ -885,20 +923,20 @@ mod borrowed_delivery_tests {
             }
         }
         let bytes = b"borrowed output";
-        let fault = Rc::new(Cell::new(false));
+        let fault = Fault::default();
         let mut reader = chain(
             packed(bytes),
             bytes.len(),
             crc32(bytes),
             0,
-            Rc::clone(&fault),
+            fault.clone(),
             Rc::new(Cell::new(None)),
         );
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             write_pushed(&mut reader, &mut Panics)
         }));
         assert!(panic.is_err());
-        assert!(!fault.get());
+        assert!(!fault.happened());
     }
 
     #[cfg(feature = "compress")]
@@ -1173,7 +1211,7 @@ impl Archive {
         }
 
         if nid == K_ADDITIONAL_STREAMS_INFO {
-            return Err(Error::other("Additional streams unsupported"));
+            return Err(Error::unsupported("Additional streams unsupported"));
         }
         if nid == K_MAIN_STREAMS_INFO {
             Self::read_streams_info(header, archive, bounds)?;
@@ -1243,7 +1281,7 @@ impl Archive {
                 }
             }
         }
-        Err(Error::other(
+        Err(Error::corrupted(
             "Start header corrupt and unable to guess end header",
         ))
     }
@@ -1269,7 +1307,7 @@ impl Archive {
         if start_header.next_header_size > usize::MAX as u64
             || start_header.next_header_size > reader_len
         {
-            return Err(Error::other(format!(
+            return Err(Error::corrupted(format!(
                 "Cannot handle next_header_size {}",
                 start_header.next_header_size
             )));
@@ -1283,7 +1321,7 @@ impl Archive {
         let header_pos = SIGNATURE_HEADER_SIZE
             .checked_add(start_header.next_header_offset)
             .filter(|pos| *pos <= reader_len)
-            .ok_or_else(|| Error::other("next header offset out of range"))?;
+            .ok_or_else(|| Error::corrupted("next header offset out of range"))?;
         reader.seek(SeekFrom::Start(header_pos))?;
 
         let mut buf = vec![0; next_header_size_int];
@@ -1299,7 +1337,7 @@ impl Archive {
         // says there are packed bytes nothing describes.
         if buf.is_empty() {
             if start_header.next_header_offset != 0 {
-                return Err(Error::other(
+                return Err(Error::corrupted(
                     "empty next header at a non-zero offset: the archive is corrupt",
                 ));
             }
@@ -1360,7 +1398,7 @@ impl Archive {
                 3,
             ));
         } else {
-            return Err(Error::other("Broken or unsupported archive: no Header"));
+            return Err(Error::corrupted("Broken or unsupported archive: no Header"));
         }
 
         // Like CDbEx::FillLinks, stream maps depend only on parsed metadata.
@@ -1380,14 +1418,14 @@ impl Archive {
         for size in &archive.pack_sizes {
             packed_total = packed_total
                 .checked_add(*size)
-                .ok_or_else(|| Error::other("pack sizes overflow"))?;
+                .ok_or_else(|| Error::corrupted("pack sizes overflow"))?;
         }
         let packed_end = SIGNATURE_HEADER_SIZE
             .checked_add(archive.pack_pos)
             .and_then(|start| start.checked_add(packed_total))
-            .ok_or_else(|| Error::other("pack stream range out of range"))?;
+            .ok_or_else(|| Error::corrupted("pack stream range out of range"))?;
         if packed_end > reader_len {
-            return Err(Error::other(format!(
+            return Err(Error::corrupted(format!(
                 "pack streams end at {packed_end}, past the end of a {reader_len}-byte archive"
             )));
         }
@@ -1401,7 +1439,7 @@ impl Archive {
             for block in &archive.blocks {
                 unpacked_total = unpacked_total
                     .checked_add(block.get_unpack_size())
-                    .ok_or_else(|| Error::other("unpacked sizes overflow"))?;
+                    .ok_or_else(|| Error::corrupted("unpacked sizes overflow"))?;
             }
             if unpacked_total > opts.limits.max_unpack_bytes {
                 return Err(Error::limit(
@@ -1460,13 +1498,15 @@ impl Archive {
         let block = archive
             .blocks
             .first()
-            .ok_or(Error::other("no blocks, can't read encoded header"))?;
+            .ok_or(Error::corrupted("no blocks, can't read encoded header"))?;
         let first_pack_stream_index = 0;
         let block_offset = SIGNATURE_HEADER_SIZE
             .checked_add(archive.pack_pos)
-            .ok_or_else(|| Error::other("pack position out of range"))?;
+            .ok_or_else(|| Error::corrupted("pack position out of range"))?;
         if archive.pack_sizes.is_empty() {
-            return Err(Error::other("no packed streams, can't read encoded header"));
+            return Err(Error::corrupted(
+                "no packed streams, can't read encoded header",
+            ));
         }
 
         reader.seek(SeekFrom::Start(block_offset))?;
@@ -1483,7 +1523,7 @@ impl Archive {
             ));
         }
         let unpack_size = usize::try_from(declared_unpack)
-            .map_err(|_| Error::other("encoded header unpack size out of range"))?;
+            .map_err(|_| Error::corrupted("encoded header unpack size out of range"))?;
         // Each coder is checked against the memory limit as it is built, which
         // alone lets a chain of them hold the limit several times over; the
         // chain is refused here, as a whole, before any of them allocates.
@@ -1503,7 +1543,7 @@ impl Archive {
         let mut decoder = if coder_len > 0 {
             for (index, coder) in block.ordered_coder_iter() {
                 if coder.num_in_streams() != 1 || coder.num_out_streams() != 1 {
-                    return Err(Error::other(
+                    return Err(Error::unsupported(
                         "Multi input/output stream coders are not yet supported",
                     ));
                 }
@@ -1607,7 +1647,7 @@ impl Archive {
                     let n = if let Some(s) = &is_empty_stream {
                         s.len()
                     } else {
-                        return Err(Error::other(
+                        return Err(Error::corrupted(
                             "Header format error: kEmptyStream must appear before kEmptyFile",
                         ));
                     };
@@ -1617,7 +1657,7 @@ impl Archive {
                     let n = if let Some(s) = is_empty_stream.as_ref() {
                         s.len()
                     } else {
-                        return Err(Error::other(
+                        return Err(Error::corrupted(
                             "Header format error: kEmptyStream must appear before kEmptyFile",
                         ));
                     };
@@ -1626,11 +1666,11 @@ impl Archive {
                 K_NAME => {
                     let external = header.read_u8()?;
                     if external != 0 {
-                        return Err(Error::other("Not implemented:external != 0"));
+                        return Err(Error::unsupported("Not implemented:external != 0"));
                     }
                     // A zero `size` would underflow `size - 1`; reject it explicitly.
                     if size == 0 || (size - 1) & 1 != 0 {
-                        return Err(Error::other("file names length invalid"));
+                        return Err(Error::corrupted("file names length invalid"));
                     }
 
                     let size = bounds.count(size, Limit::TotalNameBytes)?;
@@ -1648,21 +1688,21 @@ impl Archive {
                         // names than `num_files`. Bail with an error instead of letting
                         // `files[next_file]` panic with an out-of-bounds index.
                         if next_file >= files.len() {
-                            return Err(Error::other("Error parsing file names"));
+                            return Err(Error::corrupted("Error parsing file names"));
                         }
                         files[next_file].name = s?;
                         next_file += 1;
                     }
 
                     if next_file != files.len() {
-                        return Err(Error::other("Error parsing file names"));
+                        return Err(Error::corrupted("Error parsing file names"));
                     }
                 }
                 K_C_TIME => {
                     let times_defined = read_all_or_bits(header, num_files)?;
                     let external = header.read_u8()?;
                     if external != 0 {
-                        return Err(Error::other(format!(
+                        return Err(Error::unsupported(format!(
                             "kCTime Unimplemented:external={external}"
                         )));
                     }
@@ -1677,7 +1717,7 @@ impl Archive {
                     let times_defined = read_all_or_bits(header, num_files)?;
                     let external = header.read_u8()?;
                     if external != 0 {
-                        return Err(Error::other(format!(
+                        return Err(Error::unsupported(format!(
                             "kATime Unimplemented:external={external}"
                         )));
                     }
@@ -1692,7 +1732,7 @@ impl Archive {
                     let times_defined = read_all_or_bits(header, num_files)?;
                     let external = header.read_u8()?;
                     if external != 0 {
-                        return Err(Error::other(format!(
+                        return Err(Error::unsupported(format!(
                             "kMTime Unimplemented:external={external}"
                         )));
                     }
@@ -1707,7 +1747,7 @@ impl Archive {
                     let times_defined = read_all_or_bits(header, num_files)?;
                     let external = header.read_u8()?;
                     if external != 0 {
-                        return Err(Error::other(format!(
+                        return Err(Error::unsupported(format!(
                             "kWinAttributes Unimplemented:external={external}"
                         )));
                     }
@@ -1718,7 +1758,11 @@ impl Archive {
                         }
                     }
                 }
-                K_START_POS => return Err(Error::other("kStartPos is unsupported, please report")),
+                K_START_POS => {
+                    return Err(Error::unsupported(
+                        "kStartPos is unsupported, please report",
+                    ));
+                }
                 K_DUMMY => {
                     // Bound the skip against the buffer: an unbounded value cast to `i64`
                     // could go negative and seek backwards, re-reading the same bytes forever.
@@ -1743,7 +1787,7 @@ impl Archive {
                 let sub_stream_info = if let Some(s) = archive.sub_streams_info.as_ref() {
                     s
                 } else {
-                    return Err(Error::other(
+                    return Err(Error::corrupted(
                         "Archive contains file with streams but no subStreamsInfo",
                     ));
                 };
@@ -1755,7 +1799,7 @@ impl Archive {
                     sub_stream_info.crcs.get(non_empty_file_counter),
                     sub_stream_info.unpack_sizes.get(non_empty_file_counter),
                 ) else {
-                    return Err(Error::other(
+                    return Err(Error::corrupted(
                         "Archive declares more streamed files than sub-streams",
                     ));
                 };
@@ -1786,7 +1830,7 @@ impl Archive {
             .as_ref()
             .map_or(0, |s| s.unpack_sizes.len());
         if non_empty_file_counter != sub_streams {
-            return Err(Error::other(
+            return Err(Error::corrupted(
                 "Archive declares fewer streamed files than sub-streams",
             ));
         }
@@ -1809,9 +1853,9 @@ impl Archive {
             // panicking there.
             next_block_pack_stream_index = next_block_pack_stream_index
                 .checked_add(archive.blocks[i].packed_streams().len())
-                .ok_or_else(|| Error::other("pack stream index overflow"))?;
+                .ok_or_else(|| Error::corrupted("pack stream index overflow"))?;
             if next_block_pack_stream_index > archive.pack_sizes.len() {
-                return Err(Error::other(
+                return Err(Error::corrupted(
                     "block references pack streams beyond the available pack sizes",
                 ));
             }
@@ -1835,7 +1879,7 @@ impl Archive {
             stream_map.pack_stream_offsets[i] = next_pack_stream_offset;
             next_pack_stream_offset = next_pack_stream_offset
                 .checked_add(archive.pack_sizes[i])
-                .ok_or_else(|| Error::other("pack stream offset overflow"))?;
+                .ok_or_else(|| Error::corrupted("pack stream offset overflow"))?;
         }
 
         stream_map.block_first_file_index = vec![0; num_blocks];
@@ -1856,7 +1900,7 @@ impl Archive {
                     next_block_index += 1;
                 }
                 if next_block_index >= archive.blocks.len() {
-                    return Err(Error::other("Too few blocks in archive"));
+                    return Err(Error::corrupted("Too few blocks in archive"));
                 }
             }
             stream_map.file_block_index[i] = Some(next_block_index);
@@ -1874,12 +1918,12 @@ impl Archive {
                     .checked_add(archive.blocks[next_block_index].packed_streams().len())
                     .and_then(|end| archive.pack_sizes.get(first_pack_stream_index..end))
                     .ok_or_else(|| {
-                        Error::other("block references a pack stream index beyond pack_sizes")
+                        Error::corrupted("block references a pack stream index beyond pack_sizes")
                     })?;
                 let pack_size = pack_sizes
                     .iter()
                     .try_fold(0u64, |total, &size| total.checked_add(size))
-                    .ok_or_else(|| Error::other("block pack size overflow"))?;
+                    .ok_or_else(|| Error::corrupted("block pack size overflow"))?;
 
                 archive.files[i].compressed_size = pack_size;
             }
@@ -1908,9 +1952,9 @@ impl Archive {
             let start = stream_map.block_first_file_index[b];
             let end = start
                 .checked_add(block.num_unpack_sub_streams)
-                .ok_or_else(|| Error::other("block file span overflow"))?;
+                .ok_or_else(|| Error::corrupted("block file span overflow"))?;
             if end > archive.files.len() {
-                return Err(Error::other(
+                return Err(Error::corrupted(
                     "block declares more sub-streams than the archive has files",
                 ));
             }
@@ -1960,7 +2004,7 @@ impl Archive {
     ) -> Result<(), Error> {
         let nid = header.read_u8()?;
         if nid != K_FOLDER {
-            return Err(Error::other(format!("Expected kFolder, got {nid}")));
+            return Err(Error::corrupted(format!("Expected kFolder, got {nid}")));
         }
         let num_blocks = bounds.count(read_variable_u64(header)?, Limit::Entries)?;
 
@@ -1991,7 +2035,7 @@ impl Archive {
 
         let nid = header.read_u8()?;
         if nid != K_CODERS_UNPACK_SIZE {
-            return Err(Error::other(format!(
+            return Err(Error::corrupted(format!(
                 "Expected kCodersUnpackSize, got {nid}"
             )));
         }
@@ -2071,11 +2115,11 @@ impl Archive {
                     next_unpack_stream += 1;
                     sum = sum
                         .checked_add(size)
-                        .ok_or_else(|| Error::other("sub-stream size sum overflow"))?;
+                        .ok_or_else(|| Error::corrupted("sub-stream size sum overflow"))?;
                 }
             }
             if sum > block.get_unpack_size() {
-                return Err(Error::other(
+                return Err(Error::corrupted(
                     "sum of unpack sizes of block exceeds total unpack size",
                 ));
             }
@@ -2093,7 +2137,7 @@ impl Archive {
                 num_digests = num_digests
                     .checked_add(block.num_unpack_sub_streams)
                     .filter(|total| *total <= total_unpack_streams)
-                    .ok_or_else(|| Error::other("sub-stream digest count out of range"))?;
+                    .ok_or_else(|| Error::corrupted("sub-stream digest count out of range"))?;
             }
         }
 
@@ -2174,10 +2218,10 @@ impl Archive {
             // addition must be rejected rather than wrap past the bound below.
             total_in_streams = total_in_streams
                 .checked_add(input_streams)
-                .ok_or_else(|| Error::other("coder stream counts exceed available input"))?;
+                .ok_or_else(|| Error::corrupted("coder stream counts exceed available input"))?;
             total_out_streams = total_out_streams
                 .checked_add(output_streams)
-                .ok_or_else(|| Error::other("coder stream counts exceed available input"))?;
+                .ok_or_else(|| Error::corrupted("coder stream counts exceed available input"))?;
             if input_streams > bounds.limits.max_streams_per_coder
                 || output_streams > bounds.limits.max_streams_per_coder
             {
@@ -2199,7 +2243,7 @@ impl Archive {
             coders.push(coder);
             // would need to keep looping as above:
             if more_alternative_methods {
-                return Err(Error::other(
+                return Err(Error::unsupported(
                     "Alternative methods are unsupported, please report. The reference implementation doesn't support them either.",
                 ));
             }
@@ -2209,7 +2253,7 @@ impl Archive {
         let total_out_streams = total_out_streams as usize;
 
         if total_out_streams == 0 {
-            return Err(Error::other("Total output streams can't be 0"));
+            return Err(Error::corrupted("Total output streams can't be 0"));
         }
         let num_bind_pairs = total_out_streams - 1;
         let mut bind_pairs = Vec::with_capacity(num_bind_pairs);
@@ -2222,13 +2266,15 @@ impl Archive {
             // coder graph. Validate them at parse time so decoding cannot panic on an
             // out-of-range index.
             if bp.in_index >= total_in_streams as u64 || bp.out_index >= total_out_streams as u64 {
-                return Err(Error::other("bind pair references an out-of-range stream"));
+                return Err(Error::corrupted(
+                    "bind pair references an out-of-range stream",
+                ));
             }
             bind_pairs.push(bp);
         }
 
         if total_in_streams < num_bind_pairs {
-            return Err(Error::other(
+            return Err(Error::corrupted(
                 "Total input streams can't be less than the number of bind pairs",
             ));
         }
@@ -2243,7 +2289,7 @@ impl Archive {
                 }
             }
             if index == u64::MAX {
-                return Err(Error::other("Couldn't find stream's bind pair index"));
+                return Err(Error::corrupted("Couldn't find stream's bind pair index"));
             }
             packed_streams[0] = index;
         } else {
@@ -2301,7 +2347,7 @@ impl Archive {
             // Ranges were checked as the pairs were read; this is the duplicate check.
             let (i, o) = (bp.in_index as usize, bp.out_index as usize);
             if in_bound[i] || out_bound[o] {
-                return Err(Error::other("bind pairs bind a stream twice"));
+                return Err(Error::corrupted("bind pairs bind a stream twice"));
             }
             in_bound[i] = true;
             out_bound[o] = true;
@@ -2311,19 +2357,25 @@ impl Archive {
             let i = usize::try_from(ps)
                 .ok()
                 .filter(|i| *i < total_in)
-                .ok_or_else(|| Error::other("packed stream references an out-of-range stream"))?;
+                .ok_or_else(|| {
+                    Error::corrupted("packed stream references an out-of-range stream")
+                })?;
             if in_bound[i] {
-                return Err(Error::other("packed stream is also bound by a bind pair"));
+                return Err(Error::corrupted(
+                    "packed stream is also bound by a bind pair",
+                ));
             }
             in_bound[i] = true;
         }
         if in_bound.iter().any(|bound| !bound) {
-            return Err(Error::other("block leaves an input stream unaccounted for"));
+            return Err(Error::corrupted(
+                "block leaves an input stream unaccounted for",
+            ));
         }
 
         let unbound_outputs = out_bound.iter().filter(|bound| !**bound).count();
         if unbound_outputs != 1 {
-            return Err(Error::other(
+            return Err(Error::corrupted(
                 "block must have exactly one unbound output stream",
             ));
         }
@@ -2358,7 +2410,7 @@ impl Archive {
         while let Some((coder_index, step)) = stack.pop() {
             if step == 0 {
                 match state[coder_index] {
-                    ON_PATH => return Err(Error::other("block's coders form a cycle")),
+                    ON_PATH => return Err(Error::corrupted("block's coders form a cycle")),
                     DONE => continue,
                     _ => state[coder_index] = ON_PATH,
                 }
@@ -2426,7 +2478,7 @@ impl<'a> HeaderBounds<'a> {
     fn add_count(self, total: usize, additional: usize) -> Result<usize, Error> {
         let total = total
             .checked_add(additional)
-            .ok_or_else(|| Error::other("total unpack streams overflow"))?;
+            .ok_or_else(|| Error::corrupted("total unpack streams overflow"))?;
         self.count(total as u64, Limit::Entries)
     }
 
@@ -2537,7 +2589,7 @@ impl<R: Read> Iterator for NamesReader<'_, R> {
             self.cache.push(u);
         }
 
-        Some(String::from_utf16(&self.cache).map_err(|e| Error::other(e.to_string())))
+        Some(String::from_utf16(&self.cache).map_err(|e| Error::corrupted(e.to_string())))
     }
 }
 
@@ -3078,7 +3130,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             .and_then(|v| {
                 v.checked_add(archive.stream_map.pack_stream_offsets[first_pack_stream_index])
             })
-            .ok_or_else(|| Error::other("block offset out of range"))?;
+            .ok_or_else(|| Error::corrupted("block offset out of range"))?;
 
         // A large stored folder, with threads to spare and a cursor of its
         // own on the archive, is read ahead on a thread that checksums as it
@@ -3247,7 +3299,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let packed = BoundedReader::new(
             cursor,
             usize::try_from(pack_size)
-                .map_err(|_| Error::other("pack stream size exceeds address space"))?,
+                .map_err(|_| Error::corrupted("pack stream size exceeds address space"))?,
         );
         let checksums = (!opts.checksum_splits.is_empty()).then(|| {
             store_overlap::Checksums::new(Arc::clone(control), opts.checksum_splits, unpack_size)
@@ -3308,7 +3360,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let first_pack_stream_index = archive.stream_map.block_first_pack_stream_index[block_index];
         let start_pos = SIGNATURE_HEADER_SIZE
             .checked_add(archive.pack_pos)
-            .ok_or_else(|| Error::other("pack position out of range"))?;
+            .ok_or_else(|| Error::corrupted("pack position out of range"))?;
         let offsets = &archive.stream_map.pack_stream_offsets[first_pack_stream_index..];
 
         // A direct pack stream can be inspected by seeking over payload.
@@ -3361,11 +3413,11 @@ impl<R: Read + Seek> ArchiveReader<R> {
         for (i, offset) in offsets[..block.packed_streams().len()].iter().enumerate() {
             let pack_pos = start_pos
                 .checked_add(*offset)
-                .ok_or_else(|| Error::other("pack stream offset out of range"))?;
+                .ok_or_else(|| Error::corrupted("pack stream offset out of range"))?;
             let pack_size = archive.pack_sizes[first_pack_stream_index + i];
             let pack_end = pack_pos
                 .checked_add(pack_size)
-                .ok_or_else(|| Error::other("pack stream size out of range"))?;
+                .ok_or_else(|| Error::corrupted("pack stream size out of range"))?;
 
             let pack_reader =
                 SharedBoundedReader::new(Rc::clone(&shared_source), (pack_pos, pack_end));
@@ -3389,7 +3441,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 // index that would fall outside it instead of panicking.
                 let out_index = bp.out_index as usize;
                 if out_index >= block.coders.len() {
-                    return Err(Error::other("bind pair out index exceeds coder count"));
+                    return Err(Error::corrupted("bind pair out index exceeds coder count"));
                 }
                 coder_used[out_index] = true;
             }
@@ -3472,7 +3524,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 // with the caller's shared seek/read cursor on this graph.
                 let (start, end) = sources[index].bounds;
                 let size = usize::try_from(end - start)
-                    .map_err(|_| Error::other("pack stream size exceeds address space"))?;
+                    .map_err(|_| Error::corrupted("pack stream size exceeds address space"))?;
                 let mut cursor = ReadAtCursor::new(Arc::clone(positional));
                 cursor.seek(SeekFrom::Start(start))?;
                 return Ok(Stage::OwnedLeaf(Box::new(BoundedReader::new(cursor, size))));
@@ -3483,7 +3535,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let bp = block
             .find_bind_pair_for_in_stream(in_stream_index as u64)
             .ok_or_else(|| {
-                Error::other(format!(
+                Error::corrupted(format!(
                     "Couldn't find bind pair for stream {in_stream_index}"
                 ))
             })?;
@@ -3523,21 +3575,21 @@ impl<R: Read + Seek> ArchiveReader<R> {
         // than the coder count means the bind pairs form a cycle. Bail out instead of
         // recursing until the stack overflows (an uncatchable abort).
         if depth > block.coders.len() {
-            return Err(Error::other("cyclic coder bind-pair graph"));
+            return Err(Error::corrupted("cyclic coder bind-pair graph"));
         }
         let (Some(coder), Some(&start_index)) = (
             block.coders.get(in_stream_index),
             coder_to_stream_map.get(in_stream_index),
         ) else {
-            return Err(Error::other("in_stream_index out of range"));
+            return Err(Error::corrupted("in_stream_index out of range"));
         };
         if start_index == usize::MAX {
-            return Err(Error::other("in_stream_index out of range"));
+            return Err(Error::corrupted("in_stream_index out of range"));
         }
         let uncompressed_len = *block
             .unpack_sizes()
             .get(in_stream_index)
-            .ok_or_else(|| Error::other("in_stream_index out of range"))?
+            .ok_or_else(|| Error::corrupted("in_stream_index out of range"))?
             as usize;
         if coder.num_in_streams() == 1 {
             let input = Self::get_in_stream(
@@ -3560,7 +3612,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             // The BCJ2 decoder indexes exactly four input streams; reject a malformed count
             // up front instead of handing a short/long input list to the upstream decoder.
             if num_in_streams != 4 {
-                return Err(Error::other(
+                return Err(Error::corrupted(
                     "BCJ2 coder must declare exactly four input streams",
                 ));
             }
@@ -3623,7 +3675,9 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 .flatten()
                 .any(|&block| block >= self.archive.blocks.len())
         {
-            return Err(Error::other("the archive's stream map does not match it"));
+            return Err(Error::corrupted(
+                "the archive's stream map does not match it",
+            ));
         }
         for phase in self.folder_phases() {
             match phase {
@@ -3866,7 +3920,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
 
         let block_index = index_entry
             .block_index
-            .ok_or_else(|| Error::other("File has no associated block"))?;
+            .ok_or_else(|| Error::corrupted("File has no associated block"))?;
 
         match self.archive.is_solid {
             true => {
@@ -3911,7 +3965,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 let block_offset = SIGNATURE_HEADER_SIZE
                     .checked_add(self.archive.pack_pos)
                     .and_then(|v| v.checked_add(pack_offset))
-                    .ok_or_else(|| Error::other("block offset out of range"))?;
+                    .ok_or_else(|| Error::corrupted("block offset out of range"))?;
 
                 self.source.seek(SeekFrom::Start(block_offset))?;
 
@@ -3996,13 +4050,13 @@ impl<R: Read + Seek> ArchiveReader<R> {
 
         let block_index = index_entry
             .block_index
-            .ok_or_else(|| Error::other("File has no associated block"))?;
+            .ok_or_else(|| Error::corrupted("File has no associated block"))?;
 
         let block = self
             .archive
             .blocks
             .get(block_index)
-            .ok_or_else(|| Error::other("Block not found"))?;
+            .ok_or_else(|| Error::corrupted("Block not found"))?;
 
         block
             .coders
@@ -4084,7 +4138,7 @@ impl OwedCompletions<'_> {
     /// The failure of a block whose bytes were all read and whose coder
     /// reported no checksum for them: they cannot be vouched for.
     fn unverified(&self) -> Error {
-        Error::other("the decoder reported no checksum for bytes that were read to their end")
+        Error::internal("the decoder reported no checksum for bytes that were read to their end")
             .in_block(self.block_index, self.packed_offset)
     }
 }
@@ -4138,7 +4192,7 @@ fn check_block_mapping(archive: &Archive, block_index: usize) -> Result<(), Erro
     let block = archive
         .blocks
         .get(block_index)
-        .ok_or_else(|| Error::other("block index out of range"))?;
+        .ok_or_else(|| Error::invalid_argument("block index out of range"))?;
     let pack_streams = map
         .block_first_pack_stream_index
         .get(block_index)
@@ -4148,7 +4202,7 @@ fn check_block_mapping(archive: &Archive, block_index: usize) -> Result<(), Erro
         || map.block_first_sub_stream_index.get(block_index).is_none()
         || map.block_first_file_index.get(block_index).is_none()
     {
-        return Err(Error::other(
+        return Err(Error::corrupted(
             "the archive's stream map does not describe this block",
         ));
     }
@@ -4443,10 +4497,10 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         // parallel path or degraded to the single-threaded one, and it stops
         // reporting as soon as the block finishes.
         let folding = opts.folding_checksums();
-        let faulted = Rc::new(Cell::new(false));
+        let faulted = Fault::default();
         let mut block_reader = FaultRecordingReader {
             inner: block_reader,
-            faulted: Rc::clone(&faulted),
+            faulted: faulted.clone(),
         };
         let files = block_file_range(archive, block_index);
         // The last file of the block with bytes in it. A callback that asks to
@@ -4464,7 +4518,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
             .stream_map
             .block_first_sub_stream_index
             .get(block_index)
-            .ok_or_else(|| Error::other("block has no sub-stream mapping"))?;
+            .ok_or_else(|| Error::corrupted("block has no sub-stream mapping"))?;
         // Where each file starts inside the block's uncompressed stream: the
         // coordinate the parallel decoder's output blocks carry, so a folded
         // checksum and a file are in the same space.
@@ -4504,7 +4558,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                             file.crc,
                             Rc::clone(&crc_report),
                         ),
-                        faulted: Rc::clone(&faulted),
+                        faulted: faulted.clone(),
                     };
                     each(file, &mut verifying)
                         .and_then(|go_on| drain_unread(&mut verifying, go_on, drain))
@@ -4513,7 +4567,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                     // inside of, and that is the block's fault as well.
                     let mut recording = FaultRecordingReader {
                         inner: &mut bounded,
-                        faulted: Rc::clone(&faulted),
+                        faulted: faulted.clone(),
                     };
                     each(file, &mut recording)
                         .and_then(|go_on| drain_unread(&mut recording, go_on, drain))
@@ -4528,12 +4582,20 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                         // Only a failure that came out of the decode chain is
                         // this block's fault; the caller's own errors pass
                         // through as they were raised.
-                        if faulted.get() {
+                        if faulted.happened() {
                             e.in_block(block_index, packed_offset)
                         } else {
                             e
                         }
                     })?;
+                if outcome && let Some(fault) = faulted.take() {
+                    // The callback went on from a failure it was handed. That
+                    // does not make the block whole: it fails with that
+                    // failure, as it does when a worker decoded the folder.
+                    return Err(Error::from(fault)
+                        .maybe_bad_password(opts.encrypted)
+                        .in_block(block_index, packed_offset));
+                }
                 consumed += taken;
                 if folding {
                     // The files before this one first, so completions are
@@ -4964,12 +5026,11 @@ impl FolderWorker<'_> {
             let file_index = next_file;
             next_file += 1;
             let send = |tx: &mut crate::ordered::Sender<'_, FolderMessage>, message, weight| {
-                tx.send(message, weight)
-                    .map_err(|_| Error::other("folder decode cancelled"))
+                tx.send(message, weight).map_err(|_| Error::Cancelled)
             };
             if flush(tx).is_err() {
                 cancelled = true;
-                return Err(Error::other("folder decode cancelled"));
+                return Err(Error::Cancelled);
             }
             send(tx, FolderMessage::Begin(file_index), FOLDER_MESSAGE_WEIGHT)
                 .inspect_err(|_| cancelled = true)?;
@@ -5000,7 +5061,7 @@ impl FolderWorker<'_> {
                     stopped = true;
                     send(tx, FolderMessage::Fault(e), FOLDER_MESSAGE_WEIGHT)
                         .inspect_err(|_| cancelled = true)?;
-                    return Err(Error::other("folder decode stopped"));
+                    return Err(Error::internal("folder decode stopped"));
                 }
                 if filled == 0 {
                     // The stream ended early: the callback would have seen the
@@ -5046,12 +5107,12 @@ where
         .first()
         .map_or(0, |range| range.offset);
     let lost = || {
-        Error::other("the worker decoding this folder stopped before finishing it")
+        Error::internal("the worker decoding this folder stopped before finishing it")
             .in_block(block_index, packed_offset)
     };
     // A file's failure the callback was handed and did not return, kept so
     // that it is still the folder's error.
-    let mut swallowed: Option<(io::ErrorKind, String)> = None;
+    let mut swallowed: Option<io::Error> = None;
     // How much of the folder the callbacks have been handed. Once that is all
     // of it the folder's own CRC is owed too, whether or not the callback
     // handed the last byte then asked to stop.
@@ -5201,10 +5262,10 @@ where
             Some(FolderMessage::Done(FolderEnd::Finished)) => return Ok(ended(true, delivered)),
             Some(FolderMessage::Done(FolderEnd::Failed(error))) => return Err(error),
             Some(FolderMessage::Done(FolderEnd::Stopped)) => {
-                let (kind, message) = swallowed
+                let error = swallowed
                     .take()
-                    .unwrap_or((io::ErrorKind::Other, "folder decode stopped".to_string()));
-                return Err(Error::from(io::Error::new(kind, message))
+                    .unwrap_or_else(|| io::Error::other("folder decode stopped"));
+                return Err(Error::from(error)
                     .maybe_bad_password(encrypted)
                     .in_block(block_index, packed_offset));
             }
@@ -5238,9 +5299,9 @@ struct ReplayEntry<'r, 'a> {
     /// How much of the file the callback has been handed.
     delivered: u64,
     state: ReplayState,
-    /// The failure the callback was handed, described, for a later read and
+    /// A copy of the failure the callback was handed, for a later read and
     /// for a callback that does not return it.
-    fault: Option<(io::ErrorKind, String)>,
+    fault: Option<io::Error>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -5264,9 +5325,12 @@ impl ReplayEntry<'_, '_> {
                 }
                 _ => {
                     self.state = ReplayState::Lost;
-                    return Some(io::Error::other(
-                        "the worker decoding this folder stopped before finishing it",
-                    ));
+                    return Some(
+                        Error::internal(
+                            "the worker decoding this folder stopped before finishing it",
+                        )
+                        .into_io(),
+                    );
                 }
             }
         }
@@ -5316,11 +5380,10 @@ impl ReplayEntry<'_, '_> {
                 ReplayState::Open => {}
                 ReplayState::Ended => return Ok(false),
                 ReplayState::Faulted | ReplayState::Lost => {
-                    let (kind, message) = self
-                        .fault
-                        .clone()
-                        .unwrap_or((io::ErrorKind::Other, "folder decode failed".to_string()));
-                    return Err(io::Error::new(kind, message));
+                    return Err(self.fault.as_ref().map_or_else(
+                        || io::Error::other("folder decode failed"),
+                        crate::error::copy_io,
+                    ));
                 }
             }
             match self.rx.recv() {
@@ -5334,15 +5397,16 @@ impl ReplayEntry<'_, '_> {
                 }
                 Some(FolderMessage::Fault(error)) => {
                     self.state = ReplayState::Faulted;
-                    self.fault = Some((error.kind(), error.to_string()));
+                    self.fault = Some(crate::error::copy_io(&error));
                     return Err(error);
                 }
                 _ => {
                     self.state = ReplayState::Lost;
-                    let error = io::Error::other(
+                    let error = Error::internal(
                         "the worker decoding this folder stopped before finishing it",
-                    );
-                    self.fault = Some((error.kind(), error.to_string()));
+                    )
+                    .into_io();
+                    self.fault = Some(crate::error::copy_io(&error));
                     return Err(error);
                 }
             }
@@ -5367,8 +5431,12 @@ fn read_decoded_header(
     encrypted: bool,
 ) -> Result<Vec<u8>, Error> {
     let mut buf = Vec::new();
-    buf.try_reserve_exact(declared)
-        .map_err(|_| Error::other("encoded header unpack size cannot be allocated"))?;
+    buf.try_reserve_exact(declared).map_err(|e| {
+        Error::io_msg(
+            io::Error::new(io::ErrorKind::OutOfMemory, e),
+            "encoded header unpack size cannot be allocated",
+        )
+    })?;
     // `take` stops the read at the declared size, and a buffer whose length
     // reaches its capacity is probed on the stack before `read_to_end` grows
     // it, so an exact-sized stream ends with the capacity unchanged.
@@ -5912,12 +5980,17 @@ mod header_damage_tests {
         archive.files[0].has_crc = false;
         for verify in [true, false] {
             match read_all(&archive, &Password::empty(), &mut source, verify) {
-                Err(Error::BlockDecode {
-                    block_index: 0,
-                    kind: BlockErrorKind::Io,
-                    message,
-                    ..
-                }) => assert!(message.contains("UnexpectedEof"), "{message}"),
+                Err(
+                    error @ Error::BlockDecode {
+                        block_index: 0,
+                        kind: BlockErrorKind::Io,
+                        ..
+                    },
+                ) => assert_eq!(
+                    error.io_error().map(std::io::Error::kind),
+                    Some(std::io::ErrorKind::UnexpectedEof),
+                    "{error}"
+                ),
                 other => panic!("verify {verify}: expected an early end, got {other:?}"),
             }
         }

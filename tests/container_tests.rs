@@ -429,7 +429,8 @@ fn a_copy_block_is_charged_its_read_buffer() {
         })
     };
     match decode(BUFFER - 1024) {
-        Err(Error::BlockDecode { ref message, .. }) if message.starts_with("MaxMemLimited") => {}
+        Err(Error::BlockDecode { ref cause, .. })
+            if matches!(**cause, Error::MaxMemLimited { .. }) => {}
         other => panic!("a block budget below the read buffer must be refused, got {other:?}"),
     }
     decode(BUFFER).expect("the read buffer fits exactly");
