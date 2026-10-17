@@ -132,6 +132,17 @@ impl Encoder {
         }
     }
 
+    /// The most the next stream supplies, or `u64::MAX`; see
+    /// [`PullCoder::set_data_limit`]. lzma-turbo 0.10 offers the promise on
+    /// its LZMA2 encoder only, so an LZMA encoder sizes its window from the
+    /// dictionary as before.
+    fn set_data_limit(&mut self, limit: u64) {
+        match self {
+            Encoder::Lzma(_) => {}
+            Encoder::Lzma2(enc) => enc.set_data_limit(limit),
+        }
+    }
+
     /// Runs the whole stream on the calling thread, from an input that may
     /// not be sent anywhere. The same bytes as [`Encoder::run`] for a coder
     /// [`PullCoder::drives`]: with one block thread and the one-thread match
@@ -903,6 +914,7 @@ struct Kept {
 #[derive(Default)]
 pub(crate) struct PullCoder {
     kept: Option<Kept>,
+    data_limit: Option<u64>,
 }
 
 impl PullCoder {
@@ -1049,7 +1061,17 @@ impl PullCoder {
         }
     }
 
+    /// Promises that the next stream supplies at most `limit` bytes, so that
+    /// the encoder's window need be no longer than that. The output is the
+    /// same bytes either way; a stream that supplies more fails. The promise
+    /// covers that one stream: a stream with no promise of its own is coded
+    /// with none, whatever the kept encoder was last told.
+    pub(crate) fn set_data_limit(&mut self, limit: u64) {
+        self.data_limit = Some(limit);
+    }
+
     fn take_encoder(&mut self, props: &LzmaEncProps, coder: Coder) -> io::Result<Kept> {
+        let limit = self.data_limit.take().unwrap_or(u64::MAX);
         let coder = Self::as_written(coder);
         let reuse = self.kept.as_ref().is_some_and(|kept| kept.coder == coder);
         if !reuse {
@@ -1072,7 +1094,9 @@ impl PullCoder {
             }
             kept.props = *props;
         }
-        Ok(self.kept.take().expect("built above"))
+        let mut kept = self.kept.take().expect("built above");
+        kept.encoder.set_data_limit(limit);
+        Ok(kept)
     }
 }
 
@@ -1544,6 +1568,53 @@ mod tests {
         let decoded = sample(5);
         let packed = pulled(&mut pull, &props(), solid, &decoded);
         assert_eq!(decode_lzma2(&packed, decoded.len()), decoded);
+    }
+
+    /// A stream promised to be no longer than it is writes the same bytes as
+    /// one with no promise: the limit shortens the window, not the matches.
+    #[test]
+    fn a_data_limit_leaves_the_bytes_unchanged() {
+        let solid = Coder::Lzma2 {
+            block_size: BLOCK_SIZE_SOLID,
+            threads: 1,
+        };
+        let level5 = LzmaEncProps::new().with_level(5).with_dict_size(1 << 16);
+        for len in [0, 1, 2048, 3 * CHUNK + 77] {
+            let data = sample(len);
+            let want = pulled(&mut PullCoder::default(), &level5, solid, &data);
+            let mut pull = PullCoder::default();
+            pull.set_data_limit(len as u64);
+            assert_eq!(pulled(&mut pull, &level5, solid, &data), want, "{len}");
+        }
+    }
+
+    /// A kept coder told a small folder's length after coding a large one,
+    /// then given a large folder with no promise, codes all three as fresh
+    /// encoders do: the promise is one stream's, never the next one's.
+    #[test]
+    fn a_kept_coder_takes_each_streams_limit_and_no_other() {
+        let solid = Coder::Lzma2 {
+            block_size: BLOCK_SIZE_SOLID,
+            threads: 1,
+        };
+        let level5 = LzmaEncProps::new().with_level(5).with_dict_size(1 << 16);
+        let mut pull = PullCoder::default();
+        for (len, limit) in [
+            (3 * CHUNK + 77, None),
+            (2048, Some(2048)),
+            (3 * CHUNK + 1, None),
+            (100, Some(100)),
+            (2 * CHUNK, Some(2 * CHUNK as u64)),
+        ] {
+            let data = sample(len);
+            let want = pulled(&mut PullCoder::default(), &level5, solid, &data);
+            if let Some(limit) = limit {
+                pull.set_data_limit(limit);
+            }
+            let packed = pulled(&mut pull, &level5, solid, &data);
+            assert_eq!(packed, want, "{len}");
+            assert_eq!(decode_lzma2(&packed, len), data, "{len}");
+        }
     }
 
     /// Block threads and the threaded match finder need threads of their own,

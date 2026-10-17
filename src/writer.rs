@@ -239,6 +239,28 @@ fn folder_size<'a, R: Read>(
     Ok((head, (n < READ_AHEAD).then_some(n)))
 }
 
+/// [`folder_size`] for a folder the coder may be promised the length of: one that declares no
+/// more than [`READ_AHEAD`] is read ahead as well, and the third value says whether the size is a
+/// fact, which it is when the folder ended within the read-ahead. A declared size is not one - a
+/// file can grow after it was measured - and a coder promised too short an input fails, so only
+/// a size read to the end is passed on as the coder's data limit.
+fn exact_folder_size<'a, R: Read>(
+    entries: impl IntoIterator<Item = &'a ArchiveEntry>,
+    reader: &mut R,
+) -> std::io::Result<(Vec<u8>, Option<u64>, bool)> {
+    let declared = declared_size(entries);
+    if declared.is_some_and(|size| size >= READ_AHEAD) {
+        return Ok((Vec::new(), declared, false));
+    }
+    let mut head = Vec::with_capacity(declared.map_or(0, |size| size as usize));
+    let n = reader.by_ref().take(READ_AHEAD).read_to_end(&mut head)? as u64;
+    Ok(if n < READ_AHEAD {
+        (head, Some(n), true)
+    } else {
+        (head, declared, false)
+    })
+}
+
 /// Names of the entries in a block, for an error message. Truncated at ~512 bytes, since a solid
 /// block can hold many thousands.
 fn entries_names(entries: &[ArchiveEntry]) -> String {
@@ -1608,7 +1630,7 @@ fn encode_entry_input<O: Write>(
     let mut compressed_len = 0;
     let mut compressed = CompressWrapWriter::new(output, &mut compressed_len);
     let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(content_methods.len() - 1);
-    let (head, folder) = folder_size([&entry], &mut r)
+    let (head, folder, exact) = exact_folder_size([&entry], &mut r)
         .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
     let mut out = std::io::BufWriter::with_capacity(output_buffer_len(folder), &mut compressed);
     let methods = folder_methods(content_methods, folder)?;
@@ -1616,7 +1638,8 @@ fn encode_entry_input<O: Write>(
     let pulled = match methods.split_last() {
         Some((first, _)) => r.plan(first)?,
         None => None,
-    };
+    }
+    .map(|pulled| pulled.with_data_limit(folder.filter(|_| exact)));
 
     let (crc, size) = if let Some(pulled) = pulled {
         encode_pulled::<true, _>(
@@ -2309,7 +2332,7 @@ mod header_coder_tests {
 
 #[cfg(test)]
 mod folder_size_tests {
-    use super::declared_size;
+    use super::{READ_AHEAD, declared_size, exact_folder_size};
     use crate::ArchiveEntry;
 
     fn file(size: u64) -> ArchiveEntry {
@@ -2329,6 +2352,31 @@ mod folder_size_tests {
         assert_eq!(declared_size(&[file(10), file(0)]), None);
         assert_eq!(declared_size(&[file(0)]), None);
         assert_eq!(declared_size(&[ArchiveEntry::new_directory("d")]), None);
+    }
+
+    /// Only a folder read to its end is given an exact size: a declaration
+    /// that disagrees with the bytes is overruled by them, and one too large
+    /// to read ahead stays a hint.
+    #[test]
+    fn a_folder_size_is_exact_only_when_read_to_the_end() {
+        let big = READ_AHEAD as usize;
+        let exact = |entries: &[ArchiveEntry], len: usize| {
+            let data = vec![7u8; len];
+            let (head, size, exact) = exact_folder_size(entries, &mut data.as_slice()).unwrap();
+            (head.len(), size, exact)
+        };
+        assert_eq!(exact(&[file(2048)], 2048), (2048, Some(2048), true));
+        // Declared 10, holds 100: the 100 read is the size.
+        assert_eq!(exact(&[file(10)], 100), (100, Some(100), true));
+        assert_eq!(exact(&[file(0)], 100), (100, Some(100), true));
+        assert_eq!(exact(&[file(0)], big + 1), (big, None, false));
+        // Declared under the read-ahead but holding more: the declaration, as a hint.
+        assert_eq!(exact(&[file(10)], big + 1), (big, Some(10), false));
+        // Declared at or past the read-ahead: nothing is read and nothing promised.
+        assert_eq!(
+            exact(&[file(READ_AHEAD)], big),
+            (0, Some(READ_AHEAD), false)
+        );
     }
 }
 

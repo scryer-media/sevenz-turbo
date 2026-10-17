@@ -450,14 +450,43 @@ pub(crate) struct FolderCoder {
 pub(crate) struct PulledCoder {
     props: lzma_turbo::LzmaEncProps,
     coder: Coder,
+    data_limit: Option<u64>,
+}
+
+impl PulledCoder {
+    /// The folder's exact length, when it is known as a fact and not as a
+    /// declaration: the encoder's window is then no longer than the folder,
+    /// which is the same bytes out (see [`PullCoder::set_data_limit`]).
+    pub(crate) fn with_data_limit(mut self, limit: Option<u64>) -> Self {
+        self.data_limit = limit;
+        self
+    }
 }
 
 // C++: CHandler::SetHeaderMethod. Header compression has its own settings;
 // it must not inherit the data coder's larger dictionary or BT4 hash tables.
+//
+// The SDK also sets the header's fast bytes (nice_len) to 273. That is not
+// copied: the header is serialised on the calling thread after every folder
+// is done, so its encode is serial at every thread count, and a header is
+// thousands of near-identical member records, on which a BT2 walk to 273
+// bytes (and its depth of 16 + 273/2) runs long. Measured on an M-series
+// Mac, level 5 non-solid encodes of 2 KiB members, header encode time and
+// archive size against 273:
+//
+//   members  level default (32)        273
+//   2048     5.0 ms, +227 B (0.008%)   36 ms
+//   8192     37 ms, +15,308 B (0.13%)  224 ms
+//
+// Fast bytes 64 took 86 ms at 8192 members (+11 KB) and 128 took 145 ms
+// (the same size as 273); 273 with the depth cut to 8 kept the size within
+// 0.003% but still took ~1.8x the default's time. All were rejected for the
+// default. 0.27.0, which coded the header as a default LZMA folder, wrote
+// 12,033,743 B at 8192 members against the default's 12,040,977 B here.
+// Archives of up to 32 such members are the same bytes either way.
 pub(crate) fn header_coder(size: u64) -> (EncoderConfiguration, PulledCoder) {
     let mut options = LzmaOptions::from_level(5);
     options.set_dictionary_size(1 << 20);
-    options.set_nice_len(273);
     options.0.set_input_size(size);
     let props = turbo_props(&options.0, 1).with_match_finder(lzma_turbo::MatchFinderKind::Bt2);
     (
@@ -465,6 +494,7 @@ pub(crate) fn header_coder(size: u64) -> (EncoderConfiguration, PulledCoder) {
         PulledCoder {
             props,
             coder: Coder::Lzma,
+            data_limit: None,
         },
     )
 }
@@ -520,7 +550,11 @@ impl FolderCoder {
         } else {
             PullCoder::drives(&props, coder)
         };
-        Ok(drives.then_some(PulledCoder { props, coder }))
+        Ok(drives.then_some(PulledCoder {
+            props,
+            coder,
+            data_limit: None,
+        }))
     }
 
     /// Codes everything `input` yields with `coder` into `out`, on this
@@ -535,6 +569,9 @@ impl FolderCoder {
         input: &mut dyn std::io::Read,
         out: &mut dyn Write,
     ) -> std::io::Result<()> {
+        if let Some(limit) = coder.data_limit {
+            self.pull.set_data_limit(limit);
+        }
         self.pull.encode(&coder.props, coder.coder, input, out)
     }
 
@@ -544,6 +581,9 @@ impl FolderCoder {
         input: &mut (dyn std::io::Read + Send),
         out: &mut dyn Write,
     ) -> std::io::Result<()> {
+        if let Some(limit) = coder.data_limit {
+            self.pull.set_data_limit(limit);
+        }
         if PullCoder::drives_send(&coder.props, coder.coder) {
             self.pull.encode_send(&coder.props, coder.coder, input, out)
         } else {
