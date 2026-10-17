@@ -14,13 +14,48 @@ row only, because it is the external `ppmd-turbo` crate.
 ## What it runs
 
 Every measured run is its own child process. Wall time is the harness's
-monotonic clock around start-to-exit. CPU (user+sys) and peak RSS come from
-the kernel's accounting of the exited child: `wait4` rusage `ru_maxrss` on
-Linux and macOS, `PeakWorkingSetSize` on a handle held across the exit on
-Windows. A run without a peak RSS is a failure (`harness-missing-rss`), never
-a zero. The crate is driven through `tools/decode-bench op ...`, which does
-exactly one operation per process and prints one JSON line, so its peak RSS is
-that operation's alone and is measured the same way as `7zz`'s.
+monotonic clock around start-to-exit. CPU (user+sys) comes from the kernel's
+accounting of the exited child (`wait4` rusage, or the process handle on
+Windows). Peak RSS is the child's own, read where each OS keeps it
+uncontaminated:
+
+| OS | source tag | peak RSS |
+|---|---|---|
+| macOS | `rusage` | `wait4` rusage `ru_maxrss` of the exited child |
+| Linux | `vmhwm-exit-stop` | `VmHWM` in `/proc/<pid>/status`, read at the child's ptrace exit stop |
+| Windows | `peak-working-set` | `PeakWorkingSetSize` on a handle held across the exit |
+
+On Linux `ru_maxrss` is not usable: Go starts a child with vfork, so until it
+execs the child runs on the harness's memory map, and `execve` records that
+map's high-water mark into the child's `ru_maxrss` as a floor. Every row whose
+true peak was below the harness's own (about 16 MiB into a run) read as the
+harness, both contenders alike, which hid real differences on the list,
+non-solid, stored and key-derivation rows. `VmHWM` is the high-water mark of
+the map the tool's exec created, so the harness is not in it. A zombie has
+already released its map and has no `VmHWM`, so the child is traced
+(`PTRACE_O_TRACEEXIT` on its main thread only; its other threads never stop)
+and read at its exit stop, when it has finished but still holds its map; it is
+then let go and reaped as usual. Through `--pin-cpus`, `taskset` execs the
+tool in place, and the figure is still the tool's own. This was chosen over a
+cgroup per child and its `memory.peak`, which counts the page cache a decode
+writes through (gigabytes, here) and so is not a resident set, and which
+needs a delegated cgroup v2 hierarchy the harness cannot count on. The trace
+needs ptrace of its own children to be allowed (`kernel.yama.ptrace_scope`
+of 2 or less, and a container seccomp profile that permits ptrace); where it
+is not, the run stops at the self-check below.
+
+There is no fallback: a run whose peak was not read is a failure
+(`harness-missing-rss`, with the reason), never a zero and never the floored
+rusage. Before it measures anything, `run` runs `true` through the same code
+and requires its peak to be below the harness's own (`VmHWM` of the harness on
+Linux, its rusage on macOS), and refuses to run otherwise; it logs both
+figures (`run: RSS self-check: /usr/bin/true peaked 1.2 MiB (rusage), below
+the harness's own 13.3 MiB`). A floor coming back shows there, on every run.
+Windows skips the check: its figure is the child's own process handle's.
+
+The crate is driven through `tools/decode-bench op ...`, which does exactly
+one operation per process and prints one JSON line, so its peak RSS is that
+operation's alone and is measured the same way as `7zz`'s.
 
 Decode fixtures are complete local files. The driver enables
 `set_input_complete(true)`, matching file-backed `ArchiveReader::open`.
@@ -309,7 +344,7 @@ before it starts.
 | code | meaning |
 |---|---|
 | 0 | every candidate and reference run succeeded with a peak RSS |
-| 1 | a candidate or reference run failed, did not finish, lacked a peak RSS, or the run was interrupted; the reports are still written |
+| 1 | a candidate or reference run failed, did not finish, lacked a peak RSS, or the run was interrupted (the reports are still written); or the RSS self-check failed, and nothing was measured |
 | 2 | usage error |
 | 3 | a prerequisite is missing: no oracle, no candidate, no corpus, or a p7zip oracle |
 

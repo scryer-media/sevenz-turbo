@@ -282,6 +282,9 @@ func measure(ctx context.Context, raw *Raw, scenario Scenario, run Run, options 
 	if record.Status == StatusOK && (record.MaxRSSBytes <= 0 || record.RSSSource == "") {
 		record.Status, record.Failure = StatusFailed, procmeasure.FailureMissingRSS
 		record.Error = "the process exited but its peak RSS was not captured"
+		if result.Err != nil {
+			record.Error += ": " + result.Err.Error()
+		}
 	}
 	return record
 }

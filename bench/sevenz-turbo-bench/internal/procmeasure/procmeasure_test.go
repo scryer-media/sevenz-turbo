@@ -154,3 +154,80 @@ func TestParsePinRange(t *testing.T) {
 		}
 	}
 }
+
+// The peak of a captured Linux status file is its VmHWM line, in bytes.
+func TestParseVmHWMReadsACapturedStatus(t *testing.T) {
+	status, err := os.ReadFile("testdata/linux-proc-status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	peak, err := ParseVmHWM(status)
+	if err != nil || peak != 2892<<10 {
+		t.Fatalf("got %d, %v; want %d", peak, err, 2892<<10)
+	}
+}
+
+// A status without a usable VmHWM gives no peak and an error, never a guess:
+// a zombie's status has no Vm lines at all, since its map is released.
+func TestParseVmHWMRefusesWhatItCannotRead(t *testing.T) {
+	status, err := os.ReadFile("testdata/linux-proc-status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var zombie []string
+	for _, line := range strings.Split(string(status), "\n") {
+		if !strings.HasPrefix(line, "Vm") && !strings.HasPrefix(line, "Rss") {
+			zombie = append(zombie, line)
+		}
+	}
+	zombieStatus := strings.Replace(strings.Join(zombie, "\n"), "State:\tS (sleeping)", "State:\tZ (zombie)", 1)
+	for name, text := range map[string]string{
+		"zombie":   zombieStatus,
+		"no unit":  "Name:\tx\nVmHWM:\t  2892\n",
+		"pages":    "Name:\tx\nVmHWM:\t  2892 pages\n",
+		"negative": "Name:\tx\nVmHWM:\t  -1 kB\n",
+		"zero":     "Name:\tx\nVmHWM:\t  0 kB\n",
+		"empty":    "",
+	} {
+		if peak, err := ParseVmHWM([]byte(text)); err == nil || peak != 0 {
+			t.Errorf("%s: got %d, %v; want an error and no peak", name, peak, err)
+		}
+	}
+}
+
+// The start-up self-check passes on a host whose children carry no floor,
+// and reports what it measured.
+func TestSelfCheckPassesOnThisHost(t *testing.T) {
+	check, err := SelfCheck(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		if check.Skipped == "" {
+			t.Fatal("not skipped on Windows")
+		}
+		return
+	}
+	if check.ChildBytes <= 0 || check.ChildBytes >= check.HarnessBytes || check.Source != NativeRSSSource {
+		t.Fatalf("got %+v", check)
+	}
+	t.Logf("%s peaked %s MiB, the test binary %s MiB (%s)", check.Tool, MiB(check.ChildBytes), MiB(check.HarnessBytes), check.Source)
+}
+
+// A child far smaller than the harness reads far smaller than it: the
+// figure is the child's own. Run under the test binary, whose own peak is
+// raised first so that a floor, if one came back, could not hide under it.
+func TestASmallChildReadsBelowABigParent(t *testing.T) {
+	ballast := make([]byte, 256<<20)
+	for index := 0; index < len(ballast); index += 4096 {
+		ballast[index] = 1
+	}
+	result := Run(context.Background(), Command{Path: self(t), Env: []string{touchEnv + "=1"}})
+	runtime.KeepAlive(ballast)
+	if result.Failure != "" || result.ExitCode != 0 {
+		t.Fatalf("child failed: %s exit %d: %v %s", result.Failure, result.ExitCode, result.Err, result.Stderr)
+	}
+	if result.MaxRSSBytes <= 0 || result.MaxRSSBytes >= 128<<20 {
+		t.Fatalf("a child that touched 1 MiB peaked at %s MiB beside a 256 MiB parent", MiB(result.MaxRSSBytes))
+	}
+}

@@ -394,6 +394,18 @@ func cmdRun(ctx context.Context, args []string) int {
 		return exitOK
 	}
 	fmt.Fprintf(os.Stderr, "run: %s\n", planLine)
+	// Every run first proves its peak RSS figures carry no floor: a tiny
+	// child must read below the harness itself, or nothing is measured.
+	check, err := procmeasure.SelfCheck(ctx)
+	if err != nil {
+		return fail(err)
+	}
+	if check.Skipped != "" {
+		fmt.Fprintf(os.Stderr, "run: RSS self-check skipped: %s\n", check.Skipped)
+	} else {
+		fmt.Fprintf(os.Stderr, "run: RSS self-check: %s peaked %s MiB (%s), below the harness's own %s MiB\n",
+			check.Tool, procmeasure.MiB(check.ChildBytes), check.Source, procmeasure.MiB(check.HarnessBytes))
+	}
 	raw := &suite.Raw{
 		SchemaVersion: 1, Schema: suite.RawSchema, StartedUTC: time.Now().UTC().Format(time.RFC3339),
 		Machine: host.Collect(ctx, *machine), Toolchain: chain, Fixtures: manifest, RunProfile: profile.Name, Quick: *quick,
