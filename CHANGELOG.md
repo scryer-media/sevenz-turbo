@@ -497,11 +497,15 @@ arm, and this crate can add a variant without a breaking release.
   8192, which made a level 5 non-solid encode of 2048 2 KiB members slower
   than 0.27.0 at every thread count. Such a header is 0.008% to 0.13% of the
   archive larger; archives of a few dozen members are the same bytes.
-- A non-solid folder of up to 1 MiB is read to its end before it is coded,
-  and its LZMA2 coder is told that exact length, so the coder's window is
+- A non-solid LZMA2 folder of up to 1 MiB is read to its end before it is
+  coded, and its coder is told that exact length, so the coder's window is
   no longer than the folder: 192 KiB in place of 3.3 MiB for each worker
   coding 2 KiB members. The bytes written are the same. A size declared by
-  the entry is not passed on, since a file can grow after it is measured.
+  the entry is not passed on, since a file can grow after it is measured;
+  the folder is coded from what was read, and the source is not read again
+  after its end was seen. A folder of exactly 1 MiB is sized too: the
+  read-ahead takes one byte more to tell it from a longer one. Folders whose
+  first coder is anything but LZMA2 stream as before, with no read-ahead.
   On Linux, where a window over 1 MiB is advised to use huge pages, this
   removes the 2 MiB page each worker faulted in for a small folder.
 
