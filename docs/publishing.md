@@ -4,8 +4,9 @@ Releases are published by `.github/workflows/release.yml`, started one of two
 ways:
 
 - **From GitHub Actions** (the usual way): run the `release` workflow on
-  `main` with the version. No local signing or tagging is involved; the
-  workflow creates the tag. See "Each release" below.
+  `main`. It releases the version in `Cargo.toml`; nothing is typed in. No
+  local signing or tagging is involved; the workflow creates the tag. See
+  "Each release" below.
 - **From a machine**, with `cargo xtask release`, which pushes a signed tag
   that starts the workflow. The task (`xtask/src/main.rs`, plain Rust with no
   dependencies, so it runs wherever `cargo` does) runs every check the
@@ -56,13 +57,13 @@ which it requests for that job only.
      unreleased (the `## Fork` section stays where it is; it is the record of
      the divergence from sevenz-rust2, not a release note);
    - commit, signed, and push. Wait for `ci` to go green on that commit.
-3. Actions → `release` → Run workflow, branch `main`, the version, and
-   `dry_run` left on. The run refuses a branch other than `main`, a version
-   that is not the manifest's, a changelog section missing or still marked
-   unreleased, a `path` on `lzma-turbo`, a tag `v<version>` at another
-   commit, a commit whose `ci-complete` is not green, a public API change
-   larger than the version bump (`cargo semver-checks`), and a crate that
-   does not package.
+3. Actions → `release` → Run workflow, branch `main`, `dry_run` left on. The
+   run releases the version in `Cargo.toml`. It refuses a branch other than
+   `main`, a version below the newest on crates.io, a changelog section
+   missing or still marked unreleased, a `path` on `lzma-turbo`, a tag
+   `v<version>` at another commit, a commit whose `ci-complete` is not green,
+   a public API change larger than the version bump (`cargo semver-checks`),
+   and a crate that does not package.
 4. Run it again with `dry_run` off. It publishes to crates.io, then creates
    the tag `v<version>` at the commit it checked and the GitHub release with
    the changelog section as its notes. A run that fails after the upload can

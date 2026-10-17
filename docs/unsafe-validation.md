@@ -121,12 +121,14 @@ disabled.
 
 `tests/sevenzip_encode_tests.rs`, the 7-Zip half of
 `tests/bcj2_compress_tests.rs` and `tests/differential_7zz_tests.rs` need
-`7zz` (or `7z`) on `PATH` and skip themselves without it, which they do on
-every CI lane today. With `SEVENZ_TURBO_7ZZ_REQUIRED` set, a missing 7-Zip
-fails them instead, as `SEVENZ_TURBO_SDK_REQUIRED` does for the SDK oracle.
-A `sevenzip-interop` job that sets it is prepared in `ci.yml`, commented
-out until the operator approves where 7-Zip comes from (apt's `7zip` on
-ubuntu-24.04, or `7zz` built from the pinned tree the SDK lane fetches).
+`7zz` (or `7z`) on `PATH` and skip themselves without it. ubuntu-26.04
+preinstalls apt's `7zip`, so the Linux CI lanes run them against whatever
+7-Zip that image carries. With `SEVENZ_TURBO_7ZZ_REQUIRED` set, a missing
+7-Zip fails them instead, as `SEVENZ_TURBO_SDK_REQUIRED` does for the SDK
+oracle. A `sevenzip-interop` job that sets it is prepared in `ci.yml`,
+commented out until the operator approves where 7-Zip comes from (apt's
+`7zip` on ubuntu-26.04, or `7zz` built from the pinned tree the SDK lane
+fetches).
 `tests/lzma2_mt_tests.rs` also needs `7zz` and does not yet honour the
 variable.
 

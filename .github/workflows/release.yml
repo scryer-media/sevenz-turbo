@@ -2,11 +2,11 @@ name: release
 
 # Two ways in, the same checks and the same publish (see docs/publishing.md):
 #
-# - Run from the Actions tab (workflow_dispatch) on main with the version to
-#   release. The run refuses unless that commit already passed ci.yml, then
-#   publishes the crate to crates.io through trusted publishing and creates
-#   the tag v<version> and the GitHub release. dry_run (the default) stops
-#   after the checks.
+# - Run from the Actions tab (workflow_dispatch) on main. It releases the
+#   version in Cargo.toml; nothing is typed in. The run refuses unless that
+#   commit already passed ci.yml, then publishes the crate to crates.io
+#   through trusted publishing and creates the tag v<version> and the GitHub
+#   release. dry_run (the default) stops after the checks.
 # - Push a signed tag v<version> on main, as `cargo xtask release` does. The
 #   run tests the tag itself, then publishes the same way.
 #
@@ -19,10 +19,6 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      version:
-        description: "Version to release, exactly as in Cargo.toml (e.g. 0.24.0)"
-        required: true
-        type: string
       dry_run:
         description: "Run the checks only; publish nothing"
         required: true
@@ -44,7 +40,7 @@ env:
 jobs:
   verify:
     name: verify
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     permissions:
       contents: read
@@ -62,13 +58,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
+      # A dispatched release releases the manifest's version; a pushed tag
+      # names its own, which the next step holds to the manifest.
       - name: The version being released
         id: version
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
         run: |
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
-            version="$INPUT_VERSION"
+            version="$(cargo pkgid -p "$CRATE" | sed 's/.*[#@]//')"
             if [ "$GITHUB_REF" != refs/heads/main ]; then
               echo "::error::a release is dispatched from main, not $GITHUB_REF"
               exit 1
@@ -88,6 +84,26 @@ jobs:
           manifest="$(cargo pkgid -p "$CRATE" | sed 's/.*[#@]//')"
           echo "manifest $manifest, releasing $VERSION"
           test "$manifest" = "$VERSION"
+      # The version already on crates.io is a rerun after a later step failed,
+      # and the publish job takes it as done. One below the newest release is
+      # a manifest that was not bumped.
+      - name: Not below the newest version on crates.io
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          code="$(curl -s -o "$RUNNER_TEMP/crate.json" -w '%{http_code}' -A "$CRATE release workflow" "https://crates.io/api/v1/crates/$CRATE")"
+          if [ "$code" = 404 ]; then
+            echo "$CRATE is not on crates.io yet"
+            exit 0
+          fi
+          test "$code" = 200
+          newest="$(jq -r '.crate.max_version' "$RUNNER_TEMP/crate.json")"
+          echo "newest on crates.io $newest, releasing $VERSION"
+          if [ "$(printf '%s\n%s\n' "$newest" "$VERSION" | sort -V | tail -n1)" != "$VERSION" ]; then
+            echo "::error::$VERSION is below $newest, the newest version on crates.io; bump Cargo.toml"
+            exit 1
+          fi
       - name: The changelog has a dated section for this version
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -161,7 +177,7 @@ jobs:
     if: >-
       !cancelled() && !inputs.dry_run
       && needs.verify.result == 'success'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     environment: crates-io
     permissions:
@@ -199,7 +215,7 @@ jobs:
     name: github release
     needs: [verify, publish]
     if: ${{ !cancelled() && needs.publish.result == 'success' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: write
