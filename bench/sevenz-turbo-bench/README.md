@@ -35,6 +35,7 @@ Variants:
 | `sevenz-turbo` | candidate | `decode-bench` built with default features (AWS-LC cryptography) |
 | `sevenz-turbo native-crypto` | candidate (AES rows only) | `decode-bench --features native-crypto` (RustCrypto) |
 | `sevenz-turbo no-ledger` | candidate (decode ledger rows with no limit) | the same `decode-bench`, run without `--ledger`: the decode as a consumer runs it, in the same passes as the observed one |
+| `sevenz-turbo unbudgeted` | candidate (every row with a memory limit) | the same `decode-bench` command at the same threads with `--memory-limit` taken off: what the budget costs (see [Memory budget rows](#memory-budget-rows)) |
 | `7zz` | reference (oracle) | the official 7-Zip console binary: `7zz t` (decode), `7zz l -slt` (list), `7zz a` (encode) |
 | `sevenz-rust2` | secondary | upstream `sevenz-rust2 =0.22.2`, already linked by `decode-bench`; decode rows only, informational |
 
@@ -47,8 +48,8 @@ the core count, then `all`; `--quick` runs 1 and `all`):
 | lzma2 single-stream | `decode/st/T{1,all}` | one LZMA2 stream; threads cannot help |
 | lzma2 parallel | `decode/mt/T<sweep>`, plus `Tall/no-verify` and `Tall/stream` | the parallel LZMA2 decoder; the CRC-32 cost; the single-parse streaming consumer (`block_decoder` per block, sub-stream CRC hook) |
 | lzma | `decode/lzma/T1` | LZMA (not LZMA2) |
-| memory budget | `decode/mt/T8/budget-<N>MiB` (full 64 and 512 MiB, quick 20 and 96 MiB) | `ArchiveLimits::memory`: `parallel_path=false` in the notes means the budget forced the single-threaded fallback; compare its peak RSS with the unbudgeted row |
-| decode ledger | `decode/{media_mx5_3g,media_mx5_2g,mt}/T{2,4,8,all}/ledger` and the same under a limit, `…/budget-<N>MiB/ledger` for 512, 553, 1024, 1065 and 2089 MiB; `decode/{media_mx1,aes_mx1}/T{2,4,8}/ledger`. Full and fleet only | the parallel LZMA2 decoder given more runs than it has threads, at each thread count and under the limits a consumer passes (553, 1065 and 2089 MiB are what weaver passes at 2, 4 and 8 threads), with each decode's memory and dispatch ledger (below). The `-mx1` rows are controls: their runs are small, so a change made for the large-run fixtures must not move them |
+| memory budget | `decode/mt/T8/budget-64MiB` (quick: `T8/budget-20MiB`, `T8/budget-96MiB`), and in the full matrix weaver's pairings `decode/mt/T2/budget-553MiB`, `T4/budget-1065MiB`, `T8/budget-2089MiB` | `ArchiveLimits::memory`. The 64 MiB row (and the quick ones, sized for the quick corpus) is the fallback row: `parallel_path=false` in the notes means the budget forced the single-threaded fallback. The weaver rows are each limit weaver passes at the thread count it passes it with. Every row carries the `sevenz-turbo unbudgeted` twin; see [Memory budget rows](#memory-budget-rows) |
+| decode ledger | `decode/{media_mx5_3g,media_mx5_2g,mt}/T{2,4,8,all}/ledger` with no limit, and under weaver's limits at their own thread counts, `…/T2/budget-553MiB/ledger`, `…/T4/budget-1065MiB/ledger`, `…/T8/budget-2089MiB/ledger`; `decode/{media_mx1,aes_mx1}/T{2,4,8}/ledger`. Full and fleet only | the parallel LZMA2 decoder given more runs than it has threads, at each thread count and under the limits weaver passes (553, 1065 and 2089 MiB at 2, 4 and 8 threads), with each decode's memory and dispatch ledger (below). The `-mx1` rows are controls: their runs are small, so a change made for the large-run fixtures must not move them |
 | solid vs non-solid | `decode/tree_{solid,nonsolid}/T{1,all}`, plus `no-verify`, `stream` | many small members: per-member CRC-32, folder setup and header cost vs one large stream |
 | stored | `decode/store/T{1,2,4,8}` | a stored (COPY) folder: the read-ahead and stage-thread CRC from two threads against the serial path at one |
 | aes-256 | `decode/aes_store/T{1,2,4,8}`, `decode/aes_mx1/T{1,all}`, `decode/aes_kdf/T1` (+ `list/aes_kdf`) | AES-256-CBC decrypt in both cryptography builds; SHA-256 key derivation dominated rows |
@@ -79,6 +80,39 @@ direction rarpar-bench and the weaver bench reports use, so merged reports
 read the same way): ratio = 7zz / sevenz-turbo, >1 = sevenz-turbo better.
 Above 1.000 sevenz-turbo is faster, smaller or lower; below 1.000 it is
 slower, larger or higher. The peak RSS section lists the lowest ratio first.
+
+### Memory budget rows
+
+A memory limit is passed to sevenz-turbo only: 7zz has no decode budget, so
+its side of every budget row runs unbounded at the same `-mmt`. The limits
+measured are the ones weaver passes, each at the thread count weaver passes it
+with: 553 MiB at 2 threads, 1065 MiB at 4, 2089 MiB at 8. A limit is never
+measured at a wider thread count than its own: 553 MiB affords two ~128 MiB
+runs, so 553 MiB at 4, 8 or all threads against an unbounded 7zz at the same
+count reads low by construction and says nothing about the decoder. A pairing
+whose thread count is above the usable cores is left out.
+
+Each budget row has the variant `sevenz-turbo unbudgeted` beside it: the same
+command, at the same threads, without `--memory-limit`, interleaved with the
+others in the same passes. The report gives two figures for the row:
+
+- `sevenz-turbo` against `7zz`, as on every row: what a consumer with that
+  budget gets against 7-Zip with none;
+- `sevenz-turbo vs sevenz-turbo unbudgeted`, on a line of its own: the
+  unbudgeted median over the budgeted one, the cost of the budget alone. 1.000
+  is free; below it the budget slowed the decode (wall, CPU) or raised its
+  peak (RSS). In `report.json` this is the ratio whose `reference` is
+  `sevenz-turbo unbudgeted`.
+
+The unbudgeted twin also gets its own ratio against 7zz. Every fixture of the
+ledger group has more runs than these limits hold at once at their thread
+counts (`mt` 8 runs of 128 MiB; `media_mx5_2g` 16; `media_mx5_3g` 24, more
+than eight threads take in two batches), so each budget binds. Row names that
+kept their shape (`…/T2/budget-553MiB…`, `…/T4/budget-1065MiB…`,
+`…/T8/budget-2089MiB…`, `decode/mt/T8/budget-64MiB`) are unchanged, so earlier
+rounds compare row for row; the mismatched pairings (512 and 1024 MiB at any
+count, 553 MiB at 4, 8 and all, 1065 MiB at 2, 8 and all, 2089 MiB at 2, 4
+and all) are gone.
 
 ### Parity at one thread
 
@@ -239,9 +273,9 @@ are three profiles:
 | `fleet` | full | every scenario | 3 + 1 |
 
 A smoke run is `fixtures --profile quick` then `run --quick`, which takes a
-few minutes. `fleet` keeps every scenario of `full`, 143 on an 18-core host
+few minutes. `fleet` keeps every scenario of `full`, 101 on an 18-core host
 (the thread sweep stops below the core count), and only cuts the repeats.
-78 of them are the `decode ledger` group, which `--only /ledger` runs alone.
+27 of them are the `decode ledger` group, which `--only /ledger` runs alone.
 From the quick-corpus numbers scaled to the full corpus, the others project
 to about 4.5 hours on a 12- or 16-thread x86 host. Most of that is a handful of rows:
 the non-solid tree encode, the PPMd decode (mostly its secondary
