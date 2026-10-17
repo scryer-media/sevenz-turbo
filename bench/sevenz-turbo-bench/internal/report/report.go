@@ -73,7 +73,10 @@ type Row struct {
 }
 
 // Ratio compares one candidate variant against one reference in one
-// scenario: 7zz, or on a row that has a second reference, that one too.
+// scenario: 7zz, or on a row that has a second reference, that one too. On a
+// row with a memory limit, sevenz-turbo is also compared against
+// suite.VariantTurboUnbudgeted, itself at the same threads with no limit:
+// that ratio is what the budget costs, apart from the ratio against 7zz.
 type Ratio struct {
 	Scenario string `json:"scenario"`
 	Group    string `json:"group"`
@@ -170,7 +173,14 @@ func Build(raw *suite.Raw) *Report {
 			}
 		}
 		oracle := byVariant[suite.VariantOracle]
-		for _, variant := range []string{suite.VariantTurbo, suite.VariantTurboNative, suite.VariantTurboPlain} {
+		// The cost of a budget: the candidate against itself with the limit
+		// taken off, at the same threads, beside its ratio against 7zz.
+		if ours, unbudgeted := byVariant[suite.VariantTurbo], byVariant[suite.VariantTurboUnbudgeted]; ours != nil && unbudgeted != nil && ours.OK > 0 && unbudgeted.OK > 0 {
+			report.Ratios = append(report.Ratios, Ratio{Scenario: scenario.ID, Group: scenario.Group, Variant: suite.VariantTurbo,
+				Reference: suite.VariantTurboUnbudgeted, Wall: divide(unbudgeted.Wall.Median, ours.Wall.Median),
+				CPU: divide(unbudgeted.CPU.Median, ours.CPU.Median), RSS: divide(unbudgeted.RSS.Median, ours.RSS.Median)})
+		}
+		for _, variant := range []string{suite.VariantTurbo, suite.VariantTurboNative, suite.VariantTurboPlain, suite.VariantTurboUnbudgeted} {
 			ours := byVariant[variant]
 			if ours == nil {
 				continue

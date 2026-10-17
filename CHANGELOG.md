@@ -354,6 +354,10 @@ arm, and this crate can add a variant without a breaking release.
   dictionary is coded with one its size (never below 4 KiB), and one that fits
   a single LZMA2 block is coded on one thread. `ArchiveEntry::from_path`
   records the file's length so the size is known before the push.
+- A non-solid folder known exactly to be at most 1 MiB is coded by an LZMA2
+  encoder whose window is no longer than the folder (0.29.1), the same bytes
+  as a full-size window. 7-Zip sizes the window from the dictionary
+  whatever the input.
 - A writer whose push failed after writing part of a folder is poisoned
   (0.28.0): later pushes return `Error::WriterPoisoned` and `finish()` writes
   no header. Upstream lets the caller go on and writes an archive whose pack
@@ -482,6 +486,39 @@ arm, and this crate can add a variant without a breaking release.
 - The vendored BCJ round-trip tests generate their sample data instead of
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
+
+## 0.29.1 - 2026-10-17
+
+- Archive headers are compressed with the level's 32 fast bytes, not the
+  SDK's 273. The header is coded on the calling thread after every folder,
+  so its encode is serial at any thread count, and on a header of thousands
+  of near-identical member records 273 fast bytes made it 6 to 7 times
+  slower: 36 ms against 5 ms at 2048 members, and 224 ms against 37 ms at
+  8192, which made a level 5 non-solid encode of 2048 2 KiB members slower
+  than 0.27.0 at every thread count. Such a header is 0.008% to 0.13% of the
+  archive larger; archives of a few dozen members are the same bytes.
+- A non-solid LZMA2 folder of up to 1 MiB is read to its end before it is
+  coded, and its coder is told that exact length, so the coder's window is
+  no longer than the folder: 192 KiB in place of 3.3 MiB for each worker
+  coding 2 KiB members. The bytes written are the same. A size declared by
+  the entry is not passed on, since a file can grow after it is measured;
+  the folder is coded from what was read, and the source is not read again
+  after its end was seen. The dictionary is still fitted to a declared size,
+  as it is in a folder that is not read ahead, so a folder whose declaration
+  is wrong codes to the same bytes either way. A folder of exactly 1 MiB is sized too: the
+  read-ahead takes one byte more to tell it from a longer one. Folders whose
+  first coder is anything but LZMA2 stream as before, with no read-ahead,
+  and so does a folder whose threaded LZMA2 coder is pushed a local reader's
+  bytes rather than pulling them, since that coder is never told the length.
+  On Linux, where a window over 1 MiB is advised to use huge pages, this
+  removes the 2 MiB page each worker faulted in for a small folder.
+- Requires `lzma-turbo` 0.10.1, published to crates.io on 2026-10-17. It
+  pads and advises a match finder for huge pages only when the data limit
+  is 8 MiB or more or unset, so the folder-sized window above stays off a
+  2 MiB page; a memory-budgeted decode no longer charges parked buffers
+  against the budget, which had admitted fewer runs than the budget
+  afforded; and the parallel xz reader costs the serial reader's memory at
+  one thread.
 
 ## 0.29.0 - 2026-10-16
 
