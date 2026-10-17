@@ -217,3 +217,43 @@ func TestEveryRatioNamesItsReference(t *testing.T) {
 		}
 	}
 }
+
+// A row with a memory limit reports the candidate against 7zz and, beside
+// it, against its own unbudgeted twin: the budget's cost.
+func TestBudgetRowReportsItsCost(t *testing.T) {
+	const id = "decode/mt/T2/budget-553MiB"
+	raw := sampleRaw()
+	raw.Scenarios = append(raw.Scenarios, suite.Scenario{ID: id, Group: "memory budget", Op: suite.OpDecode, Fixture: "mt.7z", Threads: "2", MemoryLimit: 553 << 20,
+		Variants: []suite.Run{{Variant: suite.VariantTurbo, Role: suite.RoleCandidate}, {Variant: suite.VariantTurboUnbudgeted, Role: suite.RoleCandidate},
+			{Variant: suite.VariantOracle, Role: suite.RoleReference}}})
+	for range 3 {
+		ours := run(id, suite.VariantTurbo, suite.RoleCandidate, 2, 500<<20, suite.StatusOK)
+		free := run(id, suite.VariantTurboUnbudgeted, suite.RoleCandidate, 1.5, 600<<20, suite.StatusOK)
+		oracle := run(id, suite.VariantOracle, suite.RoleReference, 1, 400<<20, suite.StatusOK)
+		for _, r := range []*suite.RunRecord{&ours, &free, &oracle} {
+			r.Group = "memory budget"
+		}
+		raw.Runs = append(raw.Runs, ours, free, oracle)
+	}
+	built := Build(raw)
+	got := map[string]Ratio{}
+	for _, ratio := range built.Ratios {
+		if ratio.Scenario == id {
+			got[ratio.Variant+" vs "+ratio.Reference] = ratio
+		}
+	}
+	cost, ok := got[suite.VariantTurbo+" vs "+suite.VariantTurboUnbudgeted]
+	if !ok || *cost.Wall != 0.75 || *cost.RSS != 1.2 || cost.Parity {
+		t.Fatalf("budget cost %+v (all %v)", cost, got)
+	}
+	if against := got[suite.VariantTurbo+" vs "+suite.VariantOracle]; *against.Wall != 0.5 {
+		t.Fatalf("budgeted vs 7zz %+v", against)
+	}
+	if against := got[suite.VariantTurboUnbudgeted+" vs "+suite.VariantOracle]; against.Wall == nil || *against.Wall != 1/1.5 {
+		t.Fatalf("unbudgeted vs 7zz %+v", against)
+	}
+	md := Markdown(built)
+	if !strings.Contains(md, "| | sevenz-turbo vs sevenz-turbo unbudgeted | - | - | - | - | 0.750 |") {
+		t.Errorf("report.md lacks the budget cost line:\n%s", md)
+	}
+}
