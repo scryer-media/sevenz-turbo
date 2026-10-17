@@ -22,8 +22,13 @@ const (
 	// scenario whose candidate keeps one: the same decode as a consumer runs
 	// it, in the same passes, so the report shows what observing it costs.
 	VariantTurboPlain = "sevenz-turbo no-ledger"
-	VariantUpstream   = "sevenz-rust2"
-	VariantOracle     = "7zz"
+	// VariantTurboUnbudgeted is the candidate with the memory limit taken
+	// off, on a row that passes one: the same command at the same threads,
+	// so the report shows what the budget costs apart from the ratio
+	// against 7zz, which has no decode budget and always runs unbounded.
+	VariantTurboUnbudgeted = "sevenz-turbo unbudgeted"
+	VariantUpstream        = "sevenz-rust2"
+	VariantOracle          = "7zz"
 	// VariantOracleOneThread is 7zz with -mmtf=off beside -mmt=1, a second
 	// reference on a one-thread filter row: at -mmt=1 alone 7-Zip still runs
 	// the BCJ2 stage on a thread of its own.
@@ -68,14 +73,23 @@ const GroupLedger = "decode ledger"
 var (
 	LedgerFixtures = []string{"media_mx5_3g.7z", "media_mx5_2g.7z", "mt.7z"}
 	LedgerControls = []string{"media_mx1.7z", "aes_mx1.7z"}
-	// LedgerThreads is the sweep of the ledger rows; a count above the usable
-	// cores is left out.
+	// LedgerThreads is the sweep of the ledger rows with no limit; a count
+	// above the usable cores is left out.
 	LedgerThreads = []string{"2", "4", "8", "all"}
-	// LedgerLimits are the decode limits of the ledger rows, in MiB, after
-	// the row with none: 512 and 1024, and 553, 1065 and 2089, which are what
-	// weaver passes for 2, 4 and 8 threads.
-	LedgerLimits = []int64{512, 553, 1024, 1065, 2089}
 )
+
+// WeaverBudget is a decode limit at the thread count weaver pairs it with.
+type WeaverBudget struct {
+	Threads string
+	MiB     int64
+}
+
+// WeaverBudgets are the limits weaver passes with 2, 4 and 8 decode threads.
+// A limit is only ever measured at its own thread count: a 553 MiB budget
+// affords two ~128 MiB runs, so asking it for four or eight threads and
+// setting it against an unbounded 7zz at four or eight reads low by
+// construction and says nothing about the decoder.
+var WeaverBudgets = []WeaverBudget{{"2", 553}, {"4", 1065}, {"8", 2089}}
 
 // Groups, in report order.
 var Groups = []string{
@@ -153,9 +167,11 @@ type Settings struct {
 	// Threads is the decode/encode sweep; "all" is always last.
 	Threads []string
 	Levels  []int
-	// Budgets are the memory-budget decode limits, low first.
+	// Budgets are the fallback rows' decode limits, low first: limits too
+	// small for a parallel decode at all. The full matrix adds the
+	// WeaverBudgets pairings beside them.
 	Budgets []int64
-	// BudgetThreads is the thread count the budget rows ask for.
+	// BudgetThreads is the thread count the fallback rows ask for.
 	BudgetThreads string
 	// CPUs is what "all" resolves to: the host's cores, or the size of the
 	// --pin-cpus range when the run is pinned, so "all" never asks for more
@@ -183,7 +199,7 @@ func DefaultSettings(quick bool, cpus int) Settings {
 		}
 		settings.Threads = append(settings.Threads, "all")
 		settings.Levels = []int{1, 3, 5, 7, 9}
-		settings.Budgets = []int64{64 << 20, 512 << 20}
+		settings.Budgets = []int64{64 << 20}
 	}
 	settings.BudgetThreads = strconv.Itoa(min(8, cpus))
 	return settings
@@ -283,7 +299,7 @@ func Plan(manifest *fixtures.Manifest, dir, scratch string, tools Tools, setting
 		}
 		p.decode("lzma2 near-incompressible", "media_mx5.7z", "all", decodeOpts{adaptive: true, note: adaptiveNote})
 		p.decode("lzma2 near-incompressible", "media_mx5.7z", "all", decodeOpts{adaptive: true, memoryLimit: 4 << 30,
-			note: adaptiveNote + "; under an explicit 4 GiB limit, as weaver passes its granted decode budget"})
+			note: adaptiveNote + "; under an explicit 4 GiB limit, as weaver passes its granted decode budget. " + budgetCostNote})
 	}
 	if !settings.Quick {
 		p.ledgerRows()
@@ -291,7 +307,16 @@ func Plan(manifest *fixtures.Manifest, dir, scratch string, tools Tools, setting
 	p.decode("lzma", "lzma.7z", "1", decodeOpts{upstream: true})
 	for _, budget := range settings.Budgets {
 		p.decode("memory budget", "mt.7z", settings.BudgetThreads, decodeOpts{memoryLimit: budget,
-			note: "decode under ArchiveLimits::memory; parallel_path=false means the budget forced the single-threaded fallback. 7zz has no decode budget: it runs unbounded at the same threads"})
+			note: "decode under ArchiveLimits::memory; parallel_path=false means the budget forced the single-threaded fallback. 7zz has no decode budget: it runs unbounded at the same threads. " + budgetCostNote})
+	}
+	if !settings.Quick {
+		for _, pairing := range WeaverBudgets {
+			if !p.affords(pairing.Threads) {
+				continue
+			}
+			p.decode("memory budget", "mt.7z", pairing.Threads, decodeOpts{memoryLimit: pairing.MiB << 20,
+				note: fmt.Sprintf("the limit weaver passes with %s decode threads, at %s threads. 7zz has no decode budget: it runs unbounded at the same threads. %s", pairing.Threads, pairing.Threads, budgetCostNote)})
+		}
 	}
 	for _, name := range []string{"tree_solid.7z", "tree_nonsolid.7z"} {
 		for _, threads := range []string{"1", "all"} {
@@ -427,6 +452,9 @@ func (p *planner) list(name string) {
 	})
 }
 
+// budgetCostNote describes the unbudgeted twin of every row with a limit.
+const budgetCostNote = "The `vs sevenz-turbo unbudgeted` line is the cost of the budget: the same decode at the same threads with no limit, over the budgeted one, so below 1.000 the budget slowed it (or raised its peak) and 1.000 is free"
+
 // adaptiveNote describes the adaptive rows.
 const adaptiveNote = "weaver's chase decode: set_adaptive_lzma2 + set_threads(1), widened every 100 ms to the queued runs + 1, up to the thread count; 7zz runs fixed at the same threads"
 
@@ -444,8 +472,8 @@ type decodeOpts struct {
 }
 
 // ledgerRows plans the ledger group: every ledger fixture at every ledger
-// thread count with no limit and under each ledger limit, and the controls at
-// the fixed thread counts with no limit.
+// thread count with no limit and under each weaver limit at its own thread
+// count, and the controls at the fixed thread counts with no limit.
 func (p *planner) ledgerRows() {
 	for _, name := range LedgerFixtures {
 		for _, threads := range LedgerThreads {
@@ -453,8 +481,10 @@ func (p *planner) ledgerRows() {
 				continue
 			}
 			p.decode(GroupLedger, name, threads, decodeOpts{ledger: true})
-			for _, limit := range LedgerLimits {
-				p.decode(GroupLedger, name, threads, decodeOpts{ledger: true, memoryLimit: limit << 20})
+			for _, pairing := range WeaverBudgets {
+				if pairing.Threads == threads {
+					p.decode(GroupLedger, name, threads, decodeOpts{ledger: true, memoryLimit: pairing.MiB << 20, note: budgetCostNote})
+				}
 			}
 		}
 	}
@@ -494,13 +524,18 @@ func (p *planner) decode(group, name, threads string, o decodeOpts) {
 	}
 	if o.memoryLimit > 0 {
 		id += fmt.Sprintf("/budget-%dMiB", o.memoryLimit>>20)
+	}
+	// The twin of a budget row is the same command without the limit, and
+	// the twin of a ledger row the same command without the ledger.
+	unbudgeted := append([]string(nil), ours...)
+	if o.memoryLimit > 0 {
 		ours = append(ours, "--memory-limit", strconv.FormatInt(o.memoryLimit, 10))
 	}
-	// The twin of a ledger row is the same command without the ledger.
 	plain := append([]string(nil), ours...)
 	if o.ledger {
 		id += "/ledger"
 		ours = append(ours, "--ledger")
+		unbudgeted = append(unbudgeted, "--ledger")
 	}
 	if !p.settings.Keeps(id) {
 		return
@@ -513,6 +548,7 @@ func (p *planner) decode(group, name, threads string, o decodeOpts) {
 	if record.Encrypted {
 		ours = append(ours, "--password", fixtures.Password)
 		plain = append(plain, "--password", fixtures.Password)
+		unbudgeted = append(unbudgeted, "--password", fixtures.Password)
 		oracle = append(oracle, "-p"+fixtures.Password)
 	}
 	oracle = append(oracle, path)
@@ -522,6 +558,9 @@ func (p *planner) decode(group, name, threads string, o decodeOpts) {
 	}
 	if o.ledger && o.memoryLimit == 0 {
 		variants = append(variants, Run{Variant: VariantTurboPlain, Role: RoleCandidate, Tool: p.tools.Candidate, Args: plain, JSON: true})
+	}
+	if o.memoryLimit > 0 {
+		variants = append(variants, Run{Variant: VariantTurboUnbudgeted, Role: RoleCandidate, Tool: p.tools.Candidate, Args: unbudgeted, JSON: true})
 	}
 	variants = append(variants, Run{Variant: VariantOracle, Role: RoleReference, Tool: p.tools.Oracle, Args: oracle})
 	parity := ""

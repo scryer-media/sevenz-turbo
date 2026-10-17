@@ -205,7 +205,8 @@ func TestBCJ2RowHasBothOneThreadReferences(t *testing.T) {
 }
 
 // The ledger group is every ledger fixture at 2, 4, 8 and all threads with no
-// limit and under each ledger limit, and the controls at 2, 4 and 8.
+// limit and under each weaver limit at its own thread count only, and the
+// controls at 2, 4 and 8.
 func TestLedgerRows(t *testing.T) {
 	dir, manifest := fakeCorpus(t, fixtures.Full())
 	tools := Tools{Candidate: "decode-bench", Native: "decode-bench-native", Oracle: "7zz"}
@@ -221,15 +222,17 @@ func TestLedgerRows(t *testing.T) {
 			t.Errorf("%s keeps a ledger outside the ledger group", scenario.ID)
 		}
 	}
-	if want := len(LedgerFixtures)*4*(1+len(LedgerLimits)) + len(LedgerControls)*3; len(rows) != want {
+	if want := len(LedgerFixtures)*(4+len(WeaverBudgets)) + len(LedgerControls)*3; len(rows) != want {
 		t.Fatalf("%d ledger rows, want %d", len(rows), want)
 	}
 	for _, name := range []string{"media_mx5_3g", "media_mx5_2g", "mt"} {
 		for _, threads := range []string{"2", "4", "8", "all"} {
 			for _, limit := range []string{"", "/budget-512MiB", "/budget-553MiB", "/budget-1024MiB", "/budget-1065MiB", "/budget-2089MiB"} {
 				id := "decode/" + name + "/T" + threads + limit + "/ledger"
-				if _, ok := rows[id]; !ok {
-					t.Errorf("missing %s", id)
+				paired := limit == "" || (threads == "2" && limit == "/budget-553MiB") ||
+					(threads == "4" && limit == "/budget-1065MiB") || (threads == "8" && limit == "/budget-2089MiB")
+				if _, ok := rows[id]; ok != paired {
+					t.Errorf("%s planned=%t, want %t", id, ok, paired)
 				}
 			}
 		}
@@ -264,6 +267,7 @@ func TestLedgerRows(t *testing.T) {
 		if scenario.MemoryLimit > 0 && !strings.Contains(ours, "--memory-limit "+strconv.FormatInt(scenario.MemoryLimit, 10)) {
 			t.Errorf("%s: candidate runs %q without its limit", id, ours)
 		}
+		checkUnbudgetedTwin(t, scenario)
 		if _, native := byVariant[VariantTurboNative]; native != scenario.Encrypted {
 			t.Errorf("%s: encrypted=%t, native-crypto row planned=%t", id, scenario.Encrypted, native)
 		}
@@ -438,5 +442,71 @@ func TestOnlyFiltersBeforeFixturesAreRequired(t *testing.T) {
 	settings.Only = []string{"decode/st"}
 	if _, err := Plan(manifest, dir, t.TempDir(), Tools{Candidate: "c", Oracle: "o"}, settings); err == nil {
 		t.Error("a selection whose fixture is missing was planned")
+	}
+}
+
+// checkUnbudgetedTwin asserts that a row with a limit runs the candidate a
+// second time without it, and that no other row does.
+func checkUnbudgetedTwin(t *testing.T, scenario Scenario) {
+	t.Helper()
+	byVariant := map[string]Run{}
+	for _, run := range scenario.Variants {
+		byVariant[run.Variant] = run
+	}
+	twin, ok := byVariant[VariantTurboUnbudgeted]
+	if ok != (scenario.MemoryLimit > 0) {
+		t.Errorf("%s: limit %d, unbudgeted twin planned=%t", scenario.ID, scenario.MemoryLimit, ok)
+	}
+	if !ok {
+		return
+	}
+	ours := strings.Join(byVariant[VariantTurbo].Args, " ")
+	want := strings.Replace(ours, " --memory-limit "+strconv.FormatInt(scenario.MemoryLimit, 10), "", 1)
+	if got := strings.Join(twin.Args, " "); got != want || twin.Role != RoleCandidate || !twin.JSON || twin.Tool != byVariant[VariantTurbo].Tool {
+		t.Errorf("%s: unbudgeted twin runs %q, want %q", scenario.ID, got, want)
+	}
+}
+
+// The memory budget group is the fallback limits at the budget thread count
+// and, in the full matrix, each weaver limit at its own thread count, every
+// one with its unbudgeted twin.
+func TestMemoryBudgetRows(t *testing.T) {
+	for _, quick := range []bool{true, false} {
+		profile := fixtures.Full()
+		if quick {
+			profile = fixtures.Quick()
+		}
+		dir, manifest := fakeCorpus(t, profile)
+		scenarios, err := Plan(manifest, dir, t.TempDir(), Tools{Candidate: "decode-bench", Oracle: "7zz"}, DefaultSettings(quick, 18))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ids []string
+		for _, scenario := range scenarios {
+			if scenario.MemoryLimit > 0 || scenario.Group == "memory budget" {
+				checkUnbudgetedTwin(t, scenario)
+			}
+			if scenario.Group == "memory budget" {
+				ids = append(ids, scenario.ID)
+			}
+		}
+		want := []string{"decode/mt/T8/budget-64MiB", "decode/mt/T2/budget-553MiB", "decode/mt/T4/budget-1065MiB", "decode/mt/T8/budget-2089MiB"}
+		if quick {
+			want = []string{"decode/mt/T8/budget-20MiB", "decode/mt/T8/budget-96MiB"}
+		}
+		if !slices.Equal(ids, want) {
+			t.Errorf("quick=%t: memory budget rows %v, want %v", quick, ids, want)
+		}
+	}
+	// A weaver pairing whose thread count the host lacks is left out.
+	dir, manifest := fakeCorpus(t, fixtures.Full())
+	scenarios, err := Plan(manifest, dir, t.TempDir(), Tools{Candidate: "decode-bench", Oracle: "7zz"}, DefaultSettings(false, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, scenario := range scenarios {
+		if strings.Contains(scenario.ID, "budget-2089MiB") {
+			t.Errorf("a four-core host plans %s", scenario.ID)
+		}
 	}
 }

@@ -239,6 +239,60 @@ fn folder_size<'a, R: Read>(
     Ok((head, (n < READ_AHEAD).then_some(n)))
 }
 
+/// [`folder_size`] for a folder the coder may be promised the length of: one that declares no
+/// more than [`READ_AHEAD`] is read ahead as well, and the third value says whether the size is a
+/// fact, which it is when the folder ended within the read-ahead. A declared size is not one - a
+/// file can grow after it was measured - and a coder promised too short an input fails, so only
+/// a size read to the end is passed on as the coder's data limit.
+///
+/// The read-ahead takes one byte past [`READ_AHEAD`], so that a folder of exactly that length is
+/// told apart from a longer one. When the size is a fact, the head is the whole folder: the
+/// caller codes it and does not read the source again, since a reader that returned end of file
+/// once may yield more later (a file appended to), which would break the promise.
+fn exact_folder_size<'a, R: Read>(
+    entries: impl IntoIterator<Item = &'a ArchiveEntry>,
+    reader: &mut R,
+) -> std::io::Result<(Vec<u8>, Option<u64>, bool)> {
+    let declared = declared_size(entries);
+    if declared.is_some_and(|size| size > READ_AHEAD) {
+        return Ok((Vec::new(), declared, false));
+    }
+    let mut head = Vec::with_capacity(declared.map_or(0, |size| size as usize + 1));
+    let n = reader
+        .by_ref()
+        .take(READ_AHEAD + 1)
+        .read_to_end(&mut head)? as u64;
+    Ok(if n <= READ_AHEAD {
+        (head, Some(n), true)
+    } else {
+        (head, declared, false)
+    })
+}
+
+/// Whether a folder coded with `methods` from `input` reads ahead to learn its exact size: only
+/// when the coder that meets the data is LZMA2 and pulls `input` itself, the one coder that takes
+/// the size as its window's limit. A threaded LZMA2 coder given a local reader is pushed instead
+/// (see [`PullCoder::drives`](crate::codec::lzma_turbo::writer::PullCoder::drives)) and never
+/// takes the limit. Every other folder streams as [`folder_size`] lets it, with no more buffered
+/// than it needs.
+///
+/// The plan is asked of the methods as a folder of [`READ_AHEAD`] bytes would be sized: one the
+/// coder pulls at that size it pulls at any smaller one, since a smaller folder never has more
+/// block threads.
+fn sizes_exactly(
+    methods: &Arc<Vec<EncoderConfiguration>>,
+    input: &FolderInput<'_>,
+) -> Result<bool> {
+    let Some(last) = methods.last() else {
+        return Ok(false);
+    };
+    if last.method.id() != EncoderMethod::ID_LZMA2 {
+        return Ok(false);
+    }
+    let sized = sized_methods(methods, Some(READ_AHEAD));
+    Ok(input.plan(sized.last().expect("same length"))?.is_some())
+}
+
 /// Names of the entries in a block, for an error message. Truncated at ~512 bytes, since a solid
 /// block can hold many thousands.
 fn entries_names(entries: &[ArchiveEntry]) -> String {
@@ -1605,18 +1659,69 @@ fn encode_entry_input<O: Write>(
     sides: encoder::Bcj2Sides,
     coder: &mut encoder::FolderCoder,
 ) -> Result<EncodedFolder> {
+    let (head, folder, exact) = if sizes_exactly(content_methods, &r)? {
+        exact_folder_size([&entry], &mut r)
+    } else {
+        folder_size([&entry], &mut r).map(|(head, folder)| (head, folder, false))
+    }
+    .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
+    // The coder is sized as a folder that does not read ahead is: by the entry's declaration
+    // when it makes one, a hint, so that a misdeclared folder codes to the same bytes whether or
+    // not its coder reads ahead. The length read to the end is the coder's limit alone.
+    let sized = SizedFolder {
+        head,
+        folder: declared_size([&entry]).or(folder),
+        limit: folder.filter(|_| exact),
+    };
+    // An exact size is the head, all of it: the source is not read again.
+    let mut ended = std::io::empty();
+    match r {
+        FolderInput::Local(_) if exact => {
+            let r = FolderInput::Local(&mut ended);
+            encode_sized_entry(content_methods, entry, r, sized, output, sides, coder)
+        }
+        FolderInput::Send(_) if exact => {
+            let r = FolderInput::Send(&mut ended);
+            encode_sized_entry(content_methods, entry, r, sized, output, sides, coder)
+        }
+        r => encode_sized_entry(content_methods, entry, r, sized, output, sides, coder),
+    }
+}
+
+/// What reading the start of a folder found: the bytes read, the size the folder's coder is
+/// sized for when known, and its exact length when it was read to its end (see
+/// [`exact_folder_size`]).
+struct SizedFolder {
+    head: Vec<u8>,
+    folder: Option<u64>,
+    limit: Option<u64>,
+}
+
+fn encode_sized_entry<O: Write>(
+    content_methods: &Arc<Vec<EncoderConfiguration>>,
+    entry: ArchiveEntry,
+    mut r: FolderInput<'_>,
+    sized: SizedFolder,
+    output: O,
+    sides: encoder::Bcj2Sides,
+    coder: &mut encoder::FolderCoder,
+) -> Result<EncodedFolder> {
+    let SizedFolder {
+        head,
+        folder,
+        limit,
+    } = sized;
     let mut compressed_len = 0;
     let mut compressed = CompressWrapWriter::new(output, &mut compressed_len);
     let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(content_methods.len() - 1);
-    let (head, folder) = folder_size([&entry], &mut r)
-        .map_err(|e| Error::io_msg(e, format!("Encode entry:{}", entry.name())))?;
     let mut out = std::io::BufWriter::with_capacity(output_buffer_len(folder), &mut compressed);
     let methods = folder_methods(content_methods, folder)?;
     let mut bcj2 = None;
     let pulled = match methods.split_last() {
         Some((first, _)) => r.plan(first)?,
         None => None,
-    };
+    }
+    .map(|pulled| pulled.with_data_limit(limit));
 
     let (crc, size) = if let Some(pulled) = pulled {
         encode_pulled::<true, _>(
@@ -2309,7 +2414,7 @@ mod header_coder_tests {
 
 #[cfg(test)]
 mod folder_size_tests {
-    use super::declared_size;
+    use super::{READ_AHEAD, declared_size, exact_folder_size};
     use crate::ArchiveEntry;
 
     fn file(size: u64) -> ArchiveEntry {
@@ -2329,6 +2434,78 @@ mod folder_size_tests {
         assert_eq!(declared_size(&[file(10), file(0)]), None);
         assert_eq!(declared_size(&[file(0)]), None);
         assert_eq!(declared_size(&[ArchiveEntry::new_directory("d")]), None);
+    }
+
+    /// Only a folder read to its end is given an exact size: a declaration
+    /// that disagrees with the bytes is overruled by them, and one too large
+    /// to read ahead stays a hint.
+    #[test]
+    fn a_folder_size_is_exact_only_when_read_to_the_end() {
+        let big = READ_AHEAD as usize;
+        let exact = |entries: &[ArchiveEntry], len: usize| {
+            let data = vec![7u8; len];
+            let (head, size, exact) = exact_folder_size(entries, &mut data.as_slice()).unwrap();
+            (head.len(), size, exact)
+        };
+        assert_eq!(exact(&[file(2048)], 2048), (2048, Some(2048), true));
+        // Declared 10, holds 100: the 100 read is the size.
+        assert_eq!(exact(&[file(10)], 100), (100, Some(100), true));
+        assert_eq!(exact(&[file(0)], 100), (100, Some(100), true));
+        // Exactly the read-ahead's length is told apart from a longer folder.
+        assert_eq!(exact(&[file(0)], big), (big, Some(READ_AHEAD), true));
+        assert_eq!(
+            exact(&[file(READ_AHEAD)], big),
+            (big, Some(READ_AHEAD), true)
+        );
+        assert_eq!(exact(&[file(0)], big + 1), (big + 1, None, false));
+        // Declared under the read-ahead but holding more: the declaration, as a hint.
+        assert_eq!(exact(&[file(10)], big + 1), (big + 1, Some(10), false));
+        // Declared past the read-ahead: nothing is read and nothing promised.
+        assert_eq!(
+            exact(&[file(READ_AHEAD + 1)], big + 1),
+            (0, Some(READ_AHEAD + 1), false)
+        );
+    }
+
+    /// A folder reads ahead only when its LZMA2 coder pulls the input and so
+    /// can take the length as its limit. A threaded LZMA2 coder pulls a `Send`
+    /// input but is pushed a local one, which it would never be told the
+    /// length of, so a local input streams instead.
+    #[cfg(all(
+        feature = "compress",
+        not(target_family = "wasm"),
+        not(sevenz_turbo_unthreaded)
+    ))]
+    #[test]
+    fn only_a_pulled_lzma2_folder_reads_ahead() {
+        use std::sync::Arc;
+
+        use super::{FolderInput, sizes_exactly};
+        use crate::{
+            EncoderConfiguration, EncoderMethod,
+            encoder_options::{Lzma2Options, LzmaOptions},
+        };
+
+        let methods = |mc: EncoderConfiguration| Arc::new(vec![mc]);
+        let local = |mc: EncoderConfiguration| {
+            sizes_exactly(&methods(mc), &FolderInput::Local(&mut std::io::empty())).unwrap()
+        };
+        let send = |mc: EncoderConfiguration| {
+            sizes_exactly(&methods(mc), &FolderInput::Send(&mut std::io::empty())).unwrap()
+        };
+        let one_thread = || Lzma2Options::from_level(5).into();
+        let threaded = || Lzma2Options::from_level_mt(5, 4, 4 << 20).into();
+        assert!(local(one_thread()));
+        assert!(send(one_thread()));
+        assert!(!local(threaded()));
+        assert!(send(threaded()));
+        for mc in [
+            EncoderConfiguration::new(EncoderMethod::COPY),
+            LzmaOptions::from_level(5).into(),
+        ] {
+            assert!(!local(mc.clone()));
+            assert!(!send(mc));
+        }
     }
 }
 
