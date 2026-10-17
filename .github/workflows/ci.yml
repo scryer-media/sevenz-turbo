@@ -21,7 +21,7 @@ env:
 jobs:
   hygiene:
     name: hygiene
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -54,7 +54,7 @@ jobs:
 
   fmt:
     name: fmt
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -68,7 +68,7 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -83,7 +83,7 @@ jobs:
 
   docs:
     name: docs
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       RUSTDOCFLAGS: -D warnings
@@ -105,9 +105,9 @@ jobs:
       matrix:
         platform:
           - name: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - name: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
           - name: macos-aarch64
             runner: macos-15
           - name: windows-x86_64
@@ -155,9 +155,9 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
           - platform: macos-aarch64
             runner: macos-15
           - platform: windows-x86_64
@@ -189,9 +189,9 @@ jobs:
         scope: [allocation, source-lifecycle]
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
     env:
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: valgrind --quiet --error-exitcode=1 --leak-check=full --errors-for-leak-kinds=definite,indirect
@@ -225,10 +225,10 @@ jobs:
         sanitizer: [address, thread]
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             target: x86_64-unknown-linux-gnu
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             target: aarch64-unknown-linux-gnu
     env:
       RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
@@ -266,7 +266,7 @@ jobs:
 
   unsafe-miri-plan:
     name: unsafe-miri-plan
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -292,7 +292,7 @@ jobs:
   unsafe-miri:
     name: unsafe-miri-${{ matrix.test }}
     needs: unsafe-miri-plan
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -318,7 +318,7 @@ jobs:
     name: unsafe-complete
     if: always()
     needs: [guard-pages, unsafe-valgrind, unsafe-sanitizer, unsafe-miri-plan, unsafe-miri]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       - name: Require every native and Miri safety shard
@@ -335,9 +335,9 @@ jobs:
       matrix:
         include:
           - platform: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
           - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -355,7 +355,7 @@ jobs:
 
   unthreaded:
     name: unthreaded
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     env:
       # The LZMA and LZMA2 writers take the path a target without threads
@@ -379,7 +379,7 @@ jobs:
 
   wasm:
     name: wasm
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -433,7 +433,7 @@ jobs:
 
   msrv:
     name: msrv
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -451,10 +451,12 @@ jobs:
 
   # Prepared, not enabled. The 7-Zip interop tests (sevenzip_encode_tests,
   # the 7zz half of bcj2_compress_tests, differential_7zz_tests) skip
-  # themselves where no 7-Zip is on PATH, which is every other lane. With
-  # SEVENZ_TURBO_7ZZ_REQUIRED set they fail instead. Enabling this job needs
-  # the operator's approval of the install source, one of:
-  #   - apt's `7zip` package on ubuntu-24.04 (provides `7zz`):
+  # themselves where no 7-Zip is on PATH. ubuntu-26.04 preinstalls apt's
+  # `7zip`, so the Linux lanes run them against whatever 7-Zip the image
+  # carries; this job would pin that. With SEVENZ_TURBO_7ZZ_REQUIRED set they
+  # fail instead of skipping. Enabling this job needs the operator's approval
+  # of the install source, one of:
+  #   - apt's `7zip` package, preinstalled on ubuntu-26.04 (provides `7zz`):
   #       sudo apt-get update && sudo apt-get install -y --no-install-recommends 7zip
   #   - `7zz` built from the pinned 7-Zip tree that
   #     .github/scripts/build-sdk-oracle.sh already fetches
@@ -464,7 +466,7 @@ jobs:
   # replace the placeholder install step and add it to ci-complete's needs.
   # sevenzip-interop:
   #   name: sevenzip-interop
-  #   runs-on: ubuntu-24.04
+  #   runs-on: ubuntu-26.04
   #   timeout-minutes: 30
   #   env:
   #     SEVENZ_TURBO_7ZZ_REQUIRED: "1"
@@ -487,7 +489,7 @@ jobs:
 
   package:
     name: package
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -509,7 +511,7 @@ jobs:
     name: ci-complete
     if: always()
     needs: [hygiene, fmt, clippy, docs, test, unsafe-complete, sdk-functional, unthreaded, wasm, msrv, package]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:
       # Every required lane must have succeeded: a skipped lane is as much a

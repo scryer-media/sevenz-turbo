@@ -110,11 +110,15 @@ unpacked byte count; either mismatch fails the run. The digest comes from one
 extra untimed decode per engine (`--digest`), so no timed row pays for
 hashing.
 
-Every ratio is **7zz / sevenz-turbo** of the medians (oracle over ours, the
-direction rarpar-bench and the weaver bench reports use, so merged reports
-read the same way): ratio = 7zz / sevenz-turbo, >1 = sevenz-turbo better.
-Above 1.000 sevenz-turbo is faster, smaller or lower; below 1.000 it is
-slower, larger or higher. The peak RSS section lists the lowest ratio first.
+Every ratio is reference over candidate of the medians, against the
+reference its label names. The default reference is the host's own 7zz, so a
+ratio is **7zz / sevenz-turbo** (oracle over ours, the direction rarpar-bench
+and the weaver bench reports use, so merged reports read the same way):
+ratio = 7zz / sevenz-turbo, >1 = sevenz-turbo better. The one self-referenced
+ratio is a budget row's `vs sevenz-turbo unbudgeted` line, sevenz-turbo
+unbudgeted over sevenz-turbo budgeted (see below). Above 1.000 the candidate
+is faster, smaller or lower than its reference; below 1.000 it is slower,
+larger or higher. The peak RSS section lists the lowest ratio first.
 
 ### Memory budget rows
 
