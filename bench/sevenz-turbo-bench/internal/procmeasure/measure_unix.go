@@ -44,12 +44,16 @@ func fillRusage(measurement *Measurement, state *os.ProcessState) {
 	if !ok || usage == nil {
 		return
 	}
-	maxRSS := int64(usage.Maxrss)
-	if runtime.GOOS != "darwin" {
-		// Linux and the BSDs report KiB; Darwin reports bytes.
-		maxRSS *= 1024
+	switch runtime.GOOS {
+	case "linux":
+		// Floored at the harness's own peak (see trace_linux.go): the peak
+		// is read at the child's exit stop instead.
+	case "darwin":
+		measurement.MaxRSSBytes = int64(usage.Maxrss)
+	default:
+		// The BSDs report KiB; Darwin reports bytes.
+		measurement.MaxRSSBytes = int64(usage.Maxrss) * 1024
 	}
-	measurement.MaxRSSBytes = maxRSS
 	measurement.BlockInOps = int64(usage.Inblock)
 	measurement.BlockOutOps = int64(usage.Oublock)
 }
@@ -71,8 +75,3 @@ func configureKill(cmd *exec.Cmd) {
 		return nil
 	}
 }
-
-// NativeRSSSource is where Run and Track read the peak resident set here.
-const NativeRSSSource = RSSSourceRusage
-
-const nativeRSSSource = NativeRSSSource

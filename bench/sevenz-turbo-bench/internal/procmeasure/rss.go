@@ -11,14 +11,20 @@ import (
 // never a wrapper's: the harness launches each tool as its direct child, or
 // through something that execs into it in place (taskset).
 const (
-	// RSSSourceRusage is the direct child's wait4 rusage ru_maxrss (bytes on
-	// macOS, KiB normalised to bytes on Linux), the figure /usr/bin/time
-	// prints as the maximum resident set size. The direct child is the tool.
+	// RSSSourceRusage is the direct child's wait4 rusage ru_maxrss, the
+	// figure /usr/bin/time prints as the maximum resident set size. It is
+	// the macOS (and BSD) source. Reports from before the Linux source below
+	// carry it for Linux rows too, where it was floored at the harness's own
+	// peak (see trace_linux.go).
 	RSSSourceRusage = "rusage"
-	// RSSSourceRusageTasksetExec is the same rusage read through taskset,
-	// which execs the tool in place: same pid, and Linux keeps the larger of
-	// the pre-exec and post-exec peaks, so taskset's own small image (a few
-	// MiB at most) is the only floor under the tool's figure.
+	// RSSSourceVmHWMExitStop is Linux's: VmHWM from /proc/<pid>/status of
+	// the tool's own process, read at its ptrace exit stop, when it has
+	// finished but still holds its memory map, the one its exec created. The
+	// harness's footprint is not in it, through taskset or not.
+	RSSSourceVmHWMExitStop = "vmhwm-exit-stop"
+	// RSSSourceRusageTasksetExec is what Linux pinned rows carried before
+	// RSSSourceVmHWMExitStop: the rusage read through taskset, floored at the
+	// larger of the harness's and taskset's peaks. Only old reports have it.
 	RSSSourceRusageTasksetExec = "rusage-taskset-exec"
 	// RSSSourcePeakWorkingSet is Windows PeakWorkingSetSize from
 	// K32GetProcessMemoryInfo on a handle held across the child's exit.
@@ -34,8 +40,10 @@ func DescribeRSSSource(source string) string {
 	switch source {
 	case RSSSourceRusage:
 		return "rusage ru_maxrss of the tool as the harness's direct child"
+	case RSSSourceVmHWMExitStop:
+		return "VmHWM of the tool's own process (Linux /proc/<pid>/status), read at its ptrace exit stop; the harness's footprint is not in it"
 	case RSSSourceRusageTasksetExec:
-		return "rusage ru_maxrss of the tool, launched through taskset which execs it in place"
+		return "rusage ru_maxrss of the tool, launched through taskset which execs it in place (an older Linux source, floored at the harness's peak)"
 	case RSSSourcePeakWorkingSet:
 		return "Windows PeakWorkingSetSize of the tool's process, read through a handle held across its exit"
 	case "":
@@ -47,7 +55,7 @@ func DescribeRSSSource(source string) string {
 
 // MultiProcessNote is the caveat every RSS report carries: a peak resident
 // set is one process's figure.
-const MultiProcessNote = "Peak RSS is one process's high-water mark. On POSIX the figure also covers descendants the tool reaped (the largest single peak, not their sum); on Windows it is the tool's process alone. sevenz-turbo (through decode-bench op), sevenz-rust2 and 7zz each run as one multi-threaded process, so the figure is the tool's whole footprint."
+const MultiProcessNote = "Peak RSS is one process's high-water mark. On macOS the figure also covers descendants the tool reaped (the largest single peak, not their sum); on Linux and Windows it is the tool's process alone. sevenz-turbo (through decode-bench op), sevenz-rust2 and 7zz each run as one multi-threaded process, so the figure is the tool's whole footprint."
 
 // RSSScenario compares one scenario's peak resident set: the candidate's
 // (sevenz-turbo) peak against the reference's (7zz), both medians [min, max]

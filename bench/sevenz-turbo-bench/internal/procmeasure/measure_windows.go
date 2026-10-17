@@ -167,4 +167,8 @@ func isQuarantineError(err error) bool {
 // NativeRSSSource is where Run and Track read the peak resident set here.
 const NativeRSSSource = RSSSourcePeakWorkingSet
 
+// selfPeak is not needed here: the self-check does not run on Windows, whose
+// peak is read from the child's own process handle (see SelfCheck).
+func selfPeak() (int64, error) { return 0, errors.New("no self-check on Windows") }
+
 const nativeRSSSource = NativeRSSSource

@@ -1,8 +1,9 @@
 // Package procmeasure measures one child process: wall time from the parent's
 // monotonic clock, and CPU time, peak resident set and I/O counters from the
-// kernel's accounting of the exited child. Every lane — sevenz-turbo, 7zz and
-// sevenz-rust2 — is a direct child measured by the same code, so the rows are
-// comparable.
+// kernel's accounting of the exited child (on Linux the peak is read from the
+// child at its exit stop instead; see trace_linux.go). Every lane —
+// sevenz-turbo, 7zz and sevenz-rust2 — is a direct child measured by the same
+// code, so the rows are comparable.
 //
 // Copied from rarpar-bench's internal/procmeasure (same JSON field names and
 // RSS source tags), without its perf-stat shim, which this harness does not
@@ -55,11 +56,13 @@ type Measurement struct {
 	SysSeconds  float64 `json:"sys_seconds"`
 	// MaxRSSBytes is the peak resident set, required on every row: the
 	// child's own rusage ru_maxrss on macOS (bytes, the figure
-	// `/usr/bin/time -l` prints as "maximum resident set size") and Linux
-	// (KiB, normalised; `/usr/bin/time -v` "Maximum resident set size"), and
-	// PeakWorkingSetSize from K32GetProcessMemoryInfo on a handle held
-	// across the child's exit on Windows (Process.PeakWorkingSet64 reads
-	// null once the process has exited, so it is not used).
+	// `/usr/bin/time -l` prints as "maximum resident set size"); on Linux
+	// VmHWM from /proc/<pid>/status read at the child's ptrace exit stop,
+	// because there ru_maxrss is floored at the harness's own peak (see
+	// trace_linux.go); and PeakWorkingSetSize from K32GetProcessMemoryInfo
+	// on a handle held across the child's exit on Windows
+	// (Process.PeakWorkingSet64 reads null once the process has exited, so it
+	// is not used).
 	MaxRSSBytes int64 `json:"max_rss_bytes"`
 	// RSSSource names where MaxRSSBytes came from (one of the RSSSource*
 	// constants), so a reader can tell that two compared rows were measured
@@ -180,9 +183,16 @@ func Run(ctx context.Context, command Command) Result {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	// On Linux the child is traced to its exit stop, where its own peak is
+	// read (trace_linux.go); nil elsewhere.
+	trace := beginExitTrace(cmd)
 
 	started := time.Now()
 	if err := cmd.Start(); err != nil {
+		trace.abandon()
+		if trace != nil {
+			err = fmt.Errorf("start traced to its exit stop, for its peak RSS (a ptrace refusal here is kernel.yama.ptrace_scope or a seccomp profile): %w", err)
+		}
 		result := Result{Err: err, Failure: "start-failed"}
 		if isQuarantineError(err) {
 			result.Failure = "binary-quarantined"
@@ -190,16 +200,29 @@ func Run(ctx context.Context, command Command) Result {
 		return result
 	}
 	tracker := Track(cmd, command.PinCPUs)
+	var peak int64
+	var peakErr error
+	if trace != nil {
+		peak, peakErr = trace.await(cmd.Process.Pid)
+	}
 	waitErr := cmd.Wait()
 	wall := time.Since(started)
 
 	result := Result{Stdout: tail(&stdout), Stderr: tail(&stderr)}
 	result.WallSeconds = wall.Seconds()
 	if pinned != "" {
+		// taskset execs the tool in place: the pid is the tool's, and the
+		// peak read at its exit stop is the tool's own map's.
 		result.Pinned = pinned
-		// taskset execs the tool in place: the pid, and so the rusage, is
-		// the tool's, with taskset's own small image as the only floor.
-		result.RSSSource = RSSSourceRusageTasksetExec
+	}
+	if trace != nil {
+		// The traced peak is the only one: no fallback to the floored
+		// rusage. A run without it has no peak, which the caller fails.
+		result.MaxRSSBytes = peak
+		if peakErr != nil {
+			result.MaxRSSBytes = 0
+			result.Err = fmt.Errorf("peak RSS not read: %w", peakErr)
+		}
 	}
 	tracker.Finish(cmd, &result.Measurement)
 	if result.MaxRSSBytes <= 0 {
