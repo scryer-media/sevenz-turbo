@@ -210,8 +210,8 @@ and writers. CRC-32 comes from `crc-fast`, through `lzma-turbo`.
 
 ## Speed
 
-Measured with sevenz-turbo 0.27.0 against 7-Zip 26.03 and sevenz-rust2
-0.22.2 on five idle machines, 2026-10-13. Each number is the reference's
+Measured with sevenz-turbo 0.29.1 against 7-Zip 26.04 and sevenz-rust2
+0.22.2 on two idle machines, 2026-10-18. Each number is the reference's
 time or memory divided by sevenz-turbo's, averaged (geometric mean) over the
 tests, so above 1.00 means sevenz-turbo was faster or used less memory.
 Decoding covers one thread to all of them, solid and non-solid, encrypted
@@ -219,19 +219,19 @@ and filtered archives; encoding covers levels 1 to 9.
 
 | CPU | threads | vs 7-Zip: decode | encode | peak memory | vs sevenz-rust2: decode | peak memory |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Zen 4 | 16 | 1.16 | 1.54 | 0.97 | 2.42 | 1.16 |
-| Graviton4 | 16 | 1.12 | 1.45 | 0.97 | 1.95 | 1.16 |
-| Alder Lake | 16 | 1.13 | 1.42 | 0.96 | 1.88 | 1.11 |
-| Zen 2 | 12 | 1.10 | 1.33 | 0.98 | 2.51 | 1.19 |
-| M5 Max | 18 | 1.13 | 1.38 | 0.93 | 2.44 | 1.24 |
+| Sapphire Rapids | 16 | 1.26 | 1.50 | 0.99 | 1.87 | 1.18 |
+| Graviton4 | 16 | 1.15 | 1.49 | 1.01 | 1.96 | 1.24 |
 
-- LZMA2 decoding matches 7-Zip at every thread count on every machine. The
-  decode average is above 1.00 because of encrypted, PPMd and non-solid
-  archives.
+- LZMA2 decoding is within 5% of 7-Zip at every thread count on both
+  machines. The decode average is above 1.00 because of encrypted, stored,
+  PPMd and non-solid archives.
 - Slower than 7-Zip: nearly incompressible archives decoded on every thread
-  (0.88 to 0.99), single-thread decoding through the ARM64 filter on Zen 4,
-  Graviton4 and M5 Max (0.91 to 0.94), the peak memory of single-thread
-  decoding with a large dictionary, and the encoder's peak memory.
+  (0.94 to 0.96), single-thread decoding through the ARM64 and delta filters
+  on Graviton4 (0.95 to 0.96), and some multi-threaded encodes (BCJ2 on
+  four threads 0.96 to 0.97, level 9 on every thread on Graviton4 0.95).
+- Memory: sevenz-turbo holds more than 7-Zip when decoding stored and
+  non-solid archives on several threads (0.5 to 0.8) and when encoding a
+  non-solid tree on every thread (0.3 to 0.7).
 
 Every test on every machine is in [docs/benchmarks.md](docs/benchmarks.md),
 and how to measure your own is in [docs/benchmarking.md](docs/benchmarking.md).
