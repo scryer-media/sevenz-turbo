@@ -250,7 +250,7 @@ GOOS=windows GOARCH=amd64 go build -o ../../dist/sevenz-turbo-bench.exe .
 
 `decode-bench op version` reports the crypto backend and the Cargo build
 profile it was built with and the locked versions of `lzma-turbo`,
-`sevenz-rust2`, `aws-lc-rs`, `crc-fast` and every `ppmd-*` crate the lock
+`sevenz-rust2`, `aws-lc-rs`, `crc-turbo` and every `ppmd-*` crate the lock
 carries; the harness refuses a `--candidate-native` whose backend is the same
 as `--candidate`'s, and refuses any candidate whose build profile is not
 `release`.

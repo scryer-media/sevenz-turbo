@@ -531,10 +531,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce1932d832b1d6c0fcb852d4b1fd1fe9930fc2e0cfa7d125a90ee3f86978310d"
 
 [[package]]
-name = "crc-fast"
-version = "1.10.0"
+name = "crc-turbo"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e75b2483e97a5a7da73ac68a05b629f9c53cff58d8ed1c77866079e18b00dba5"
+checksum = "fe9845f8267cd17ae1edacec5cd2bc0f8b891d1946db64d929209170fcf7e9b8"
 dependencies = [
  "digest 0.10.7",
  "spin",
@@ -1317,12 +1317,11 @@ checksum = "5e2a88783b84d2d67ef2791778a9e76bfb68b8017aaf6c9d7d5f2626a478b16c"
 
 [[package]]
 name = "lzma-turbo"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53fb40ce177d0fd92480e8a17b469ee3688cc9f64c615b6457635a661398bde6"
+version = "0.10.2"
+source = "git+https://github.com/scryer-media/lzma-turbo?branch=feature%2Fcrc-turbo#4062be7ebc217478e74423625fadfb52d862d0a4"
 dependencies = [
  "aws-lc-rs",
- "crc-fast",
+ "crc-turbo",
  "sha2 0.11.0",
 ]
 
@@ -1751,7 +1750,7 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.29.1"
+version = "0.29.2"
 dependencies = [
  "aes",
  "aws-lc-rs",
@@ -2196,7 +2195,7 @@ version = "0.0.0"
 dependencies = [
  "aes",
  "cbc",
- "crc-fast",
+ "crc-turbo",
  "sevenz-turbo",
  "sha2 0.11.0",
  "tempfile",

@@ -72,7 +72,7 @@ at a level and thread count), printing one JSON line, so the caller can take
 the operation's peak RSS from the exited process. `op version` reports the
 crypto backend, which LZMA encoder is linked (`lzma_encoder`), the Cargo build
 profile, the commit and whether the tree was dirty, the lock file's SHA-256,
-the locked `lzma-turbo`, `sevenz-rust2`, `aws-lc-rs` and `crc-fast` versions,
+the locked `lzma-turbo`, `sevenz-rust2`, `aws-lc-rs` and `crc-turbo` versions,
 and every `ppmd-*` crate the lock carries with its version (`ppmd_crates`, and
 `ppmd_turbo` on its own); the harness refuses a candidate that was not built
 with the `release` profile.

@@ -25,7 +25,7 @@ func TestParseBanner(t *testing.T) {
 }
 
 func TestLockedVersion(t *testing.T) {
-	lock := "[[package]]\nname = \"crc-fast\"\nversion = \"1.10.0\"\n\n[[package]]\nname = \"lzma-turbo\"\nversion = \"0.6.0\"\nsource = \"registry\"\n"
+	lock := "[[package]]\nname = \"crc-turbo\"\nversion = \"1.11.0\"\n\n[[package]]\nname = \"lzma-turbo\"\nversion = \"0.6.0\"\nsource = \"registry\"\n"
 	if got := LockedVersion(lock, "lzma-turbo"); got != "0.6.0" {
 		t.Fatalf("got %q", got)
 	}
@@ -114,6 +114,22 @@ func TestBindRustOnlyAttachesAMatchingCheckout(t *testing.T) {
 		}
 		if bound.Commit == "abc" && name == "other commit" {
 			t.Errorf("%s: kept the checkout's commit: %+v", name, bound)
+		}
+	}
+}
+
+func TestCRCCrateReadsEitherRecord(t *testing.T) {
+	for _, tc := range []struct {
+		version map[string]any
+		want    string
+	}{
+		{map[string]any{"crc_turbo": "1.11.0"}, "crc-turbo 1.11.0"},
+		{map[string]any{"crc_fast": "1.10.0"}, "crc-fast 1.10.0"},
+		{map[string]any{"crc_turbo": "unknown", "crc_fast": "1.10.0"}, "crc-fast 1.10.0"},
+		{map[string]any{}, "unknown"},
+	} {
+		if got := (Candidate{Version: tc.version}).CRCCrate(); got != tc.want {
+			t.Errorf("%v: got %q, want %q", tc.version, got, tc.want)
 		}
 	}
 }

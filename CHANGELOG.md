@@ -487,6 +487,20 @@ arm, and this crate can add a variant without a breaking release.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.29.2 - 2026-10-20
+
+- Requires `lzma-turbo` 0.10.2, which takes its CRC-32 from `crc-turbo` 1.11,
+  the maintained fork of `crc-fast`, in place of `crc-fast` 1.10. Every
+  CRC-32 this crate computes goes through `lzma-turbo`'s `crc` module, so the
+  checksums are unchanged and `crc-fast` is no longer in the dependency
+  graph. On x86-64 CPUs that have VPCLMULQDQ without AVX-512 (AMD Zen 3,
+  Intel Alder Lake through Arrow Lake) `crc-turbo` folds 256 bits at a time
+  where `crc-fast` used its 128-bit SSE tier; `CRC_TURBO_TIER` pins the tier.
+- `tools/decode-bench` `op version` reports the locked `crc-turbo` version as
+  `crc_turbo` in place of `crc_fast`. The bench report names the CRC crate a
+  candidate carries and still reads `crc_fast` from a binary built before
+  the change.
+
 ## 0.29.1 - 2026-10-17
 
 - Archive headers are compressed with the level's 32 fast bytes, not the

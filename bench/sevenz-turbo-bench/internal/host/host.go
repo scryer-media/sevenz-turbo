@@ -38,7 +38,7 @@ type Machine struct {
 }
 
 // WantedISA is every flag the descriptor reports, by architecture. They are
-// the extensions lzma-turbo, crc-fast, AWS-LC and RustCrypto dispatch on.
+// the extensions lzma-turbo, crc-turbo, AWS-LC and RustCrypto dispatch on.
 var WantedISA = map[string][]string{
 	"amd64": {"sse4.2", "pclmulqdq", "aes", "sha_ni", "bmi2", "avx2", "avx512f", "avx512bw", "avx512vl",
 		"avx512vbmi", "avx512vbmi2", "gfni", "vaes", "vpclmulqdq"},

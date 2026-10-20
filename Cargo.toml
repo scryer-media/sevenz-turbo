@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/scryer-media/sevenz-turbo"
 # Raised from upstream's 1.93: `lzma-turbo` requires 1.97.1.
 rust-version = "1.97.1"
-version = "0.29.1"
+version = "0.29.2"
 # Repository scaffolding that has no business in the crate archive.
 exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml"]
 
@@ -90,7 +90,7 @@ getrandom = { version = "0.4", optional = true }
 # A caret requirement: the floor this crate is known to need, not a pin.
 # `Cargo.lock` fixes the exact version that was tested, and CI builds with
 # `--locked`.
-lzma-turbo = { version = "0.10.1", default-features = false, features = ["std", "asm", "crc", "filters"] }
+lzma-turbo = { version = "0.10.2", default-features = false, features = ["std", "asm", "crc", "filters"] }
 ppmd-turbo = { version = "0.2.0", optional = true }
 lz4_flex = { version = "0.14", optional = true }
 nt-time = { version = "0.15", optional = true }
@@ -162,9 +162,9 @@ incremental = false
 # Dev and test builds optimise only the crates that dominate test time; debug
 # assertions and overflow checks stay on. Each comment gives the measured cost
 # of leaving that crate at opt-level 0 with the other override in place (local
-# runs of `cargo test --all-features` on an Apple M5 Max). AWS-LC, crc-fast,
-# zlib-rs, libbz2-rs-sys, zstd-sys, lz4_flex and brotli were measured too and
-# left out: optimising them saved nothing measurable in the test run.
+# runs of `cargo test --all-features` on an Apple M5 Max). AWS-LC, crc-fast
+# (now crc-turbo), zlib-rs, libbz2-rs-sys, zstd-sys, lz4_flex and brotli were
+# measured too and left out: optimising them saved nothing measurable in the test run.
 
 # LZMA/LZMA2 coding, BCJ/delta filters and CRC: the test run takes 121 s instead
 # of 50 s, folder_parallel_tests 56 s instead of 17 s; it costs under 1 s of
@@ -186,3 +186,8 @@ opt-level = 3
 # tested and measured on a host that has them. Never set for a build that ships.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sevenz_turbo_unthreaded)"] }
+
+# Carries lzma-turbo 0.10.2 until it is on crates.io. Remove before merge,
+# then refresh Cargo.lock.
+[patch.crates-io]
+lzma-turbo = { git = "https://github.com/scryer-media/lzma-turbo", branch = "feature/crc-turbo" }
