@@ -500,6 +500,11 @@ arm, and this crate can add a variant without a breaking release.
   `crc_turbo` in place of `crc_fast`. The bench report names the CRC crate a
   candidate carries and still reads `crc_fast` from a binary built before
   the change.
+- `tools/wasm-conformance` requires `wasmtime` and `wasmtime-wasi` 48.0.7,
+  which fixes RUSTSEC-2026-0378 (a panic lowering a host-created component
+  stream) and RUSTSEC-2026-0379 (an aarch64 Cranelift `br_table` miscompile).
+  `wasmtime` is a dependency of that test tool only and never reaches the
+  published crate.
 
 ## 0.29.1 - 2026-10-17
 
