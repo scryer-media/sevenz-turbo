@@ -79,7 +79,7 @@ with a version bump and a changelog entry like any other.
   `native-crypto` feature is on. Never call a backend crate directly from
   anywhere else; the one exception is the test-only reference host hook in
   `src/hooks/aes.rs`, which stands in for an embedder's AES.
-- CRC-32 is `crc-fast` (via `lzma-turbo`'s `crc` module), never `crc32fast`.
+- CRC-32 is `crc-turbo` (via `lzma-turbo`'s `crc` module), never `crc32fast`.
 - **No CRC-32 is computed in a serialised section of the multi-threaded path.**
   Checksumming is O(bytes) and the in-order section is the one place where the
   core count does not help, so a checksum taken there is a tax that grows with

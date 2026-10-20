@@ -9,7 +9,7 @@
 //! ABI — it implements every import exactly to contract (raw offsets into the
 //! guest's linear memory; in-place AES-256-CBC, no padding, stateless per
 //! call; CRCs resumed from a finalized seed; SHA-256 behind opaque handles)
-//! with RustCrypto and `crc-fast` references.
+//! with RustCrypto and `crc-turbo` references.
 //!
 //! What is asserted:
 //!
@@ -108,13 +108,13 @@ fn read_guest(caller: &mut Caller<'_, Host>, ptr: i32, len: i32) -> Vec<u8> {
 }
 
 /// The reference `host_crc32`: CRC-32/ISO-HDLC resumed from a finalized seed.
-/// `crc-fast`'s running register is the complement of the finalized value, so
+/// `crc-turbo`'s running register is the complement of the finalized value, so
 /// seeding it with `!seed` resumes the stream exactly.
 fn reference_host_crc32(mut caller: Caller<'_, Host>, seed: i32, ptr: i32, len: i32) -> i32 {
     caller.data_mut().calls.crc32 += 1;
     let data = read_guest(&mut caller, ptr, len);
-    let mut digest = crc_fast::Digest::new_with_init_state(
-        crc_fast::CrcAlgorithm::Crc32IsoHdlc,
+    let mut digest = crc_turbo::Digest::new_with_init_state(
+        crc_turbo::CrcAlgorithm::Crc32IsoHdlc,
         u64::from(!(seed as u32)),
     );
     digest.update(&data);
@@ -126,7 +126,7 @@ fn reference_host_crc32(mut caller: Caller<'_, Host>, seed: i32, ptr: i32, len: 
 fn reference_host_crc64_xz(mut caller: Caller<'_, Host>, seed: i64, ptr: i32, len: i32) -> i64 {
     let data = read_guest(&mut caller, ptr, len);
     let mut digest =
-        crc_fast::Digest::new_with_init_state(crc_fast::CrcAlgorithm::Crc64Xz, !(seed as u64));
+        crc_turbo::Digest::new_with_init_state(crc_turbo::CrcAlgorithm::Crc64Xz, !(seed as u64));
     digest.update(&data);
     digest.finalize() as i64
 }

@@ -34,7 +34,7 @@ type Candidate struct {
 	Label string `json:"label"`
 	// Version is the `op version` object: crypto_backend, lzma_encoder,
 	// build_profile, git_commit, git_dirty, cargo_lock_sha256, lzma_turbo,
-	// sevenz_rust2, aws_lc_rs, crc_fast, ppmd_crates, ppmd_turbo,
+	// sevenz_rust2, aws_lc_rs, crc_turbo, ppmd_crates, ppmd_turbo,
 	// available_parallelism.
 	Version map[string]any `json:"version"`
 }
@@ -45,6 +45,20 @@ func (c Candidate) Field(name string) string {
 		return value
 	}
 	return ""
+}
+
+// CRCCrate is the CRC crate the candidate's Cargo.lock carries, as
+// "name version": crc-turbo (crc_turbo), or crc-fast (crc_fast) for a binary
+// built before sevenz-turbo moved to crc-turbo. One that reports neither
+// gives "unknown".
+func (c Candidate) CRCCrate() string {
+	if version := c.Field("crc_turbo"); version != "" && version != "unknown" {
+		return "crc-turbo " + version
+	}
+	if version := c.Field("crc_fast"); version != "" && version != "unknown" {
+		return "crc-fast " + version
+	}
+	return "unknown"
 }
 
 // PPMdCrates is every `ppmd-*` crate the candidate's Cargo.lock carries, as

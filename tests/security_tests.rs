@@ -49,8 +49,8 @@ fn decompress_rejects_backslash_traversal() {
 
 const SEVEN_Z_SIGNATURE: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
 
-/// CRC-32/ISO-HDLC over the start/next headers, reusing the crate's own `crc-fast`
-/// dependency (available to integration tests) so the crafted archives pass verification.
+/// CRC-32/ISO-HDLC over the start/next headers, through `lzma-turbo`'s `crc-turbo`
+/// checksum (available to integration tests) so the crafted archives pass verification.
 fn crc32(data: &[u8]) -> u32 {
     lzma_turbo::crc::crc32(data)
 }
