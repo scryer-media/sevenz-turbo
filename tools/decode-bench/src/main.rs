@@ -535,9 +535,12 @@ fn extract_fork_with(
 
 /// Upstream at a given thread count. Above one this is its `Lzma2ReaderMt`,
 /// the multi-threaded LZMA2 reader of its LZMA dependency, which this fork
-/// replaced.
+/// replaced. The archive is read through a `BufReader`, as in `op decode`.
 fn extract_upstream(path: &Path, threads: u32, password: Option<&str>) -> Sink {
-    let file = std::fs::File::open(path).expect("open archive");
+    let file = std::io::BufReader::with_capacity(
+        op::UPSTREAM_READ_BUFFER,
+        std::fs::File::open(path).expect("open archive"),
+    );
     let upstream_password =
         password.map_or_else(sevenz_rust2::Password::empty, sevenz_rust2::Password::from);
     let mut reader =

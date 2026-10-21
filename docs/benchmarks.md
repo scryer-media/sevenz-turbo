@@ -17,7 +17,10 @@ was not run on that host. Thread counts: `T1`, `T2`, `T4`, `T8` are fixed,
 Build: `sevenz-turbo` 0.29.1 (commit d576392) default features (`aws-lc-rs`
 1.18.1 crypto backend, `lzma-turbo` 0.10.1, `ppmd-turbo` 0.2.0), release
 profile, rustc 1.97.1. 7-Zip is the official 26.04 binary for each platform.
-sevenz-rust2 is the released 0.22.2 crate, decode rows only.
+sevenz-rust2 is the released 0.22.2 crate, decode rows only, reading the
+archive from a bare `File` as its own `ArchiveReader::open` does. The harness
+has since moved it behind a 1 MiB `BufReader` (see
+[sevenz-turbo vs sevenz-rust2](#sevenz-turbo-vs-sevenz-rust2)).
 
 ## Hosts
 
@@ -237,6 +240,15 @@ Ratios are sevenz-rust2 0.22.2 / sevenz-turbo, from the same run's
 sevenz-rust2 decode rows. sevenz-rust2 decodes on at most a few threads, so
 on `decode/mt/Tall` it holds less memory and takes several times the wall
 time; on `decode/st/Tall` it holds many times more.
+
+This run fed sevenz-rust2 a bare `File`. Its LZMA range decoder takes one
+byte per read from its input, so `decode/lzma/T1` paid a system call per
+compressed byte: that row's 10.3x and 14.9x are mostly system time, and they
+lift the sevenz-rust2 summary above. Behind a `BufReader`, which is how
+sevenz-rust2 is meant to be fed and what the harness now does, a single local
+check of the same fixture took 7.3 s of user CPU against sevenz-turbo's 4.5 s
+(about 1.6x) instead of 82 s. The LZMA2 rows read through a chunk buffer of
+their own and are not affected the same way.
 
 | scenario | Sapphire Rapids wall | Sapphire Rapids CPU | Sapphire Rapids RSS | Graviton4 wall | Graviton4 CPU | Graviton4 RSS |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |

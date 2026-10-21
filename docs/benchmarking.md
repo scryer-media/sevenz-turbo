@@ -13,8 +13,9 @@ binary that generates the corpus with the host's `7zz`, runs the whole matrix
 (container parse, LZMA/LZMA2 decode across a thread sweep, the memory budget,
 solid and non-solid archives, AES-256 in both cryptography builds, the
 filters, and LZMA2 encode across levels with the size ratio) against `7zz` as
-separate measured processes with peak RSS on every row, and merges several
-hosts' reports into one. It drives `decode-bench op ...` (below). Every result
+separate measured processes with peak RSS on every row, merges several
+hosts' reports into one, and draws grouped comparison charts from them. It
+drives `decode-bench op ...` (below). Every result
 under [Results](#results) predates it.
 
 ## The harness
@@ -34,7 +35,7 @@ For each archive it runs, in one session on one machine:
 | --- | --- |
 | `7zz t (all)` | the C reference with every thread it wants, full decode plus CRC check |
 | `7zz t -mmt=1` | coder thread count one; auxiliary folder-pipeline threads may still run |
-| `sevenz-rust2 0.22.2` | the upstream release the fork was taken from, every entry to a sink |
+| `sevenz-rust2 0.22.2` | the upstream release the fork was taken from, every entry to a sink, the archive read through a 1 MiB `BufReader` |
 | `sevenz-turbo @N` | this fork at N threads, same code path |
 | `sevenz-turbo @N no crc` | the same with `set_verify_checksums(false)`, to price verification |
 
@@ -68,7 +69,8 @@ difference. Operator-confirmed comparison policy: 2026-10-13.
 `bench/sevenz-turbo-bench` drives: exactly one operation per process (a header
 parse, a full decode on the convenience or the single-parse streaming path,
 optionally under `--memory-limit` or with the upstream engine, or an encode
-at a level and thread count), printing one JSON line, so the caller can take
+at a level and thread count, also through either engine; upstream has no BCJ2
+encoder), printing one JSON line, so the caller can take
 the operation's peak RSS from the exited process. `op version` reports the
 crypto backend, which LZMA encoder is linked (`lzma_encoder`), the Cargo build
 profile, the commit and whether the tree was dirty, the lock file's SHA-256,

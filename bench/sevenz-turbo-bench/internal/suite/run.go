@@ -198,7 +198,7 @@ func checkPass(ctx context.Context, scenario Scenario, records []passRun, skip b
 	}
 	for i := range records {
 		run, record := records[i].run, &records[i].record
-		if run.Role == RoleCandidate && scenario.Op == OpEncode && record.Status == StatusOK {
+		if run.Role != RoleReference && scenario.Op == OpEncode && record.Status == StatusOK {
 			record.Verified = verify(ctx, options.Oracle, run.Output, scenario.Encrypted, options.Timeout)
 			if record.Verified != "ok" {
 				record.Status, record.Failure, record.Error = StatusFailed, "7zz-rejects-output", record.Verified

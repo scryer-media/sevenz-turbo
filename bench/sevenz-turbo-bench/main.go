@@ -9,6 +9,7 @@
 //	                             [--only SUBSTR,...] [--pin-cpus 0-7] [--timeout 1h]
 //	sevenz-turbo-bench report    --input raw.json --out report.json [--md report.md]
 //	sevenz-turbo-bench merge     --out merged.md report.json...
+//	sevenz-turbo-bench chart     --out DIR [NAME=]report.json...
 //
 // Exit status: 0 success; 1 a measured run failed (or missing RSS); 2 usage;
 // 3 a prerequisite is missing (oracle, candidate, fixtures).
@@ -43,7 +44,7 @@ const (
 	exitPrerequisite = 3
 )
 
-const usage = `usage: sevenz-turbo-bench <fixtures|toolchain|run|report|merge> [flags]
+const usage = `usage: sevenz-turbo-bench <fixtures|toolchain|run|report|merge|chart> [flags]
 run "sevenz-turbo-bench <command> -h" for a command's flags`
 
 // prerequisite marks an error that is a missing input, not a failed run.
@@ -68,6 +69,8 @@ func main() {
 		code = cmdReport(os.Args[2:])
 	case "merge":
 		code = cmdMerge(os.Args[2:])
+	case "chart":
+		code = cmdChart(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Println(usage)
 	default:
@@ -519,5 +522,42 @@ func cmdMerge(args []string) int {
 		return fail(err)
 	}
 	fmt.Printf("wrote %s (%d hosts)\n", *out, len(reports))
+	return exitOK
+}
+
+// cmdChart draws the grouped comparison charts from one or more hosts'
+// report.json. An argument NAME=path names that host on the charts.
+func cmdChart(args []string) int {
+	set := flag.NewFlagSet("chart", flag.ContinueOnError)
+	out := set.String("out", "", "directory to write the SVG charts into")
+	if !parse(set, args) {
+		return exitUsage
+	}
+	if *out == "" || set.NArg() == 0 {
+		fmt.Fprintln(os.Stderr, "chart: --out and at least one report.json are required")
+		return exitUsage
+	}
+	var inputs []report.ChartInput
+	for _, arg := range set.Args() {
+		name, path, named := strings.Cut(arg, "=")
+		if !named {
+			name, path = "", arg
+		}
+		loaded, err := report.Load(path)
+		if err != nil {
+			return fail(prerequisite{err})
+		}
+		inputs = append(inputs, report.ChartInput{Name: name, Report: loaded})
+	}
+	paths, skipped, err := report.RenderCharts(inputs, *out)
+	if err != nil {
+		return fail(prerequisite{err})
+	}
+	if len(skipped) != 0 {
+		fmt.Printf("left out %d scenario(s) not run on every host: %s\n", len(skipped), strings.Join(skipped, ", "))
+	}
+	for _, path := range paths {
+		fmt.Printf("wrote %s\n", path)
+	}
 	return exitOK
 }

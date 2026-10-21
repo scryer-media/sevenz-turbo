@@ -16,6 +16,7 @@
 //!                        [--engine turbo|upstream] [--digest] [--ledger]
 //! decode-bench op encode --input DIR --out FILE [--level L] [--threads N]
 //!                        [--non-solid] [--password P] [--filter bcj2]
+//!                        [--engine turbo|upstream]
 //! ```
 //!
 //! A decode counts the bytes it drains and does nothing else with them, as
@@ -39,6 +40,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use super::{Sink, fork_password};
+
+/// The `BufReader` an upstream decode reads the archive through.
+pub(crate) const UPSTREAM_READ_BUFFER: usize = 1 << 20;
 
 const USAGE: &str = "usage: decode-bench op version|list|decode|encode [options]";
 
@@ -78,7 +82,11 @@ pub fn main(args: Vec<String>) -> ! {
             "upstream" => decode_upstream(&opts),
             other => usage(&format!("unknown engine {other}")),
         },
-        "encode" => encode(&opts),
+        "encode" => match opts.engine.as_str() {
+            "" | "turbo" => encode(&opts),
+            "upstream" => encode_upstream(&opts),
+            other => usage(&format!("unknown engine {other}")),
+        },
         other => usage(&format!("unknown op {other}")),
     };
     match result {
@@ -780,10 +788,16 @@ fn check_reported_crcs(
     Ok(())
 }
 
-/// The same decode through upstream `sevenz-rust2`, the secondary reference.
+/// The same decode through upstream `sevenz-rust2`, the secondary reference,
+/// with the archive behind a 1 MiB `BufReader`: the way to feed it, since its
+/// LZMA range decoder takes one byte per read from its input and the bare
+/// `File` its own `ArchiveReader::open` uses makes that a system call a byte.
 fn decode_upstream(opts: &Opts) -> Result<Fields, String> {
     let path = archive_path(opts);
-    let file = File::open(path).map_err(|e| e.to_string())?;
+    let file = std::io::BufReader::with_capacity(
+        UPSTREAM_READ_BUFFER,
+        File::open(path).map_err(|e| e.to_string())?,
+    );
     let password = opts
         .password
         .as_deref()
@@ -1034,6 +1048,161 @@ fn encode(opts: &Opts) -> Result<Fields, String> {
     ])
 }
 
+/// The same encode through upstream `sevenz-rust2` 0.22.2, the secondary
+/// reference, for what it can write: LZMA2 at `--level` from the same xz
+/// preset table, solid or not, AES-256 with an encrypted header. It has no
+/// BCJ2 encoder, so `--filter bcj2` is refused.
+///
+/// Solid, it is `push_archive_entries` under the same 4 GiB block rule, with
+/// LZMA2's own multi-threaded encoder at the crate's block size when
+/// `--threads` is above one. Non-solid at one thread it is
+/// `push_archive_entry` per member; above one, the members are compressed on
+/// `--threads` workers through its public `prepare_block` and appended in
+/// member order with `push_prepared_block`, the parallel non-solid write
+/// upstream offers.
+fn encode_upstream(opts: &Opts) -> Result<Fields, String> {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+
+    use sevenz_rust2::encoder_options::{AesEncoderOptions, Lzma2Options};
+
+    if opts.filter == "bcj2" {
+        return Err("sevenz-rust2 0.22.2 has no BCJ2 encoder".into());
+    }
+    let input = opts
+        .input
+        .as_ref()
+        .unwrap_or_else(|| usage("--input is required"));
+    let out = opts
+        .out
+        .as_ref()
+        .unwrap_or_else(|| usage("--out is required"));
+    let threads = opts.threads.max(1);
+    let dict = sevenz_turbo::encoder_options::EncoderOptions::from(
+        sevenz_turbo::encoder_options::Lzma2Options::from_level(opts.level),
+    )
+    .get_lzma_dict_size();
+    let block = mt_block_size(dict);
+    let mt_block = threads > 1 && !opts.non_solid;
+    let lzma2 = if mt_block {
+        Lzma2Options::from_level_mt(opts.level, threads, block)
+    } else {
+        Lzma2Options::from_level(opts.level)
+    };
+    let mut methods: Vec<sevenz_rust2::EncoderConfiguration> = Vec::new();
+    if let Some(password) = opts.password.as_deref() {
+        methods.push(AesEncoderOptions::new(sevenz_rust2::Password::from(password)).into());
+    }
+    methods.push(lzma2.into());
+
+    let members = source_members(input)?;
+    let files = members.len() as u64;
+    let bytes_in: u64 = members.iter().map(|m| m.size).sum();
+    let entry = |m: &Member| sevenz_rust2::ArchiveEntry::from_path(&m.path, m.name.clone());
+    let lazy = |m: &Member| LazyFile {
+        path: m.path.clone(),
+        file: None,
+        done: false,
+    };
+
+    let mut writer = sevenz_rust2::ArchiveWriter::create(out).map_err(|e| e.to_string())?;
+    writer.set_content_methods(methods.clone());
+    if opts.non_solid && threads > 1 {
+        let methods = Arc::new(methods);
+        let next = AtomicUsize::new(0);
+        let (tx, rx) = mpsc::sync_channel(threads as usize * 2);
+        std::thread::scope(|scope| -> Result<(), String> {
+            for _ in 0..threads.min(members.len().max(1) as u32) {
+                let (tx, methods, next, members) = (tx.clone(), &methods, &next, &members);
+                scope.spawn(move || {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(member) = members.get(index) else {
+                            break;
+                        };
+                        let block = sevenz_rust2::prepare_block(
+                            Arc::clone(methods),
+                            vec![entry(member)],
+                            vec![sevenz_rust2::SourceReader::new(lazy(member))],
+                        )
+                        .map_err(|e| e.to_string());
+                        if tx.send((index, block)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(tx);
+            // Blocks come back in any order and go out in member order.
+            let mut pending = BTreeMap::new();
+            let mut wanted = 0;
+            for (index, block) in rx {
+                pending.insert(index, block?);
+                while let Some(block) = pending.remove(&wanted) {
+                    writer
+                        .push_prepared_block(block)
+                        .map_err(|e| e.to_string())?;
+                    wanted += 1;
+                }
+            }
+            Ok(())
+        })?;
+    } else if opts.non_solid {
+        for member in &members {
+            writer
+                .push_archive_entry(entry(member), Some(lazy(member)))
+                .map_err(|e| e.to_string())?;
+        }
+    } else {
+        // The same 4 GiB block rule as the crate's lane above.
+        let mut entries = Vec::new();
+        let mut sources = Vec::new();
+        let mut block_bytes = 0u64;
+        for member in &members {
+            if member.size >= MAX_SOLID_BLOCK {
+                writer
+                    .push_archive_entry(entry(member), Some(lazy(member)))
+                    .map_err(|e| e.to_string())?;
+                continue;
+            }
+            if block_bytes + member.size >= MAX_SOLID_BLOCK {
+                writer
+                    .push_archive_entries(
+                        std::mem::take(&mut entries),
+                        std::mem::take(&mut sources),
+                    )
+                    .map_err(|e| e.to_string())?;
+                block_bytes = 0;
+            }
+            block_bytes += member.size;
+            entries.push(entry(member));
+            sources.push(sevenz_rust2::SourceReader::new(lazy(member)));
+        }
+        if !entries.is_empty() {
+            writer
+                .push_archive_entries(entries, sources)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    writer.finish().map_err(|e| e.to_string())?;
+
+    let bytes_out = std::fs::metadata(out).map_err(|e| e.to_string())?.len();
+    Ok(vec![
+        ("engine", str("sevenz-rust2")),
+        ("crypto_backend", str("rustcrypto")),
+        ("threads", Json::Int(u64::from(threads))),
+        ("level", Json::Int(u64::from(opts.level))),
+        ("block_size", Json::Int(if mt_block { block } else { 0 })),
+        ("solid", Json::Bool(!opts.non_solid)),
+        ("filter", str("none")),
+        ("encrypted", Json::Bool(opts.password.is_some())),
+        ("files", Json::Int(files)),
+        ("bytes_in", Json::Int(bytes_in)),
+        ("bytes_out", Json::Int(bytes_out)),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1135,6 +1304,65 @@ mod tests {
                 "non_solid {non_solid}"
             );
         }
+    }
+
+    /// The upstream lane writes every layout it supports, at one thread and
+    /// several, and the crate reads each back to the same members.
+    #[test]
+    fn an_upstream_encode_round_trips_every_layout() {
+        let scratch = Scratch::new("encode-upstream");
+        let input = scratch.0.join("src");
+        tree(&input);
+        for (non_solid, threads, password) in [
+            (false, 1, None),
+            (false, 4, None),
+            (true, 1, None),
+            (true, 4, None),
+            (true, 4, Some("p")),
+        ] {
+            let out = scratch.0.join(format!(
+                "up-{non_solid}-{threads}-{}.7z",
+                password.is_some()
+            ));
+            let opts = Opts {
+                input: Some(input.clone()),
+                out: Some(out.clone()),
+                threads,
+                level: 1,
+                non_solid,
+                password: password.map(str::to_string),
+                engine: "upstream".into(),
+                ..Opts::default()
+            };
+            super::encode_upstream(&opts).unwrap();
+            let password =
+                password.map_or_else(sevenz_turbo::Password::empty, sevenz_turbo::Password::from);
+            let mut reader = sevenz_turbo::ArchiveReader::open(&out, password).unwrap();
+            let mut seen = Vec::new();
+            reader
+                .for_each_entries(|entry, data| {
+                    let mut bytes = Vec::new();
+                    data.read_to_end(&mut bytes)?;
+                    seen.push((entry.name().replace('\\', "/"), bytes));
+                    Ok(true)
+                })
+                .unwrap();
+            let names: Vec<_> = seen.iter().map(|(name, _)| name.as_str()).collect();
+            assert_eq!(
+                names,
+                ["alpha/a.bin", "alpha/b.bin", "mid/.nested-dot", "zeta.txt"],
+                "non_solid {non_solid}, threads {threads}"
+            );
+            assert_eq!(seen[3].1, b"zeta");
+        }
+        let refused = Opts {
+            input: Some(input.clone()),
+            out: Some(scratch.0.join("up-refused.7z")),
+            filter: "bcj2".into(),
+            engine: "upstream".into(),
+            ..Opts::default()
+        };
+        assert!(super::encode_upstream(&refused).is_err());
     }
 
     #[test]

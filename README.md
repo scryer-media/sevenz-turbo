@@ -222,6 +222,10 @@ and filtered archives; encoding covers levels 1 to 9.
 | Sapphire Rapids | 16 | 1.26 | 1.50 | 0.99 | 1.87 | 1.18 |
 | Graviton4 | 16 | 1.15 | 1.49 | 1.01 | 1.96 | 1.24 |
 
+The sevenz-rust2 columns read the archive from a bare `File`, which makes its
+plain-LZMA decode issue a system call per compressed byte and lifts those two
+decode figures; see [the benchmarks page](docs/benchmarks.md#sevenz-turbo-vs-sevenz-rust2).
+
 - LZMA2 decoding is within 5% of 7-Zip at every thread count on both
   machines. The decode average is above 1.00 because of encrypted, stored,
   PPMd and non-solid archives.
