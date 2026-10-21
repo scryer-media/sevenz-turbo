@@ -16,7 +16,9 @@ input bytes. The archives are written by the host's `7zz a`; `fixtures.json`
 records every source's and archive's size and SHA-256 and the `7zz` banner and
 digest, so two hosts' corpora can be compared byte for byte. A source already
 present is kept only when its `.complete` marker names the same recipe and its
-members are exactly the recipe's; an archive only when its
+members are exactly the recipe's, and gets its fixed 2026-01-01 mtimes back
+(a corpus restored from a tar image carries none, and `7zz` stores them); an
+archive only when its
 `<name>.provenance.json` names the same `7zz`, switches and source content and
 its bytes are unchanged. Anything else is regenerated. `run` rehashes every
 source and archive against `fixtures.json` before planning and refuses a

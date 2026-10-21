@@ -411,6 +411,11 @@ func ensureSource(dir string, source SourceSpec, logf func(string, ...any)) (Sou
 		if err := generateSource(root, source, problem, logf); err != nil {
 			return SourceRecord{SourceSpec: source}, err
 		}
+	} else if err := fixMtimes(root); err != nil {
+		// A reused source keeps its content but not always its mtimes (a
+		// corpus restored from a tar image carries none), and 7zz stores
+		// them, so put them back before any archive is written from it.
+		return SourceRecord{SourceSpec: source}, err
 	}
 	return measureSource(dir, source)
 }
