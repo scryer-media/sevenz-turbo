@@ -22,7 +22,7 @@
 //!
 //! This module exists whenever either feature is enabled. On native targets
 //! the features are accepted but the in-process backends (AWS-LC or
-//! RustCrypto, `crc-fast`) stay active, so an installed hook is never called
+//! RustCrypto, `crc-turbo`) stay active, so an installed hook is never called
 //! there and feature unification in a mixed workspace cannot silently turn a
 //! native build into a delegating one.
 //!

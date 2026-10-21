@@ -206,7 +206,7 @@ writer.finish().expect("compress ok");
 | DELTA         | ✓            | ✓          |
 
 The filters themselves are `lzma-turbo`'s; this crate wraps them as readers
-and writers. CRC-32 comes from `crc-fast`, through `lzma-turbo`.
+and writers. CRC-32 comes from `crc-turbo`, through `lzma-turbo`.
 
 ## Speed
 

@@ -318,7 +318,7 @@ fn version() -> Fields {
             str(env!("DECODE_BENCH_SEVENZ_RUST2_VERSION")),
         ),
         ("aws_lc_rs", str(env!("DECODE_BENCH_AWS_LC_RS_VERSION"))),
-        ("crc_fast", str(env!("DECODE_BENCH_CRC_FAST_VERSION"))),
+        ("crc_turbo", str(env!("DECODE_BENCH_CRC_TURBO_VERSION"))),
         // Every PPMd crate the lock carries, by name, so the field means the
         // same thing before and after the PPMd engine changes crates.
         ("ppmd_crates", Json::Str(locked_ppmd_crates().join(", "))),
