@@ -35,7 +35,7 @@ For each archive it runs, in one session on one machine:
 | --- | --- |
 | `7zz t (all)` | the C reference with every thread it wants, full decode plus CRC check |
 | `7zz t -mmt=1` | coder thread count one; auxiliary folder-pipeline threads may still run |
-| `sevenz-rust2 0.22.2` | the upstream release the fork was taken from, every entry to a sink, the archive read through a 1 MiB `BufReader` |
+| `sevenz-rust2 0.22.2` | the upstream release the fork was taken from, every entry to a sink, the archive read through a cache of recently read 256 KiB windows in which a seek only moves the position (`UpstreamInput` in `decode-bench`): a bare `File` costs its byte-at-a-time LZMA decoder a system call a byte, and a `BufReader` is emptied by the seek it makes before every pack-stream read |
 | `sevenz-turbo @N` | this fork at N threads, same code path |
 | `sevenz-turbo @N no crc` | the same with `set_verify_checksums(false)`, to price verification |
 

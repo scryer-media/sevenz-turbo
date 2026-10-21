@@ -72,7 +72,7 @@ Variants:
 | `sevenz-turbo no-ledger` | candidate (decode ledger rows with no limit) | the same `decode-bench`, run without `--ledger`: the decode as a consumer runs it, in the same passes as the observed one |
 | `sevenz-turbo unbudgeted` | candidate (every row with a memory limit) | the same `decode-bench` command at the same threads with `--memory-limit` taken off: what the budget costs (see [Memory budget rows](#memory-budget-rows)) |
 | `7zz` | reference (oracle) | the official 7-Zip console binary: `7zz t` (decode), `7zz l -slt` (list), `7zz a` (encode) |
-| `sevenz-rust2` | secondary | upstream `sevenz-rust2 =0.22.2`, already linked by `decode-bench`: decode rows, reading the archive through a 1 MiB `BufReader` (its LZMA decoder takes one byte per read, so a bare `File` costs a system call a byte), and every encode row but BCJ2 (it has no BCJ2 encoder) through `op encode --engine upstream`, its output checked with `7zz t` like the candidate's; informational |
+| `sevenz-rust2` | secondary | upstream `sevenz-rust2 =0.22.2`, already linked by `decode-bench`: decode rows, reading the archive through `decode-bench`'s windowed `UpstreamInput` (its LZMA decoder takes one byte per read, so a bare `File` costs a system call a byte; and it seeks before every read of a pack stream, which empties a `BufReader`, so a BCJ2 folder refilled one on every small read), and every encode row but BCJ2 (it has no BCJ2 encoder) through `op encode --engine upstream`, its output checked with `7zz t` like the candidate's; informational |
 
 The matrix (`T` = threads; the full and fleet sweep is 1, 2, 4, 8, 16 below
 the core count, then `all`; `--quick` runs 1 and `all`):

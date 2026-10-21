@@ -35,14 +35,126 @@
 //! error.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use super::{Sink, fork_password};
 
-/// The `BufReader` an upstream decode reads the archive through.
-pub(crate) const UPSTREAM_READ_BUFFER: usize = 1 << 20;
+/// One cached window of the archive an upstream decode reads through.
+const UPSTREAM_WINDOW: usize = 256 << 10;
+/// How many windows [`UpstreamInput`] keeps: more than the four pack streams
+/// of a BCJ2 folder, so each stream keeps its own.
+const UPSTREAM_WINDOWS: usize = 8;
+
+/// The archive as upstream `sevenz-rust2` is given it. Its LZMA range decoder
+/// takes one byte per read, so a bare `File` costs a system call a byte; and
+/// the reader it shares between the pack streams of a folder seeks to its own
+/// position before every read, which empties a `BufReader`, so a BCJ2
+/// folder's four interleaved streams refilled a whole buffer on each small
+/// read. This keeps a few recently read windows of the file and makes a seek
+/// only a change of position: each stream reads out of its own window, and a
+/// read the size of a window or more goes to the file directly.
+pub(crate) struct UpstreamInput {
+    file: File,
+    len: u64,
+    pos: u64,
+    /// Least recently used first.
+    windows: Vec<Window>,
+}
+
+struct Window {
+    start: u64,
+    data: Vec<u8>,
+}
+
+impl UpstreamInput {
+    pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len();
+        Ok(Self {
+            file,
+            len,
+            pos: 0,
+            windows: Vec::with_capacity(UPSTREAM_WINDOWS),
+        })
+    }
+
+    /// The window holding `pos`, read in if no window does, moved to the
+    /// most recently used end.
+    fn window(&mut self) -> std::io::Result<&Window> {
+        let pos = self.pos;
+        let hit = self
+            .windows
+            .iter()
+            .rposition(|w| pos >= w.start && pos - w.start < w.data.len() as u64);
+        match hit {
+            Some(i) if i + 1 == self.windows.len() => {}
+            Some(i) => {
+                let window = self.windows.remove(i);
+                self.windows.push(window);
+            }
+            None => {
+                let mut data = if self.windows.len() == UPSTREAM_WINDOWS {
+                    self.windows.remove(0).data
+                } else {
+                    Vec::new()
+                };
+                data.resize(UPSTREAM_WINDOW, 0);
+                self.file.seek(SeekFrom::Start(pos))?;
+                let mut filled = 0;
+                while filled < data.len() {
+                    match self.file.read(&mut data[filled..])? {
+                        0 => break,
+                        n => filled += n,
+                    }
+                }
+                data.truncate(filled);
+                self.windows.push(Window { start: pos, data });
+            }
+        }
+        Ok(self.windows.last().expect("a window was just placed"))
+    }
+}
+
+impl Read for UpstreamInput {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.pos >= self.len {
+            return Ok(0);
+        }
+        let pos = self.pos;
+        let cached = self
+            .windows
+            .iter()
+            .any(|w| pos >= w.start && pos - w.start < w.data.len() as u64);
+        if !cached && buf.len() >= UPSTREAM_WINDOW {
+            self.file.seek(SeekFrom::Start(pos))?;
+            let n = self.file.read(buf)?;
+            self.pos += n as u64;
+            return Ok(n);
+        }
+        let window = self.window()?;
+        let at = (pos - window.start) as usize;
+        let n = buf.len().min(window.data.len() - at);
+        buf[..n].copy_from_slice(&window.data[at..at + n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for UpstreamInput {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let target = match to {
+            SeekFrom::Start(n) => Some(n),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+            SeekFrom::End(d) => self.len.checked_add_signed(d),
+        };
+        self.pos = target.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek before the start")
+        })?;
+        Ok(self.pos)
+    }
+}
 
 const USAGE: &str = "usage: decode-bench op version|list|decode|encode [options]";
 
@@ -789,15 +901,11 @@ fn check_reported_crcs(
 }
 
 /// The same decode through upstream `sevenz-rust2`, the secondary reference,
-/// with the archive behind a 1 MiB `BufReader`: the way to feed it, since its
-/// LZMA range decoder takes one byte per read from its input and the bare
-/// `File` its own `ArchiveReader::open` uses makes that a system call a byte.
+/// with the archive read through [`UpstreamInput`] rather than the bare
+/// `File` its own `ArchiveReader::open` uses.
 fn decode_upstream(opts: &Opts) -> Result<Fields, String> {
     let path = archive_path(opts);
-    let file = std::io::BufReader::with_capacity(
-        UPSTREAM_READ_BUFFER,
-        File::open(path).map_err(|e| e.to_string())?,
-    );
+    let file = UpstreamInput::open(path).map_err(|e| e.to_string())?;
     let password = opts
         .password
         .as_deref()
@@ -1208,9 +1316,11 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
+    use std::io::{Read, Seek, SeekFrom};
+
     use super::{
-        Opts, check_reported_crcs, encode, locked_packages, locked_ppmd_crates, locked_version,
-        source_members,
+        Opts, UPSTREAM_WINDOW, UPSTREAM_WINDOWS, UpstreamInput, check_reported_crcs, encode,
+        locked_packages, locked_ppmd_crates, locked_version, source_members,
     };
 
     /// The PPMd record comes from the embedded lock, by prefix: whatever
@@ -1453,5 +1563,45 @@ mod tests {
         );
         // Without verification the hook is not held to anything.
         assert!(check_reported_crcs(&expected, &[], false).is_ok());
+    }
+
+    /// Interleaved cursors, more of them than there are windows, each
+    /// seeking to its own place before every read as sevenz-rust2's shared
+    /// pack-stream reader does, read the file's bytes; so do reads larger
+    /// than a window, reads across a window's end, and the relative seeks.
+    #[test]
+    fn the_upstream_input_reads_the_file_through_interleaved_seeks() {
+        let scratch = Scratch::new("upstream-input");
+        let path = scratch.0.join("archive.bin");
+        let len = UPSTREAM_WINDOW * (UPSTREAM_WINDOWS + 4) + 123;
+        let bytes: Vec<u8> = (0..len).map(|i| (i * 31 + i / 997) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut input = UpstreamInput::open(&path).unwrap();
+
+        let cursors = UPSTREAM_WINDOWS + 2;
+        let stride = len / cursors;
+        let mut at: Vec<usize> = (0..cursors).map(|c| c * stride).collect();
+        let mut buf = vec![0u8; UPSTREAM_WINDOW * 2];
+        for round in 0..400 {
+            for (c, pos) in at.iter_mut().enumerate() {
+                let want = [1, 7, 4096, UPSTREAM_WINDOW + 5][(round + c) % 4];
+                input.seek(SeekFrom::Start(*pos as u64)).unwrap();
+                let n = input.read(&mut buf[..want]).unwrap();
+                assert_eq!(&buf[..n], &bytes[*pos..*pos + n], "cursor {c} at {pos}");
+                assert_eq!(n == 0, *pos == len, "cursor {c} at {pos}");
+                *pos += n;
+            }
+        }
+
+        assert_eq!(input.seek(SeekFrom::End(-3)).unwrap(), len as u64 - 3);
+        let mut tail = Vec::new();
+        input.read_to_end(&mut tail).unwrap();
+        assert_eq!(tail, &bytes[len - 3..]);
+        input.seek(SeekFrom::Start(10)).unwrap();
+        assert_eq!(input.seek(SeekFrom::Current(-4)).unwrap(), 6);
+        let mut all = Vec::new();
+        input.read_to_end(&mut all).unwrap();
+        assert_eq!(all, &bytes[6..]);
+        assert!(input.seek(SeekFrom::Current(-(len as i64) - 1)).is_err());
     }
 }
