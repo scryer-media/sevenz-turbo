@@ -70,7 +70,7 @@ func TestChartsAverageHostsAndGroupByThreads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"7-Zip 26.04 is the 1x line", ">4.00x<", ">2.00x*<", ">0.50x<", "CPU time, 7-Zip ÷ tool", "peak RSS, tool ÷ 7-Zip", "better →", "essentially unimplemented"} {
+	for _, want := range []string{"7-Zip 26.04 is the 1x line", ">4.00x<", ">2.00x*<", ">0.50x<", "CPU time, 7-Zip ÷ tool", "peak RSS, tool ÷ 7-Zip", "better →", "essentially unimplemented", "decode-ledger rows count only in the All decode bar"} {
 		if !strings.Contains(string(svg), want) {
 			t.Errorf("decode chart lacks %q", want)
 		}

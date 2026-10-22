@@ -361,6 +361,15 @@ func chartHeadline(scenario suite.Scenario, op string) bool {
 	return scenario.Op == suite.OpDecode
 }
 
+// chartLeftOut is the chart description's account of the rows it leaves
+// out, which matches chartHeadline and chartExcluded.
+func chartLeftOut(op string) string {
+	if op == suite.OpDecode {
+		return "Memory-budget and adaptive rows are left out; decode-ledger rows count only in the All decode bar."
+	}
+	return "Memory-budget and adaptive rows are left out."
+}
+
 // chartOverall is op's headline group.
 func chartOverall(op string) string {
 	return "All " + op
@@ -395,8 +404,8 @@ func renderChart(inputs []ChartInput, op string, bars []chartBar) []byte {
 	upstream := toolLabel(first, suite.VariantUpstream)
 	title := fmt.Sprintf("sevenz-turbo %s vs %s", op, oracle)
 	subtitle := fmt.Sprintf("Geometric mean over %s, weighted equally. %s is the 1x line.", strings.Join(hostNames, " and "), oracle)
-	description := fmt.Sprintf("%s %s wall time, CPU time and peak memory against %s, grouped by kind of work and thread count. Each thick bar is %s's median wall time over the tool's, and the two thinner bars under it the same for CPU time and peak RSS (labelled as 7-Zip's CPU time over the tool's, and as the tool's peak RSS over 7-Zip's), as a geometric mean of the group's scenarios on each host and then across %d hosts (%s), on a symmetric log scale: right of the line the tool is better. Memory-budget, adaptive and decode-ledger rows are left out.",
-		turbo, op, oracle, oracle, len(inputs), strings.Join(hostNames, ", "))
+	description := fmt.Sprintf("%s %s wall time, CPU time and peak memory against %s, grouped by kind of work and thread count. Each thick bar is %s's median wall time over the tool's, and the two thinner bars under it the same for CPU time and peak RSS (labelled as 7-Zip's CPU time over the tool's, and as the tool's peak RSS over 7-Zip's), as a geometric mean of the group's scenarios on each host and then across %d hosts (%s), on a symmetric log scale: right of the line the tool is better. %s",
+		turbo, op, oracle, oracle, len(inputs), strings.Join(hostNames, ", "), chartLeftOut(op))
 	hasUpstream, asterisk := false, false
 	height := chartTop + 48
 	for _, bar := range bars {

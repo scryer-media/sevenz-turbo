@@ -538,6 +538,7 @@ func cmdChart(args []string) int {
 		return exitUsage
 	}
 	var inputs []report.ChartInput
+	var reports []*report.Report
 	for _, arg := range set.Args() {
 		name, path, named := strings.Cut(arg, "=")
 		if !named {
@@ -548,10 +549,16 @@ func cmdChart(args []string) int {
 			return fail(prerequisite{err})
 		}
 		inputs = append(inputs, report.ChartInput{Name: name, Report: loaded})
+		reports = append(reports, loaded)
+	}
+	// Reports that cannot be charted together are a missing input; anything
+	// RenderCharts fails on after that is writing the charts.
+	if err := report.Comparable(reports); err != nil {
+		return fail(prerequisite{err})
 	}
 	paths, skipped, err := report.RenderCharts(inputs, *out)
 	if err != nil {
-		return fail(prerequisite{err})
+		return fail(err)
 	}
 	if len(skipped) != 0 {
 		fmt.Printf("left out %d scenario(s) not run on every host: %s\n", len(skipped), strings.Join(skipped, ", "))
