@@ -1103,6 +1103,8 @@ fn encode(opts: &Opts) -> Result<Fields, String> {
     } else {
         // The crate's `push_source_path` rule: a block closes before it would
         // reach 4 GiB, and a member that size or larger is a block of its own.
+        // The block before such a member is closed first, so the archive
+        // keeps member order, which `push_source_path` itself does not.
         let mut entries = Vec::new();
         let mut sources = Vec::new();
         let mut block_bytes = 0u64;
@@ -1113,6 +1115,15 @@ fn encode(opts: &Opts) -> Result<Fields, String> {
                 done: false,
             };
             if member.size >= MAX_SOLID_BLOCK {
+                if !entries.is_empty() {
+                    writer
+                        .push_archive_entries_send(
+                            std::mem::take(&mut entries),
+                            std::mem::take(&mut sources),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    block_bytes = 0;
+                }
                 writer
                     .push_archive_entry_send(entry(member), Some(lazy()))
                     .map_err(|e| e.to_string())?;
@@ -1171,7 +1182,7 @@ fn encode(opts: &Opts) -> Result<Fields, String> {
 fn encode_upstream(opts: &Opts) -> Result<Fields, String> {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, mpsc};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
 
     use sevenz_rust2::encoder_options::{AesEncoderOptions, Lzma2Options};
 
@@ -1219,16 +1230,27 @@ fn encode_upstream(opts: &Opts) -> Result<Fields, String> {
     if opts.non_solid && threads > 1 {
         let methods = Arc::new(methods);
         let next = AtomicUsize::new(0);
-        let (tx, rx) = mpsc::sync_channel(threads as usize * 2);
+        // A worker starts a member only within `window` of the next one to be
+        // written, so a slow early member holds at most that many finished
+        // blocks in memory behind it, not the rest of the archive.
+        let window = threads as usize * 2;
+        let written = (Mutex::new(0usize), Condvar::new());
+        let (tx, rx) = mpsc::sync_channel(window);
         std::thread::scope(|scope| -> Result<(), String> {
             for _ in 0..threads.min(members.len().max(1) as u32) {
-                let (tx, methods, next, members) = (tx.clone(), &methods, &next, &members);
+                let (tx, methods, next, members, written) =
+                    (tx.clone(), &methods, &next, &members, &written);
                 scope.spawn(move || {
                     loop {
                         let index = next.fetch_add(1, Ordering::Relaxed);
                         let Some(member) = members.get(index) else {
                             break;
                         };
+                        let mut done = written.0.lock().unwrap();
+                        while index >= done.saturating_add(window) {
+                            done = written.1.wait(done).unwrap();
+                        }
+                        drop(done);
                         let block = sevenz_rust2::prepare_block(
                             Arc::clone(methods),
                             vec![entry(member)],
@@ -1245,16 +1267,27 @@ fn encode_upstream(opts: &Opts) -> Result<Fields, String> {
             // Blocks come back in any order and go out in member order.
             let mut pending = BTreeMap::new();
             let mut wanted = 0;
-            for (index, block) in rx {
-                pending.insert(index, block?);
-                while let Some(block) = pending.remove(&wanted) {
-                    writer
-                        .push_prepared_block(block)
-                        .map_err(|e| e.to_string())?;
-                    wanted += 1;
+            let result = (|| {
+                for (index, block) in rx {
+                    pending.insert(index, block?);
+                    while let Some(block) = pending.remove(&wanted) {
+                        writer
+                            .push_prepared_block(block)
+                            .map_err(|e| e.to_string())?;
+                        wanted += 1;
+                        *written.0.lock().unwrap() = wanted;
+                        written.1.notify_all();
+                    }
                 }
+                Ok(())
+            })();
+            // On a failure the workers waiting on the window are let go; the
+            // receiver is gone, so each stops at its next send.
+            if result.is_err() {
+                *written.0.lock().unwrap() = usize::MAX;
+                written.1.notify_all();
             }
-            Ok(())
+            result
         })?;
     } else if opts.non_solid {
         for member in &members {
@@ -1269,6 +1302,15 @@ fn encode_upstream(opts: &Opts) -> Result<Fields, String> {
         let mut block_bytes = 0u64;
         for member in &members {
             if member.size >= MAX_SOLID_BLOCK {
+                if !entries.is_empty() {
+                    writer
+                        .push_archive_entries(
+                            std::mem::take(&mut entries),
+                            std::mem::take(&mut sources),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    block_bytes = 0;
+                }
                 writer
                     .push_archive_entry(entry(member), Some(lazy(member)))
                     .map_err(|e| e.to_string())?;

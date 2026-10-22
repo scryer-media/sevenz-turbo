@@ -113,3 +113,43 @@ func TestChartsLeaveOutScenariosAHostDidNotRun(t *testing.T) {
 		}
 	}
 }
+
+// A tool that failed a different scenario on each host has as many ratios on
+// each, but not of the same workloads, so it gets no bar there.
+func TestChartsDropASeriesMeasuredOnDifferentScenarios(t *testing.T) {
+	fail := func(r *Report, scenario string) *Report {
+		for i := range r.Rows {
+			if r.Rows[i].Scenario == scenario && r.Rows[i].Variant == suite.VariantUpstream {
+				r.Rows[i].OK = 0
+			}
+		}
+		return r
+	}
+	inputs := []ChartInput{{Report: fail(chartReport("x", 2), "decode/mt/T1")}, {Report: fail(chartReport("y", 2), "decode/mt/T4")}}
+	bars := chartBars(inputs, all(inputs), suite.OpDecode)
+	if bars[0].category != "All decode" {
+		t.Fatalf("first group %q, want the headline", bars[0].category)
+	}
+	for _, series := range bars[0].series {
+		if series.tool == suite.VariantUpstream {
+			t.Fatalf("sevenz-rust2 has a headline bar %+v over different scenarios on each host", series)
+		}
+	}
+}
+
+// Charting into a directory that holds an earlier run's encode chart, from
+// reports with no encode rows, removes it rather than leave it beside the
+// new decode chart.
+func TestChartsRemoveAStaleChart(t *testing.T) {
+	out := t.TempDir()
+	stale := filepath.Join(out, "sevenz-turbo-encode.svg")
+	if err := os.WriteFile(stale, []byte("<svg/>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := RenderCharts([]ChartInput{{Report: chartReport("x", 2)}}, out); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatal("an encode chart from other inputs was left in place")
+	}
+}

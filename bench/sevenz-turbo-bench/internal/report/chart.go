@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -151,10 +152,14 @@ func RenderCharts(inputs []ChartInput, out string) (paths, skipped []string, err
 	}
 	for _, op := range []string{suite.OpDecode, suite.OpEncode} {
 		bars := chartBars(inputs, common, op)
+		path := filepath.Join(out, "sevenz-turbo-"+op+".svg")
 		if len(bars) == 0 {
+			// An earlier run's chart for op is not of these inputs.
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return paths, skipped, err
+			}
 			continue
 		}
-		path := filepath.Join(out, "sevenz-turbo-"+op+".svg")
 		if err := os.WriteFile(path, renderChart(inputs, op, bars), 0o644); err != nil {
 			return paths, skipped, err
 		}
@@ -201,10 +206,11 @@ func chartInputName(input ChartInput) string {
 // first, with a bar per tool that has a measured ratio on every host.
 func chartBars(inputs []ChartInput, common map[string]bool, op string) []chartBar {
 	type key struct{ category, tool string }
-	// logs[key][host] are the log ratios of that host's scenarios, and
-	// cpuLogs and rssLogs the CPU-time and peak-RSS ones of the same
-	// scenarios.
+	// logs[key][host] are the log ratios of that host's scenarios, ids[key][host]
+	// those scenarios, and cpuLogs and rssLogs the CPU-time and peak-RSS
+	// ratios of the same scenarios.
 	logs := map[key][][]float64{}
+	ids := map[key][][]string{}
 	cpuLogs := map[key][][]float64{}
 	rssLogs := map[key][][]float64{}
 	multiThread := map[key]bool{}
@@ -257,10 +263,12 @@ func chartBars(inputs []ChartInput, common map[string]bool, op string) []chartBa
 					k := key{name, tool}
 					if logs[k] == nil {
 						logs[k] = make([][]float64, len(inputs))
+						ids[k] = make([][]string, len(inputs))
 						cpuLogs[k] = make([][]float64, len(inputs))
 						rssLogs[k] = make([][]float64, len(inputs))
 					}
 					logs[k][h] = append(logs[k][h], math.Log(*ratio))
+					ids[k][h] = append(ids[k][h], scenario.ID)
 					cpuLogs[k][h] = append(cpuLogs[k][h], math.Log(*cpu))
 					rssLogs[k][h] = append(rssLogs[k][h], math.Log(*rss))
 					multiThread[k] = multiThread[k] || scenario.Threads != "1"
@@ -279,7 +287,7 @@ func chartBars(inputs []ChartInput, common map[string]bool, op string) []chartBa
 			}
 			series := chartSeries{tool: tool, scenarios: len(perHost[0]), multiThread: multiThread[key{category, tool}]}
 			var complete bool
-			if series.mean, complete = hostMeans(perHost, series.scenarios); !complete {
+			if series.mean, complete = hostMeans(perHost, series.scenarios); !complete || !sameScenarios(ids[key{category, tool}]) {
 				continue
 			}
 			series.cpuMean, _ = hostMeans(cpuLogs[key{category, tool}], series.scenarios)
@@ -313,6 +321,22 @@ func hostMeans(perHost [][]float64, n int) (float64, bool) {
 		total += sum / float64(n)
 	}
 	return math.Exp(total / float64(len(perHost))), len(perHost) != 0
+}
+
+// sameScenarios reports whether every host measured the same scenarios: a
+// tool that failed a different one on each host has as many ratios on each
+// but not a ratio of the same workloads.
+func sameScenarios(perHost [][]string) bool {
+	if len(perHost) == 0 {
+		return false
+	}
+	first := slices.Sorted(slices.Values(perHost[0]))
+	for _, ids := range perHost[1:] {
+		if !slices.Equal(first, slices.Sorted(slices.Values(ids))) {
+			return false
+		}
+	}
+	return true
 }
 
 func turboMean(bar chartBar) float64 {

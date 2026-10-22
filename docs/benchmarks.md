@@ -20,9 +20,11 @@ the right is faster than 7-Zip and one to the left slower. The two thin bars
 under it are CPU time and peak RSS on the same scale, right of the line again
 better (the RSS figure is labelled the tool's peak over 7-Zip's, so 0.5x
 there is half 7-Zip's memory). `All decode` and `All encode` are the summary
-rows below, averaged over the two hosts. The
-memory-budget, adaptive and decode-ledger rows are left off. The harness
-draws them with `sevenz-turbo-bench chart`.
+rows below, averaged over the two hosts, so the decode-ledger rows count in
+`All decode` as they do in the summary; the groups under it leave them out,
+since they repeat LZMA2 decodes already there. The memory-budget and adaptive
+rows are left off every bar. The harness draws them with
+`sevenz-turbo-bench chart`.
 
 Every ratio is **reference / sevenz-turbo**, so above 1.000 means
 sevenz-turbo took less wall time, less CPU time or less peak memory than the
