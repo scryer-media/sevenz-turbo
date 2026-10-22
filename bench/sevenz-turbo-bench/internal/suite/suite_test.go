@@ -67,6 +67,24 @@ func TestPlanCoversTheMatrix(t *testing.T) {
 			if !candidate || !reference {
 				t.Errorf("%s: candidate=%t reference=%t", scenario.ID, candidate, reference)
 			}
+			// Upstream writes every encode but BCJ2, to an archive of its own.
+			if scenario.Op == OpEncode {
+				var upstream *Run
+				for i := range scenario.Variants {
+					if scenario.Variants[i].Variant == VariantUpstream {
+						upstream = &scenario.Variants[i]
+					}
+				}
+				bcj2 := strings.HasPrefix(scenario.ID, "encode/bcj2/")
+				switch {
+				case bcj2 && upstream != nil:
+					t.Errorf("%s: sevenz-rust2 has no BCJ2 encoder but is planned", scenario.ID)
+				case !bcj2 && upstream == nil:
+					t.Errorf("%s: no sevenz-rust2 encode", scenario.ID)
+				case upstream != nil && (!slices.Contains(upstream.Args, "upstream") || upstream.Output == scenario.Variants[0].Output || upstream.Role != RoleSecondary):
+					t.Errorf("%s: sevenz-rust2 run %+v", scenario.ID, *upstream)
+				}
+			}
 		}
 		for _, group := range Groups {
 			want := !quick || !FullOnlyGroups[group]

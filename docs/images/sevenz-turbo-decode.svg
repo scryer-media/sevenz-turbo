@@ -1,0 +1,210 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="1008" viewBox="0 0 960 1008" role="img" aria-labelledby="title desc">
+  <title id="title">sevenz-turbo decode vs 7-Zip 26.04</title>
+  <desc id="desc">sevenz-turbo 0.29.2 decode wall time, CPU time and peak memory against 7-Zip 26.04, grouped by kind of work and thread count. Each thick bar is 7-Zip 26.04&apos;s median wall time over the tool&apos;s, and the two thinner bars under it the same for CPU time and peak RSS (labelled as 7-Zip&apos;s CPU time over the tool&apos;s, and as the tool&apos;s peak RSS over 7-Zip&apos;s), as a geometric mean of the group&apos;s scenarios on each host and then across 2 hosts (Graviton4, Sapphire Rapids), on a symmetric log scale: right of the line the tool is better. Memory-budget and adaptive rows are left out; decode-ledger rows count only in the All decode bar.</desc>
+  <style>
+    .bg { fill: #ffffff; } text { font-family: Arial, sans-serif; fill: #172033; }
+    .title { font-size: 22px; font-weight: 600; } .subtitle, .legend, .note { font-size: 12px; fill: #667085; }
+    .group { font-size: 13px; } .headline { font-weight: 600; }
+    .tick { font-size: 11px; fill: #667085; } .value { font-size: 11px; font-weight: 600; } .cpu-value, .rss-value { font-size: 9px; font-weight: 500; } .cpu-value { fill: #0f766e; } .rss-value { fill: #7c3aed; }
+    .grid { stroke: #e7eaf0; stroke-width: 1; } .parity { stroke: #172033; stroke-width: 1.5; } .rule { stroke: #f0f2f5; stroke-width: 1; }
+    .turbo { fill: #2563eb; } .upstream { fill: #d97706; } .turbo-rss { fill: #7c3aed; } .upstream-rss { fill: #c4b5fd; } .turbo-cpu { fill: #0d9488; } .upstream-cpu { fill: #99f6e4; } .inbar { fill: #ffffff; }
+    @media (prefers-color-scheme: dark) { .bg { fill: #0d1117; } text { fill: #e6edf3; } .subtitle, .legend, .note, .tick { fill: #9ca7b5; } .cpu-value { fill: #5eead4; } .rss-value { fill: #bc8cff; } .grid { stroke: #21262d; } .parity { stroke: #e6edf3; } .rule { stroke: #161b22; } .turbo { fill: #58a6ff; } .upstream { fill: #f2a65a; } .turbo-rss { fill: #bc8cff; } .upstream-rss { fill: #6e5a9e; } .turbo-cpu { fill: #2dd4bf; } .upstream-cpu { fill: #1f6f66; } .inbar { fill: #0d1117; } }
+  </style>
+  <metadata>schema=sevenz-turbo-bench/report/1; op=decode; reference=7-Zip 26.04; inputs=Graviton4:linux-aarch64-graviton4:0cb336d95db4db3b5386f1e271e5978de47bf08cb0d1c0e73167f77242e7fc67:1/3, Sapphire Rapids:linux-x86_64-spr:07751507e646e06f1f463d078847a35e7f9350ae38553fb00c74a621c44d8184:1/3</metadata>
+  <rect class="bg" width="960" height="1008"/>
+  <text class="title" x="32" y="38">sevenz-turbo decode vs 7-Zip 26.04</text>
+  <text class="subtitle" x="32" y="60">Geometric mean over Graviton4 and Sapphire Rapids, weighted equally. 7-Zip 26.04 is the 1x line.</text>
+  <g aria-label="Legend"><rect class="turbo" x="32" y="71" width="14" height="10" rx="1"/><text class="legend" x="52" y="80">sevenz-turbo 0.29.2</text><rect class="upstream" x="199" y="71" width="14" height="10" rx="1"/><text class="legend" x="219" y="80">sevenz-rust2 0.22.2</text><rect class="turbo-cpu" x="366" y="73" width="14" height="6" rx="1"/><text class="legend" x="386" y="80">CPU time, 7-Zip ÷ tool</text><rect class="turbo-rss" x="553" y="74" width="14" height="4" rx="1"/><text class="legend" x="573" y="80">peak RSS, tool ÷ 7-Zip</text></g>
+  <g aria-label="Axis">
+    <line class="grid" x1="300.0" y1="86" x2="300.0" y2="956"/><text class="tick" x="300.0" y="970" text-anchor="middle">8x</text>
+    <line class="grid" x1="403.3" y1="86" x2="403.3" y2="956"/><text class="tick" x="403.3" y="970" text-anchor="middle">4x</text>
+    <line class="grid" x1="506.7" y1="86" x2="506.7" y2="956"/><text class="tick" x="506.7" y="970" text-anchor="middle">2x</text>
+    <line class="parity" x1="610.0" y1="86" x2="610.0" y2="956"/><text class="tick" x="610.0" y="970" text-anchor="middle">1x</text>
+    <line class="grid" x1="713.3" y1="86" x2="713.3" y2="956"/><text class="tick" x="713.3" y="970" text-anchor="middle">2x</text>
+    <line class="grid" x1="816.7" y1="86" x2="816.7" y2="956"/><text class="tick" x="816.7" y="970" text-anchor="middle">4x</text>
+    <line class="grid" x1="920.0" y1="86" x2="920.0" y2="956"/><text class="tick" x="920.0" y="970" text-anchor="middle">8x</text>
+    <text class="tick" x="455.0" y="984" text-anchor="middle">← worse</text><text class="tick" x="765.0" y="984" text-anchor="middle">better →</text>
+  </g>
+  <g aria-label="Groups">
+    <text class="group headline" x="32" y="124">All decode</text>
+    <rect class="turbo" x="610.0" y="95" width="28.5" height="10" rx="1"/>
+    <text class="value" x="643.5" y="104">1.21x</text>
+    <rect class="turbo-cpu" x="610.0" y="107" width="9.9" height="5" rx="1"/>
+    <text class="value cpu-value" x="624.9" y="113">1.07x</text>
+    <rect class="turbo-rss" x="608.6" y="114" width="1.4" height="4" rx="1"/>
+    <text class="value rss-value" x="603.6" y="120" text-anchor="end">1.01x</text>
+    <rect class="upstream" x="562.1" y="123" width="47.9" height="10" rx="1"/>
+    <text class="value" x="557.1" y="132" text-anchor="end">1.38x*</text>
+    <rect class="upstream-cpu" x="569.8" y="135" width="40.2" height="5" rx="1"/>
+    <text class="value cpu-value" x="564.8" y="141" text-anchor="end">0.76x</text>
+    <rect class="upstream-rss" x="586.8" y="142" width="23.2" height="4" rx="1"/>
+    <text class="value rss-value" x="581.8" y="148" text-anchor="end">1.17x</text>
+    <line class="rule" x1="32" y1="153" x2="920" y2="153"/>
+    <text class="group" x="32" y="176">Non-solid trees, multi-thread</text>
+    <rect class="turbo" x="610.0" y="161" width="310.0" height="10" rx="1"/>
+    <text class="value inbar" x="916.0" y="170" text-anchor="end">13x</text>
+    <rect class="turbo-cpu" x="590.6" y="173" width="19.4" height="5" rx="1"/>
+    <text class="value cpu-value" x="585.6" y="179" text-anchor="end">0.88x</text>
+    <rect class="turbo-rss" x="510.2" y="180" width="99.8" height="4" rx="1"/>
+    <text class="value rss-value" x="505.2" y="186" text-anchor="end">1.95x</text>
+    <line class="rule" x1="32" y1="191" x2="920" y2="191"/>
+    <text class="group" x="32" y="228">Stored, 1 thread</text>
+    <rect class="turbo" x="610.0" y="199" width="102.5" height="10" rx="1"/>
+    <text class="value" x="717.5" y="208">1.99x</text>
+    <rect class="turbo-cpu" x="610.0" y="211" width="102.7" height="5" rx="1"/>
+    <text class="value cpu-value" x="717.7" y="217">1.99x</text>
+    <rect class="turbo-rss" x="610.0" y="218" width="6.8" height="4" rx="1"/>
+    <text class="value rss-value" x="621.8" y="224">0.96x</text>
+    <rect class="upstream" x="610.0" y="227" width="41.5" height="10" rx="1"/>
+    <text class="value" x="656.5" y="236">1.32x</text>
+    <rect class="upstream-cpu" x="610.0" y="239" width="41.7" height="5" rx="1"/>
+    <text class="value cpu-value" x="656.7" y="245">1.32x</text>
+    <rect class="upstream-rss" x="600.3" y="246" width="9.7" height="4" rx="1"/>
+    <text class="value rss-value" x="595.3" y="252" text-anchor="end">1.07x</text>
+    <line class="rule" x1="32" y1="257" x2="920" y2="257"/>
+    <text class="group" x="32" y="280">Stored, multi-thread</text>
+    <rect class="turbo" x="610.0" y="265" width="85.0" height="10" rx="1"/>
+    <text class="value" x="700.0" y="274">1.77x</text>
+    <rect class="turbo-cpu" x="610.0" y="277" width="81.5" height="5" rx="1"/>
+    <text class="value cpu-value" x="696.5" y="283">1.73x</text>
+    <rect class="turbo-rss" x="556.9" y="284" width="53.1" height="4" rx="1"/>
+    <text class="value rss-value" x="551.9" y="290" text-anchor="end">1.43x</text>
+    <line class="rule" x1="32" y1="295" x2="920" y2="295"/>
+    <text class="group" x="32" y="332">AES-256, 1 thread</text>
+    <rect class="turbo" x="610.0" y="303" width="65.8" height="10" rx="1"/>
+    <text class="value" x="680.8" y="312">1.56x</text>
+    <rect class="turbo-cpu" x="610.0" y="315" width="40.1" height="5" rx="1"/>
+    <text class="value cpu-value" x="655.1" y="321">1.31x</text>
+    <rect class="turbo-rss" x="610.0" y="322" width="29.6" height="4" rx="1"/>
+    <text class="value rss-value" x="644.6" y="328">0.82x</text>
+    <rect class="upstream" x="610.0" y="331" width="2.6" height="10" rx="1"/>
+    <text class="value" x="617.6" y="340">1.02x</text>
+    <rect class="upstream-cpu" x="586.8" y="343" width="23.2" height="5" rx="1"/>
+    <text class="value cpu-value" x="581.8" y="349" text-anchor="end">0.86x</text>
+    <rect class="upstream-rss" x="610.0" y="350" width="10.2" height="4" rx="1"/>
+    <text class="value rss-value" x="625.2" y="356">0.93x</text>
+    <line class="rule" x1="32" y1="361" x2="920" y2="361"/>
+    <text class="group" x="32" y="384">AES-256, multi-thread</text>
+    <rect class="turbo" x="610.0" y="369" width="64.3" height="10" rx="1"/>
+    <text class="value" x="679.3" y="378">1.54x</text>
+    <rect class="turbo-cpu" x="610.0" y="381" width="15.0" height="5" rx="1"/>
+    <text class="value cpu-value" x="630.0" y="387">1.11x</text>
+    <rect class="turbo-rss" x="565.8" y="388" width="44.2" height="4" rx="1"/>
+    <text class="value rss-value" x="560.8" y="394" text-anchor="end">1.35x</text>
+    <line class="rule" x1="32" y1="399" x2="920" y2="399"/>
+    <text class="group" x="32" y="436">PPMd, 1 thread</text>
+    <rect class="turbo" x="610.0" y="407" width="38.6" height="10" rx="1"/>
+    <text class="value" x="653.6" y="416">1.30x</text>
+    <rect class="turbo-cpu" x="610.0" y="419" width="38.6" height="5" rx="1"/>
+    <text class="value cpu-value" x="653.6" y="425">1.30x</text>
+    <rect class="turbo-rss" x="610.0" y="426" width="11.0" height="4" rx="1"/>
+    <text class="value rss-value" x="626.0" y="432">0.93x</text>
+    <rect class="upstream" x="610.0" y="435" width="4.4" height="10" rx="1"/>
+    <text class="value" x="619.4" y="444">1.03x</text>
+    <rect class="upstream-cpu" x="610.0" y="447" width="4.4" height="5" rx="1"/>
+    <text class="value cpu-value" x="619.4" y="453">1.03x</text>
+    <rect class="upstream-rss" x="610.0" y="454" width="1.4" height="4" rx="1"/>
+    <text class="value rss-value" x="616.4" y="460">0.99x</text>
+    <line class="rule" x1="32" y1="465" x2="920" y2="465"/>
+    <text class="group" x="32" y="502">Solid trees, 1 thread</text>
+    <rect class="turbo" x="610.0" y="473" width="2.3" height="10" rx="1"/>
+    <text class="value" x="617.3" y="482">1.02x</text>
+    <rect class="turbo-cpu" x="610.0" y="485" width="2.3" height="5" rx="1"/>
+    <text class="value cpu-value" x="617.3" y="491">1.02x</text>
+    <rect class="turbo-rss" x="610.0" y="492" width="3.4" height="4" rx="1"/>
+    <text class="value rss-value" x="618.4" y="498">0.98x</text>
+    <rect class="upstream" x="561.0" y="501" width="49.0" height="10" rx="1"/>
+    <text class="value" x="556.0" y="510" text-anchor="end">1.39x</text>
+    <rect class="upstream-cpu" x="561.0" y="513" width="49.0" height="5" rx="1"/>
+    <text class="value cpu-value" x="556.0" y="519" text-anchor="end">0.72x</text>
+    <rect class="upstream-rss" x="602.5" y="520" width="7.5" height="4" rx="1"/>
+    <text class="value rss-value" x="597.5" y="526" text-anchor="end">1.05x</text>
+    <line class="rule" x1="32" y1="531" x2="920" y2="531"/>
+    <text class="group" x="32" y="568">Non-solid trees, 1 thread</text>
+    <rect class="turbo" x="610.0" y="539" width="1.2" height="10" rx="1"/>
+    <text class="value" x="616.2" y="548">1.01x</text>
+    <rect class="turbo-cpu" x="610.0" y="551" width="1.2" height="5" rx="1"/>
+    <text class="value cpu-value" x="616.2" y="557">1.01x</text>
+    <rect class="turbo-rss" x="605.2" y="558" width="4.8" height="4" rx="1"/>
+    <text class="value rss-value" x="600.2" y="564" text-anchor="end">1.03x</text>
+    <rect class="upstream" x="560.3" y="567" width="49.7" height="10" rx="1"/>
+    <text class="value" x="555.3" y="576" text-anchor="end">1.40x</text>
+    <rect class="upstream-cpu" x="560.3" y="579" width="49.7" height="5" rx="1"/>
+    <text class="value cpu-value" x="555.3" y="585" text-anchor="end">0.72x</text>
+    <rect class="upstream-rss" x="532.0" y="586" width="78.0" height="4" rx="1"/>
+    <text class="value rss-value" x="527.0" y="592" text-anchor="end">1.69x</text>
+    <line class="rule" x1="32" y1="597" x2="920" y2="597"/>
+    <text class="group" x="32" y="634">LZMA2, 1 thread</text>
+    <rect class="turbo" x="610.0" y="605" width="1.0" height="10" rx="1"/>
+    <text class="value" x="616.0" y="614">1.00x</text>
+    <rect class="turbo-cpu" x="610.0" y="617" width="1.0" height="5" rx="1"/>
+    <text class="value cpu-value" x="616.0" y="623">1.00x</text>
+    <rect class="turbo-rss" x="610.0" y="624" width="13.8" height="4" rx="1"/>
+    <text class="value rss-value" x="628.8" y="630">0.91x</text>
+    <rect class="upstream" x="556.4" y="633" width="53.6" height="10" rx="1"/>
+    <text class="value" x="551.4" y="642" text-anchor="end">1.43x</text>
+    <rect class="upstream-cpu" x="556.4" y="645" width="53.6" height="5" rx="1"/>
+    <text class="value cpu-value" x="551.4" y="651" text-anchor="end">0.70x</text>
+    <rect class="upstream-rss" x="607.7" y="652" width="2.3" height="4" rx="1"/>
+    <text class="value rss-value" x="602.7" y="658" text-anchor="end">1.02x</text>
+    <line class="rule" x1="32" y1="663" x2="920" y2="663"/>
+    <text class="group" x="32" y="700">LZMA, 1 thread</text>
+    <rect class="turbo" x="610.0" y="671" width="1.0" height="10" rx="1"/>
+    <text class="value" x="616.0" y="680">1.00x</text>
+    <rect class="turbo-cpu" x="610.0" y="683" width="1.0" height="5" rx="1"/>
+    <text class="value cpu-value" x="616.0" y="689">1.00x</text>
+    <rect class="turbo-rss" x="610.0" y="690" width="6.4" height="4" rx="1"/>
+    <text class="value rss-value" x="621.4" y="696">0.96x</text>
+    <rect class="upstream" x="503.9" y="699" width="106.1" height="10" rx="1"/>
+    <text class="value" x="498.9" y="708" text-anchor="end">2.04x</text>
+    <rect class="upstream-cpu" x="503.9" y="711" width="106.1" height="5" rx="1"/>
+    <text class="value cpu-value" x="498.9" y="717" text-anchor="end">0.49x</text>
+    <rect class="upstream-rss" x="610.0" y="718" width="1.0" height="4" rx="1"/>
+    <text class="value rss-value" x="616.0" y="724">1.00x</text>
+    <line class="rule" x1="32" y1="729" x2="920" y2="729"/>
+    <text class="group" x="32" y="766">BCJ / BCJ2 / delta, 1 thread</text>
+    <rect class="turbo" x="610.0" y="737" width="1.0" height="10" rx="1"/>
+    <text class="value" x="616.0" y="746">1.00x</text>
+    <rect class="turbo-cpu" x="610.0" y="749" width="1.7" height="5" rx="1"/>
+    <text class="value cpu-value" x="616.7" y="755">1.01x</text>
+    <rect class="turbo-rss" x="610.0" y="756" width="9.3" height="4" rx="1"/>
+    <text class="value rss-value" x="624.3" y="762">0.94x</text>
+    <rect class="upstream" x="566.0" y="765" width="44.0" height="10" rx="1"/>
+    <text class="value" x="561.0" y="774" text-anchor="end">1.34x</text>
+    <rect class="upstream-cpu" x="567.1" y="777" width="42.9" height="5" rx="1"/>
+    <text class="value cpu-value" x="562.1" y="783" text-anchor="end">0.75x</text>
+    <rect class="upstream-rss" x="610.0" y="784" width="1.0" height="4" rx="1"/>
+    <text class="value rss-value" x="616.0" y="790">0.99x</text>
+    <line class="rule" x1="32" y1="795" x2="920" y2="795"/>
+    <text class="group" x="32" y="818">Solid trees, multi-thread</text>
+    <rect class="turbo" x="610.0" y="803" width="1.0" height="10" rx="1"/>
+    <text class="value" x="616.0" y="812">1.00x</text>
+    <rect class="turbo-cpu" x="610.0" y="815" width="1.0" height="5" rx="1"/>
+    <text class="value cpu-value" x="616.0" y="821">1.00x</text>
+    <rect class="turbo-rss" x="609.9" y="822" width="1.0" height="4" rx="1"/>
+    <text class="value rss-value" x="604.9" y="828" text-anchor="end">1.00x</text>
+    <line class="rule" x1="32" y1="833" x2="920" y2="833"/>
+    <text class="group" x="32" y="856">Streamed extract, multi-thread</text>
+    <rect class="turbo" x="609.9" y="841" width="1.0" height="10" rx="1"/>
+    <text class="value" x="604.9" y="850" text-anchor="end">1.00x</text>
+    <rect class="turbo-cpu" x="610.0" y="853" width="1.0" height="5" rx="1"/>
+    <text class="value cpu-value" x="616.0" y="859">1.01x</text>
+    <rect class="turbo-rss" x="606.1" y="860" width="3.9" height="4" rx="1"/>
+    <text class="value rss-value" x="601.1" y="866" text-anchor="end">1.03x</text>
+    <line class="rule" x1="32" y1="871" x2="920" y2="871"/>
+    <text class="group" x="32" y="908">LZMA2, multi-thread</text>
+    <rect class="turbo" x="608.3" y="879" width="1.7" height="10" rx="1"/>
+    <text class="value" x="603.3" y="888" text-anchor="end">1.01x</text>
+    <rect class="turbo-cpu" x="610.0" y="891" width="1.0" height="5" rx="1"/>
+    <text class="value cpu-value" x="616.0" y="897">1.00x</text>
+    <rect class="turbo-rss" x="610.0" y="898" width="22.5" height="4" rx="1"/>
+    <text class="value rss-value" x="637.5" y="904">0.86x</text>
+    <rect class="upstream" x="449.8" y="907" width="160.2" height="10" rx="1"/>
+    <text class="value" x="444.8" y="916" text-anchor="end">2.93x*</text>
+    <rect class="upstream-cpu" x="555.1" y="919" width="54.9" height="5" rx="1"/>
+    <text class="value cpu-value" x="550.1" y="925" text-anchor="end">0.69x</text>
+    <rect class="upstream-rss" x="435.5" y="926" width="174.5" height="4" rx="1"/>
+    <text class="value rss-value" x="430.5" y="932" text-anchor="end">3.22x</text>
+  </g>
+  <text class="note" x="32" y="996">* sevenz-rust2&apos;s multi-threaded decode is essentially unimplemented.</text>
+</svg>

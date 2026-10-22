@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func smallTree() SourceSpec {
@@ -46,6 +47,71 @@ func TestATreeIsReusedOnlyWhenItIsExactlyTheRecipe(t *testing.T) {
 	changed.Seed++
 	if problem := sourceProblem(root, changed); problem == "" {
 		t.Fatal("a tree written for another seed was accepted")
+	}
+}
+
+// A source restored without its mtimes, as a pulled fixture image is, is
+// reused as is but gets the fixed mtime back, so archives written from it
+// match ones written from a freshly generated source, and the archives
+// already written from it are written again.
+func TestAReusedSourceGetsTheFixedMtimeBack(t *testing.T) {
+	dir := t.TempDir()
+	source := smallTree()
+	if _, err := ensureSource(dir, source, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	root := SourceDir(dir, source.Name)
+	ours := provenancePath(dir, "ours.7z")
+	theirs := provenancePath(dir, "theirs.7z")
+	for path, from := range map[string]string{ours: source.Name, theirs: "other"} {
+		if err := os.WriteFile(path, []byte(mustJSON(t, provenance{Source: from})), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := ensureSource(dir, source, func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(ours); err != nil {
+		t.Fatal("an archive's provenance was dropped although no mtime changed")
+	}
+	epoch := time.Unix(0, 0)
+	if err := filepath.WalkDir(root, func(path string, _ os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Chtimes(path, epoch, epoch)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	regenerated := false
+	if _, err := ensureSource(dir, source, func(string, ...any) { regenerated = true }); err != nil {
+		t.Fatal(err)
+	}
+	if regenerated {
+		t.Fatal("a source whose content matches its recipe was regenerated")
+	}
+	// An archive written from the source before its mtimes were restored
+	// carries the wrong ones, so it must not be reused; another source's is.
+	if _, err := os.Stat(ours); !os.IsNotExist(err) {
+		t.Error("the provenance of an archive written from the source survived")
+	}
+	if _, err := os.Stat(theirs); err != nil {
+		t.Error("the provenance of an archive written from another source was dropped")
+	}
+	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !info.ModTime().Equal(fixedTime) {
+			t.Errorf("%s: mtime %v, want %v", path, info.ModTime(), fixedTime)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

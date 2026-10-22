@@ -211,7 +211,6 @@ fn encode_path<W: Write + Seek>(
     zip: &mut ArchiveWriter<W>,
     filter: impl Fn(&Path) -> bool,
 ) -> Result<(), Error> {
-    let mut entries = Vec::new();
     let mut paths = Vec::new();
     collect_file_paths(&src, &mut paths, &filter).map_err(|e| {
         Error::io_msg(
@@ -231,23 +230,45 @@ fn encode_path<W: Write + Seek>(
         }
         return Ok(());
     }
+    encode_solid(&src, paths, zip, MAX_BLOCK_SIZE)
+}
+
+/// Writes `paths` as solid blocks that close before they would reach
+/// `max_block` bytes; a file that size or larger is a block of its own, and
+/// the block open before it is written first, so the archive keeps the order
+/// of `paths`.
+fn encode_solid<W: Write + Seek>(
+    src: &impl AsRef<Path>,
+    paths: Vec<PathBuf>,
+    zip: &mut ArchiveWriter<W>,
+    max_block: u64,
+) -> Result<(), Error> {
+    let mut entries = Vec::new();
     let mut files = Vec::new();
     let mut file_size = 0;
     for ele in paths.into_iter() {
         let size = ele.metadata()?.len();
-        let name = extract_file_name(&src, &ele)?;
+        let name = extract_file_name(src, &ele)?;
 
-        if size >= MAX_BLOCK_SIZE {
+        if size >= max_block {
+            if !entries.is_empty() {
+                zip.push_archive_entries_send(
+                    std::mem::take(&mut entries),
+                    std::mem::take(&mut files),
+                )?;
+                file_size = 0;
+            }
             zip.push_archive_entry_send(
                 ArchiveEntry::from_path(ele.as_path(), name),
                 Some(File::open(ele.as_path())?),
             )?;
             continue;
         }
-        if file_size + size >= MAX_BLOCK_SIZE {
-            zip.push_archive_entries_send(entries, files)?;
-            entries = Vec::new();
-            files = Vec::new();
+        if file_size + size >= max_block {
+            zip.push_archive_entries_send(
+                std::mem::take(&mut entries),
+                std::mem::take(&mut files),
+            )?;
             file_size = 0;
         }
         file_size += size;
@@ -277,5 +298,43 @@ fn extract_file_name(src: &impl AsRef<Path>, ele: &PathBuf) -> Result<String, Er
     } else {
         // Directory case: remove path.
         Ok(ele.strip_prefix(src).unwrap().to_string_lossy().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::{ArchiveReader, Password};
+
+    /// A file at the block limit is a block of its own, written after the
+    /// block open before it, so the archive keeps the order it was given.
+    #[test]
+    fn a_block_sized_file_keeps_its_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let sizes = [("a", 10), ("b", 10), ("big", 100), ("c", 10)];
+        let paths: Vec<PathBuf> = sizes
+            .iter()
+            .map(|(name, size)| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, vec![b'x'; *size]).unwrap();
+                path
+            })
+            .collect();
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        encode_solid(&dir.path(), paths, &mut writer, 100).unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+
+        let mut reader = ArchiveReader::new(Cursor::new(bytes), Password::empty()).unwrap();
+        let archive = reader.archive();
+        let names: Vec<&str> = archive.files.iter().map(|f| f.name()).collect();
+        assert_eq!(names, ["a", "b", "big", "c"]);
+        // a and b share a block, big is alone, and c starts the next one.
+        assert_eq!(archive.blocks.len(), 3);
+        for name in ["a", "big", "c"] {
+            let size = sizes.iter().find(|(n, _)| *n == name).unwrap().1;
+            assert_eq!(reader.read_file(name).unwrap(), vec![b'x'; size]);
+        }
     }
 }

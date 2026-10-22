@@ -72,7 +72,7 @@ Variants:
 | `sevenz-turbo no-ledger` | candidate (decode ledger rows with no limit) | the same `decode-bench`, run without `--ledger`: the decode as a consumer runs it, in the same passes as the observed one |
 | `sevenz-turbo unbudgeted` | candidate (every row with a memory limit) | the same `decode-bench` command at the same threads with `--memory-limit` taken off: what the budget costs (see [Memory budget rows](#memory-budget-rows)) |
 | `7zz` | reference (oracle) | the official 7-Zip console binary: `7zz t` (decode), `7zz l -slt` (list), `7zz a` (encode) |
-| `sevenz-rust2` | secondary | upstream `sevenz-rust2 =0.22.2`, already linked by `decode-bench`; decode rows only, informational |
+| `sevenz-rust2` | secondary | upstream `sevenz-rust2 =0.22.2`, already linked by `decode-bench`: decode rows, reading the archive through `decode-bench`'s windowed `UpstreamInput` (its LZMA decoder takes one byte per read, so a bare `File` costs a system call a byte; and it seeks before every read of a pack stream, which empties a `BufReader`, so a BCJ2 folder refilled one on every small read), and every encode row but BCJ2 (it has no BCJ2 encoder) through `op encode --engine upstream`, its output checked with `7zz t` like the candidate's; informational |
 
 The matrix (`T` = threads; the full and fleet sweep is 1, 2, 4, 8, 16 below
 the core count, then `all`; `--quick` runs 1 and `all`):
@@ -293,6 +293,33 @@ $B/sevenz-turbo-bench merge --out cross-arch.md host-*/report.json
 `merge` refuses reports that measured different workloads: a different corpus
 or run profile, source content, archive switches, 7zz release, or candidate
 commit or `Cargo.lock`.
+
+`chart` draws the grouped comparison charts from the same reports, under the
+same check, into one directory:
+
+```sh
+$B/sevenz-turbo-bench chart --out docs/images \
+    "Sapphire Rapids=host-spr/report.json" "Graviton4=host-graviton4/report.json"
+```
+
+It writes `sevenz-turbo-decode.svg` and `sevenz-turbo-encode.svg`. Each row
+is one group of work at one thread or several, against 7-Zip as the 1x line,
+with right of the line better. File trees split into solid and non-solid, and
+extraction streamed through one writer has its own row. A tool's bar is 7zz's median over the tool's (against the
+scenario's parity reference, as in `report.md`): first a geometric mean over
+the group's scenarios on each host, then a geometric mean across hosts, so
+every host weighs the same. Two thinner bars under it are CPU time (teal) and
+peak RSS (purple) over the same scenarios. The wall-time label is the
+multiplier on the better side; the CPU label is the plain ratio, below 1x left
+of the line; the RSS label is the tool's peak over 7-Zip's, below 1x right of
+the line. sevenz-rust2 has a bar wherever it ran, marked with an asterisk on
+the decode chart where that includes multi-threaded decode. Groups are ordered by
+sevenz-turbo's speed, best first, under the headline group, which is the
+benchmarks page's summary. Per-scenario detail stays in `report.md`. The memory-budget,
+adaptive and decode-ledger rows are left out of the groups. A scenario that
+some host did not run is left out of every chart, and the command lists those.
+`NAME=` sets the host's name on the charts; without it, the machine label is
+used.
 
 `report` regenerates `report.json` and `report.md` from a `raw.json`, the same
 protocol rarpar-bench's macro suites use:

@@ -411,6 +411,22 @@ func ensureSource(dir string, source SourceSpec, logf func(string, ...any)) (Sou
 		if err := generateSource(root, source, problem, logf); err != nil {
 			return SourceRecord{SourceSpec: source}, err
 		}
+	} else {
+		// A reused source keeps its content but not always its mtimes (a
+		// corpus restored from a tar image carries none), and 7zz stores
+		// them, so put them back before any archive is written from it.
+		changed, err := fixMtimes(root)
+		if err != nil {
+			return SourceRecord{SourceSpec: source}, err
+		}
+		// The source digest leaves mtimes out, so an archive already
+		// written from this source may carry the wrong ones: drop its
+		// provenance and it is written again.
+		if changed {
+			if err := forgetArchivesOf(dir, source.Name); err != nil {
+				return SourceRecord{SourceSpec: source}, err
+			}
+		}
 	}
 	return measureSource(dir, source)
 }
@@ -452,7 +468,7 @@ func generateSource(root string, source SourceSpec, reason string, logf func(str
 			return err
 		}
 	}
-	if err := fixMtimes(root); err != nil {
+	if _, err := fixMtimes(root); err != nil {
 		return err
 	}
 	if problem := memberProblem(root, source); problem != "" {
@@ -640,11 +656,46 @@ func writeFile(path string, generate func(io.Writer) error) error {
 	return os.Rename(temporary, path)
 }
 
-func fixMtimes(root string) error {
-	return filepath.WalkDir(root, func(path string, _ fs.DirEntry, err error) error {
+// fixMtimes sets every mtime under root to fixedTime and says whether any
+// that 7zz stores was something else: root itself and the marker are not
+// archived, and writing the marker moves both.
+func fixMtimes(root string) (bool, error) {
+	changed := false
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if path != root && entry.Name() != markerName && !info.ModTime().Equal(fixedTime) {
+			changed = true
+		}
 		return os.Chtimes(path, fixedTime, fixedTime)
 	})
+	return changed, err
+}
+
+// forgetArchivesOf removes the provenance record of every archive in dir
+// written from source, so none of them is reused.
+func forgetArchivesOf(dir, source string) error {
+	records, err := filepath.Glob(filepath.Join(dir, "*.provenance.json"))
+	if err != nil {
+		return err
+	}
+	for _, record := range records {
+		data, err := os.ReadFile(record)
+		if err != nil {
+			return err
+		}
+		var have provenance
+		if json.Unmarshal(data, &have) == nil && have.Source != source {
+			continue
+		}
+		if err := os.Remove(record); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }

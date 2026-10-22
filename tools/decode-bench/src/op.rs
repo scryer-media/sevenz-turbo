@@ -16,6 +16,7 @@
 //!                        [--engine turbo|upstream] [--digest] [--ledger]
 //! decode-bench op encode --input DIR --out FILE [--level L] [--threads N]
 //!                        [--non-solid] [--password P] [--filter bcj2]
+//!                        [--engine turbo|upstream]
 //! ```
 //!
 //! A decode counts the bytes it drains and does nothing else with them, as
@@ -34,11 +35,126 @@
 //! error.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use super::{Sink, fork_password};
+
+/// One cached window of the archive an upstream decode reads through.
+const UPSTREAM_WINDOW: usize = 256 << 10;
+/// How many windows [`UpstreamInput`] keeps: more than the four pack streams
+/// of a BCJ2 folder, so each stream keeps its own.
+const UPSTREAM_WINDOWS: usize = 8;
+
+/// The archive as upstream `sevenz-rust2` is given it. Its LZMA range decoder
+/// takes one byte per read, so a bare `File` costs a system call a byte; and
+/// the reader it shares between the pack streams of a folder seeks to its own
+/// position before every read, which empties a `BufReader`, so a BCJ2
+/// folder's four interleaved streams refilled a whole buffer on each small
+/// read. This keeps a few recently read windows of the file and makes a seek
+/// only a change of position: each stream reads out of its own window, and a
+/// read the size of a window or more goes to the file directly.
+pub(crate) struct UpstreamInput {
+    file: File,
+    len: u64,
+    pos: u64,
+    /// Least recently used first.
+    windows: Vec<Window>,
+}
+
+struct Window {
+    start: u64,
+    data: Vec<u8>,
+}
+
+impl UpstreamInput {
+    pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        let len = file.metadata()?.len();
+        Ok(Self {
+            file,
+            len,
+            pos: 0,
+            windows: Vec::with_capacity(UPSTREAM_WINDOWS),
+        })
+    }
+
+    /// The window holding `pos`, read in if no window does, moved to the
+    /// most recently used end.
+    fn window(&mut self) -> std::io::Result<&Window> {
+        let pos = self.pos;
+        let hit = self
+            .windows
+            .iter()
+            .rposition(|w| pos >= w.start && pos - w.start < w.data.len() as u64);
+        match hit {
+            Some(i) if i + 1 == self.windows.len() => {}
+            Some(i) => {
+                let window = self.windows.remove(i);
+                self.windows.push(window);
+            }
+            None => {
+                let mut data = if self.windows.len() == UPSTREAM_WINDOWS {
+                    self.windows.remove(0).data
+                } else {
+                    Vec::new()
+                };
+                data.resize(UPSTREAM_WINDOW, 0);
+                self.file.seek(SeekFrom::Start(pos))?;
+                let mut filled = 0;
+                while filled < data.len() {
+                    match self.file.read(&mut data[filled..])? {
+                        0 => break,
+                        n => filled += n,
+                    }
+                }
+                data.truncate(filled);
+                self.windows.push(Window { start: pos, data });
+            }
+        }
+        Ok(self.windows.last().expect("a window was just placed"))
+    }
+}
+
+impl Read for UpstreamInput {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() || self.pos >= self.len {
+            return Ok(0);
+        }
+        let pos = self.pos;
+        let cached = self
+            .windows
+            .iter()
+            .any(|w| pos >= w.start && pos - w.start < w.data.len() as u64);
+        if !cached && buf.len() >= UPSTREAM_WINDOW {
+            self.file.seek(SeekFrom::Start(pos))?;
+            let n = self.file.read(buf)?;
+            self.pos += n as u64;
+            return Ok(n);
+        }
+        let window = self.window()?;
+        let at = (pos - window.start) as usize;
+        let n = buf.len().min(window.data.len() - at);
+        buf[..n].copy_from_slice(&window.data[at..at + n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for UpstreamInput {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let target = match to {
+            SeekFrom::Start(n) => Some(n),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+            SeekFrom::End(d) => self.len.checked_add_signed(d),
+        };
+        self.pos = target.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "seek before the start")
+        })?;
+        Ok(self.pos)
+    }
+}
 
 const USAGE: &str = "usage: decode-bench op version|list|decode|encode [options]";
 
@@ -78,7 +194,11 @@ pub fn main(args: Vec<String>) -> ! {
             "upstream" => decode_upstream(&opts),
             other => usage(&format!("unknown engine {other}")),
         },
-        "encode" => encode(&opts),
+        "encode" => match opts.engine.as_str() {
+            "" | "turbo" => encode(&opts),
+            "upstream" => encode_upstream(&opts),
+            other => usage(&format!("unknown engine {other}")),
+        },
         other => usage(&format!("unknown op {other}")),
     };
     match result {
@@ -780,10 +900,12 @@ fn check_reported_crcs(
     Ok(())
 }
 
-/// The same decode through upstream `sevenz-rust2`, the secondary reference.
+/// The same decode through upstream `sevenz-rust2`, the secondary reference,
+/// with the archive read through [`UpstreamInput`] rather than the bare
+/// `File` its own `ArchiveReader::open` uses.
 fn decode_upstream(opts: &Opts) -> Result<Fields, String> {
     let path = archive_path(opts);
-    let file = File::open(path).map_err(|e| e.to_string())?;
+    let file = UpstreamInput::open(path).map_err(|e| e.to_string())?;
     let password = opts
         .password
         .as_deref()
@@ -981,6 +1103,8 @@ fn encode(opts: &Opts) -> Result<Fields, String> {
     } else {
         // The crate's `push_source_path` rule: a block closes before it would
         // reach 4 GiB, and a member that size or larger is a block of its own.
+        // The block before such a member is closed first, so the archive
+        // keeps member order.
         let mut entries = Vec::new();
         let mut sources = Vec::new();
         let mut block_bytes = 0u64;
@@ -991,6 +1115,15 @@ fn encode(opts: &Opts) -> Result<Fields, String> {
                 done: false,
             };
             if member.size >= MAX_SOLID_BLOCK {
+                if !entries.is_empty() {
+                    writer
+                        .push_archive_entries_send(
+                            std::mem::take(&mut entries),
+                            std::mem::take(&mut sources),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    block_bytes = 0;
+                }
                 writer
                     .push_archive_entry_send(entry(member), Some(lazy()))
                     .map_err(|e| e.to_string())?;
@@ -1034,14 +1167,202 @@ fn encode(opts: &Opts) -> Result<Fields, String> {
     ])
 }
 
+/// The same encode through upstream `sevenz-rust2` 0.22.2, the secondary
+/// reference, for what it can write: LZMA2 at `--level` from the same xz
+/// preset table, solid or not, AES-256 with an encrypted header. It has no
+/// BCJ2 encoder, so `--filter bcj2` is refused.
+///
+/// Solid, it is `push_archive_entries` under the same 4 GiB block rule, with
+/// LZMA2's own multi-threaded encoder at the crate's block size when
+/// `--threads` is above one. Non-solid at one thread it is
+/// `push_archive_entry` per member; above one, the members are compressed on
+/// `--threads` workers through its public `prepare_block` and appended in
+/// member order with `push_prepared_block`, the parallel non-solid write
+/// upstream offers.
+fn encode_upstream(opts: &Opts) -> Result<Fields, String> {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
+
+    use sevenz_rust2::encoder_options::{AesEncoderOptions, Lzma2Options};
+
+    if opts.filter == "bcj2" {
+        return Err("sevenz-rust2 0.22.2 has no BCJ2 encoder".into());
+    }
+    let input = opts
+        .input
+        .as_ref()
+        .unwrap_or_else(|| usage("--input is required"));
+    let out = opts
+        .out
+        .as_ref()
+        .unwrap_or_else(|| usage("--out is required"));
+    let threads = opts.threads.max(1);
+    let dict = sevenz_turbo::encoder_options::EncoderOptions::from(
+        sevenz_turbo::encoder_options::Lzma2Options::from_level(opts.level),
+    )
+    .get_lzma_dict_size();
+    let block = mt_block_size(dict);
+    let mt_block = threads > 1 && !opts.non_solid;
+    let lzma2 = if mt_block {
+        Lzma2Options::from_level_mt(opts.level, threads, block)
+    } else {
+        Lzma2Options::from_level(opts.level)
+    };
+    let mut methods: Vec<sevenz_rust2::EncoderConfiguration> = Vec::new();
+    if let Some(password) = opts.password.as_deref() {
+        methods.push(AesEncoderOptions::new(sevenz_rust2::Password::from(password)).into());
+    }
+    methods.push(lzma2.into());
+
+    let members = source_members(input)?;
+    let files = members.len() as u64;
+    let bytes_in: u64 = members.iter().map(|m| m.size).sum();
+    let entry = |m: &Member| sevenz_rust2::ArchiveEntry::from_path(&m.path, m.name.clone());
+    let lazy = |m: &Member| LazyFile {
+        path: m.path.clone(),
+        file: None,
+        done: false,
+    };
+
+    let mut writer = sevenz_rust2::ArchiveWriter::create(out).map_err(|e| e.to_string())?;
+    writer.set_content_methods(methods.clone());
+    if opts.non_solid && threads > 1 {
+        let methods = Arc::new(methods);
+        let next = AtomicUsize::new(0);
+        // A worker starts a member only within `window` of the next one to be
+        // written, so a slow early member holds at most that many finished
+        // blocks in memory behind it, not the rest of the archive.
+        let window = threads as usize * 2;
+        let written = (Mutex::new(0usize), Condvar::new());
+        let (tx, rx) = mpsc::sync_channel(window);
+        std::thread::scope(|scope| -> Result<(), String> {
+            for _ in 0..threads.min(members.len().max(1) as u32) {
+                let (tx, methods, next, members, written) =
+                    (tx.clone(), &methods, &next, &members, &written);
+                scope.spawn(move || {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(member) = members.get(index) else {
+                            break;
+                        };
+                        let mut done = written.0.lock().unwrap();
+                        while index >= done.saturating_add(window) {
+                            done = written.1.wait(done).unwrap();
+                        }
+                        drop(done);
+                        let block = sevenz_rust2::prepare_block(
+                            Arc::clone(methods),
+                            vec![entry(member)],
+                            vec![sevenz_rust2::SourceReader::new(lazy(member))],
+                        )
+                        .map_err(|e| e.to_string());
+                        if tx.send((index, block)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(tx);
+            // Blocks come back in any order and go out in member order.
+            let mut pending = BTreeMap::new();
+            let mut wanted = 0;
+            let result = (|| {
+                for (index, block) in rx {
+                    pending.insert(index, block?);
+                    while let Some(block) = pending.remove(&wanted) {
+                        writer
+                            .push_prepared_block(block)
+                            .map_err(|e| e.to_string())?;
+                        wanted += 1;
+                        *written.0.lock().unwrap() = wanted;
+                        written.1.notify_all();
+                    }
+                }
+                Ok(())
+            })();
+            // On a failure the workers waiting on the window are let go; the
+            // receiver is gone, so each stops at its next send.
+            if result.is_err() {
+                *written.0.lock().unwrap() = usize::MAX;
+                written.1.notify_all();
+            }
+            result
+        })?;
+    } else if opts.non_solid {
+        for member in &members {
+            writer
+                .push_archive_entry(entry(member), Some(lazy(member)))
+                .map_err(|e| e.to_string())?;
+        }
+    } else {
+        // The same 4 GiB block rule as the crate's lane above.
+        let mut entries = Vec::new();
+        let mut sources = Vec::new();
+        let mut block_bytes = 0u64;
+        for member in &members {
+            if member.size >= MAX_SOLID_BLOCK {
+                if !entries.is_empty() {
+                    writer
+                        .push_archive_entries(
+                            std::mem::take(&mut entries),
+                            std::mem::take(&mut sources),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    block_bytes = 0;
+                }
+                writer
+                    .push_archive_entry(entry(member), Some(lazy(member)))
+                    .map_err(|e| e.to_string())?;
+                continue;
+            }
+            if block_bytes + member.size >= MAX_SOLID_BLOCK {
+                writer
+                    .push_archive_entries(
+                        std::mem::take(&mut entries),
+                        std::mem::take(&mut sources),
+                    )
+                    .map_err(|e| e.to_string())?;
+                block_bytes = 0;
+            }
+            block_bytes += member.size;
+            entries.push(entry(member));
+            sources.push(sevenz_rust2::SourceReader::new(lazy(member)));
+        }
+        if !entries.is_empty() {
+            writer
+                .push_archive_entries(entries, sources)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    writer.finish().map_err(|e| e.to_string())?;
+
+    let bytes_out = std::fs::metadata(out).map_err(|e| e.to_string())?.len();
+    Ok(vec![
+        ("engine", str("sevenz-rust2")),
+        ("crypto_backend", str("rustcrypto")),
+        ("threads", Json::Int(u64::from(threads))),
+        ("level", Json::Int(u64::from(opts.level))),
+        ("block_size", Json::Int(if mt_block { block } else { 0 })),
+        ("solid", Json::Bool(!opts.non_solid)),
+        ("filter", str("none")),
+        ("encrypted", Json::Bool(opts.password.is_some())),
+        ("files", Json::Int(files)),
+        ("bytes_in", Json::Int(bytes_in)),
+        ("bytes_out", Json::Int(bytes_out)),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
+    use std::io::{Read, Seek, SeekFrom};
+
     use super::{
-        Opts, check_reported_crcs, encode, locked_packages, locked_ppmd_crates, locked_version,
-        source_members,
+        Opts, UPSTREAM_WINDOW, UPSTREAM_WINDOWS, UpstreamInput, check_reported_crcs, encode,
+        locked_packages, locked_ppmd_crates, locked_version, source_members,
     };
 
     /// The PPMd record comes from the embedded lock, by prefix: whatever
@@ -1137,6 +1458,65 @@ mod tests {
         }
     }
 
+    /// The upstream lane writes every layout it supports, at one thread and
+    /// several, and the crate reads each back to the same members.
+    #[test]
+    fn an_upstream_encode_round_trips_every_layout() {
+        let scratch = Scratch::new("encode-upstream");
+        let input = scratch.0.join("src");
+        tree(&input);
+        for (non_solid, threads, password) in [
+            (false, 1, None),
+            (false, 4, None),
+            (true, 1, None),
+            (true, 4, None),
+            (true, 4, Some("p")),
+        ] {
+            let out = scratch.0.join(format!(
+                "up-{non_solid}-{threads}-{}.7z",
+                password.is_some()
+            ));
+            let opts = Opts {
+                input: Some(input.clone()),
+                out: Some(out.clone()),
+                threads,
+                level: 1,
+                non_solid,
+                password: password.map(str::to_string),
+                engine: "upstream".into(),
+                ..Opts::default()
+            };
+            super::encode_upstream(&opts).unwrap();
+            let password =
+                password.map_or_else(sevenz_turbo::Password::empty, sevenz_turbo::Password::from);
+            let mut reader = sevenz_turbo::ArchiveReader::open(&out, password).unwrap();
+            let mut seen = Vec::new();
+            reader
+                .for_each_entries(|entry, data| {
+                    let mut bytes = Vec::new();
+                    data.read_to_end(&mut bytes)?;
+                    seen.push((entry.name().replace('\\', "/"), bytes));
+                    Ok(true)
+                })
+                .unwrap();
+            let names: Vec<_> = seen.iter().map(|(name, _)| name.as_str()).collect();
+            assert_eq!(
+                names,
+                ["alpha/a.bin", "alpha/b.bin", "mid/.nested-dot", "zeta.txt"],
+                "non_solid {non_solid}, threads {threads}"
+            );
+            assert_eq!(seen[3].1, b"zeta");
+        }
+        let refused = Opts {
+            input: Some(input.clone()),
+            out: Some(scratch.0.join("up-refused.7z")),
+            filter: "bcj2".into(),
+            engine: "upstream".into(),
+            ..Opts::default()
+        };
+        assert!(super::encode_upstream(&refused).is_err());
+    }
+
     #[test]
     fn a_bcj2_encode_writes_the_bcj2_chain_and_round_trips() {
         use sevenz_turbo::EncoderMethod;
@@ -1225,5 +1605,45 @@ mod tests {
         );
         // Without verification the hook is not held to anything.
         assert!(check_reported_crcs(&expected, &[], false).is_ok());
+    }
+
+    /// Interleaved cursors, more of them than there are windows, each
+    /// seeking to its own place before every read as sevenz-rust2's shared
+    /// pack-stream reader does, read the file's bytes; so do reads larger
+    /// than a window, reads across a window's end, and the relative seeks.
+    #[test]
+    fn the_upstream_input_reads_the_file_through_interleaved_seeks() {
+        let scratch = Scratch::new("upstream-input");
+        let path = scratch.0.join("archive.bin");
+        let len = UPSTREAM_WINDOW * (UPSTREAM_WINDOWS + 4) + 123;
+        let bytes: Vec<u8> = (0..len).map(|i| (i * 31 + i / 997) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut input = UpstreamInput::open(&path).unwrap();
+
+        let cursors = UPSTREAM_WINDOWS + 2;
+        let stride = len / cursors;
+        let mut at: Vec<usize> = (0..cursors).map(|c| c * stride).collect();
+        let mut buf = vec![0u8; UPSTREAM_WINDOW * 2];
+        for round in 0..400 {
+            for (c, pos) in at.iter_mut().enumerate() {
+                let want = [1, 7, 4096, UPSTREAM_WINDOW + 5][(round + c) % 4];
+                input.seek(SeekFrom::Start(*pos as u64)).unwrap();
+                let n = input.read(&mut buf[..want]).unwrap();
+                assert_eq!(&buf[..n], &bytes[*pos..*pos + n], "cursor {c} at {pos}");
+                assert_eq!(n == 0, *pos == len, "cursor {c} at {pos}");
+                *pos += n;
+            }
+        }
+
+        assert_eq!(input.seek(SeekFrom::End(-3)).unwrap(), len as u64 - 3);
+        let mut tail = Vec::new();
+        input.read_to_end(&mut tail).unwrap();
+        assert_eq!(tail, &bytes[len - 3..]);
+        input.seek(SeekFrom::Start(10)).unwrap();
+        assert_eq!(input.seek(SeekFrom::Current(-4)).unwrap(), 6);
+        let mut all = Vec::new();
+        input.read_to_end(&mut all).unwrap();
+        assert_eq!(all, &bytes[6..]);
+        assert!(input.seek(SeekFrom::Current(-(len as i64) - 1)).is_err());
     }
 }

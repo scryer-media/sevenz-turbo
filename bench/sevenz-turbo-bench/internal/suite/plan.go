@@ -683,6 +683,19 @@ func (p *planner) encode(group, source string, level int, threads string, o enco
 		variants = append(variants, Run{Variant: VariantTurboNative, Role: RoleCandidate, Tool: p.tools.Native, Args: native, Output: nativeOut, JSON: true})
 	}
 	variants = append(variants, Run{Variant: VariantOracle, Role: RoleReference, Tool: p.tools.Oracle, Args: oracle, Dir: input, Output: oracleOut})
+	// Upstream sevenz-rust2 writes the same archive wherever it can: it has
+	// no BCJ2 encoder, so the BCJ2 rows go without.
+	if !o.bcj2 {
+		upstreamOut := filepath.Join(p.scratch, fmt.Sprintf("%d-%s-upstream.7z", len(p.scenarios), slug))
+		upstream := append([]string(nil), ours...)
+		for i := range upstream {
+			if upstream[i] == ourOut {
+				upstream[i] = upstreamOut
+			}
+		}
+		upstream = append(upstream, "--engine", "upstream")
+		variants = append(variants, Run{Variant: VariantUpstream, Role: RoleSecondary, Tool: p.tools.Candidate, Args: upstream, Output: upstreamOut, JSON: true})
+	}
 	p.add(Scenario{
 		ID: id, Group: group, Op: OpEncode, Fixture: source, Threads: threads, Level: level,
 		NonSolid: o.nonSolid, Encrypted: o.encrypted, Note: o.note, Variants: variants,
