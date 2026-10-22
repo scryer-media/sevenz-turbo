@@ -2,7 +2,9 @@
 
 Thanks for looking. A few things before you open a pull request:
 
-- Read [AGENTS.md](../AGENTS.md); the fork rules there apply to humans too.
+- Read [AGENTS.md](../AGENTS.md) and
+  [docs/design-rules.md](../docs/design-rules.md); the rules there apply to
+  humans too.
 - This is a hard **fork** of
   [sevenz-rust2](https://github.com/hasenbanck/sevenz-rust2). It is not
   rebased onto upstream and nothing is sent back, so a fix lands here on its
