@@ -358,6 +358,9 @@ arm, and this crate can add a variant without a breaking release.
   encoder whose window is no longer than the folder (0.29.1), the same bytes
   as a full-size window. 7-Zip sizes the window from the dictionary
   whatever the input.
+- `push_source_path` writes the solid block gathered before a file of 4 GiB
+  or more ahead of it (0.29.3), so the archive keeps the walk order. Upstream
+  writes the large file first.
 - A writer whose push failed after writing part of a folder is poisoned
   (0.28.0): later pushes return `Error::WriterPoisoned` and `finish()` writes
   no header. Upstream lets the caller go on and writes an archive whose pack
@@ -486,6 +489,13 @@ arm, and this crate can add a variant without a breaking release.
 - The vendored BCJ round-trip tests generate their sample data instead of
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
+
+## 0.29.3 - 2026-10-21
+
+- `ArchiveWriter::push_source_path` (solid) keeps the order it walks the
+  files in when one of them is 4 GiB or larger. Such a file is still a block
+  of its own, but the smaller files gathered before it were written after it;
+  their block is now closed and written first. Inherited from sevenz-rust2.
 
 ## 0.29.2 - 2026-10-20
 
