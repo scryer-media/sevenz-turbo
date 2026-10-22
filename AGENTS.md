@@ -19,6 +19,8 @@ Read before changing code:
 - `docs/security.md` and `SECURITY.md`: the limits and the threat model.
 - `docs/unsafe-validation.md`: every unsafe surface and what checks it.
 - `docs/benchmarking.md`: how speed is measured.
+- `docs/failed-experiments.md`: what has been tried and did not pay. Do not
+  retry an entry without new evidence, and add to it when an experiment fails.
 - `docs/lzma-turbo-requests.md`: what this crate needs from `lzma-turbo`.
 
 ## Working on a task
