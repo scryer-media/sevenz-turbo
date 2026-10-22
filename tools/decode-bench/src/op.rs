@@ -1104,7 +1104,7 @@ fn encode(opts: &Opts) -> Result<Fields, String> {
         // The crate's `push_source_path` rule: a block closes before it would
         // reach 4 GiB, and a member that size or larger is a block of its own.
         // The block before such a member is closed first, so the archive
-        // keeps member order, which `push_source_path` itself does not.
+        // keeps member order.
         let mut entries = Vec::new();
         let mut sources = Vec::new();
         let mut block_bytes = 0u64;
