@@ -40,6 +40,13 @@ The API started as sevenz-rust2's, so most code moves over by renaming
 of one decode thread, is listed in [CHANGELOG.md](CHANGELOG.md) under
 `## Fork`.
 
+How it compares with 7-Zip and sevenz-rust2, averaged over two machines
+(the numbers are under [Speed](#speed)):
+
+[![sevenz-turbo and sevenz-rust2 decode vs 7-Zip, mean of both hosts](docs/images/sevenz-turbo-decode.svg)](docs/images/sevenz-turbo-decode.svg)
+
+[![sevenz-turbo and sevenz-rust2 encode vs 7-Zip, mean of both hosts](docs/images/sevenz-turbo-encode.svg)](docs/images/sevenz-turbo-encode.svg)
+
 ## Reading an archive
 
 ```rust
@@ -217,19 +224,16 @@ tests, so above 1.00 means sevenz-turbo was faster or used less memory.
 Decoding covers one thread to all of them, solid and non-solid, encrypted
 and filtered archives; encoding covers levels 1 to 9.
 
-[![sevenz-turbo and sevenz-rust2 decode vs 7-Zip, mean of both hosts](docs/images/sevenz-turbo-decode.svg)](docs/images/sevenz-turbo-decode.svg)
-
-[![sevenz-turbo and sevenz-rust2 encode vs 7-Zip, mean of both hosts](docs/images/sevenz-turbo-encode.svg)](docs/images/sevenz-turbo-encode.svg)
-
 | CPU | threads | vs 7-Zip: decode | encode | peak memory | vs sevenz-rust2: decode | encode | decode peak memory |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Sapphire Rapids | 16 | 1.28 | 1.57 | 0.97 | 1.52 | 3.10 | 1.32 |
 | Graviton4 | 16 | 1.15 | 1.48 | 0.98 | 1.62 | 2.89 | 1.36 |
 
-The charts average the two machines, with 7-Zip as the 1x line: a bar to
-the right is faster than 7-Zip, one to the left slower. sevenz-rust2 reads
-its archives through a buffered input in these runs, as it is meant to be
-fed; see [the benchmarks page](docs/benchmarks.md#sevenz-turbo-vs-sevenz-rust2).
+The charts [at the top](#why-a-fork) average the two machines, with 7-Zip as
+the 1x line: a bar to the right is faster than 7-Zip, one to the left slower.
+sevenz-rust2 reads its archives through a buffered input in these runs, as it
+is meant to be fed; see
+[the benchmarks page](docs/benchmarks.md#sevenz-turbo-vs-sevenz-rust2).
 
 - LZMA2 decoding is within 5% of 7-Zip at every thread count on both
   machines. The decode average is above 1.00 because of encrypted, stored,
