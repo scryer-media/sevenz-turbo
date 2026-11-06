@@ -421,32 +421,6 @@ impl HeaderMethod {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn finished_folders_keep_properties_without_retaining_encoder_options() {
-        let methods = Arc::new(vec![EncoderConfiguration::new(EncoderMethod::LZMA2)]);
-        let source = Arc::downgrade(&methods);
-        let mut info = UnpackInfo::default();
-        info.add(Arc::clone(&methods), vec![100], 7);
-        info.add(Arc::clone(&methods), vec![200], 8);
-        assert!(Arc::ptr_eq(
-            &info.blocks[0].methods,
-            &info.blocks[1].methods
-        ));
-        assert_eq!(Arc::strong_count(&methods), 1);
-        let mut before = Vec::new();
-        info.write_to(&mut before).unwrap();
-        drop(methods);
-        assert!(source.upgrade().is_none());
-        let mut after = Vec::new();
-        info.write_to(&mut after).unwrap();
-        assert_eq!(before, after);
-    }
-}
-
 /// Writes a block's coders back as the reader parsed them, the inverse of
 /// `read_block`, so a coder graph of any shape survives the copy: bind pairs
 /// and several packed streams included.
@@ -485,4 +459,30 @@ fn write_raw_block<W: Write>(block: &Block, header: &mut W) -> std::io::Result<(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finished_folders_keep_properties_without_retaining_encoder_options() {
+        let methods = Arc::new(vec![EncoderConfiguration::new(EncoderMethod::LZMA2)]);
+        let source = Arc::downgrade(&methods);
+        let mut info = UnpackInfo::default();
+        info.add(Arc::clone(&methods), vec![100], 7);
+        info.add(Arc::clone(&methods), vec![200], 8);
+        assert!(Arc::ptr_eq(
+            &info.blocks[0].methods,
+            &info.blocks[1].methods
+        ));
+        assert_eq!(Arc::strong_count(&methods), 1);
+        let mut before = Vec::new();
+        info.write_to(&mut before).unwrap();
+        drop(methods);
+        assert!(source.upgrade().is_none());
+        let mut after = Vec::new();
+        info.write_to(&mut after).unwrap();
+        assert_eq!(before, after);
+    }
 }
