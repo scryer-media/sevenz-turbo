@@ -79,22 +79,55 @@ fn bzip2_workers_fold_container_checksums_at_file_boundaries() {
             &opts,
         )
         .unwrap();
-        assert_eq!(opts.folding_checksums(), limit == u64::MAX);
+        // A finite limit takes the compact layout and keeps the worker.
+        assert!(opts.folding_checksums(), "limit {limit}");
         let mut actual = Vec::new();
         decoder.read_to_end(&mut actual).unwrap();
         assert_eq!(actual, data);
-        if limit == u64::MAX {
-            for (start, stop) in [
-                (0, 10_003),
-                (10_003, 70_001),
-                (70_001, data.len()),
-                (0, data.len()),
-            ] {
-                assert_eq!(
-                    control.folded(start as u64, (stop - start) as u64),
-                    Some(lzma_turbo::crc::crc32(&data[start..stop]))
-                );
-            }
+        for (start, stop) in [
+            (0, 10_003),
+            (10_003, 70_001),
+            (70_001, data.len()),
+            (0, data.len()),
+        ] {
+            assert_eq!(
+                control.folded(start as u64, (stop - start) as u64),
+                Some(lzma_turbo::crc::crc32(&data[start..stop])),
+                "limit {limit}"
+            );
         }
+    }
+}
+
+#[test]
+fn a_single_threaded_bzip2_coder_leaves_checksums_to_the_reader() {
+    let data: Vec<_> = (0..150_001).map(|i| (i * 7 + i / 97) as u8).collect();
+    let mut encoder = bzip2_turbo::Encoder::new(Vec::new(), Default::default());
+    encoder.write_all(&data).unwrap();
+    let packed = encoder.finish().unwrap();
+    let mut coder = Coder::single_stream();
+    coder.set_id_size(3);
+    coder
+        .decompression_method_id_mut()
+        .copy_from_slice(EncoderMethod::ID_BZIP2);
+    for limit in [u64::MAX, 16 << 20] {
+        let control = Arc::new(Lzma2Control::new(1));
+        let limits = ArchiveLimits::memory(limit);
+        let mut opts = DecodeOptions::header(&limits);
+        opts.threads = 1;
+        opts.lzma2_control = Some(&control);
+        opts.checksum_splits = &[u64::MAX];
+        let mut decoder = add_decoder(
+            packed.as_slice(),
+            data.len() as u64,
+            &coder,
+            &Password::empty(),
+            &opts,
+        )
+        .unwrap();
+        assert!(!opts.folding_checksums(), "limit {limit}");
+        let mut actual = Vec::new();
+        decoder.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, data);
     }
 }

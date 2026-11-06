@@ -2980,8 +2980,10 @@ impl<R: Read + Seek> ArchiveReader<R> {
     /// BZip2 uses at most two of them, as 7-Zip does: the caller parses the
     /// entropy coding while one worker rebuilds each block and writes it out.
     /// The worker is started only where the count leaves a thread beyond the
-    /// block's pipeline stages and the memory limit is unlimited; under a
-    /// finite limit BZip2 decodes on one thread. An archive with several
+    /// block's pipeline stages. Under a finite memory limit the decoder takes
+    /// its compact layout and the worker is also charged the two-thread
+    /// bound, 12 MiB, beside the rest of the chain; where that does not fit,
+    /// BZip2 decodes on one thread. An archive with several
     /// BZip2 folders can also decode them side by side, one thread each.
     ///
     /// **The default is one**, which is the behaviour of every other coder in

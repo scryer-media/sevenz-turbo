@@ -495,6 +495,17 @@ arm, and this crate can add a variant without a breaking release.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.29.5 - 2026-11-06
+
+- A BZip2 coder decodes on two threads under a finite `memory_limit_bytes`
+  as well, in `bzip2-turbo`'s compact layout. 0.29.4 forced it onto one
+  thread whenever a limit was set, which threw away the thread budget of
+  every caller that sets one. The pipeline now charges the reconstruction
+  worker the rest of the 12 MiB two-thread bound beside the chain at decode
+  time, and only where the limit has no room for it does the coder decode
+  on one thread. Admission is unchanged: an archive opens under the same
+  limits as before.
+
 ## 0.29.4 - 2026-11-06
 
 - BZip2 is coded by `bzip2-turbo` 0.1.1, a translation of the 7-Zip 26.04

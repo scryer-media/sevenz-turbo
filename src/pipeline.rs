@@ -845,12 +845,38 @@ impl<'r> Chain<'r> {
             } else {
                 None
             };
+        let parallel_bzip2 = parallel_bzip2.filter(|_| Self::room_for_bzip2_worker(opts));
         Self {
             pipeline: Pipeline::default(),
             offload,
             parallel_lzma2,
             parallel_bzip2,
         }
+    }
+
+    /// Whether the limit holds a BZip2 decoder's second thread, charging it
+    /// to `opts.reserved_kb` when it does.
+    ///
+    /// The memory model counts BZip2 at its compact single-threaded figure.
+    /// The reconstruction worker needs more than that, so under a finite
+    /// limit it is taken only where the rest fits beside everything the
+    /// chain already holds; otherwise the coder decodes on one thread, as it
+    /// would with no worker to spare. Without a limit nothing is charged.
+    fn room_for_bzip2_worker(opts: &mut DecodeOptions<'_>) -> bool {
+        if opts.limits.memory_limit_bytes == u64::MAX {
+            return true;
+        }
+        #[cfg(feature = "bzip2")]
+        let extra_kb = usize::try_from(crate::container::BZIP2_SECOND_THREAD_BYTES.div_ceil(1024))
+            .unwrap_or(usize::MAX);
+        #[cfg(not(feature = "bzip2"))]
+        let extra_kb = 0;
+        let chain_kb = opts.reserved_kb.saturating_add(extra_kb);
+        if chain_kb.saturating_add(opts.unsized_kb) > opts.limits.memory_limit_kb() {
+            return false;
+        }
+        opts.reserved_kb = chain_kb;
+        true
     }
 
     /// Builds the coder at `index` of `block` over `input`.
@@ -1171,6 +1197,43 @@ mod tests {
         block.coders[1] = coder(EncoderMethod::ID_LZMA2, 1);
         let chain = Chain::new(&block, &mut opts);
         assert!(chain.parallel_bzip2.is_none());
+    }
+
+    /// A finite limit keeps the worker wherever its memory fits: it costs the
+    /// chain the two-thread decoder's bound beyond the single-threaded figure
+    /// the model already counts, and only where the limit is too small for
+    /// that does the coder fall back to one thread.
+    #[cfg(feature = "bzip2")]
+    #[test]
+    fn a_finite_limit_keeps_the_bzip2_worker_where_its_memory_fits() {
+        let block = aes_under(EncoderMethod::ID_BZIP2, 64 << 20, 32 << 20);
+        let unsized_kb = usize::try_from(crate::container::BZIP2_BYTES / 1024).unwrap();
+        let extra_kb =
+            usize::try_from(crate::container::BZIP2_SECOND_THREAD_BYTES.div_ceil(1024)).unwrap();
+        assert!(extra_kb > 0);
+        let plan = |limit: u64| {
+            let limits = crate::ArchiveLimits::memory(limit);
+            let mut opts = DecodeOptions::header(&limits);
+            opts.threads = 8;
+            opts.unsized_kb = unsized_kb;
+            let chain = Chain::new(&block, &mut opts);
+            (chain.offload, chain.parallel_bzip2, opts.reserved_kb)
+        };
+        // The pipes alone, as an unlimited plan charges them.
+        let (offload, worker, pipes_kb) = plan(u64::MAX);
+        assert_ne!(offload, 0);
+        assert_eq!(worker, Some(0));
+        let need = u64::try_from(pipes_kb + unsized_kb + extra_kb).unwrap() * 1024;
+        for limit in [need, 4 << 30] {
+            let (o, worker, reserved_kb) = plan(limit);
+            assert_eq!(o, offload, "limit {limit}");
+            assert_eq!(worker, Some(0), "limit {limit}");
+            assert_eq!(reserved_kb, pipes_kb + extra_kb, "limit {limit}");
+        }
+        let (o, worker, reserved_kb) = plan(need - 1024);
+        assert_eq!(o, offload);
+        assert_eq!(worker, None);
+        assert_eq!(reserved_kb, pipes_kb);
     }
 
     /// The decisions, for the chains 7-Zip writes.
