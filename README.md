@@ -36,9 +36,10 @@ All reasonable methods of creating `7z` archives are also differentially tested 
 ### Moving from sevenz-rust2
 
 The API started as sevenz-rust2's, so most code moves over by renaming
-`sevenz_rust2::` to `sevenz_turbo::`. Every difference, such as the default
-of one decode thread, is listed in [CHANGELOG.md](CHANGELOG.md) under
-`## Fork`.
+`sevenz_rust2::` to `sevenz_turbo::`. The differences from the fork point,
+such as the default of one decode thread, are listed in
+[CHANGELOG.md](CHANGELOG.md) under `## Fork`; changes since then are under
+their version headings.
 
 ## Reading an archive
 

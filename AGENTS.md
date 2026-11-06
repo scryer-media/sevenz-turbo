@@ -36,10 +36,10 @@ with a version bump and a changelog entry like any other.
 2. **Bugs are fixed here.** A bug inherited from sevenz-rust2 is a bug in this
    crate; it is fixed and released here, whether or not the other crate has
    it too.
-3. **Keep the `## Fork` section of `CHANGELOG.md` honest.** It is the record
-   of how this crate differs from the commit it was taken at, kept for readers
-   who know the other crate. A change that adds to that difference is noted
-   there in the same commit; it is a record, not a checklist to reconcile.
+3. **The `## Fork` section of `CHANGELOG.md` is closed.** The two crates have
+   diverged, so it is no longer kept as a running list of differences. Record
+   new changes, including ones taken from sevenz-rust2, under their version
+   heading only; never add to `## Fork` or ask for an entry there.
 
 ## Codec rules
 

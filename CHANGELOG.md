@@ -15,8 +15,9 @@ one crate could carry both, and the offer was declined - see
 [hasenbanck/sevenz-rust2#144](https://github.com/hasenbanck/sevenz-rust2/issues/144).
 That left a hard fork as the only way to ship the work, and the two crates
 have diverged for good since: this one is not rebased onto sevenz-rust2 and
-nothing goes back. This section is the record of how it differs from the
-commit it was taken at, kept for readers who know the other crate.
+nothing goes back. This section records how it came to differ from the
+commit it was taken at, for readers who know the other crate. It is closed:
+later changes are under their version headings.
 sevenz-rust2's own changelog up to the fork point continues below, unchanged.
 
 ### Packaging
