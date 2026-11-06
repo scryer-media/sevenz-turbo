@@ -524,6 +524,10 @@ arm, and this crate can add a variant without a breaking release.
   tokio 1.54.1 for the wasm conformance tool. This clears RUSTSEC-2026-0391,
   -0398, -0403, -0410, -0420, -0422, -0423 and -0424, and the zstd-safe and
   tokio unsoundness warnings.
+- Dependencies are updated to their latest compatible releases, among them
+  aws-lc-rs 1.19, brotli 9.1 and ppmd-rust 1.5.2, and the wasm conformance
+  tool moves to wasmtime 50. The decode benchmark keeps its sevenz-rust2
+  0.22.2 reference, the release this fork was taken from.
 
 ## 0.29.3 - 2026-10-21
 
