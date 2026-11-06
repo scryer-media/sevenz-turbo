@@ -863,7 +863,7 @@ impl<'r> Chain<'r> {
         opts: &DecodeOptions<'_>,
     ) -> Result<Stage<'r>, Error> {
         let coder = &block.coders[index];
-        let len = block.get_unpack_size_at_index(index) as usize;
+        let len = block.get_unpack_size_at_index(index);
         if coder.encoder_method_id() == EncoderMethod::ID_COPY
             && opts.limits.memory_limit_bytes != u64::MAX
         {

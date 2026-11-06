@@ -65,7 +65,7 @@ sets them, because only the caller knows what it can afford.
 | `max_entries` | 1,000,000 | The amplifying counts: files, blocks, pack streams, sub-streams, bind pairs. An `ArchiveEntry` is a hundred-odd bytes reserved by one byte of count. The largest archives seen in the wild have a few hundred thousand entries. | `Error::LimitExceeded { what: Entries }` before the reservation. |
 | `max_name_bytes` | 64 KiB | The names blob carries one length for all of the names in it, so without a per-name bound a single name can be the whole blob — and a name becomes a path in every consumer. Four times the longest path any mainstream filesystem accepts. | `Error::LimitExceeded { what: NameBytes }`. |
 | `max_total_name_bytes` | 64 MiB | The names blob itself; a million names of 64 characters. | `Error::LimitExceeded { what: TotalNameBytes }`. |
-| `max_coders_per_block` | 8 | A block's coder chain is built recursively and walked per stream. 7-Zip writes at most four (AES over BCJ2 over LZMA2). | `Error::LimitExceeded { what: CodersPerBlock }` before the coders are read. |
+| `max_coders_per_block` | 8 | A block's coder chain is built recursively and walked per stream. 7-Zip writes at most four (AES over BCJ2 over LZMA2). Whatever this is set to, more than 64 coders is refused as corrupt. | `Error::LimitExceeded { what: CodersPerBlock }` before the coders are read. |
 | `max_streams_per_coder` | 8 | `num_in_streams` / `num_out_streams` are unbounded varints, and the graph is searched linearly per stream: one coder claiming a million streams is a million-entry allocation and a quadratic walk. Only BCJ2 takes more than one stream (four in, one out). | `Error::LimitExceeded { what: StreamsPerCoder }`. |
 | `max_total_coders` | 1,000,000 | A block is cheap to declare and a coder is not; the per-block bound says nothing about a million blocks. | `Error::LimitExceeded { what: TotalCoders }`. |
 | `max_unpack_bytes` | unlimited | The decompression bomb. The sizes are in the header, so an archive whose declared output exceeds what the consumer will store is refused before a byte is decoded. | `Error::LimitExceeded { what: UnpackBytes }` at open. |
@@ -74,8 +74,12 @@ sets them, because only the caller knows what it can afford.
 | `max_aes_kdf_rounds` | 2^28 | The per-header bound says nothing about how many times a key is derived: an archive with many encrypted blocks, each with its own salt, multiplies the work. This counts the SHA-256 rounds actually run over the reader's password, encoded headers and repeated block decodes included; a cached key costs nothing. | `Error::LimitExceeded { what: AesKdfRounds }` before the derivation that would exceed it, so it can fail during extraction as well as at open. |
 | `reject_unsafe_paths` | false | Path traversal on extraction. Off by default because a reader is not always a writer: a consumer listing an archive should see what it really contains, and `ArchiveEntry::is_unsafe_path` says which entries are dangerous. A consumer that extracts should set it. | `Error::UnsafeEntryName { name, reason }` at open, for the first entry that would escape. |
 
-`ArchiveLimits::unlimited()` removes every structural bound, for a caller
-reading archives it wrote itself. Nothing in this crate calls it.
+`ArchiveLimits::unlimited()` removes every configurable structural bound, for
+a caller reading archives it wrote itself. Nothing in this crate calls it. Some
+checks are fixed and survive it. A block with more than 64 coders or more than
+64 input streams is refused as corrupt, as 7-Zip refuses it: the decoder nests
+one reader per coder, and a longer chain exhausts the stack. A coder must have
+exactly one output stream, and a block at least one packed stream.
 
 ### Reporting which bound was hit
 

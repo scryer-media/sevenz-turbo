@@ -932,11 +932,175 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 methods,
                 sizes,
                 crc,
-                entries.len() as u64,
+                sub_stream_sizes.len() as u64,
                 sub_stream_sizes,
                 sub_stream_crcs,
             )
             .set_bcj2(bcj2.map(|b| b.sizes));
+        self.files.extend(entries);
+        Ok(())
+    }
+
+    /// Copies block `block_index` of an existing archive into this one as it
+    /// is encoded, without decoding it.
+    ///
+    /// The block's packed streams are copied from `source` byte for byte, and
+    /// its coders, sizes and CRCs are carried over as they were, so this costs
+    /// a read and a write of the compressed bytes and nothing else. Each of its
+    /// entries is written under the name `rename` returns for it, keeping the
+    /// rest of its metadata. Renaming an entry, dropping a block's entries or
+    /// adding to an archive then need no re-encoding: write the new archive
+    /// from the old one's blocks.
+    ///
+    /// A block's entries go together, since leaving one out of a solid block
+    /// means re-encoding the others. Entries without data belong to no block;
+    /// push them with [`push_archive_entry`](Self::push_archive_entry) and no
+    /// reader. An encrypted block stays encrypted under its original password.
+    ///
+    /// `archive` must be the one `source` holds, as [`Archive::read`] parsed
+    /// it. Nothing is decoded, so nothing is checked against the CRCs; they are
+    /// copied for the reader of the new archive to verify.
+    ///
+    /// # Errors
+    ///
+    /// `invalid_argument` if `block_index` is out of range, the archive has no
+    /// stream map for the block (it has no files info), the block's entries do
+    /// not match its sub-streams, or an entry has no CRC: this writer records
+    /// every sub-stream's CRC. A read or write failure, or a `source` shorter
+    /// than the block, returns the error; if part of the block reached the
+    /// output, the writer is poisoned: see [`ArchiveWriter`].
+    pub fn push_raw_block<R: Read + Seek>(
+        &mut self,
+        archive: &Archive,
+        block_index: usize,
+        source: &mut R,
+        rename: impl FnMut(&ArchiveEntry) -> String,
+    ) -> Result<&mut Self> {
+        self.check_poisoned()?;
+        let pushed = self.push_raw(archive, block_index, source, rename);
+        self.pushed_self(pushed)
+    }
+
+    /// [`ArchiveWriter::push_raw_block`], without the poisoning. Everything is
+    /// validated before the first byte is written.
+    fn push_raw<R: Read + Seek>(
+        &mut self,
+        archive: &Archive,
+        block_index: usize,
+        source: &mut R,
+        mut rename: impl FnMut(&ArchiveEntry) -> String,
+    ) -> Result<()> {
+        let invalid = |what: &str| {
+            Error::invalid_argument(format!("push_raw_block: block {block_index} {what}"))
+        };
+        let block = archive
+            .blocks
+            .get(block_index)
+            .ok_or_else(|| invalid("does not exist"))?;
+        let map = &archive.stream_map;
+
+        // Its sub-streams: its entries' sizes and CRCs.
+        let count = block.num_unpack_sub_streams;
+        let first_sub_stream = map
+            .block_first_sub_stream_index
+            .get(block_index)
+            .ok_or_else(|| invalid("is missing from the stream map"))?;
+        let info = archive.sub_streams_info.as_ref();
+        let mut sub_stream_sizes = Vec::with_capacity(count);
+        let mut sub_stream_crcs = Vec::with_capacity(count);
+        for index in first_sub_stream..first_sub_stream + count {
+            let crc = match info {
+                Some(info) if info.has_crc.contains(index) => info.crcs.get(index).copied(),
+                // A lone sub-stream may carry its CRC on the block instead.
+                _ if count == 1 && block.has_crc => Some(block.crc as u32),
+                _ => None,
+            }
+            .ok_or_else(|| invalid("has an entry without a CRC"))?;
+            let size = match info {
+                Some(info) => info.unpack_sizes.get(index).copied(),
+                None if count == 1 => Some(block.get_unpack_size()),
+                None => None,
+            }
+            .ok_or_else(|| invalid("is missing from the stream map"))?;
+            sub_stream_crcs.push(crc);
+            sub_stream_sizes.push(size);
+        }
+
+        // Its entries: the files with data in it, in order. An empty file
+        // between two of a solid block's maps to it too, with no sub-stream.
+        // The block's files are contiguous from its first, so the scan starts
+        // there and stops at the first file of another block.
+        let first_file = *map
+            .block_first_file_index
+            .get(block_index)
+            .ok_or_else(|| invalid("is missing from the stream map"))?;
+        let entries: Vec<ArchiveEntry> = archive
+            .files
+            .get(first_file..)
+            .unwrap_or_default()
+            .iter()
+            .zip(map.file_block_index.get(first_file..).unwrap_or_default())
+            .take_while(|(_, block)| **block == Some(block_index))
+            .filter(|(entry, _)| entry.has_stream)
+            .map(|(entry, _)| ArchiveEntry {
+                name: rename(entry),
+                ..entry.clone()
+            })
+            .collect();
+        if entries.len() != count {
+            return Err(invalid(&format!(
+                "has {} entries for {count} sub-streams",
+                entries.len()
+            )));
+        }
+
+        // Its packed streams, located before anything is written.
+        let first_pack_stream = *map
+            .block_first_pack_stream_index
+            .get(block_index)
+            .ok_or_else(|| invalid("is missing from the stream map"))?;
+        let mut streams = Vec::with_capacity(block.packed_streams().len());
+        for pack_stream in first_pack_stream..first_pack_stream + block.packed_streams().len() {
+            let (Some(&size), Some(&offset)) = (
+                archive.pack_sizes.get(pack_stream),
+                map.pack_stream_offsets.get(pack_stream),
+            ) else {
+                return Err(invalid("is missing from the stream map"));
+            };
+            // The header's offsets are not bounded when it is read.
+            let offset = SIGNATURE_HEADER_SIZE
+                .checked_add(archive.pack_pos)
+                .and_then(|start| start.checked_add(offset))
+                .ok_or_else(|| invalid("lies past the end of any file"))?;
+            // 0 records no CRC here: a packed stream whose CRC is 0 is
+            // written as one without, which only drops an optional check.
+            let crc = if archive.pack_crcs_defined.contains(pack_stream) {
+                archive
+                    .pack_crcs
+                    .get(pack_stream)
+                    .map_or(0, |&crc| crc as u32)
+            } else {
+                0
+            };
+            streams.push((offset, size, crc));
+        }
+
+        for (offset, size, crc) in streams {
+            source
+                .seek(std::io::SeekFrom::Start(offset))
+                .map_err(|e| Error::io_msg(e, "push_raw_block: seek".to_string()))?;
+            let copied = std::io::copy(&mut (&mut *source).take(size), &mut self.output)
+                .map_err(|e| Error::io_msg(e, "push_raw_block: copy".to_string()))?;
+            if copied != size {
+                return Err(Error::io_msg(
+                    std::io::ErrorKind::UnexpectedEof.into(),
+                    format!("push_raw_block: block {block_index} is truncated in its source"),
+                ));
+            }
+            self.pack_info.add_stream(size, crc);
+        }
+        self.unpack_info
+            .add_raw(block, sub_stream_sizes, sub_stream_crcs);
         self.files.extend(entries);
         Ok(())
     }
@@ -1064,17 +1228,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         drop(out);
         let crc = fold_source_crcs(&r);
         let compressed_crc = compressed.crc_value();
-        let mut sub_stream_crcs = Vec::with_capacity(entries.len());
-        let mut sub_stream_sizes = Vec::with_capacity(entries.len());
-        for i in 0..entries.len() {
-            let entry = &mut entries[i];
-            let ri = &r[i];
-            entry.crc = ri.crc_value() as u64;
-            entry.size = ri.read_count() as u64;
-            sub_stream_crcs.push(entry.crc as u32);
-            sub_stream_sizes.push(entry.size);
-            entry.has_crc = true;
-        }
+        let (sub_stream_sizes, sub_stream_crcs) = sub_streams(&mut entries, &r)?;
 
         self.pack_info
             .add_stream(compressed_len as u64, compressed_crc);
@@ -1093,7 +1247,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 content_methods,
                 sizes,
                 crc,
-                entries.len() as u64,
+                sub_stream_sizes.len() as u64,
                 sub_stream_sizes,
                 sub_stream_crcs,
             )
@@ -1376,10 +1530,16 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         Ok(())
     }
 
+    fn empty_stream_count(&self) -> usize {
+        self.files.iter().filter(|entry| !entry.has_stream).count()
+    }
+
     fn write_file_empty_files<H: Write>(&self, header: &mut H) -> std::io::Result<()> {
         let mut has_empty = false;
         let mut empty_stream_counter = 0;
-        let mut bitset = BitSet::new();
+        // Readers take one bit per entry without a stream, so the vector spans all of them
+        // even when the trailing bits are clear.
+        let mut bitset = BitSet::with_capacity(self.empty_stream_count());
         for entry in self.files.iter() {
             if !entry.has_stream {
                 let is_dir = entry.is_directory();
@@ -1404,7 +1564,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     fn write_file_anti_items<H: Write>(&self, header: &mut H) -> std::io::Result<()> {
         let mut has_anti = false;
         let mut counter = 0;
-        let mut bitset = BitSet::new();
+        // One bit per entry without a stream, as for `kEmptyFile`.
+        let mut bitset = BitSet::with_capacity(self.empty_stream_count());
         for entry in self.files.iter() {
             if !entry.has_stream {
                 let is_anti = entry.is_anti_item();
@@ -1506,6 +1667,39 @@ struct EncodedFolder {
     compressed_len: u64,
     compressed_crc: u32,
     bcj2: Option<Bcj2Packed>,
+}
+
+/// Sizes and CRCs of a solid block's sub-streams: one per entry with a stream, in order.
+/// Sets each entry's size and CRC from what its reader returned. An entry without a stream
+/// (a directory, an empty file or an anti-item) owns no sub-stream, so its reader must return
+/// nothing; giving it one would shift every later entry's data onto the wrong entry.
+fn sub_streams<R>(
+    entries: &mut [ArchiveEntry],
+    readers: &[SourceReader<R>],
+) -> Result<(Vec<u64>, Vec<u32>)> {
+    let mut sizes = Vec::with_capacity(entries.len());
+    let mut crcs = Vec::with_capacity(entries.len());
+    for (entry, reader) in entries.iter_mut().zip(readers) {
+        if !entry.has_stream {
+            if reader.read_count() != 0 {
+                return Err(Error::invalid_argument(format!(
+                    "entry '{}' has no stream, but its reader returned {} bytes",
+                    entry.name,
+                    reader.read_count()
+                )));
+            }
+            entry.crc = 0;
+            entry.size = 0;
+            entry.has_crc = false;
+            continue;
+        }
+        entry.crc = reader.crc_value() as u64;
+        entry.size = reader.read_count() as u64;
+        entry.has_crc = true;
+        sizes.push(entry.size);
+        crcs.push(entry.crc as u32);
+    }
+    Ok((sizes, crcs))
 }
 
 /// C: `CFolderInStream::Read` checksums each file once. Preserve our folder
@@ -2131,17 +2325,7 @@ pub fn prepare_block<R: Read>(
     };
 
     let crc = fold_source_crcs(&r);
-    let mut sub_stream_crcs = Vec::with_capacity(entries.len());
-    let mut sub_stream_sizes = Vec::with_capacity(entries.len());
-    for i in 0..entries.len() {
-        let entry = &mut entries[i];
-        let ri = &r[i];
-        entry.crc = ri.crc_value() as u64;
-        entry.size = ri.read_count() as u64;
-        sub_stream_crcs.push(entry.crc as u32);
-        sub_stream_sizes.push(entry.size);
-        entry.has_crc = true;
-    }
+    let (sub_stream_sizes, sub_stream_crcs) = sub_streams(&mut entries, &r)?;
 
     let mut sizes = Vec::with_capacity(more_sizes.len() + 1);
     sizes.extend(more_sizes.iter().map(|s| s.get() as u64));

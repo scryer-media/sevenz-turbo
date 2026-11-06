@@ -15,8 +15,9 @@ one crate could carry both, and the offer was declined - see
 [hasenbanck/sevenz-rust2#144](https://github.com/hasenbanck/sevenz-rust2/issues/144).
 That left a hard fork as the only way to ship the work, and the two crates
 have diverged for good since: this one is not rebased onto sevenz-rust2 and
-nothing goes back. This section is the record of how it differs from the
-commit it was taken at, kept for readers who know the other crate.
+nothing goes back. This section records how it came to differ from the
+commit it was taken at, for readers who know the other crate. It is closed:
+later changes are under their version headings.
 sevenz-rust2's own changelog up to the fork point continues below, unchanged.
 
 ### Packaging
@@ -528,6 +529,43 @@ arm, and this crate can add a variant without a breaking release.
   aws-lc-rs 1.19, brotli 9.1 and ppmd-rust 1.5.2, and the wasm conformance
   tool moves to wasmtime 50. The decode benchmark keeps its sevenz-rust2
   0.22.2 reference, the release this fork was taken from.
+
+Correctness and hardening fixes, and one API, from checking sevenz-rust2 0.23
+through 0.25 against this fork. The tests upstream added for them, where this crate lacked
+an equivalent, are in `tests/upstream_sevenz_rust2_regressions.rs`.
+
+- The writer sizes the empty-file and anti-item bit vectors by the number of
+  entries without a stream, not by every entry. An empty file or anti-item
+  followed by directories no longer writes a header that fails to read back.
+- `push_archive_entries` and `prepare_block` write a directory in a solid block
+  as an entry without a stream. Data offered for an entry without a stream is
+  now refused with `invalid_argument`.
+- A block with no packed streams is refused as corrupt instead of panicking, as
+  are a coder with zero or several output streams and a block with more than 64
+  coders or input streams. The 64 cap holds whatever `ArchiveLimits` says,
+  `ArchiveLimits::unlimited` included, where a long coder chain used to
+  overflow the stack while the decoders were built.
+- When a block is read through its last entry, one probe byte past the declared
+  size turns surplus decoded output into `InvalidData` ("block decodes to more
+  than its declared size") instead of it being dropped. A callback that stops
+  early still gets `Ok`, and nothing past what it read is decoded. AES output is
+  also capped at the coder's declared size, so padding never reaches an entry.
+- Pack and unpack sizes stay `u64` through the decode stack. On 32-bit targets,
+  wasm32 included, sizes above 4 GiB were truncated, and the LZMA dictionary
+  was clamped to the truncated length.
+- The wasm `Uint8Array` source no longer underflows on a seek from the start
+  past the end, or on a read or write at the end.
+- Extraction leaves a file time unset when the stored time lies outside
+  `SystemTime`'s range, instead of panicking. `From<NtTime> for SystemTime`
+  documents that panic.
+- `ArchiveWriter::push_raw_block`, from sevenz-rust2 0.24, copies a block of
+  an existing archive into the one being written without decoding it, with
+  its entries under new names. Its coder graph is written back as it was
+  read, so filter chains, BCJ2's four packed streams and encryption survive
+  the copy; an encrypted block keeps its original password. Renaming entries
+  or adding to an archive no longer means re-encoding it. The block is
+  validated before a byte is written. Its tests are in
+  `tests/raw_block_tests.rs`, and 7-Zip accepts the copies.
 
 ## 0.29.3 - 2026-10-21
 

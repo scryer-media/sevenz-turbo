@@ -411,11 +411,19 @@ pub(crate) fn create_extract_entry(
 }
 
 pub(crate) fn set_extract_times(file: &std::fs::File, entry: &ArchiveEntry) {
-    let file_times = FileTimes::new()
-        .set_accessed(entry.access_date().into())
-        .set_modified(entry.last_modified_date().into());
+    // The platform's `SystemTime` cannot hold every file time (Windows stops
+    // at 2^63); a time it cannot hold is left unset rather than panicking.
+    let mut file_times = FileTimes::new();
+    if let Some(time) = entry.access_date().checked_system_time() {
+        file_times = file_times.set_accessed(time);
+    }
+    if let Some(time) = entry.last_modified_date().checked_system_time() {
+        file_times = file_times.set_modified(time);
+    }
     #[cfg(any(windows, target_os = "macos"))]
-    let file_times = file_times.set_created(entry.creation_date().into());
+    if let Some(time) = entry.creation_date().checked_system_time() {
+        file_times = file_times.set_created(time);
+    }
     let _ = file.set_times(file_times);
 }
 

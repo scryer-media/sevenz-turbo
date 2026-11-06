@@ -4,8 +4,8 @@ use std::{
 };
 
 use super::*;
-use crate::EncoderConfiguration;
 use crate::block::SmallSlice;
+use crate::{Block, EncoderConfiguration};
 #[derive(Debug, Clone, Default)]
 pub(crate) struct UnpackInfo {
     pub(crate) blocks: Vec<BlockInfo>,
@@ -78,18 +78,55 @@ impl UnpackInfo {
                 sub_stream_crcs: sub_stream_crcs.into_boxed_slice(),
                 sub_stream_sizes: sub_stream_sizes.into_boxed_slice(),
                 bcj2: None,
+                raw_pack_streams: None,
             })),
         });
         self.blocks.last_mut().expect("just pushed")
     }
 
+    /// A block copied from another archive by `ArchiveWriter::push_raw_block`,
+    /// whose coders are written back as the reader parsed them.
+    pub(crate) fn add_raw(
+        &mut self,
+        block: &Block,
+        sub_stream_sizes: Vec<u64>,
+        sub_stream_crcs: Vec<u32>,
+    ) {
+        let mut methods = Vec::new();
+        write_raw_block(block, &mut methods)
+            .expect("writing a folder descriptor to Vec cannot fail");
+        self.blocks.push(BlockInfo {
+            methods: methods.into(),
+            sizes: {
+                let mut sizes = SmallSlice::with_len(block.unpack_sizes().len());
+                sizes.copy_from_slice(block.unpack_sizes());
+                sizes
+            },
+            crc: block.crc as u32,
+            extra: Some(Box::new(BlockExtra {
+                num_sub_unpack_streams: block.num_unpack_sub_streams as u64,
+                sub_stream_sizes: sub_stream_sizes.into_boxed_slice(),
+                sub_stream_crcs: sub_stream_crcs.into_boxed_slice(),
+                bcj2: None,
+                raw_pack_streams: Some(block.packed_streams().len()),
+            })),
+        });
+    }
+
     /// How many pack streams the recorded blocks read: four for a BCJ2 block
-    /// (main, rc, call, jump), one for any other.
+    /// (main, rc, call, jump), what its graph names for a block copied by
+    /// `push_raw_block`, one for any other.
     pub(crate) fn pack_streams(&self) -> usize {
         self.blocks
             .iter()
             .map(|block| {
-                if block
+                if let Some(count) = block
+                    .extra
+                    .as_ref()
+                    .and_then(|extra| extra.raw_pack_streams)
+                {
+                    count
+                } else if block
                     .extra
                     .as_ref()
                     .is_some_and(|extra| extra.bcj2.is_some())
@@ -209,6 +246,9 @@ struct BlockExtra {
     sub_stream_sizes: Box<[u64]>,
     sub_stream_crcs: Box<[u32]>,
     bcj2: Option<Bcj2SideSizes>,
+    /// The pack streams of a block copied by `push_raw_block`, which its
+    /// coder graph names rather than its method list.
+    raw_pack_streams: Option<usize>,
 }
 
 impl BlockInfo {
@@ -239,6 +279,7 @@ impl BlockInfo {
                         sub_stream_sizes: Box::default(),
                         sub_stream_crcs: Box::default(),
                         bcj2: None,
+                        raw_pack_streams: None,
                     })
                 })
                 .bcj2 = sizes;
@@ -378,6 +419,46 @@ impl HeaderMethod {
         }
         Ok(())
     }
+}
+
+/// Writes a block's coders back as the reader parsed them, the inverse of
+/// `read_block`, so a coder graph of any shape survives the copy: bind pairs
+/// and several packed streams included.
+fn write_raw_block<W: Write>(block: &Block, header: &mut W) -> std::io::Result<()> {
+    write_u64(header, block.coders.len() as u64)?;
+    for coder in &block.coders {
+        let id = coder.encoder_method_id();
+        let properties = coder.properties();
+        let simple = coder.num_in_streams() == 1 && coder.num_out_streams() == 1;
+        let mut flags = id.len() as u8;
+        if !simple {
+            flags |= 0x10;
+        }
+        if !properties.is_empty() {
+            flags |= 0x20;
+        }
+        header.write_u8(flags)?;
+        header.write_all(id)?;
+        if !simple {
+            write_u64(header, coder.num_in_streams())?;
+            write_u64(header, coder.num_out_streams())?;
+        }
+        if !properties.is_empty() {
+            write_u64(header, properties.len() as u64)?;
+            header.write_all(properties)?;
+        }
+    }
+    for pair in block.bind_pairs() {
+        write_u64(header, pair.in_index)?;
+        write_u64(header, pair.out_index)?;
+    }
+    // One packed stream is implied: the input no bind pair consumes.
+    if block.packed_streams().len() > 1 {
+        for &stream in block.packed_streams() {
+            write_u64(header, stream)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

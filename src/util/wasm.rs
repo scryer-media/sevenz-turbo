@@ -140,7 +140,9 @@ impl Seek for Uint8ArrayStream {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         match pos {
             SeekFrom::Start(n) => {
-                self.pos = n as usize;
+                // Clamped like the other two: a position past the data would
+                // make the next read or write underflow.
+                self.pos = n.min(self.data.length() as u64) as usize;
             }
             SeekFrom::End(i) => {
                 let posi = self.data.length() as i64 + i;
@@ -177,11 +179,13 @@ impl Uint8ArrayStream {
 
 impl Read for Uint8ArrayStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let end = (self.pos + buf.len()).min(self.data.length() as usize);
-        let len = end - self.pos;
+        let len = buf
+            .len()
+            .min((self.data.length() as usize).saturating_sub(self.pos));
         if len == 0 {
             return Ok(0);
         }
+        let end = self.pos + len;
         self.data
             .slice(self.pos as u32, end as u32)
             .copy_to(&mut buf[..len]);
@@ -192,11 +196,13 @@ impl Read for Uint8ArrayStream {
 
 impl Write for Uint8ArrayStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let end = (self.pos + buf.len()).min(self.data.length() as usize);
-        let len = end - self.pos;
+        let len = buf
+            .len()
+            .min((self.data.length() as usize).saturating_sub(self.pos));
         if len == 0 {
             return Ok(0);
         }
+        let end = self.pos + len;
         self.data
             .slice(self.pos as u32, end as u32)
             .copy_from(&buf[..len]);

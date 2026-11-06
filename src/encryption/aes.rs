@@ -51,6 +51,10 @@ pub(crate) struct Aes256Sha256Decoder<R> {
     plain_start: usize,
     plain_end: usize,
     pos: usize,
+    /// Plaintext still to hand over: the coder's unpack size, which stops
+    /// short of the final block's padding. Unbounded until
+    /// [`Self::limit_output`] is called.
+    output_left: u64,
 }
 
 impl<R> Drop for Aes256Sha256Decoder<R> {
@@ -81,6 +85,7 @@ impl<R: Read> Aes256Sha256Decoder<R> {
             plain_start: 0,
             plain_end: 0,
             pos: 0,
+            output_left: u64::MAX,
         })
     }
 
@@ -115,6 +120,13 @@ impl<R: Read> Aes256Sha256Decoder<R> {
 
     /// Finite budgets keep owned delivery at the ordinary AES chunk size.
     /// A larger buffer buys little for this path while raising retained RSS.
+    /// Hands over at most `len` bytes of plaintext. CBC pads the last block,
+    /// and the padding is no part of the stream: passed on, it reads as data
+    /// past the declared size to whatever sits above.
+    pub(crate) fn limit_output(&mut self, len: u64) {
+        self.output_left = len;
+    }
+
     pub(crate) fn keep_push_buffer_small(&mut self) {
         self.compact_push = true;
     }
@@ -145,6 +157,7 @@ impl<R: Read> Aes256Sha256Decoder<R> {
         max: usize,
         sink: &mut dyn FnMut(&[u8]),
     ) -> std::io::Result<usize> {
+        let max = max.min(usize::try_from(self.output_left).unwrap_or(usize::MAX));
         if max == 0 {
             return Ok(0);
         }
@@ -167,6 +180,7 @@ impl<R: Read> Aes256Sha256Decoder<R> {
         let start = self.plain_start;
         self.plain_start += size;
         self.pos += size;
+        self.output_left -= size as u64;
         sink(&self.plain[start..start + size]);
         Ok(size)
     }
@@ -213,9 +227,22 @@ impl<R: Read> Aes256Sha256Decoder<R> {
 
 impl<R: Read> Read for Aes256Sha256Decoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if buf.is_empty() {
+        if buf.is_empty() || self.output_left == 0 {
             return Ok(0);
         }
+        // The read goes ahead on the caller's whole buffer, so the bulk path is
+        // taken exactly as before; only the count handed back is cut. What lies
+        // past the bound is padding nobody may see.
+        let size = self.read_bounded(buf)?;
+        let size = size.min(usize::try_from(self.output_left).unwrap_or(usize::MAX));
+        self.output_left -= size as u64;
+        Ok(size)
+    }
+}
+
+impl<R: Read> Aes256Sha256Decoder<R> {
+    /// [`Read::read`] into a buffer already cut to the output bound.
+    fn read_bounded(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.plain_start < self.plain_end {
             return Ok(self.drain_plain(buf));
         }
@@ -249,6 +276,7 @@ impl<R: Read + Seek> Seek for Aes256Sha256Decoder<R> {
                     Ok(0)
                 } else {
                     self.plain_start += n as usize;
+                    self.output_left = self.output_left.saturating_sub(n as u64);
                     Ok(p)
                 }
             }
@@ -262,6 +290,7 @@ impl<R: Read + Seek> Seek for Aes256Sha256Decoder<R> {
                     Ok(0)
                 } else {
                     self.plain_start += n as usize;
+                    self.output_left = self.output_left.saturating_sub(n as u64);
                     Ok(self.pos as u64 + n as u64)
                 }
             }
