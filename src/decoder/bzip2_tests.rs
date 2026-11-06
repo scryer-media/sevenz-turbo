@@ -32,7 +32,7 @@ fn bzip2_rejects_decoded_bytes_beyond_the_declared_folder_length() {
             // the folder declaration. Test the adapter before container CRCs.
             let mut decoder = add_decoder(
                 packed.as_slice(),
-                data.len() - 1,
+                data.len() as u64 - 1,
                 &coder,
                 &Password::empty(),
                 &opts,
@@ -73,7 +73,7 @@ fn bzip2_workers_fold_container_checksums_at_file_boundaries() {
         opts.checksum_splits = &splits;
         let mut decoder = add_decoder(
             packed.as_slice(),
-            data.len(),
+            data.len() as u64,
             &coder,
             &Password::empty(),
             &opts,

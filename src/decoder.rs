@@ -449,16 +449,16 @@ impl<R: Read> Read for Decoder<R> {
 /// limit leaves (see [`DecodeOptions::reserved_kb`]). `None` too for
 /// properties too short to read a size out of, so that [`add_decoder`] still
 /// reports them in its own words when it reaches the coder.
-fn sized_coder_memory_kb(coder: &Coder, uncompressed_len: usize) -> Option<usize> {
+fn sized_coder_memory_kb(coder: &Coder, uncompressed_len: u64) -> Option<usize> {
     let method_id = coder.encoder_method_id();
     if method_id == EncoderMethod::ID_LZMA {
         let dict_size = crate::codec::lzma_turbo::clamp_dictionary(
             crate::codec::lzma_turbo::lzma_dictionary_size(coder.properties()).ok()?,
-            uncompressed_len as u64,
+            uncompressed_len,
         );
         Some(lzma2_memory_usage_kb(dict_size))
     } else if method_id == EncoderMethod::ID_LZMA2 {
-        let dict_prop = lzma2_clamped_prop(*coder.properties().first()?, uncompressed_len as u64);
+        let dict_prop = lzma2_clamped_prop(*coder.properties().first()?, uncompressed_len);
         Some(lzma2_memory_usage_kb(
             lzma2_dictionary_size(&[dict_prop]).ok()?,
         ))
@@ -540,7 +540,7 @@ pub(crate) fn check_chain_memory<'c>(
     let max_kb = limits.memory_limit_kb();
     let total_kb = coders
         .into_iter()
-        .filter_map(|(coder, len)| sized_coder_memory_kb(coder, len as usize))
+        .filter_map(|(coder, len)| sized_coder_memory_kb(coder, len))
         .fold(base_kb, usize::saturating_add);
     if total_kb > max_kb {
         return Err(Error::MaxMemLimited {
@@ -571,7 +571,7 @@ pub(crate) fn unsized_coders_memory_kb<'c>(
 ) -> usize {
     coders
         .into_iter()
-        .filter(|&(coder, len)| sized_coder_memory_kb(coder, len as usize).is_none())
+        .filter(|&(coder, len)| sized_coder_memory_kb(coder, len).is_none())
         .filter_map(|(coder, _)| coder_memory_estimate(coder).ok())
         .map(|bytes| usize::try_from(bytes.div_ceil(1024)).unwrap_or(usize::MAX))
         .fold(0, usize::saturating_add)
@@ -579,7 +579,7 @@ pub(crate) fn unsized_coders_memory_kb<'c>(
 
 pub fn add_decoder<I: Read>(
     input: I,
-    uncompressed_len: usize,
+    uncompressed_len: u64,
     coder: &Coder,
     #[allow(unused)] password: &Password,
     opts: &DecodeOptions<'_>,
@@ -598,7 +598,7 @@ pub fn add_decoder<I: Read>(
         EncoderMethod::ID_COPY => Ok(Decoder::Copy(CopyReader {
             input,
             buffer: Vec::new(),
-            remaining: uncompressed_len as u64,
+            remaining: uncompressed_len,
             // COPY has always required no coder allocation in the admission
             // model. Finite-budget chains preserve their upstream push
             // stage instead; read-only header decoding needs no output here.
@@ -614,7 +614,7 @@ pub fn add_decoder<I: Read>(
             // dictionary for a small stream is decoded rather than refused.
             let dict_size = crate::codec::lzma_turbo::clamp_dictionary(
                 crate::codec::lzma_turbo::lzma_dictionary_size(coder.properties())?,
-                uncompressed_len as u64,
+                uncompressed_len,
             );
             let mem_size = lzma2_memory_usage_kb(dict_size);
             if mem_size > max_mem_limit_kb {
@@ -640,7 +640,7 @@ pub fn add_decoder<I: Read>(
                 .first()
                 .copied()
                 .ok_or_else(|| Error::corrupted("LZMA2 properties too short"))?;
-            let dict_prop = lzma2_clamped_prop(dict_prop, uncompressed_len as u64);
+            let dict_prop = lzma2_clamped_prop(dict_prop, uncompressed_len);
             let dic_size = lzma2_dictionary_size(&[dict_prop])?;
             let mem_size = lzma2_memory_usage_kb(dic_size);
             if mem_size > max_mem_limit_kb {
@@ -661,7 +661,7 @@ pub fn add_decoder<I: Read>(
                         mem_size,
                     ),
                     dic_size,
-                    uncompressed_len as u64,
+                    uncompressed_len,
                     control,
                     opts.checksum_splits,
                 ),
@@ -691,7 +691,7 @@ pub fn add_decoder<I: Read>(
             // stream. A stream that is corrupt or cut short fails its read as
             // an I/O error of kind `InvalidData` or `UnexpectedEof`, the same
             // classes the LZMA decoders report.
-            let decoder = PpmdDecoder::new(params, Some(uncompressed_len as u64))
+            let decoder = PpmdDecoder::new(params, Some(uncompressed_len))
                 .map_err(|err| Error::from(std::io::Error::from(err)))?;
             Ok(Decoder::Ppmd(Box::new(SevenZReader::from_decoder(
                 input, decoder,
@@ -723,7 +723,7 @@ pub fn add_decoder<I: Read>(
                 let mut checksums = crate::reader::store_overlap::Checksums::new(
                     Arc::clone(control),
                     opts.checksum_splits,
-                    uncompressed_len as u64,
+                    uncompressed_len,
                 );
                 let de = BzDecoder::with_output_callback(input, threads, move |bytes| {
                     checksums.update(bytes);
@@ -833,6 +833,7 @@ pub fn add_decoder<I: Read>(
             if opts.limits.memory_limit_bytes != u64::MAX {
                 de.keep_push_buffer_small();
             }
+            de.limit_output(uncompressed_len);
             Ok(Decoder::Aes256Sha256(Box::new(de)))
         }
         _ => Err(Error::UnsupportedCompressionMethod(

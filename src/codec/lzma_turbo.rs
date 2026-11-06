@@ -176,7 +176,7 @@ pub(crate) fn lzma2_memory_usage_kb(dict_size: u32) -> usize {
 /// carries no end marker, so the length is what stops the decode.
 pub(crate) fn lzma_decoder<R: Read>(
     input: R,
-    uncompressed_len: usize,
+    uncompressed_len: u64,
     properties: &[u8],
     dict_size: u32,
 ) -> Result<LzmaReader<R>, std::io::Error> {
@@ -189,7 +189,7 @@ pub(crate) fn lzma_decoder<R: Read>(
     raw[1..5].copy_from_slice(&dict_size.to_le_bytes());
     let props = LzmaProps::parse(&raw)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    LzmaReader::with_props(input, props, Some(uncompressed_len as u64))
+    LzmaReader::with_props(input, props, Some(uncompressed_len))
 }
 /// Bytes of input read from the coder below in one go when the adaptive
 /// decoder asks for more. `lzma-turbo`'s own single-threaded path reads in

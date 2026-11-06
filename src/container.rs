@@ -96,7 +96,9 @@ pub struct ArchiveLimits {
     ///
     /// Default: 8. 7-Zip itself writes at most four (say AES over BCJ2 over
     /// LZMA2), and the chain is walked recursively when the decode stack is
-    /// built.
+    /// built. A block with more than 64 coders or 64 input streams, 7-Zip's
+    /// own ceiling, is refused whatever this says, [`ArchiveLimits::unlimited`]
+    /// included.
     pub max_coders_per_block: u64,
     /// Largest number of streams one coder may declare, in or out.
     ///

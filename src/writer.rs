@@ -932,7 +932,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 methods,
                 sizes,
                 crc,
-                entries.len() as u64,
+                sub_stream_sizes.len() as u64,
                 sub_stream_sizes,
                 sub_stream_crcs,
             )
@@ -1064,17 +1064,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         drop(out);
         let crc = fold_source_crcs(&r);
         let compressed_crc = compressed.crc_value();
-        let mut sub_stream_crcs = Vec::with_capacity(entries.len());
-        let mut sub_stream_sizes = Vec::with_capacity(entries.len());
-        for i in 0..entries.len() {
-            let entry = &mut entries[i];
-            let ri = &r[i];
-            entry.crc = ri.crc_value() as u64;
-            entry.size = ri.read_count() as u64;
-            sub_stream_crcs.push(entry.crc as u32);
-            sub_stream_sizes.push(entry.size);
-            entry.has_crc = true;
-        }
+        let (sub_stream_sizes, sub_stream_crcs) = sub_streams(&mut entries, &r)?;
 
         self.pack_info
             .add_stream(compressed_len as u64, compressed_crc);
@@ -1093,7 +1083,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
                 content_methods,
                 sizes,
                 crc,
-                entries.len() as u64,
+                sub_stream_sizes.len() as u64,
                 sub_stream_sizes,
                 sub_stream_crcs,
             )
@@ -1376,10 +1366,16 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         Ok(())
     }
 
+    fn empty_stream_count(&self) -> usize {
+        self.files.iter().filter(|entry| !entry.has_stream).count()
+    }
+
     fn write_file_empty_files<H: Write>(&self, header: &mut H) -> std::io::Result<()> {
         let mut has_empty = false;
         let mut empty_stream_counter = 0;
-        let mut bitset = BitSet::new();
+        // Readers take one bit per entry without a stream, so the vector spans all of them
+        // even when the trailing bits are clear.
+        let mut bitset = BitSet::with_capacity(self.empty_stream_count());
         for entry in self.files.iter() {
             if !entry.has_stream {
                 let is_dir = entry.is_directory();
@@ -1404,7 +1400,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     fn write_file_anti_items<H: Write>(&self, header: &mut H) -> std::io::Result<()> {
         let mut has_anti = false;
         let mut counter = 0;
-        let mut bitset = BitSet::new();
+        // One bit per entry without a stream, as for `kEmptyFile`.
+        let mut bitset = BitSet::with_capacity(self.empty_stream_count());
         for entry in self.files.iter() {
             if !entry.has_stream {
                 let is_anti = entry.is_anti_item();
@@ -1506,6 +1503,39 @@ struct EncodedFolder {
     compressed_len: u64,
     compressed_crc: u32,
     bcj2: Option<Bcj2Packed>,
+}
+
+/// Sizes and CRCs of a solid block's sub-streams: one per entry with a stream, in order.
+/// Sets each entry's size and CRC from what its reader returned. An entry without a stream
+/// (a directory, an empty file or an anti-item) owns no sub-stream, so its reader must return
+/// nothing; giving it one would shift every later entry's data onto the wrong entry.
+fn sub_streams<R>(
+    entries: &mut [ArchiveEntry],
+    readers: &[SourceReader<R>],
+) -> Result<(Vec<u64>, Vec<u32>)> {
+    let mut sizes = Vec::with_capacity(entries.len());
+    let mut crcs = Vec::with_capacity(entries.len());
+    for (entry, reader) in entries.iter_mut().zip(readers) {
+        if !entry.has_stream {
+            if reader.read_count() != 0 {
+                return Err(Error::invalid_argument(format!(
+                    "entry '{}' has no stream, but its reader returned {} bytes",
+                    entry.name,
+                    reader.read_count()
+                )));
+            }
+            entry.crc = 0;
+            entry.size = 0;
+            entry.has_crc = false;
+            continue;
+        }
+        entry.crc = reader.crc_value() as u64;
+        entry.size = reader.read_count() as u64;
+        entry.has_crc = true;
+        sizes.push(entry.size);
+        crcs.push(entry.crc as u32);
+    }
+    Ok((sizes, crcs))
 }
 
 /// C: `CFolderInStream::Read` checksums each file once. Preserve our folder
@@ -2131,17 +2161,7 @@ pub fn prepare_block<R: Read>(
     };
 
     let crc = fold_source_crcs(&r);
-    let mut sub_stream_crcs = Vec::with_capacity(entries.len());
-    let mut sub_stream_sizes = Vec::with_capacity(entries.len());
-    for i in 0..entries.len() {
-        let entry = &mut entries[i];
-        let ri = &r[i];
-        entry.crc = ri.crc_value() as u64;
-        entry.size = ri.read_count() as u64;
-        sub_stream_crcs.push(entry.crc as u32);
-        sub_stream_sizes.push(entry.size);
-        entry.has_crc = true;
-    }
+    let (sub_stream_sizes, sub_stream_crcs) = sub_streams(&mut entries, &r)?;
 
     let mut sizes = Vec::with_capacity(more_sizes.len() + 1);
     sizes.extend(more_sizes.iter().map(|s| s.get() as u64));

@@ -38,13 +38,25 @@ use crate::{
 /// read; this only stops a tiny archive from forcing a huge up-front allocation.
 const MAX_PREALLOC_BYTES: usize = 4 << 20;
 
+/// 7-Zip's ceiling on a block's coders and on its input streams
+/// (`k_NumCodersStreams_in_Folder_MAX`). It holds whatever [`ArchiveLimits`] say: the decode
+/// stack is built recursively, one frame per coder, so an unbounded chain overflows the stack.
+const MAX_BLOCK_CODERS_AND_STREAMS: u64 = 64;
+
 pub struct BoundedReader<R: Read> {
     inner: R,
-    remain: usize,
+    /// A `u64`, as the 7z sizes are: a 32-bit target must not cut a stream
+    /// longer than 4 GiB down to its low bits.
+    remain: u64,
+}
+
+/// `len`, capped at `remain`. A `remain` beyond `usize` caps nothing.
+fn capped(len: usize, remain: u64) -> usize {
+    usize::try_from(remain).map_or(len, |remain| len.min(remain))
 }
 
 impl<R: Read> BoundedReader<R> {
-    pub fn new(inner: R, max_size: usize) -> Self {
+    pub fn new(inner: R, max_size: u64) -> Self {
         Self {
             inner,
             remain: max_size,
@@ -57,12 +69,12 @@ impl<R: Read> Read for BoundedReader<R> {
         if self.remain == 0 || buf.is_empty() {
             return Ok(0);
         }
-        let bound = buf.len().min(self.remain);
+        let bound = capped(buf.len(), self.remain);
         let size = self.inner.read(&mut buf[..bound])?;
         if size == 0 {
             return Err(ended_early());
         }
-        self.remain -= size;
+        self.remain -= size as u64;
         Ok(size)
     }
 }
@@ -80,10 +92,10 @@ impl<R: DecodeRead> DecodeRead for BoundedReader<R> {
         if self.remain == 0 || max == 0 {
             return Some(Ok(0));
         }
-        let limit = max.min(self.remain);
+        let limit = capped(max, self.remain);
         let remain = &mut self.remain;
         let read = self.inner.read_borrowed(limit, &mut |bytes| {
-            *remain -= bytes.len();
+            *remain -= bytes.len() as u64;
             sink(bytes)
         })?;
         Some(read.and_then(|size| {
@@ -99,12 +111,12 @@ impl<R: DecodeRead> DecodeRead for BoundedReader<R> {
         if self.remain == 0 || max == 0 {
             return Some(Ok(0));
         }
-        let size = match self.inner.push(max.min(self.remain), sink)? {
+        let size = match self.inner.push(capped(max, self.remain), sink)? {
             Ok(0) => return Some(Err(ended_early())),
             Ok(size) => size,
             Err(e) => return Some(Err(e)),
         };
-        self.remain -= size;
+        self.remain -= size as u64;
         Some(Ok(size))
     }
 }
@@ -479,12 +491,12 @@ struct Crc32VerifyingReader<R> {
 }
 
 impl<R: Read> Crc32VerifyingReader<R> {
-    fn new(inner: R, remaining: usize, expected_value: u64) -> Self {
+    fn new(inner: R, remaining: u64, expected_value: u64) -> Self {
         Self {
             inner,
             crc_digest: Crc32::new(),
             expected_value,
-            remaining: remaining as i64,
+            remaining: i64::try_from(remaining).unwrap_or(i64::MAX),
             report: None,
         }
     }
@@ -492,7 +504,7 @@ impl<R: Read> Crc32VerifyingReader<R> {
     /// Same, and hands the computed checksum to `report` when it matches.
     fn reporting(
         inner: R,
-        remaining: usize,
+        remaining: u64,
         expected_value: u64,
         report: Rc<Cell<Option<u32>>>,
     ) -> Self {
@@ -623,8 +635,8 @@ mod borrowed_delivery_tests {
         });
         FaultRecordingReader {
             inner: Crc32VerifyingReader::reporting(
-                BoundedReader::new(inner, len),
-                len,
+                BoundedReader::new(inner, len as u64),
+                len as u64,
                 u64::from(expected),
                 report,
             ),
@@ -1537,7 +1549,7 @@ impl Archive {
         let opts = &opts
             .reserving(reserved_kb, unsized_kb)
             .decrypting(block.is_encrypted());
-        let pack_size = archive.pack_sizes[first_pack_stream_index] as usize;
+        let pack_size = archive.pack_sizes[first_pack_stream_index];
         let input_reader = BoundedReader::new(reader, pack_size);
         let mut decoder: Box<dyn Read> = Box::new(input_reader);
         let mut decoder = if coder_len > 0 {
@@ -1549,7 +1561,7 @@ impl Archive {
                 }
                 let next = add_decoder(
                     decoder,
-                    block.get_unpack_size_at_index(index) as usize,
+                    block.get_unpack_size_at_index(index),
                     coder,
                     password,
                     opts,
@@ -1566,7 +1578,11 @@ impl Archive {
         // one place the multi-threaded path must not spend time. See
         // `BlockDecoder::for_each_entries`.
         if block.has_crc && opts.verify_checksums && !opts.folding_checksums() {
-            decoder = Box::new(Crc32VerifyingReader::new(decoder, unpack_size, block.crc));
+            decoder = Box::new(Crc32VerifyingReader::new(
+                decoder,
+                unpack_size as u64,
+                block.crc,
+            ));
         }
 
         Ok((decoder, unpack_size))
@@ -2193,6 +2209,9 @@ impl Archive {
 
     fn read_block<R: Read>(header: &mut R, bounds: HeaderBounds<'_>) -> Result<Block, Error> {
         let num_coders = bounds.count(read_variable_u64(header)?, Limit::CodersPerBlock)?;
+        if num_coders as u64 > MAX_BLOCK_CODERS_AND_STREAMS {
+            return Err(Error::corrupted("block has more than 64 coders"));
+        }
         let mut coders = Vec::with_capacity(num_coders);
         let mut total_in_streams: u64 = 0;
         let mut total_out_streams: u64 = 0;
@@ -2212,6 +2231,13 @@ impl Archive {
             } else {
                 (read_variable_u64(header)?, read_variable_u64(header)?)
             };
+            // A block keeps one unpack size per coder, so every coder has exactly one output;
+            // 7-Zip refuses any other count too.
+            if output_streams != 1 {
+                return Err(Error::corrupted(
+                    "coder must have exactly one output stream",
+                ));
+            }
             // Each stream is referenced by a bind-pair/packed-stream entry that consumes
             // header bytes, so the totals cannot legitimately exceed `limit`. The counts are
             // unbounded attacker-controlled varints, so the sums are checked: an overflowing
@@ -2230,6 +2256,9 @@ impl Archive {
                     bounds.limits.max_streams_per_coder,
                     input_streams.max(output_streams),
                 ));
+            }
+            if total_in_streams > MAX_BLOCK_CODERS_AND_STREAMS {
+                return Err(Error::corrupted("block has more than 64 input streams"));
             }
             bounds.count(total_in_streams, Limit::Entries)?;
             bounds.count(total_out_streams, Limit::Entries)?;
@@ -2279,6 +2308,10 @@ impl Archive {
             ));
         }
         let num_packed_streams = total_in_streams - num_bind_pairs;
+        // Decoding a block starts at its first packed stream.
+        if num_packed_streams == 0 {
+            return Err(Error::corrupted("block has no packed streams"));
+        }
         let mut packed_streams = SmallSlice::with_len(num_packed_streams);
         if num_packed_streams == 1 {
             let mut index = u64::MAX;
@@ -3092,7 +3125,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         block_index: usize,
         password: &Password,
         opts: &DecodeOptions<'_>,
-    ) -> Result<(Box<dyn DecodeRead + 'r>, usize), Error> {
+    ) -> Result<(Box<dyn DecodeRead + 'r>, u64), Error> {
         let block = &archive.blocks[block_index];
         crate::container::check_aes_coders(block.coders.iter(), opts.limits)?;
         // The chain as a whole against the memory limit, before any coder is
@@ -3146,10 +3179,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         if let Some(decoder) =
             Self::stored_overlap(archive, block_index, block_offset, password, &opts)?
         {
-            return Ok((
-                decoder,
-                archive.pack_sizes[first_pack_stream_index] as usize,
-            ));
+            return Ok((decoder, archive.pack_sizes[first_pack_stream_index]));
         }
 
         let (mut has_crc, mut crc) = (block.has_crc, block.crc);
@@ -3201,7 +3231,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             );
         // Always restore the cursor, including a declined or failed probe.
         source.seek(SeekFrom::Start(block_offset))?;
-        let pack_size = archive.pack_sizes[first_pack_stream_index] as usize;
+        let pack_size = archive.pack_sizes[first_pack_stream_index];
 
         // Buffered at the bottom too, for a chain whose first coder reads
         // whatever its caller asks for: Copy, or delta straight off the pack
@@ -3241,7 +3271,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         if has_crc && opts.verify_checksums && !opts.folding_checksums() {
             decoder = Box::new(Crc32VerifyingReader::new(
                 decoder,
-                block.get_unpack_size() as usize,
+                block.get_unpack_size(),
                 crc,
             ));
         }
@@ -3303,11 +3333,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let pack_size = archive.pack_sizes[first_pack_stream_index];
         let mut cursor = ReadAtCursor::new(Arc::clone(positional));
         cursor.seek(SeekFrom::Start(block_offset))?;
-        let packed = BoundedReader::new(
-            cursor,
-            usize::try_from(pack_size)
-                .map_err(|_| Error::corrupted("pack stream size exceeds address space"))?,
-        );
+        let packed = BoundedReader::new(cursor, pack_size);
         let checksums = (!opts.checksum_splits.is_empty()).then(|| {
             store_overlap::Checksums::new(Arc::clone(control), opts.checksum_splits, unpack_size)
         });
@@ -3319,7 +3345,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     return Ok(None);
                 };
                 let coder = &block.coders[index];
-                let len = block.get_unpack_size_at_index(index) as usize;
+                let len = block.get_unpack_size_at_index(index);
                 // The serial path's decoder, over the fetched ciphertext.
                 let crate::decoder::Decoder::Aes256Sha256(decrypting) =
                     add_decoder(fetch, len, coder, password, opts)?
@@ -3352,7 +3378,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         block_index: usize,
         password: &Password,
         opts: &DecodeOptions<'_>,
-    ) -> Result<(Box<dyn DecodeRead + 'r>, usize), Error> {
+    ) -> Result<(Box<dyn DecodeRead + 'r>, u64), Error> {
         const MAX_CODER_COUNT: usize = 32;
         let block = &archive.blocks[block_index];
         if block.coders.len() > MAX_CODER_COUNT {
@@ -3488,14 +3514,11 @@ impl<R: Read + Seek> ArchiveReader<R> {
         if block.has_crc && opts.verify_checksums {
             decoder = Box::new(Crc32VerifyingReader::new(
                 decoder,
-                block.get_unpack_size() as usize,
+                block.get_unpack_size(),
                 block.crc,
             ));
         }
-        Ok((
-            decoder,
-            archive.pack_sizes[first_pack_stream_index] as usize,
-        ))
+        Ok((decoder, archive.pack_sizes[first_pack_stream_index]))
     }
 
     // One more parameter than clippy likes, because the memory limit has to
@@ -3530,8 +3553,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 // those consumed inline. Never mix positional worker reads
                 // with the caller's shared seek/read cursor on this graph.
                 let (start, end) = sources[index].bounds;
-                let size = usize::try_from(end - start)
-                    .map_err(|_| Error::corrupted("pack stream size exceeds address space"))?;
+                let size = end - start;
                 let mut cursor = ReadAtCursor::new(Arc::clone(positional));
                 cursor.seek(SeekFrom::Start(start))?;
                 return Ok(Stage::OwnedLeaf(Box::new(BoundedReader::new(cursor, size))));
@@ -4005,14 +4027,10 @@ impl<R: Read + Seek> ArchiveReader<R> {
 
                 let mut data = Vec::with_capacity((file.size as usize).min(MAX_PREALLOC_BYTES));
                 let mut decoder: Box<dyn Read> =
-                    Box::new(BoundedReader::new(&mut block_reader, file.size as usize));
+                    Box::new(BoundedReader::new(&mut block_reader, file.size));
 
                 if file.has_crc {
-                    decoder = Box::new(Crc32VerifyingReader::new(
-                        decoder,
-                        file.size as usize,
-                        file.crc,
-                    ));
+                    decoder = Box::new(Crc32VerifyingReader::new(decoder, file.size, file.crc));
                 }
 
                 decoder.read_to_end(&mut data).map_err(|e| {
@@ -4272,9 +4290,21 @@ fn read_to_stream_end<R: Read>(reader: &mut R, mut left: u64) -> io::Result<()> 
     loop {
         match reader.read(&mut probe) {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            end => return end.map(|_| ()),
+            Ok(0) => return Ok(()),
+            // The stream goes on past the size its header declares: the
+            // block is not what the header says it is, CRC or none.
+            Ok(_) => return Err(decoded_past_declared_size()),
+            Err(e) => return Err(e),
         }
     }
+}
+
+/// The error of a block whose decoded stream is longer than its header says.
+fn decoded_past_declared_size() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "block decodes to more than its declared size",
+    )
 }
 
 /// Decoder for a specific block within a 7z archive.
@@ -4549,7 +4579,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         for file_index in files {
             let file = &archive.files[file_index];
             if file.has_stream && file.size > 0 {
-                let bound = file.size as usize;
+                let bound = file.size;
                 let drain = last_sized.is_some_and(|last| file_index < last);
                 let mut bounded = BoundedReader::new(&mut block_reader, bound);
                 let outcome = if file.has_crc && verify_checksums && !folding {
@@ -4581,7 +4611,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                 };
                 // What the callback took of the file, and whether that was all
                 // of it.
-                let taken = (bound - bounded.remain) as u64;
+                let taken = bound - bounded.remain;
                 let read_to_end = taken == file.size;
                 let outcome = outcome
                     .map_err(|e| e.maybe_bad_password(opts.encrypted))
@@ -4698,6 +4728,14 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         // sequential path compares it on the read that hands the last byte
         // over, before the callback can answer.
         let read_in_full = unpack_size != 0 && consumed == unpack_size;
+        if read_in_full && !stream_ended {
+            // Every declared byte is out; the coder must have nothing more. One
+            // read finds out, and is the one that brings an LZMA2 coder to its
+            // end marker, so a stream cut short just before it fails here too.
+            read_to_stream_end(&mut block_reader, 0)
+                .map_err(|e| Error::from(e).in_block(block_index, packed_offset))?;
+            stream_ended = true;
+        }
         let outcome = BlockOutcome {
             finished,
             read_in_full: consumed == unpack_size,
