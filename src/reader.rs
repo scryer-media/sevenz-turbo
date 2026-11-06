@@ -2941,8 +2941,15 @@ impl<R: Read + Seek> ArchiveReader<R> {
         }
     }
 
-    /// Sets how many threads one block's LZMA2 coder may decode on, clamped
-    /// to `1..=256`.
+    /// Sets how many threads one block's LZMA2 or BZip2 coder may decode on,
+    /// clamped to `1..=256`.
+    ///
+    /// BZip2 uses at most two of them, as 7-Zip does: the caller parses the
+    /// entropy coding while one worker rebuilds each block and writes it out.
+    /// The worker is started only where the count leaves a thread beyond the
+    /// block's pipeline stages and the memory limit is unlimited; under a
+    /// finite limit BZip2 decodes on one thread. An archive with several
+    /// BZip2 folders can also decode them side by side, one thread each.
     ///
     /// **The default is one**, which is the behaviour of every other coder in
     /// this crate and the behaviour this fork had before the parallel path
@@ -4355,8 +4362,8 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         self.input_complete = complete;
     }
 
-    /// Sets how many threads this block's LZMA2 coder may decode on, clamped
-    /// to `1..=256`. See [`ArchiveReader::set_threads`].
+    /// Sets how many threads this block's LZMA2 or BZip2 coder may decode on,
+    /// clamped to `1..=256`. See [`ArchiveReader::set_threads`].
     pub fn set_threads(&mut self, threads: u32) {
         self.thread_count = threads.clamp(1, 256);
         self.lzma2.set_threads(self.thread_count);
