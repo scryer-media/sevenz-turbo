@@ -54,7 +54,7 @@ pub(crate) enum Encoder<W: Write> {
     #[cfg(feature = "brotli")]
     Brotli(BrotliEncoder<CountingWriter<W>>),
     #[cfg(feature = "bzip2")]
-    Bzip2(Option<bzip2::write::BzEncoder<CountingWriter<W>>>),
+    Bzip2(Option<bzip2_turbo::Encoder<CountingWriter<W>>>),
     #[cfg(feature = "deflate")]
     Deflate(Option<flate2::write::DeflateEncoder<CountingWriter<W>>>),
     #[cfg(feature = "lz4")]
@@ -635,12 +635,20 @@ fn lzma2_block_plan(options: &Lzma2Options) -> (u64, usize) {
     }
 }
 
-/// The threads of its own the coder of `mc` runs on: a block-parallel LZMA2
-/// coder's block threads, and with `lzma-turbo`'s encoder every other LZMA
-/// and LZMA2 coder's one. Any other coder has none: it runs on the thread
-/// writing into the chain.
+/// The coder's thread reservation: a block-parallel LZMA2 coder's block
+/// threads, every other LZMA/LZMA2 coder's one, or BZip2's total block budget.
+/// BZip2 includes the caller, conservatively counting it again if another
+/// compressor shares that thread. Other coders run on the writing thread.
 fn coder_threads(mc: &EncoderConfiguration) -> u32 {
     match (mc.method.id(), &mc.options) {
+        #[cfg(feature = "bzip2")]
+        (EncoderMethod::ID_BZIP2, Some(EncoderOptions::Bzip2(options))) => {
+            if cfg!(target_arch = "wasm32") || options.threads <= 1 {
+                0
+            } else {
+                options.threads.min(64)
+            }
+        }
         (EncoderMethod::ID_LZMA2, Some(EncoderOptions::Lzma2(options))) => {
             lzma2_block_plan(options).1 as u32
         }
@@ -712,6 +720,14 @@ pub(crate) fn one_thread_each(methods: &[EncoderConfiguration]) -> Vec<EncoderCo
                 options: Some(EncoderOptions::Lzma2(Lzma2Options {
                     threads: 1,
                     ..options.clone()
+                })),
+            },
+            #[cfg(feature = "bzip2")]
+            Some(EncoderOptions::Bzip2(options)) if options.threads > 1 => EncoderConfiguration {
+                method: mc.method,
+                options: Some(EncoderOptions::Bzip2(Bzip2Options {
+                    threads: 1,
+                    ..*options
                 })),
             },
             _ => mc.clone(),
@@ -813,8 +829,15 @@ pub(crate) fn add_encoder<W: Write>(
                 _ => Bzip2Options::default(),
             };
 
-            let bzip2_encoder =
-                bzip2::write::BzEncoder::new(input, bzip2::Compression::new(options.0));
+            let bzip2_encoder = bzip2_turbo::Encoder::new(
+                input,
+                bzip2_turbo::EncoderOptions {
+                    level: options.level,
+                    threads: options.threads as usize,
+                    block_size: options.block_size,
+                    passes: options.passes,
+                },
+            );
 
             Ok(Encoder::Bzip2(Some(bzip2_encoder)))
         }
@@ -1252,6 +1275,27 @@ mod tests {
         ];
         assert_eq!(folder_threads(&wide), 5);
         assert_eq!(folder_threads(&one_thread_each(&wide)), 2);
+    }
+
+    #[cfg(feature = "bzip2")]
+    #[test]
+    fn bzip2_workers_share_the_folder_thread_budget() {
+        use super::{folder_threads, one_thread_each};
+        use crate::EncoderConfiguration;
+        use crate::encoder_options::Bzip2Options;
+
+        for threads in [0, 1, 2, 4, 64, 100] {
+            let chain = [EncoderConfiguration::from(Bzip2Options::from_level_mt(
+                5, threads,
+            ))];
+            let expected = if cfg!(target_arch = "wasm32") {
+                1
+            } else {
+                threads.clamp(1, 64)
+            };
+            assert_eq!(folder_threads(&chain), expected);
+            assert_eq!(folder_threads(&one_thread_each(&chain)), 1);
+        }
     }
 
     /// A compressor with no thread of its own codes on the thread writing

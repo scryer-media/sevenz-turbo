@@ -153,6 +153,9 @@ jobs:
             echo "::error::ci-complete on $GITHUB_SHA is '${conclusion:-absent}', not success; wait for ci.yml or fix it"
             exit 1
           fi
+      - name: Build the pinned BZip2 reference oracle
+        if: github.event_name == 'push'
+        run: bash .github/scripts/build-bzip2-oracle.sh
       - name: Test
         if: github.event_name == 'push'
         # The wasm conformance harness builds wasmtime and needs a wasip1

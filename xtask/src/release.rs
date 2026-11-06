@@ -161,7 +161,11 @@ impl Release {
             println!(
                 "release: cargo nextest run --locked --workspace --exclude wasm-conformance --release"
             );
-            if !cargo(&[
+            if env::var_os("BZIP2_TURBO_7ZZ").is_none() {
+                self.problem(
+                    "native tests require BZIP2_TURBO_7ZZ pointing to the pinned reference; build it with bash .github/scripts/build-bzip2-oracle.sh and use the printed executable path",
+                )?;
+            } else if !cargo(&[
                 "nextest",
                 "run",
                 "--locked",

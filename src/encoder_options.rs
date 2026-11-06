@@ -277,7 +277,12 @@ impl Lzma2Options {
 #[cfg(feature = "bzip2")]
 #[derive(Debug, Copy, Clone)]
 /// Options for BZIP2 compression.
-pub struct Bzip2Options(pub(crate) u32);
+pub struct Bzip2Options {
+    pub(crate) level: u32,
+    pub(crate) threads: u32,
+    pub(crate) block_size: Option<u32>,
+    pub(crate) passes: Option<u32>,
+}
 
 #[cfg(feature = "bzip2")]
 impl Bzip2Options {
@@ -286,14 +291,41 @@ impl Bzip2Options {
     /// # Arguments
     /// * `level` - Compression level (typically 1-9)
     pub const fn from_level(level: u32) -> Self {
-        Self(level)
+        Self {
+            level,
+            threads: 1,
+            block_size: None,
+            passes: None,
+        }
+    }
+
+    /// Uses up to `threads` block encoders, with output in input order.
+    /// Zero requests one thread; the codec supports at most 64.
+    pub const fn from_level_mt(level: u32, threads: u32) -> Self {
+        Self {
+            threads,
+            ..Self::from_level(level)
+        }
+    }
+
+    /// Sets the BZip2 block size in bytes, rounded down to a 100,000-byte
+    /// step and clamped to 100,000 through 900,000. The default follows 7-Zip's
+    /// level mapping: 100k/300k/500k/700k/900k at levels 1/2/3/4/5 and above.
+    pub fn set_block_size(&mut self, bytes: u32) {
+        self.block_size = Some(bytes);
+    }
+
+    /// Sets recursive block optimization passes, clamped to 1 through 10.
+    /// The default is one at levels 0–6, two at 7–8, and seven at 9.
+    pub fn set_passes(&mut self, passes: u32) {
+        self.passes = Some(passes);
     }
 }
 
 #[cfg(feature = "bzip2")]
 impl Default for Bzip2Options {
     fn default() -> Self {
-        Self(6)
+        Self::from_level(6)
     }
 }
 

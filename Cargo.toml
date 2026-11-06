@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/scryer-media/sevenz-turbo"
 # Raised from upstream's 1.93: `lzma-turbo` requires 1.97.1.
 rust-version = "1.97.1"
-version = "0.29.3"
+version = "0.29.4"
 # Repository scaffolding that has no business in the crate archive.
 exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml"]
 
@@ -60,14 +60,14 @@ crypto-host = ["lzma-turbo/crypto-host"]
 # own and stay in the guest.
 crc-host = ["lzma-turbo/crc-host"]
 brotli = ["dep:brotli"]
-bzip2 = ["dep:bzip2"]
+bzip2 = ["dep:bzip2-turbo"]
 # Writing archives. LZMA and LZMA2 are encoded by `lzma-turbo`'s port of the
 # SDK encoder (see `src/codec/lzma_turbo/writer.rs`); with `aes256`, the
 # AES-256 encryptor is the selected backend's (RustCrypto under
 # `native-crypto`, AWS-LC otherwise). `crypto-host` delegates decryption only,
 # so a wasm `crypto-host` build with `compress` and `aes256` also needs
 # `native-crypto`; without it the build is a compile error.
-compress = ["lzma-turbo/enc"]
+compress = ["lzma-turbo/enc", "bzip2-turbo?/compress"]
 deflate = ["dep:flate2"]
 lz4 = ["dep:lz4_flex"]
 # PPMd decodes and encodes through `ppmd-turbo`.
@@ -83,7 +83,7 @@ aes = { version = "0.9", features = ["zeroize"], optional = true }
 # cryptography is not `lzma-turbo`'s job), so the dependency is direct.
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
 brotli = { version = ">= 7, < 10", default-features = false, optional = true, features = ["std"] }
-bzip2 = { version = "0.6", optional = true }
+bzip2-turbo = { version = "0.1.1", default-features = false, optional = true }
 cbc = { version = "0.2", optional = true }
 flate2 = { version = "1", optional = true, features = ["zlib-rs"] }
 getrandom = { version = "0.4", optional = true }
@@ -186,3 +186,8 @@ opt-level = 3
 # tested and measured on a host that has them. Never set for a build that ships.
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(sevenz_turbo_unthreaded)"] }
+
+# bzip2-turbo 0.1.1 is not published yet: this points at its release commit
+# until it is, and is removed then.
+[patch.crates-io]
+bzip2-turbo = { git = "https://github.com/scryer-media/bzip2-turbo", rev = "924d9e6057dbf43dcd926e35fa7149d5c510b219" }

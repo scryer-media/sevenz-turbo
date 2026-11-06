@@ -780,6 +780,9 @@ pub(crate) struct Chain<'r> {
     /// The one coder that is built with the reader's live LZMA2 control, and
     /// so may decode in parallel: see [`parallel_lzma2_coder`].
     parallel_lzma2: Option<usize>,
+    /// At most one BZip2 reconstruction worker, from the budget left after
+    /// the caller and stage threads. LZMA2 retains its existing worker budget.
+    parallel_bzip2: Option<usize>,
 }
 
 impl<'r> Chain<'r> {
@@ -824,10 +827,29 @@ impl<'r> Chain<'r> {
                 opts.reserved_kb = chain_kb;
             }
         }
+        let parallel_lzma2 = parallel_lzma2_coder(block).filter(|&index| Some(index) != serial);
+        let parallel_bzip2 =
+            if parallel_lzma2.is_none() && offload.count_ones().saturating_add(1) < opts.threads {
+                block
+                    .coders
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, coder)| coder.encoder_method_id() == EncoderMethod::ID_BZIP2)
+                    .find(|(index, _)| {
+                        !block
+                            .bind_pairs()
+                            .iter()
+                            .any(|pair| pair.out_index == *index as u64)
+                    })
+                    .map(|(index, _)| index)
+            } else {
+                None
+            };
         Self {
             pipeline: Pipeline::default(),
             offload,
-            parallel_lzma2: parallel_lzma2_coder(block).filter(|&index| Some(index) != serial),
+            parallel_lzma2,
+            parallel_bzip2,
         }
     }
 
@@ -864,7 +886,15 @@ impl<'r> Chain<'r> {
         // Every other LZMA2 coder of the chain is built without the control,
         // which is what a single-threaded plan is.
         let single_threaded;
-        let opts = if coder.encoder_method_id() == EncoderMethod::ID_LZMA2
+        let opts = if coder.encoder_method_id() == EncoderMethod::ID_BZIP2
+            && self.parallel_bzip2 != Some(index)
+        {
+            single_threaded = DecodeOptions {
+                threads: 1,
+                ..*opts
+            };
+            &single_threaded
+        } else if coder.encoder_method_id() == EncoderMethod::ID_LZMA2
             && self.parallel_lzma2 != Some(index)
         {
             single_threaded = DecodeOptions {
@@ -1117,6 +1147,30 @@ mod tests {
         assert_eq!(offload_plan_with_serial(&main, 2, Some(1)), 0b0010);
         assert_eq!(offload_plan_with_serial(&main, 8, Some(1)), 0b1110);
         assert_eq!(offload_plan_with_serial(&main, 8, None), 0b1100);
+    }
+
+    #[cfg(feature = "bzip2")]
+    #[test]
+    fn bzip2_reconstruction_workers_use_only_the_remaining_thread_budget() {
+        let limits = crate::ArchiveLimits::default();
+        let mut block = aes_under(EncoderMethod::ID_BZIP2, 64 << 20, 32 << 20);
+        for threads in [1, 2, 3, 4, 8] {
+            let mut opts = DecodeOptions::header(&limits);
+            opts.threads = threads;
+            let chain = Chain::new(&block, &mut opts);
+            let workers =
+                chain.offload.count_ones() + 1 + u32::from(chain.parallel_bzip2.is_some());
+            assert!(workers <= threads);
+            assert_eq!(chain.parallel_bzip2.is_some(), threads >= 3);
+        }
+        block.coders[1] = coder(EncoderMethod::ID_BZIP2, 1);
+        let mut opts = DecodeOptions::header(&limits);
+        opts.threads = 8;
+        let chain = Chain::new(&block, &mut opts);
+        assert_eq!(chain.parallel_bzip2, Some(0));
+        block.coders[1] = coder(EncoderMethod::ID_LZMA2, 1);
+        let chain = Chain::new(&block, &mut opts);
+        assert!(chain.parallel_bzip2.is_none());
     }
 
     /// The decisions, for the chains 7-Zip writes.
