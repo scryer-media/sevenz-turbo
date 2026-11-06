@@ -14,8 +14,9 @@ Thanks for looking. A few things before you open a pull request:
   `cargo clippy --locked --all-targets --no-default-features -- -D warnings`,
   `cargo nextest run --locked --all-features --no-fail-fast`
   and `cargo test --doc --locked --all-features --no-fail-fast` locally.
-- Record every divergence from upstream in the "Fork" section of
-  [CHANGELOG.md](../CHANGELOG.md), in the same change.
+- Record every change under its version heading in
+  [CHANGELOG.md](../CHANGELOG.md), in the same change. The `## Fork`
+  section is closed and takes no new entries.
 - Enable the hooks once per clone: `git config core.hooksPath .githooks`.
 
 Install the native test runner with `cargo install cargo-nextest --locked --version 0.9.143`.
