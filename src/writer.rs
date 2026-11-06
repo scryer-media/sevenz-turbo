@@ -1028,11 +1028,20 @@ impl<W: Write + Seek> ArchiveWriter<W> {
 
         // Its entries: the files with data in it, in order. An empty file
         // between two of a solid block's maps to it too, with no sub-stream.
+        // The block's files are contiguous from its first, so the scan starts
+        // there and stops at the first file of another block.
+        let first_file = *map
+            .block_first_file_index
+            .get(block_index)
+            .ok_or_else(|| invalid("is missing from the stream map"))?;
         let entries: Vec<ArchiveEntry> = archive
             .files
+            .get(first_file..)
+            .unwrap_or_default()
             .iter()
-            .zip(&map.file_block_index)
-            .filter(|(entry, block)| entry.has_stream && **block == Some(block_index))
+            .zip(map.file_block_index.get(first_file..).unwrap_or_default())
+            .take_while(|(_, block)| **block == Some(block_index))
+            .filter(|(entry, _)| entry.has_stream)
             .map(|(entry, _)| ArchiveEntry {
                 name: rename(entry),
                 ..entry.clone()
