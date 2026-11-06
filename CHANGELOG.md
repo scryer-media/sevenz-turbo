@@ -519,6 +519,11 @@ arm, and this crate can add a variant without a breaking release.
 - CI builds the pinned 7-Zip 26.04 `7zz` and runs the BZip2 differential
   tests against it on Linux and macOS; the release path requires
   `BZIP2_TURBO_7ZZ`.
+- The `zstd` requirement is raised to 0.14.3, and the lockfile takes the
+  patched zstd, zstd-safe and zstd-sys releases, plus wasmtime 48.0.8 and
+  tokio 1.54.1 for the wasm conformance tool. This clears RUSTSEC-2026-0391,
+  -0398, -0403, -0410, -0420, -0422, -0423 and -0424, and the zstd-safe and
+  tokio unsoundness warnings.
 
 ## 0.29.3 - 2026-10-21
 
