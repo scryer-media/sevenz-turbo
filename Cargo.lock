@@ -237,7 +237,8 @@ dependencies = [
 [[package]]
 name = "bzip2-turbo"
 version = "0.1.1"
-source = "git+https://github.com/scryer-media/bzip2-turbo?rev=924d9e6057dbf43dcd926e35fa7149d5c510b219#924d9e6057dbf43dcd926e35fa7149d5c510b219"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f542fbec5f6cd891cb388b7e45670b56624a5e207ad507d830e64956aaf64a0"
 dependencies = [
  "crc-turbo",
 ]
