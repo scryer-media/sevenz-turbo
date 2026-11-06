@@ -2,7 +2,20 @@ use std::io::Read;
 use std::sync::Arc;
 
 #[cfg(feature = "bzip2")]
-use bzip2::read::BzDecoder;
+mod bzip2;
+#[cfg(feature = "bzip2")]
+use bzip2::Bzip2Decoder;
+
+#[cfg(all(
+    test,
+    feature = "bzip2",
+    feature = "compress",
+    not(target_arch = "wasm32")
+))]
+mod bzip2_tests;
+
+#[cfg(feature = "bzip2")]
+use bzip2_turbo::Decoder as BzDecoder;
 #[cfg(feature = "deflate")]
 use flate2::bufread::DeflateDecoder;
 use lzma_turbo::LzmaReader;
@@ -389,7 +402,7 @@ pub enum Decoder<R: Read> {
     #[cfg(feature = "brotli")]
     Brotli(Box<BrotliDecoder<R>>),
     #[cfg(feature = "bzip2")]
-    Bzip2(BzDecoder<R>),
+    Bzip2(Box<Bzip2Decoder<R>>),
     #[cfg(feature = "deflate")]
     Deflate(DeflateDecoder<std::io::BufReader<R>>),
     #[cfg(feature = "lz4")]
@@ -691,8 +704,45 @@ pub fn add_decoder<I: Read>(
         }
         #[cfg(feature = "bzip2")]
         EncoderMethod::ID_BZIP2 => {
-            let de = BzDecoder::new(input);
-            Ok(Decoder::Bzip2(de))
+            // Finite-budget chains use compact links on one thread.
+            // This keeps its allocation within the existing 8 MiB admission
+            // estimate, even when other codecs or pipeline buffers are live.
+            let threads = if opts.limits.memory_limit_bytes == u64::MAX {
+                opts.threads as usize
+            } else {
+                1
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            if threads > 1
+                && !opts.checksum_splits.is_empty()
+                && let Some(control) = opts.lzma2_control
+            {
+                // The chain gives final-file splits only to an output BZip2
+                // coder. Compute container CRCs there, before queueing output,
+                // and reuse the reader's existing per-file folding protocol.
+                let mut checksums = crate::reader::store_overlap::Checksums::new(
+                    Arc::clone(control),
+                    opts.checksum_splits,
+                    uncompressed_len as u64,
+                );
+                let de = BzDecoder::with_output_callback(input, threads, move |bytes| {
+                    checksums.update(bytes);
+                });
+                control.fold_elsewhere();
+                return Ok(Decoder::Bzip2(Box::new(Bzip2Decoder::new(
+                    de,
+                    uncompressed_len,
+                ))));
+            }
+            let de = if opts.limits.memory_limit_bytes == u64::MAX {
+                BzDecoder::with_threads(input, threads)
+            } else {
+                BzDecoder::with_low_memory(input, 1)
+            };
+            Ok(Decoder::Bzip2(Box::new(Bzip2Decoder::new(
+                de,
+                uncompressed_len,
+            ))))
         }
         #[cfg(feature = "deflate")]
         EncoderMethod::ID_DEFLATE => {

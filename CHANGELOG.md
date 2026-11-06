@@ -52,6 +52,10 @@ sevenz-rust2's own changelog up to the fork point continues below, unchanged.
 
 ### Decoding
 
+- BZip2 encoding and decoding use the independent `bzip2-turbo` crate,
+  translating 7-Zip 26.04 with its LGPL-2.1-or-later license retained.
+  Native encode and decode support explicit thread counts; one remains the
+  default. The former third-party `bzip2` backend is removed.
 - SDK conformance covers empty archive encodings and interleaved empty
   members. Block iteration uses the parsed file span rather than the count
   of non-empty substreams, preserving all solid-folder members.
@@ -489,6 +493,41 @@ arm, and this crate can add a variant without a breaking release.
 - The vendored BCJ round-trip tests generate their sample data instead of
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
+
+## 0.29.4 - 2026-11-06
+
+- BZip2 is coded by `bzip2-turbo` 0.1.1, a translation of the 7-Zip 26.04
+  BZip2 codec, in place of the `bzip2` crate, which is no longer a
+  dependency. Encoding can run block-parallel and decoding pipelines parsing
+  and reconstruction on a second thread, within the folder's thread budget;
+  one thread remains the default. Under a finite `memory_limit_bytes` the
+  decoder takes the compact single-threaded path, inside the existing 8 MiB
+  admission estimate. When decoding runs on two threads, per-file CRCs are
+  computed on the reconstruction worker and folded as the stored-folder
+  reader's are.
+- A BZip2 coder decodes exactly one stream, as 7-Zip's 7z handler does, and
+  reads it through its trailer: output short of the coder's declared size is
+  `UnexpectedEof`, output beyond it is `InvalidData`, and the stream CRC is
+  checked even when every file CRC has already been folded.
+- `Bzip2Options::from_level_mt`, `set_block_size` and `set_passes` are new.
+  Levels now follow 7-Zip's block-size and pass mapping rather than libbz2's
+  100,000 bytes per level, so the compressed bytes for a given level differ
+  from earlier releases; the default stays level 6.
+- `bzip2-turbo` is LGPL-2.1-or-later with MIT adapter notices. This crate
+  stays Apache-2.0; enabling the `bzip2` feature brings that separately
+  licensed dependency into a build.
+- CI builds the pinned 7-Zip 26.04 `7zz` and runs the BZip2 differential
+  tests against it on Linux and macOS; the release path requires
+  `BZIP2_TURBO_7ZZ`.
+- The `zstd` requirement is raised to 0.14.3, and the lockfile takes the
+  patched zstd, zstd-safe and zstd-sys releases, plus wasmtime 48.0.8 and
+  tokio 1.54.1 for the wasm conformance tool. This clears RUSTSEC-2026-0391,
+  -0398, -0403, -0410, -0420, -0422, -0423 and -0424, and the zstd-safe and
+  tokio unsoundness warnings.
+- Dependencies are updated to their latest compatible releases, among them
+  aws-lc-rs 1.19, brotli 9.1 and ppmd-rust 1.5.2, and the wasm conformance
+  tool moves to wasmtime 50. The decode benchmark keeps its sevenz-rust2
+  0.22.2 reference, the release this fork was taken from.
 
 ## 0.29.3 - 2026-10-21
 

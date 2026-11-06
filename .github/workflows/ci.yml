@@ -142,6 +142,29 @@ jobs:
       - name: Run doctests
         run: cargo test --doc --locked --no-fail-fast ${{ matrix.configuration.args }}
 
+  bzip2-conformance:
+    name: bzip2-conformance-${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-26.04, macos-15]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
+        with:
+          tool: cargo-nextest@0.9.143
+      - name: Build the pinned BZip2 reference
+        run: bash .github/scripts/build-bzip2-oracle.sh
+      - name: Archive integration, including the required oracle
+        run: cargo nextest run --locked -p sevenz-turbo --no-default-features --features bzip2,compress --test bzip2_codec_tests --run-ignored all --no-fail-fast
+
   # Native guards also cover assembly reached through the archive APIs.
   # The 2 MiB guard alignment includes sevenz's HugeInput allocation. The
   # guarded cases: LZMA2 through every push path, parallel LZMA2 decode at two
@@ -209,7 +232,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends valgrind
       - name: Aligned allocation and native madvise under Memcheck
         if: matrix.scope == 'allocation'
-        run: cargo nextest run --locked --release --no-default-features --features compress --lib -E 'test(/^writer::input_buffer::tests::/)' --no-fail-fast
+        run: cargo nextest run --locked --release --no-default-features --features compress,bzip2 --lib -E 'test(/^writer::input_buffer::tests::/)' --no-fail-fast
       - name: Archive source lifetimes, short reads and failures under Memcheck
         if: matrix.scope == 'source-lifecycle'
         run: cargo nextest run --locked --release --no-default-features --features compress --test input_buffer_tests --no-fail-fast
@@ -246,7 +269,7 @@ jobs:
         with:
           tool: cargo-nextest@0.9.143
       - name: Instrument the aligned allocation and ownership tests
-        run: cargo +nightly-2026-09-01 nextest run -Zbuild-std --target ${{ matrix.target }} --locked --no-default-features --features compress --lib -E 'test(/^writer::input_buffer::tests::/)' --no-fail-fast
+        run: cargo +nightly-2026-09-01 nextest run -Zbuild-std --target ${{ matrix.target }} --locked --no-default-features --features compress,bzip2 --lib -E 'test(/^writer::input_buffer::tests::/)' --no-fail-fast
       - name: Instrument source handoff, errors and teardown
         run: cargo +nightly-2026-09-01 nextest run -Zbuild-std --target ${{ matrix.target }} --locked --no-default-features --features compress --test input_buffer_tests --no-fail-fast
       # The concurrency machinery: the ordered job queue (send, receive,
@@ -285,8 +308,8 @@ jobs:
         id: plan
         run: |
           cargo +nightly-2026-09-01 miri nextest list --locked --lib \
-            --no-default-features --features compress --message-format json \
-            -E 'test(/^writer::input_buffer::tests::/) & !test(/native_advice/)' > "$RUNNER_TEMP/miri-tests.json"
+            --no-default-features --features compress,bzip2 --message-format json \
+            -E '(test(/^writer::input_buffer::tests::/) & !test(/native_advice/))' > "$RUNNER_TEMP/miri-tests.json"
           python3 .github/scripts/miri-matrix.py "$RUNNER_TEMP/miri-tests.json" "$GITHUB_OUTPUT"
 
   unsafe-miri:
@@ -312,7 +335,7 @@ jobs:
         with:
           tool: cargo-nextest@0.9.143
       - name: Check one portable allocation invariant
-        run: cargo +nightly-2026-09-01 miri nextest run --locked --lib --no-default-features --features compress --no-fail-fast -- --exact "$MIRI_TEST"
+        run: cargo +nightly-2026-09-01 miri nextest run --locked --lib --no-default-features --features compress,bzip2 --no-fail-fast -- --exact "$MIRI_TEST"
 
   unsafe-complete:
     name: unsafe-complete
@@ -510,7 +533,7 @@ jobs:
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [hygiene, fmt, clippy, docs, test, unsafe-complete, sdk-functional, unthreaded, wasm, msrv, package]
+    needs: [hygiene, fmt, clippy, docs, test, bzip2-conformance, unsafe-complete, sdk-functional, unthreaded, wasm, msrv, package]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:

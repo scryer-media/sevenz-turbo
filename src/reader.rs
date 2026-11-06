@@ -15,7 +15,7 @@ pub use positional_block::PositionalBlockDecoder;
 #[cfg(all(feature = "util", not(target_arch = "wasm32")))]
 mod extract;
 #[cfg(not(target_arch = "wasm32"))]
-mod store_overlap;
+pub(crate) mod store_overlap;
 
 use crate::{
     ByteReader, Password,
@@ -2941,8 +2941,15 @@ impl<R: Read + Seek> ArchiveReader<R> {
         }
     }
 
-    /// Sets how many threads one block's LZMA2 coder may decode on, clamped
-    /// to `1..=256`.
+    /// Sets how many threads one block's LZMA2 or BZip2 coder may decode on,
+    /// clamped to `1..=256`.
+    ///
+    /// BZip2 uses at most two of them, as 7-Zip does: the caller parses the
+    /// entropy coding while one worker rebuilds each block and writes it out.
+    /// The worker is started only where the count leaves a thread beyond the
+    /// block's pipeline stages and the memory limit is unlimited; under a
+    /// finite limit BZip2 decodes on one thread. An archive with several
+    /// BZip2 folders can also decode them side by side, one thread each.
     ///
     /// **The default is one**, which is the behaviour of every other coder in
     /// this crate and the behaviour this fork had before the parallel path
@@ -4355,8 +4362,8 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         self.input_complete = complete;
     }
 
-    /// Sets how many threads this block's LZMA2 coder may decode on, clamped
-    /// to `1..=256`. See [`ArchiveReader::set_threads`].
+    /// Sets how many threads this block's LZMA2 or BZip2 coder may decode on,
+    /// clamped to `1..=256`. See [`ArchiveReader::set_threads`].
     pub fn set_threads(&mut self, threads: u32) {
         self.thread_count = threads.clamp(1, 256);
         self.lzma2.set_threads(self.thread_count);
@@ -4744,7 +4751,20 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         // A stored folder's bytes are the files' too, whatever its coders —
         // COPY, AES, or both — and its reader thread checksums them the same
         // way when it has one: see `store_overlap`.
-        if block.coders.len() != 1 && stored_chain(block).is_none() {
+        // A lower LZMA2 coder owns the shared folding control. Its output is
+        // still compressed BZip2 bytes, so final-file splits must not reach it.
+        let bzip2_output = !block
+            .coders
+            .iter()
+            .any(|coder| coder.encoder_method_id() == EncoderMethod::ID_LZMA2)
+            && block.coders.iter().enumerate().any(|(index, coder)| {
+                coder.encoder_method_id() == EncoderMethod::ID_BZIP2
+                    && !block
+                        .bind_pairs()
+                        .iter()
+                        .any(|pair| pair.out_index == index as u64)
+            });
+        if block.coders.len() != 1 && stored_chain(block).is_none() && !bzip2_output {
             return Vec::new();
         }
         let files = &archive.files[block_file_range(archive, block_index)];
@@ -6054,6 +6074,56 @@ mod chain_plan_tests {
 
     use super::*;
     use crate::{ArchiveWriter, encoder_options::Lzma2Options};
+
+    #[cfg(feature = "bzip2")]
+    #[test]
+    fn bzip2_over_parallel_lzma2_keeps_checksums_in_the_final_byte_domain() {
+        let mut state = 0x4a91_723du32;
+        let data: Vec<_> = (0..2_100_003)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        writer.set_content_methods(vec![
+            Lzma2Options::from_level_mt(1, 4, 1 << 20).into(),
+            crate::encoder_options::Bzip2Options::from_level(1).into(),
+        ]);
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("nested.bin"), Some(data.as_slice()))
+            .unwrap();
+        let mut source = writer.finish().unwrap();
+        let password = Password::empty();
+        let archive = Archive::read(&mut source, &password).unwrap();
+        let block = &archive.blocks[0];
+        let output = block
+            .coders
+            .iter()
+            .enumerate()
+            .find(|(index, _)| {
+                !block
+                    .bind_pairs()
+                    .iter()
+                    .any(|pair| pair.out_index == *index as u64)
+            })
+            .unwrap()
+            .1;
+        assert_eq!(output.encoder_method_id(), EncoderMethod::ID_BZIP2);
+        assert!(BlockDecoder::<Cursor<Vec<u8>>>::file_boundaries(&archive, 0).is_empty());
+        crate::decoder::PARALLEL_LZMA2_PLANS.with(|plans| plans.set(0));
+        let mut actual = Vec::new();
+        BlockDecoder::new(4, 0, &archive, &password, &mut source)
+            .for_each_entries(&mut |_, reader| {
+                reader.read_to_end(&mut actual)?;
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(actual, data);
+        assert_eq!(crate::decoder::PARALLEL_LZMA2_PLANS.with(Cell::get), 1);
+    }
 
     /// A chain of two LZMA2 coders with enough to decode in parallel each is
     /// given one parallel reader. Each coder used to plan for itself: two

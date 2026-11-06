@@ -147,7 +147,7 @@ attacker-chosen. What bounds each:
 | PPMd | `mem_size` bytes of model | The format's own `PPMD7_MIN/MAX_MEM_SIZE` and `MIN/MAX_ORDER`, then `memory_limit_bytes`, summed over the chain. |
 | zstd | The back-reference window the frame declares | `window_log_max`, set from what the chain's sized coders leave of `memory_limit_bytes`, and otherwise the 128 MiB the reference decoder itself refuses to exceed. |
 | brotli | The window | Bounded by the format at 16 MiB; the large-window extension is not enabled. |
-| bzip2 | The block | Fixed by the format at 900 KiB. |
+| bzip2 | The BWT block and bounded output queue | At most 900,000 BWT bytes. Expanded runs stream into caller buffers. `bzip2-turbo` bounds its compact single-threaded decoder at 6 MiB (8 MiB on Linux x86-64 and AArch64, where its tables are whole 2 MiB pages) and its two-thread pipeline at 12 MiB (16 MiB in the ordinary layout on macOS ARM64). Finite-memory archive reads take the compact single-threaded path, inside the 8 MiB admission estimate; a compile-time check keeps that estimate at or above the codec's bound. |
 | deflate | The window | Fixed by the format at 32 KiB. |
 | lz4 | The frame block | Bounded by the format at 4 MiB. |
 | BCJ, BCJ2, Delta | Fixed-size buffers | Compile-time constants; no header field reaches them. The Delta distance is a single byte, widened before its `+1` so `0xFF` is 256 and not zero. |

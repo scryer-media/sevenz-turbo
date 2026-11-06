@@ -395,8 +395,13 @@ const LZ_STATE_BYTES: u64 = MIB;
 /// The PPMd model is one allocation of exactly the declared size; this covers
 /// the decoder's own tables around it.
 const PPMD_STATE_BYTES: u64 = MIB;
-/// A bzip2 block is at most 900 KiB, and the decoder holds a few times that.
+/// What `bzip2-turbo` bounds its compact single-threaded decoder at, which is
+/// the path a finite memory limit selects: 6 MiB, or 8 MiB on Linux x86-64 and
+/// AArch64, where its tables are whole 2 MiB pages.
 const BZIP2_BYTES: u64 = 8 * MIB;
+// The estimate must cover the codec's own bound wherever it is built.
+#[cfg(feature = "bzip2")]
+const _: () = assert!(BZIP2_BYTES >= bzip2_turbo::Decoder::<std::io::Empty>::low_memory_usage(1));
 /// Deflate's window is 32 KiB and the reader wraps its input in a buffer.
 const DEFLATE_BYTES: u64 = MIB;
 /// Brotli's largest standard window is 16 MiB.

@@ -538,7 +538,7 @@ pub(crate) struct Lzma2Control {
     /// stream they came from. Empty unless the coder was built with split
     /// points; see [`Lzma2Control::folded`].
     folder: Mutex<CrcFolder<u32>>,
-    /// Set while a stored folder is read on a thread of its own, which
+    /// Set while a stored folder or BZip2 decoder produces bytes on a worker, which
     /// checksums what it reads into `folder` as the LZMA2 workers would: see
     /// `reader::store_overlap`. Cleared as each block starts.
     folded_elsewhere: AtomicBool,
@@ -594,8 +594,8 @@ impl Lzma2Control {
         self.folder.lock().ok()?.range(offset, len)
     }
 
-    /// Adds one piece a stored folder's reader thread checksummed, before it
-    /// hands the bytes on: see `reader::store_overlap`.
+    /// Adds one piece a stored-folder reader or BZip2 reconstruction worker
+    /// checksummed before handing the bytes on: see `reader::store_overlap`.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn fold_piece(&self, offset: u64, len: u64, crc32: u32) {
         if let Ok(mut folder) = self.folder.lock() {
@@ -604,7 +604,7 @@ impl Lzma2Control {
     }
 
     /// Says that this block's checksums are folded from pieces computed off
-    /// the calling thread, by a stored folder's reader thread.
+    /// the calling thread, by a stored-folder reader or BZip2 worker.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn fold_elsewhere(&self) {
         self.folded_elsewhere.store(true, Ordering::Relaxed);

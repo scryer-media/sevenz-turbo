@@ -29,10 +29,10 @@ fn safe_join(dest: &Path, entry_name: &str) -> std::io::Result<PathBuf> {
 // 0. The simplest way to use multi threading is to use simply the ArchiveReader.
 //    If the compression of the archive blocks supports multi threading, which is supported
 //    by this crate, then the ArchiveReader will use multiple threads to decode the blocks.
-//    We currently only support multi threading for decoding & encoding LZMA2.
-//    Brotli, LZ4 and ZSTD could we supported in the future, if there is ever demand to do so.
+//    LZMA2 and BZip2 blocks decode on several threads. BZip2 uses at most two: the
+//    caller parses the entropy coding while one worker rebuilds the blocks.
 //
-//    See `ArchiveReader::set_thread_count()` for more information.`
+//    See `ArchiveReader::set_threads()` for more information.
 fn main() {
     let time = std::time::Instant::now();
     let mut file = std::fs::File::open("examples/data/sample.7z").unwrap();
@@ -56,8 +56,8 @@ fn main() {
             let mut source = std::fs::File::open("examples/data/sample.7z").unwrap();
 
             // 2. For decoders that supports it, we can set the thread_count on the block decoder
-            //    so that it uses multiple threads to decode the block. Currently only LZMA2 is
-            //    supporting this. In this example we try to use 4 threads.
+            //    so that it uses multiple threads to decode the block. LZMA2 and BZip2 support
+            //    this. In this example we try to use 4 threads.
             let block_decoder = BlockDecoder::new(4, block_index, &archive, &password, &mut source);
 
             let dest = PathBuf::from("examples/data/sample_mt/");

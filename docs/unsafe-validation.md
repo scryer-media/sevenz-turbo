@@ -9,7 +9,7 @@ doctests separately.
 
 ## Memory and ownership
 
-The sevenz-owned unsafe operations are in `src/writer/input_buffer.rs`:
+The source-buffer unsafe operations are in `src/writer/input_buffer.rs`:
 initializing an aligned allocation before `assume_init`, and the Linux
 `madvise` call over that owned allocation. New unsafe operations must extend
 this inventory and the focused selectors rather than run the whole archive
@@ -100,9 +100,16 @@ What no lane above runs, so that a pass is not read as more than it is:
   decoder), the adaptive coder widening while a decode runs, and
   `decode_blocks_parallel` across a folder too large to stage are covered by
   the ordinary test matrix only.
-- bzip2, Deflate, Zstandard, Brotli and LZ4 are not under any sanitizer or
-  guard lane; bzip2 and Zstandard are C libraries the sanitizers would not
-  instrument in any case.
+- BZip2 now lives in the independent `bzip2-turbo` dependency. Its portable
+  ownership, native allocation/advice FFI and codec tests run in that repository.
+  This repository retains archive-level checks for memory admission, checksums,
+  corruption and worker callbacks. Those checks do not independently validate
+  the dependency's unsafe code. Finite-budget archive reads select compact ST
+  storage with the existing 8 MiB admission estimate. Both the BZip2 stream
+  checksum and the archive's CRC-32 come from `crc-turbo`, the first through
+  `bzip2-turbo` and the second through `lzma-turbo`.
+- Deflate, Zstandard, Brotli and LZ4 are not under any sanitizer or guard
+  lane; the Zstandard C library is not instrumented by those lanes.
 - AWS-LC's AES and SHA-256 are under the guard lane only; the sanitizer lanes
   use RustCrypto. `lzma-turbo`'s assembly kernels run under the guards and
   Memcheck but cannot be instrumented by the sanitizers.

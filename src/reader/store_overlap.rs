@@ -94,7 +94,7 @@ impl Checksums {
         }
     }
 
-    fn update(&mut self, mut bytes: &[u8]) {
+    pub(crate) fn update(&mut self, mut bytes: &[u8]) {
         while !bytes.is_empty() && self.pos < self.end {
             let boundary = self
                 .splits

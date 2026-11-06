@@ -184,7 +184,7 @@ writer.finish().expect("compress ok");
 | LZMA        | ✓            | ✓          | `lzma-turbo` |
 | LZMA2       | ✓            | ✓          | `lzma-turbo`, on one thread or several |
 | BROTLI (*)  | ✓            | ✓          | `brotli` crate |
-| BZIP2       | ✓            | ✓          | `bzip2` crate |
+| BZIP2       | ✓            | ✓          | `bzip2-turbo` crate, single-threaded and multi-threaded |
 | DEFLATE (*) | ✓            | ✓          | `flate2` crate (`zlib-rs`) |
 | PPMD        | ✓            | ✓          | `ppmd-turbo` crate |
 | LZ4 (*)     | ✓            | ✓          | `lz4_flex` crate |
@@ -206,7 +206,9 @@ writer.finish().expect("compress ok");
 | DELTA         | ✓            | ✓          |
 
 The filters themselves are `lzma-turbo`'s; this crate wraps them as readers
-and writers. CRC-32 comes from `crc-turbo`, through `lzma-turbo`.
+and writers. The container's CRC-32 comes from `crc-turbo`, through
+`lzma-turbo`; BZip2's own CRC-32/BZIP2 stream checksum is `bzip2-turbo`'s,
+also from `crc-turbo`.
 
 ## Speed
 
@@ -283,7 +285,8 @@ faster than code inside it. Two features hand that work over, on `wasm32`
 only; on native targets they change nothing:
 
 - `crypto-host`: AES-256 decryption and the key derivation's SHA-256.
-- `crc-host`: every CRC-32 in the archive.
+- `crc-host`: the 7z container's CRC-32 checksums; codec-internal checksums
+  such as BZip2's CRC-32/BZIP2 remain in the guest.
 
 ```bash
 RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --target wasm32-unknown-unknown --no-default-features --features=aes256_wasm,crc-host,crypto-host,bzip2,ppmd
@@ -346,8 +349,12 @@ named before the licence is.
 
 ## Licence
 
-This crate is licensed under the
+The archive code is licensed under the
 [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0),
 the same as upstream, and upstream's copyright notices are unchanged.
+The optional [`bzip2-turbo`](https://github.com/scryer-media/bzip2-turbo)
+dependency translates the 7-Zip BZip2 codec and retains LGPL-2.1-or-later
+licensing, with MIT notices on its compatibility adapters; see that
+package's license files. It is linked only when the `bzip2` feature is on.
 `lzma-turbo` is Apache-2.0 too, from its 0.7.0 release on; its earlier
 releases were published under GPL-3.0-or-later.
