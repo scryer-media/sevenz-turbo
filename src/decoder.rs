@@ -704,14 +704,11 @@ pub fn add_decoder<I: Read>(
         }
         #[cfg(feature = "bzip2")]
         EncoderMethod::ID_BZIP2 => {
-            // Finite-budget chains use compact links on one thread.
-            // This keeps its allocation within the existing 8 MiB admission
-            // estimate, even when other codecs or pipeline buffers are live.
-            let threads = if opts.limits.memory_limit_bytes == u64::MAX {
-                opts.threads as usize
-            } else {
-                1
-            };
+            // A finite budget takes the compact layout, at the threads the
+            // chain planned: one, or two for the coder `pipeline::Chain`
+            // chose, which charged the second thread's memory before it did.
+            let compact = opts.limits.memory_limit_bytes != u64::MAX;
+            let threads = opts.threads as usize;
             #[cfg(not(target_arch = "wasm32"))]
             if threads > 1
                 && !opts.checksum_splits.is_empty()
@@ -725,19 +722,22 @@ pub fn add_decoder<I: Read>(
                     opts.checksum_splits,
                     uncompressed_len,
                 );
-                let de = BzDecoder::with_output_callback(input, threads, move |bytes| {
-                    checksums.update(bytes);
-                });
+                let fold = move |bytes: &[u8]| checksums.update(bytes);
+                let de = if compact {
+                    BzDecoder::with_low_memory_output_callback(input, threads, fold)
+                } else {
+                    BzDecoder::with_output_callback(input, threads, fold)
+                };
                 control.fold_elsewhere();
                 return Ok(Decoder::Bzip2(Box::new(Bzip2Decoder::new(
                     de,
                     uncompressed_len,
                 ))));
             }
-            let de = if opts.limits.memory_limit_bytes == u64::MAX {
-                BzDecoder::with_threads(input, threads)
+            let de = if compact {
+                BzDecoder::with_low_memory(input, threads)
             } else {
-                BzDecoder::with_low_memory(input, 1)
+                BzDecoder::with_threads(input, threads)
             };
             Ok(Decoder::Bzip2(Box::new(Bzip2Decoder::new(
                 de,
