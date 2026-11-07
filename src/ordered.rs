@@ -460,14 +460,455 @@ where
     })
 }
 
+/// A sink for one job's messages: [`Sender`] for ordered jobs,
+/// [`UnorderedSender`] for unordered ones.
+pub(crate) trait JobSender<M> {
+    /// Queues `message`, which weighs `weight`, waiting for room; `Err` when
+    /// the job is cancelled.
+    fn send(&mut self, message: M, weight: usize) -> Result<(), Cancelled>;
+}
+
+impl<M> JobSender<M> for Sender<'_, M> {
+    fn send(&mut self, message: M, weight: usize) -> Result<(), Cancelled> {
+        Sender::send(self, message, weight)
+    }
+}
+
+/// What the caller of [`run_unordered`] says after each message it took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flow {
+    /// Go on.
+    Go,
+    /// Start no job after `job`, and cancel every job after it that has
+    /// started; the jobs before it run to their end.
+    HaltAfter(usize),
+    /// Cancel every job.
+    Stop,
+}
+
+/// What an unordered run's queue holds: a job's message, or the end of a
+/// job, which its sender's drop queues however the job ended.
+enum Item<M> {
+    Message(usize, M, usize),
+    Closed(usize),
+}
+
+struct UnorderedState<M> {
+    /// The next job a worker will claim.
+    next: usize,
+    /// Jobs at or after this are not started, and cancelled if started.
+    limit: usize,
+    /// Jobs claimed and not yet closed.
+    busy: usize,
+    /// Workers that have not exited.
+    live: usize,
+    queue: VecDeque<Item<M>>,
+    /// What each job has queued, by the weights its sends gave.
+    weights: Vec<usize>,
+}
+
+struct UnorderedShared<M> {
+    state: Mutex<UnorderedState<M>>,
+    /// The caller waits here for an item.
+    ready: Condvar,
+    /// Workers wait here for room in their job's queue or for a job.
+    workers: Condvar,
+    jobs: usize,
+    cap: usize,
+}
+
+impl<M> UnorderedShared<M> {
+    fn lock(&self) -> MutexGuard<'_, UnorderedState<M>> {
+        // No caller code runs under this lock except the pace, as in the
+        // ordered run, so a poisoned lock leaves the state consistent.
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn halt_after(&self, last: Option<usize>) {
+        let mut state = self.lock();
+        let limit = last.map_or(0, |job| job.saturating_add(1));
+        state.limit = state.limit.min(limit);
+        drop(state);
+        self.workers.notify_all();
+        self.ready.notify_one();
+    }
+}
+
+/// A worker's end of one job of an unordered run.
+pub(crate) struct UnorderedSender<'a, M> {
+    shared: &'a UnorderedShared<M>,
+    job: usize,
+}
+
+impl<M> JobSender<M> for UnorderedSender<'_, M> {
+    /// Queues `message`, waiting while this job already has `cap` or more
+    /// queued; a message is always accepted when the job has nothing queued.
+    fn send(&mut self, message: M, weight: usize) -> Result<(), Cancelled> {
+        let mut state = self.shared.lock();
+        loop {
+            if self.job >= state.limit {
+                return Err(Cancelled);
+            }
+            let queued = state.weights[self.job];
+            if queued == 0 || queued.saturating_add(weight) <= self.shared.cap {
+                state.weights[self.job] = queued.saturating_add(weight);
+                state
+                    .queue
+                    .push_back(Item::Message(self.job, message, weight));
+                drop(state);
+                self.shared.ready.notify_one();
+                return Ok(());
+            }
+            state = self
+                .shared
+                .workers
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+impl<M> Drop for UnorderedSender<'_, M> {
+    fn drop(&mut self) {
+        let mut state = self.shared.lock();
+        state.busy -= 1;
+        state.queue.push_back(Item::Closed(self.job));
+        drop(state);
+        self.shared.ready.notify_one();
+        // A job ending frees a place under the pace.
+        self.shared.workers.notify_all();
+    }
+}
+
+/// Cancels every job when the caller's side ends, however it ends.
+struct UnorderedCancel<'a, M>(&'a UnorderedShared<M>);
+
+impl<M> Drop for UnorderedCancel<'_, M> {
+    fn drop(&mut self) {
+        self.0.halt_after(None);
+    }
+}
+
+/// Counts a worker out when it exits, however it exits.
+struct UnorderedLive<'a, M>(&'a UnorderedShared<M>);
+
+impl<M> Drop for UnorderedLive<'_, M> {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.live -= 1;
+        drop(state);
+        self.0.ready.notify_one();
+        self.0.workers.notify_all();
+    }
+}
+
+/// Runs `jobs` jobs on up to `workers` threads, handing every message to
+/// `consume` on the calling thread as it arrives, whichever job sent it.
+///
+/// Jobs are claimed in index order, at most `width()` in hand at once (asked
+/// as each is about to start, as [`run_paced`] does). A job's messages reach
+/// `consume` in the order the job sent them, and after its last one
+/// `consume(job, None)`, once for every job that started; messages of
+/// different jobs interleave. A job holds at most `cap` (by the weights given
+/// to its sends) between its worker and the caller, so what the run holds is
+/// bounded by the jobs in hand times `cap`, whatever the jobs produce.
+///
+/// `consume` steers the run with its [`Flow`]: once it halts after a job,
+/// nothing reaches it from a later job, and the run returns once every worker
+/// has exited. Returns how many jobs were started, or `None`, having run
+/// nothing, when not one worker thread could be started.
+pub(crate) fn run_unordered<M, P, C>(
+    jobs: usize,
+    workers: usize,
+    cap: usize,
+    width: &(dyn Fn() -> usize + Sync),
+    produce: P,
+    mut consume: C,
+) -> Option<usize>
+where
+    M: Send,
+    P: Fn(usize, &mut UnorderedSender<'_, M>) + Sync,
+    C: FnMut(usize, Option<M>) -> Flow,
+{
+    let shared = UnorderedShared {
+        state: Mutex::new(UnorderedState {
+            next: 0,
+            limit: jobs,
+            busy: 0,
+            live: 0,
+            queue: VecDeque::new(),
+            weights: vec![0; jobs],
+        }),
+        ready: Condvar::new(),
+        workers: Condvar::new(),
+        jobs,
+        cap: cap.max(1),
+    };
+    let worker = || {
+        let _live = UnorderedLive(&shared);
+        loop {
+            let job = {
+                let mut state = shared.lock();
+                loop {
+                    if state.next >= state.limit.min(shared.jobs) {
+                        return;
+                    }
+                    // One job is always let through, whatever the pace.
+                    if state.busy < width().max(1) {
+                        let job = state.next;
+                        state.next += 1;
+                        state.busy += 1;
+                        break job;
+                    }
+                    state = shared
+                        .workers
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            };
+            let mut sender = UnorderedSender {
+                shared: &shared,
+                job,
+            };
+            produce(job, &mut sender);
+        }
+    };
+    std::thread::scope(|scope| {
+        let mut started = 0usize;
+        for index in 0..workers.max(1).min(jobs) {
+            shared.lock().live += 1;
+            let spawned = std::thread::Builder::new()
+                .name(format!("sevenz-folder-{index}"))
+                .spawn_scoped(scope, worker);
+            if spawned.is_ok() {
+                started += 1;
+            } else {
+                shared.lock().live -= 1;
+                break;
+            }
+        }
+        if started == 0 {
+            return None;
+        }
+        let _cancel = UnorderedCancel(&shared);
+        loop {
+            let item = {
+                let mut state = shared.lock();
+                loop {
+                    if let Some(item) = state.queue.pop_front() {
+                        if let Item::Message(job, _, weight) = &item {
+                            state.weights[*job] -= *weight;
+                        }
+                        break Some(item);
+                    }
+                    let unclaimed = state.next < state.limit.min(shared.jobs);
+                    if state.busy == 0 && (!unclaimed || state.live == 0) {
+                        break None;
+                    }
+                    state = shared
+                        .ready
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            };
+            let Some(item) = item else {
+                break;
+            };
+            // Taking a message makes room in its job's queue.
+            shared.workers.notify_all();
+            let (job, message) = match item {
+                Item::Message(job, message, _) => (job, Some(message)),
+                Item::Closed(job) => (job, None),
+            };
+            if job >= shared.lock().limit {
+                continue;
+            }
+            match consume(job, message) {
+                Flow::Go => {}
+                Flow::HaltAfter(last) => shared.halt_after(Some(last)),
+                Flow::Stop => shared.halt_after(None),
+            }
+        }
+        let next = shared.lock().next;
+        Some(next)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
         Barrier,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicIsize, AtomicUsize, Ordering},
     };
 
     use super::*;
+
+    #[test]
+    fn unordered_jobs_run_side_by_side_and_each_keeps_its_own_order() {
+        // Every job waits at the barrier before it sends anything, so the
+        // run returns at all only if all four were in hand at once.
+        let together = Barrier::new(4);
+        let mut pieces = vec![Vec::new(); 4];
+        let mut closed = [false; 4];
+        let started = run_unordered::<(usize, usize), _, _>(
+            4,
+            4,
+            2,
+            &|| 4,
+            |job, tx| {
+                together.wait();
+                for piece in 0..10 {
+                    if tx.send((job, piece), 1).is_err() {
+                        return;
+                    }
+                }
+            },
+            |job, message| {
+                match message {
+                    Some((from, piece)) => {
+                        assert_eq!(from, job);
+                        assert!(!closed[job]);
+                        pieces[job].push(piece);
+                    }
+                    None => closed[job] = true,
+                }
+                Flow::Go
+            },
+        );
+        assert_eq!(started, Some(4));
+        assert!(closed.iter().all(|&closed| closed));
+        for got in pieces {
+            assert_eq!(got, (0..10).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn an_unordered_job_never_queues_more_than_its_cap() {
+        let queued: Vec<AtomicIsize> = (0..6).map(|_| AtomicIsize::new(0)).collect();
+        let peak = AtomicIsize::new(0);
+        let cap = 3;
+        let started = run_unordered::<usize, _, _>(
+            6,
+            3,
+            cap,
+            &|| 3,
+            |job, tx| {
+                for _ in 0..40 {
+                    if tx.send(job, 1).is_err() {
+                        return;
+                    }
+                    let now = queued[job].fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                }
+            },
+            |job, message| {
+                if message.is_some() {
+                    // A count can go below zero for a moment when the caller
+                    // takes a message before its worker has counted it in.
+                    queued[job].fetch_sub(1, Ordering::SeqCst);
+                }
+                Flow::Go
+            },
+        );
+        assert_eq!(started, Some(6));
+        // Counted in after its send and out when the caller has it, so the
+        // one message the caller has taken and not yet counted out is the
+        // most it can be over.
+        assert!(peak.load(Ordering::SeqCst) <= cap as isize + 1);
+    }
+
+    #[test]
+    fn halting_after_a_job_cancels_the_later_ones_and_finishes_the_earlier() {
+        // Job 2 fails at once. Jobs 0 and 1 wait at the barrier until the
+        // caller has heard job 2 fail, so they are still running when it
+        // does, and must still run to their end. Every later job sends for as
+        // long as it is let, and is cancelled.
+        let halted = Barrier::new(3);
+        let mut seen = [0usize; 8];
+        let mut closed = [false; 8];
+        let started = run_unordered::<usize, _, _>(
+            8,
+            4,
+            1,
+            &|| 4,
+            |job, tx| match job {
+                2 => {
+                    let _ = tx.send(usize::MAX, 1);
+                }
+                0 | 1 => {
+                    halted.wait();
+                    for _ in 0..5 {
+                        if tx.send(job, 1).is_err() {
+                            return;
+                        }
+                    }
+                }
+                _ => while tx.send(job, 1).is_ok() {},
+            },
+            |job, message| {
+                match message {
+                    Some(usize::MAX) => {
+                        assert_eq!(job, 2);
+                        // The workers of jobs 0 and 1 may go on now.
+                        halted.wait();
+                        return Flow::HaltAfter(2);
+                    }
+                    Some(from) => {
+                        assert_eq!(from, job);
+                        seen[from] += 1;
+                    }
+                    None => closed[job] = true,
+                }
+                Flow::Go
+            },
+        );
+        assert!(started.is_some());
+        assert_eq!(&seen[..3], &[5, 5, 0]);
+        assert!(closed[0] && closed[1] && closed[2]);
+        // Nothing of a later job is heard once the run halted, so none is
+        // heard to close.
+        assert!(closed[3..].iter().all(|&closed| !closed));
+    }
+
+    #[test]
+    fn stopping_an_unordered_run_returns_once_every_worker_has_exited() {
+        let started = run_unordered::<usize, _, _>(
+            100,
+            4,
+            2,
+            &|| 4,
+            |job, tx| while tx.send(job, 1).is_ok() {},
+            |_, _| Flow::Stop,
+        );
+        assert!(started.is_some_and(|started| started <= 4));
+    }
+
+    #[test]
+    fn the_pace_bounds_how_many_unordered_jobs_are_in_hand() {
+        for width in [1, 2, 3] {
+            let active = AtomicUsize::new(0);
+            let peak = AtomicUsize::new(0);
+            let started = run_unordered::<usize, _, _>(
+                24,
+                4,
+                2,
+                &|| width,
+                |job, tx| {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    for _ in 0..4 {
+                        if tx.send(job, 1).is_err() {
+                            break;
+                        }
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
+                },
+                |_, _| Flow::Go,
+            );
+            assert_eq!(started, Some(24));
+            assert!(peak.load(Ordering::SeqCst) <= width, "width {width}");
+        }
+    }
 
     #[test]
     fn worker_local_state_is_reused_and_dropped_after_cancellation() {
