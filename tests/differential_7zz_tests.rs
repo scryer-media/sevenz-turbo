@@ -9,8 +9,9 @@
 //! Every case is extracted four times by this crate — single-threaded, with
 //! eight threads, through the adaptive coder while the ceiling is one, and with
 //! eight threads from a positional source, so that the folders of a non-solid
-//! archive decode on parallel workers — and all four are compared against
-//! `7zz`'s own extraction. The thread count
+//! archive decode on parallel workers, and once more through the unordered walk
+//! with eight threads — and all five are compared against `7zz`'s own
+//! extraction. The thread count
 //! must not be able to change a byte: a run boundary is a dictionary reset, so
 //! which decoder took which run is not observable in the output.
 //!
@@ -23,7 +24,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sevenz_turbo::{ArchiveReader, Password};
+use sevenz_turbo::{ArchiveLimits, ArchiveReader, Password, UnorderedEntry};
 
 /// Is the oracle available? With `SEVENZ_TURBO_7ZZ_REQUIRED` set, a missing
 /// `7zz` fails the test instead of skipping it.
@@ -86,9 +87,9 @@ fn members() -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
-fn write_members(dir: &Path) -> Vec<String> {
+fn write_members(dir: &Path, members: Vec<(&'static str, Vec<u8>)>) -> Vec<String> {
     let mut names = Vec::new();
-    for (name, bytes) in members() {
+    for (name, bytes) in members {
         let path = dir.join(name);
         std::fs::create_dir_all(path.parent().expect("member has a parent")).expect("mkdir");
         std::fs::write(&path, &bytes).expect("write member");
@@ -143,32 +144,45 @@ struct Lane {
     /// Read through a positional source, so that independent folders decode
     /// on parallel workers.
     positional: bool,
+    /// Decode through the unordered walk, from a positional source.
+    unordered: bool,
 }
 
-const LANES: [Lane; 4] = [
+const LANES: [Lane; 5] = [
     Lane {
         name: "threads=1",
         threads: 1,
         adaptive: false,
         positional: false,
+        unordered: false,
     },
     Lane {
         name: "threads=8",
         threads: 8,
         adaptive: false,
         positional: false,
+        unordered: false,
     },
     Lane {
         name: "adaptive, threads=1",
         threads: 1,
         adaptive: true,
         positional: false,
+        unordered: false,
     },
     Lane {
         name: "positional, threads=8",
         threads: 8,
         adaptive: false,
         positional: true,
+        unordered: false,
+    },
+    Lane {
+        name: "unordered, threads=8",
+        threads: 8,
+        adaptive: false,
+        positional: true,
+        unordered: true,
     },
 ];
 
@@ -178,6 +192,9 @@ fn extract_with_crate(
     password: &Password,
     lane: Lane,
 ) -> BTreeMap<String, Vec<u8>> {
+    if lane.unordered {
+        return extract_unordered(archive, password, lane);
+    }
     let file = std::fs::File::open(archive).expect("open archive");
     let mut reader = ArchiveReader::new(file, password.clone()).expect("read archive");
     if lane.positional {
@@ -201,6 +218,52 @@ fn extract_with_crate(
     out
 }
 
+/// Extracts `archive` through the unordered walk, checking that every entry's
+/// bytes arrive in order and that every entry ends.
+fn extract_unordered(archive: &Path, password: &Password, lane: Lane) -> BTreeMap<String, Vec<u8>> {
+    let file = std::fs::File::open(archive).expect("open archive");
+    let mut reader = ArchiveReader::from_read_at(file, password.clone(), ArchiveLimits::default())
+        .expect("read archive");
+    reader.set_threads(lane.threads);
+    let names: Vec<(String, bool)> = reader
+        .archive()
+        .files
+        .iter()
+        .map(|f| (f.name().replace('\\', "/"), f.is_directory()))
+        .collect();
+    let mut open: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
+    let mut out = BTreeMap::new();
+    reader
+        .for_each_entries_unordered(|event| {
+            match event {
+                UnorderedEntry::Begin { file_index, .. } => {
+                    assert!(open.insert(file_index, Vec::new()).is_none());
+                }
+                UnorderedEntry::Data {
+                    file_index,
+                    offset,
+                    bytes,
+                } => {
+                    let got = open.get_mut(&file_index).expect("bytes of an open entry");
+                    assert_eq!(offset, got.len() as u64);
+                    got.extend_from_slice(bytes);
+                }
+                UnorderedEntry::End { file_index } => {
+                    let bytes = open.remove(&file_index).expect("end of an open entry");
+                    let (name, directory) = &names[file_index];
+                    if !directory {
+                        assert!(out.insert(name.clone(), bytes).is_none());
+                    }
+                }
+                _ => unreachable!(),
+            }
+            Ok(true)
+        })
+        .expect("extract");
+    assert!(open.is_empty(), "every entry ended");
+    out
+}
+
 /// Concatenates `name.001`, `name.002`, … into one buffer, the way a consumer
 /// that streams a split set presents it.
 fn join_volumes(dir: &Path, stem: &str) -> PathBuf {
@@ -220,11 +283,21 @@ fn join_volumes(dir: &Path, stem: &str) -> PathBuf {
 
 /// Build with `7zz a`, extract with `7zz x` and with this crate, compare.
 fn differential(case: &str, archive_args: &[&str], password: Option<&str>) {
+    differential_of(case, archive_args, password, members());
+}
+
+/// [`differential`] over `members` instead of the usual set.
+fn differential_of(
+    case: &str,
+    archive_args: &[&str],
+    password: Option<&str>,
+    members: Vec<(&'static str, Vec<u8>)>,
+) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let root = tmp.path();
     let source = root.join("src");
     std::fs::create_dir_all(&source).expect("mkdir src");
-    let names = write_members(&source);
+    let names = write_members(&source, members);
 
     let mut args: Vec<String> = vec!["a".into(), "-bso0".into(), "-bsp0".into()];
     args.extend(archive_args.iter().map(|a| (*a).to_string()));
@@ -309,6 +382,35 @@ differential_case!(lzma2_chunked, ["-m0=lzma2", "-mmt=on", "-mx5"]);
 differential_case!(lzma2_level1, ["-m0=lzma2", "-mx1"]);
 differential_case!(lzma2_level9_solid, ["-m0=lzma2", "-mx9", "-ms=on"]);
 differential_case!(lzma2_level5_non_solid, ["-m0=lzma2", "-mx5", "-ms=off"]);
+/// Members each far over the size the ordered walk stages, one folder each,
+/// so the unordered lane decodes them side by side.
+#[test]
+fn lzma2_large_non_solid_members() {
+    if !have_7zz() {
+        eprintln!("skipping lzma2_large_non_solid_members: 7zz is not on PATH");
+        return;
+    }
+    let big = |seed: u64| {
+        let mut bytes = noise(12 << 20, seed);
+        for (i, chunk) in bytes.chunks_mut(4096).enumerate() {
+            if i % 3 == 0 {
+                chunk.fill(b'a' + (i % 26) as u8);
+            }
+        }
+        bytes
+    };
+    differential_of(
+        "lzma2_large_non_solid_members",
+        &["-m0=lzma2", "-mx5", "-ms=off"],
+        None,
+        vec![
+            ("amber_reach/large-1.bin", big(11)),
+            ("amber_reach/large-2.bin", big(12)),
+            ("amber_reach/large-3.bin", big(13)),
+            ("amber_reach/small.txt", text(64 * 1024)),
+        ],
+    );
+}
 differential_case!(lzma2_bcj_x86, ["-m0=BCJ", "-m1=lzma2", "-mx5"]);
 differential_case!(
     lzma2_bcj2,
