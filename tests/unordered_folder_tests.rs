@@ -238,6 +238,17 @@ fn small_and_large_members_decode_like_the_ordered_walk() {
 }
 
 #[test]
+fn members_of_several_lzma2_runs_decode_like_the_ordered_walk() {
+    // A 1 MiB dictionary cut into 1 MiB runs: each 9 MiB folder is longer
+    // than one encoder run, so its coder keeps the threads the plan gives it.
+    let mut options = Lzma2Options::from_level_mt(3, 2, 1 << 20);
+    options.set_dictionary_size(1 << 20);
+    let members = tree(9, 3, 9 << 20);
+    let archive = write(&[options.into()], &members);
+    assert_like_ordered(&archive, &Password::empty());
+}
+
+#[test]
 fn bcj2_and_filtered_members_decode_like_the_ordered_walk() {
     for methods in [
         vec![

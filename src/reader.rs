@@ -4070,7 +4070,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
 
     /// How [`ArchiveReader::for_each_entries_unordered`] walks the folders.
     fn unordered_phases(&self) -> Vec<UnorderedPhase> {
-        let folders: Vec<(u64, u64, bool)> = self
+        let folders: Vec<(u64, u64, bool, bool)> = self
             .archive
             .blocks
             .iter()
@@ -4084,6 +4084,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     block.get_unpack_size(),
                     estimate.unwrap_or(u64::MAX),
                     block.num_unpack_sub_streams <= 1,
+                    is_one_lzma2_run(block),
                 )
             })
             .collect();
@@ -5396,20 +5397,44 @@ const UNORDERED_QUEUE_BYTES: usize = 2 * (FOLDER_CHUNK_BYTES + FOLDER_MESSAGE_WE
 const UNORDERED_WORKER_BYTES: u64 =
     crate::container::BLOCK_INPUT_BYTES + 3 * (FOLDER_CHUNK_BYTES as u64 + 64);
 
+/// Whether `block`'s LZMA2 coder, the one that would decode on threads of its
+/// own, decodes to no more than one run as 7-Zip's encoder cuts them.
+///
+/// Such a coder has no second run for a second thread to decode, and given
+/// threads it reads its whole folder ahead looking for one before it hands the
+/// run to one worker: the packed folder held for nothing, on top of the
+/// dictionary. The dictionary is the one the coder declares, never smaller
+/// than the encoder's, so a stream cut shorter by a caller-chosen block size
+/// can be taken for one run; it then decodes on one thread, as it would alone.
+pub(crate) fn is_one_lzma2_run(block: &Block) -> bool {
+    let Some(index) = crate::pipeline::parallel_lzma2_coder(block) else {
+        return false;
+    };
+    let Ok(dict) =
+        crate::codec::lzma_turbo::lzma2_dictionary_size(block.coders[index].properties())
+    else {
+        return false;
+    };
+    block.get_unpack_size_at_index(index) <= crate::codec::lzma_turbo::lzma2_encoder_run_cap(dict)
+}
+
 /// Plans [`ArchiveReader::for_each_entries_unordered`], given each folder's
-/// unpacked size, decoder memory estimate (`u64::MAX` when it has none) and
-/// whether it holds at most one file with bytes.
+/// unpacked size, decoder memory estimate (`u64::MAX` when it has none),
+/// whether it holds at most one file with bytes, and whether it is one LZMA2
+/// run ([`is_one_lzma2_run`]).
 ///
 /// A run of at least two consecutive folders of one file each is decoded side
 /// by side, whatever their size, by as many workers as `threads`, the run and
 /// the memory limit allow; each folder's coder gets the threads divided among
 /// the workers, and under a limit each worker is charged its run's largest
 /// decoder and [`UNORDERED_WORKER_BYTES`], and its decoder is held to its
-/// share of the limit. Everything else — folders of several files, and a run
+/// share of the limit. A run whose folders are each one LZMA2 run gives each
+/// coder one thread: there is nothing in it for a second, and it is charged
+/// the one decoder it builds. Everything else — folders of several files, and a run
 /// with room for one worker — is planned as [`plan_folders`] plans it.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn plan_unordered(
-    folders: &[(u64, u64, bool)],
+    folders: &[(u64, u64, bool, bool)],
     threads: u32,
     memory_limit_bytes: u64,
 ) -> Vec<UnorderedPhase> {
@@ -5418,7 +5443,7 @@ pub(crate) fn plan_unordered(
     let ordered = |phases: &mut Vec<UnorderedPhase>, start: usize, end: usize| {
         let stretch = folders[start..end]
             .iter()
-            .map(|&(unpacked, estimate, _)| (unpacked, estimate));
+            .map(|&(unpacked, estimate, _, _)| (unpacked, estimate));
         phases.extend(
             plan_folders(stretch, threads, memory_limit_bytes)
                 .into_iter()
@@ -5469,10 +5494,15 @@ pub(crate) fn plan_unordered(
                 (shared / u64::from(workers))
                     .saturating_sub(UNORDERED_WORKER_BYTES - crate::container::BLOCK_INPUT_BYTES)
             };
+            let one_run = folders[start..end].iter().all(|folder| folder.3);
             phases.push(UnorderedPhase::Unordered {
                 blocks: start..end,
                 workers,
-                threads_per_folder: (threads / workers).max(1),
+                threads_per_folder: if one_run {
+                    1
+                } else {
+                    (threads / workers).max(1)
+                },
                 worker_memory,
             });
         } else {
@@ -7049,11 +7079,16 @@ mod folder_plan_tests {
             // Every shape with all folders free, none free, and every third
             // one holding several files.
             for pattern in 0..3 {
-                let folders: Vec<(u64, u64, bool)> = folders
+                let folders: Vec<(u64, u64, bool, bool)> = folders
                     .iter()
                     .enumerate()
                     .map(|(i, &(unpacked, estimate))| {
-                        (unpacked, estimate, [true, false, i % 3 != 0][pattern])
+                        (
+                            unpacked,
+                            estimate,
+                            [true, false, i % 3 != 0][pattern],
+                            i % 2 == 0,
+                        )
                     })
                     .collect();
                 for threads in [0, 1, 2, 3, 4, 5, 7, 8, 13, 64, 255] {
@@ -7088,6 +7123,9 @@ mod folder_plan_tests {
                                             <= u64::from(threads.max(1))
                                     );
                                     assert!(folders[blocks.clone()].iter().all(|f| f.2));
+                                    if folders[blocks.clone()].iter().all(|f| f.3) {
+                                        assert_eq!(*threads_per_folder, 1);
+                                    }
                                     if limit != u64::MAX {
                                         let largest = folders[blocks.clone()]
                                             .iter()
@@ -7139,10 +7177,10 @@ mod folder_plan_tests {
 
     #[test]
     fn large_one_file_folders_are_planned_side_by_side() {
-        // Four 56 MiB folders of one LZMA2 block each, a 16 MiB dictionary
+        // Four 56 MiB folders of several LZMA2 runs each, a 16 MiB dictionary
         // apiece: under Weaver's default 1 GiB, and its smallest 512 MiB, all
-        // four decode at once on eight threads.
-        let folders = [(56 << 20, 17 << 20, true); 4];
+        // four decode at once on eight threads, two each.
+        let folders = [(56 << 20, 17 << 20, true, false); 4];
         for limit in [u64::MAX, 1 << 30, 512 << 20] {
             let phases = plan_unordered(&folders, 8, limit);
             assert!(
@@ -7171,9 +7209,78 @@ mod folder_plan_tests {
     }
 
     #[test]
+    fn folders_of_one_lzma2_run_get_one_thread_each() {
+        // What `7zz -mx5 -ms=off` writes for four 56 MiB files: a 32 MiB
+        // dictionary, so one run each. Every profile Weaver has decodes the
+        // four side by side on one thread apiece, each charged one decoder.
+        let estimate = (32 << 20) + 64 * 1024;
+        let folders = [(56 << 20, estimate, true, true); 4];
+        for limit in [u64::MAX, 4 << 30, 1 << 30, 512 << 20] {
+            let phases = plan_unordered(&folders, 8, limit);
+            let [
+                UnorderedPhase::Unordered {
+                    ref blocks,
+                    workers,
+                    threads_per_folder,
+                    worker_memory,
+                },
+            ] = phases[..]
+            else {
+                panic!("{limit}: {phases:?}");
+            };
+            assert_eq!(
+                (blocks.clone(), workers, threads_per_folder),
+                (0..4, 4, 1),
+                "{limit}"
+            );
+            if limit != u64::MAX {
+                assert!(worker_memory >= estimate + crate::container::BLOCK_INPUT_BYTES);
+                assert!(
+                    4 * (estimate + UNORDERED_WORKER_BYTES) + FOLDER_CHUNK_BYTES as u64 <= limit
+                );
+            }
+        }
+        // One folder longer than a run among them keeps the wider coders.
+        let mut mixed = folders;
+        mixed[2].3 = false;
+        assert!(matches!(
+            plan_unordered(&mixed, 8, 1 << 30)[..],
+            [UnorderedPhase::Unordered {
+                workers: 4,
+                threads_per_folder: 2,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn a_folder_within_one_encoder_run_is_one_lzma2_run() {
+        let block = |method: &[u8], dict_prop: u8, unpacked: u64| {
+            let mut coder = Coder::single_stream();
+            coder.set_id_size(method.len() as u8);
+            coder.decompression_method_id_mut().copy_from_slice(method);
+            coder.set_properties(vec![dict_prop].into());
+            let mut block = Block::with_coders(vec![coder]);
+            block.set_streams(1, 1, Box::new([]), vec![0].into(), vec![unpacked].into());
+            block
+        };
+        let lzma2 = |dict_prop, unpacked| block(EncoderMethod::ID_LZMA2, dict_prop, unpacked);
+        // Property 24 is 16 MiB, so 64 MiB runs; 25 is 24 MiB, so 96 MiB.
+        assert!(is_one_lzma2_run(&lzma2(24, 64 << 20)));
+        assert!(!is_one_lzma2_run(&lzma2(24, (64 << 20) + 1)));
+        assert!(is_one_lzma2_run(&lzma2(25, 96 << 20)));
+        assert!(!is_one_lzma2_run(&block(
+            EncoderMethod::ID_LZMA,
+            24,
+            1 << 20
+        )));
+    }
+
+    #[test]
     fn folders_of_several_files_keep_the_ordered_plan() {
         let folders: Vec<(u64, u64)> = (0..6).map(|i| (1 << 20, i << 10)).collect();
-        let solid: Vec<(u64, u64, bool)> = folders.iter().map(|&(u, e)| (u, e, false)).collect();
+        let solid: Vec<(u64, u64, bool, bool)> =
+            folders.iter().map(|&(u, e)| (u, e, false, true)).collect();
         for limit in [u64::MAX, 1 << 30] {
             let ordered: Vec<UnorderedPhase> = plan_folders(folders.iter().copied(), 8, limit)
                 .into_iter()

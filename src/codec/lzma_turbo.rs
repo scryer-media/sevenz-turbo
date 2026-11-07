@@ -467,7 +467,7 @@ const MT_NO_WORKER_GIVE_UP_BYTES: u64 = 256 * 1024 * 1024;
 /// Such a stream's first run is then decoded on the calling thread, as a run
 /// longer than [`MT_INPUT_HOLD_BYTES`] already is, and the decode goes wide
 /// again from the second run, whose boundary the scan still finds.
-fn lzma2_encoder_run_cap(dict_size: u32) -> u64 {
+pub(crate) fn lzma2_encoder_run_cap(dict_size: u32) -> u64 {
     const MIB: u64 = 1 << 20;
     let dict = u64::from(dict_size);
     (dict * 4).clamp(MIB, 256 * MIB).max(dict).div_ceil(MIB) * MIB
