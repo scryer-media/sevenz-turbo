@@ -61,6 +61,15 @@ crypto-host = ["lzma-turbo/crypto-host"]
 crc-host = ["lzma-turbo/crc-host"]
 brotli = ["dep:brotli"]
 bzip2 = ["dep:bzip2-turbo"]
+# BZip2 through the `bzip2` crate and its pure-Rust port of libbzip2
+# (`libbz2-rs-sys`, under the BSD-style bzip2-1.0.6 license), for a build that
+# links no LGPL code: `bzip2` brings `bzip2-turbo`, which is
+# LGPL-2.1-or-later. The method and the archives are the same. Encoding and
+# decoding run on one thread at libbzip2's speed, and `Bzip2Options` keeps its
+# level and block size but ignores its thread count and passes. It excludes
+# `bzip2`: enabling both is a compile error, so turn the default `bzip2` off
+# with `default-features = false`.
+bzip2-permissive = ["dep:libbzip2"]
 # Writing archives. LZMA and LZMA2 are encoded by `lzma-turbo`'s port of the
 # SDK encoder (see `src/codec/lzma_turbo/writer.rs`); with `aes256`, the
 # AES-256 encryptor is the selected backend's (RustCrypto under
@@ -84,6 +93,8 @@ aes = { version = "0.9", features = ["zeroize"], optional = true }
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
 brotli = { version = ">= 7, < 10", default-features = false, optional = true, features = ["std"] }
 bzip2-turbo = { version = "0.2.0", default-features = false, optional = true }
+# Renamed so the crate's path never collides with this crate's `bzip2` modules.
+libbzip2 = { package = "bzip2", version = "0.6.1", optional = true }
 cbc = { version = "0.2", optional = true }
 flate2 = { version = "1", optional = true, features = ["zlib-rs"] }
 getrandom = { version = "0.4", optional = true }
@@ -145,7 +156,13 @@ name = "wasm_host_extract_conformance"
 required-features = ["aes256", "crc-host", "crypto-host"]
 
 [package.metadata.docs.rs]
-all-features = true
+# Every feature but `bzip2-permissive`, which excludes `bzip2`. Keep in step
+# with `ALL_FEATURES` in `.github/workflows/ci.yml`.
+features = [
+    "kernel-ab", "default", "default_wasm", "nt-time", "aes256", "aes256_wasm",
+    "aws-lc-crypto", "native-crypto", "crypto-host", "crc-host", "brotli",
+    "bzip2", "compress", "deflate", "lz4", "ppmd", "util", "zstd",
+]
 
 [profile.release]
 lto = "fat"

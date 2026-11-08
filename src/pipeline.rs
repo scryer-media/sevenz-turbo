@@ -829,23 +829,26 @@ impl<'r> Chain<'r> {
             }
         }
         let parallel_lzma2 = parallel_lzma2_coder(block).filter(|&index| Some(index) != serial);
-        let parallel_bzip2 =
-            if parallel_lzma2.is_none() && offload.count_ones().saturating_add(1) < opts.threads {
-                block
-                    .coders
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, coder)| coder.encoder_method_id() == EncoderMethod::ID_BZIP2)
-                    .find(|(index, _)| {
-                        !block
-                            .bind_pairs()
-                            .iter()
-                            .any(|pair| pair.out_index == *index as u64)
-                    })
-                    .map(|(index, _)| index)
-            } else {
-                None
-            };
+        // Only `bzip2-turbo` decodes with workers; `bzip2-permissive` is one thread.
+        let parallel_bzip2 = if cfg!(feature = "bzip2")
+            && parallel_lzma2.is_none()
+            && offload.count_ones().saturating_add(1) < opts.threads
+        {
+            block
+                .coders
+                .iter()
+                .enumerate()
+                .filter(|(_, coder)| coder.encoder_method_id() == EncoderMethod::ID_BZIP2)
+                .find(|(index, _)| {
+                    !block
+                        .bind_pairs()
+                        .iter()
+                        .any(|pair| pair.out_index == *index as u64)
+                })
+                .map(|(index, _)| index)
+        } else {
+            None
+        };
         // The coder's own thread only scans and copies once workers decode,
         // so it counts as one of them.
         let budget = opts.threads.saturating_sub(offload.count_ones());

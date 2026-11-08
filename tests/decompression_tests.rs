@@ -170,7 +170,7 @@ fn decompress_ppmd_single_file() {
     assert_eq!(decompressed_content, expected);
 }
 
-#[cfg(all(feature = "util", feature = "bzip2"))]
+#[cfg(all(feature = "util", any(feature = "bzip2", feature = "bzip2-permissive")))]
 #[test]
 fn decompress_bzip2_file() {
     let mut source_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

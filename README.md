@@ -198,7 +198,7 @@ writer.finish().expect("compress ok");
 | LZMA        | ✓            | ✓          | `lzma-turbo` |
 | LZMA2       | ✓            | ✓          | `lzma-turbo`, on one thread or several |
 | BROTLI (*)  | ✓            | ✓          | `brotli` crate |
-| BZIP2       | ✓            | ✓          | `bzip2-turbo` crate, single-threaded and multi-threaded |
+| BZIP2       | ✓            | ✓          | `bzip2-turbo` crate, single-threaded and multi-threaded; `bzip2` crate on one thread with `bzip2-permissive` |
 | DEFLATE (*) | ✓            | ✓          | `flate2` crate (`zlib-rs`) |
 | PPMD        | ✓            | ✓          | `ppmd-turbo` crate |
 | LZ4 (*)     | ✓            | ✓          | `lz4_flex` crate |
@@ -222,7 +222,7 @@ writer.finish().expect("compress ok");
 The filters themselves are `lzma-turbo`'s; this crate wraps them as readers
 and writers. The container's CRC-32 comes from `crc-turbo`, through
 `lzma-turbo`; BZip2's own CRC-32/BZIP2 stream checksum is `bzip2-turbo`'s,
-also from `crc-turbo`.
+also from `crc-turbo` (with `bzip2-permissive`, it is `libbz2-rs-sys`'s).
 
 ## Speed
 
@@ -367,5 +367,16 @@ The optional [`bzip2-turbo`](https://github.com/scryer-media/bzip2-turbo)
 dependency translates the 7-Zip BZip2 codec and retains LGPL-2.1-or-later
 licensing, with MIT notices on its compatibility adapters; see that
 package's license files. It is linked only when the `bzip2` feature is on.
+For a build without LGPL code, turn off the default features and enable
+`bzip2-permissive` instead: BZip2 then goes through the `bzip2` crate
+(MIT OR Apache-2.0) and `libbz2-rs-sys` (the bzip2-1.0.6 licence), on one
+thread, ignoring `Bzip2Options`' thread count and passes. The two features
+are exclusive and a build with both fails to compile.
+
+```toml
+sevenz-turbo = { version = "0.29", default-features = false, features = [
+    "aes256", "aws-lc-crypto", "bzip2-permissive", "compress", "ppmd", "util",
+] }
+```
 `lzma-turbo` is Apache-2.0 too, from its 0.7.0 release on; its earlier
 releases were published under GPL-3.0-or-later.

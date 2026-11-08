@@ -497,6 +497,19 @@ arm, and this crate can add a variant without a breaking release.
 
 ## 0.29.7 - 2026-11-08
 
+- Added the `bzip2-permissive` feature, for builds that must not link LGPL
+  code: BZip2 decodes and encodes through the `bzip2` crate
+  (MIT OR Apache-2.0) over `libbz2-rs-sys` (bzip2-1.0.6), on one thread.
+  `Bzip2Options`' thread count and passes are ignored; its level or block
+  size picks libbzip2's block size as 7-Zip maps it. It excludes `bzip2`
+  (on by default): a build with both fails to compile, so feature
+  unification can never pick a licence silently.
+- `--all-features` no longer builds, as a result. CI, the release
+  workflow's semver check, docs.rs and the commands in `AGENTS.md` and
+  `CONTRIBUTING.md` use
+  `.github/scripts/all-features.sh`, which lists every feature but
+  `bzip2-permissive`; CI also lints, tests and wasm-checks a
+  `bzip2-permissive` build and checks that both together fail.
 - Bumped `bzip2-turbo` to 0.2.0. A large non-solid BZip2 coder the pipeline
   hands the spare threads to now decodes with up to that many workers instead
   of one second thread. Under a finite `memory_limit_bytes` each worker is

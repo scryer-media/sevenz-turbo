@@ -78,8 +78,20 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      # `bzip2-permissive` excludes `bzip2`, so `--all-features` is a compile
+      # error. The script lists every other feature and checks that docs.rs
+      # builds the same list.
+      - run: bash .github/scripts/all-features.sh --check
+      - run: cargo clippy --locked --all-targets --features "$(bash .github/scripts/all-features.sh)" -- -D warnings
+      - run: cargo clippy --locked --all-targets --no-default-features --features aes256,native-crypto,bzip2-permissive,compress,deflate,ppmd,util -- -D warnings
       - run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      - name: Enabling both BZip2 backends is a compile error
+        run: |
+          if cargo check --locked --features bzip2-permissive 2> both.log; then
+            echo "bzip2 and bzip2-permissive built together" >&2
+            exit 1
+          fi
+          grep -q 'are exclusive' both.log
 
   docs:
     name: docs
@@ -94,7 +106,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - run: cargo doc --locked --no-deps --all-features
+      - run: cargo doc --locked --no-deps --features "$(bash .github/scripts/all-features.sh)"
 
   test:
     name: test-${{ matrix.platform.name }}-${{ matrix.configuration.name }}
@@ -116,7 +128,9 @@ jobs:
           - name: aws-lc
             args: ""
           - name: all-features
-            args: --all-features
+            args: --features "$(bash .github/scripts/all-features.sh)"
+          - name: bzip2-permissive
+            args: --no-default-features --features aes256,native-crypto,bzip2-permissive,compress,deflate,ppmd,util
           - name: no-default-features
             args: --no-default-features
           - name: rustcrypto
@@ -137,9 +151,12 @@ jobs:
       - name: Install NASM (Windows, for aws-lc-rs)
         if: matrix.platform.name == 'windows-x86_64' && (matrix.configuration.name == 'aws-lc' || matrix.configuration.name == 'all-features')
         uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+      # bash on every platform: the all-features row expands a script.
       - name: Test ${{ matrix.configuration.name }}
+        shell: bash
         run: cargo nextest run --locked --no-fail-fast ${{ matrix.configuration.args }}
       - name: Run doctests
+        shell: bash
         run: cargo test --doc --locked --no-fail-fast ${{ matrix.configuration.args }}
 
   bzip2-conformance:
@@ -164,6 +181,8 @@ jobs:
         run: bash .github/scripts/build-bzip2-oracle.sh
       - name: Archive integration, including the required oracle
         run: cargo nextest run --locked -p sevenz-turbo --no-default-features --features bzip2,compress --test bzip2_codec_tests --run-ignored all --no-fail-fast
+      - name: The same through the permissive backend
+        run: cargo nextest run --locked -p sevenz-turbo --no-default-features --features bzip2-permissive,compress --test bzip2_codec_tests --run-ignored all --no-fail-fast
 
   # Native guards also cover assembly reached through the archive APIs.
   # The 2 MiB guard alignment includes sevenz's HugeInput allocation. The
@@ -423,6 +442,11 @@ jobs:
         run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features default_wasm
         env:
           RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+      # The browser set with the permissive BZip2 backend in place of bzip2-turbo.
+      - name: Check the wasm feature set with the permissive BZip2 backend
+        run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features aes256_wasm,native-crypto,bzip2-permissive,compress,ppmd,util
+        env:
+          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
       # The same set plus `crypto-host`, which moves the bulk AES-256-CBC
       # decrypt out to the embedding host.
       - name: Check the wasm feature set with the host-delegated AES
@@ -470,7 +494,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - run: cargo check --locked --all-features
+      - run: cargo check --locked --features "$(bash .github/scripts/all-features.sh)"
 
   # Prepared, not enabled. The 7-Zip interop tests (sevenzip_encode_tests,
   # the 7zz half of bcj2_compress_tests, differential_7zz_tests) skip
@@ -508,7 +532,7 @@ jobs:
   #         echo "choose and approve a 7-Zip install source before enabling this job" >&2
   #         exit 1
   #     - name: Check 7-Zip interop with the tool required
-  #       run: cargo nextest run --locked --all-features --test sevenzip_encode_tests --test bcj2_compress_tests --test differential_7zz_tests --test lzma2_mt_tests --no-fail-fast
+  #       run: cargo nextest run --locked --features "$(bash .github/scripts/all-features.sh)" --test sevenzip_encode_tests --test bcj2_compress_tests --test differential_7zz_tests --test lzma2_mt_tests --no-fail-fast
 
   package:
     name: package

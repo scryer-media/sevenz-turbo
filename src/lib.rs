@@ -50,6 +50,17 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 
+// One BZip2 backend per build. The two features bring code under different
+// licenses, so feature unification must never pick one silently. The
+// permissive backend's code is behind `not(feature = "bzip2")`, so with both
+// on this is the only error reported.
+#[cfg(all(feature = "bzip2", feature = "bzip2-permissive"))]
+compile_error!(
+    "features `bzip2` and `bzip2-permissive` are exclusive: `bzip2` (on by default) uses \
+     bzip2-turbo, LGPL-2.1-or-later; `bzip2-permissive` uses libbz2-rs-sys, bzip2-1.0.6. \
+     For `bzip2-permissive`, set `default-features = false` and list the features you need"
+);
+
 #[cfg(target_arch = "wasm32")]
 extern crate wasm_bindgen;
 

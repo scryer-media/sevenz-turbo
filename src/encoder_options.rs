@@ -274,7 +274,7 @@ impl Lzma2Options {
     }
 }
 
-#[cfg(feature = "bzip2")]
+#[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
 #[derive(Debug, Copy, Clone)]
 /// Options for BZIP2 compression.
 pub struct Bzip2Options {
@@ -284,7 +284,7 @@ pub struct Bzip2Options {
     pub(crate) passes: Option<u32>,
 }
 
-#[cfg(feature = "bzip2")]
+#[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
 impl Bzip2Options {
     /// Creates BZIP2 options with the specified compression level.
     ///
@@ -300,7 +300,8 @@ impl Bzip2Options {
     }
 
     /// Uses up to `threads` block encoders, with output in input order.
-    /// Zero requests one thread; the codec supports at most 64.
+    /// Zero requests one thread; the codec supports at most 64. Under
+    /// `bzip2-permissive` the encoder is single-threaded and ignores this.
     pub const fn from_level_mt(level: u32, threads: u32) -> Self {
         Self {
             threads,
@@ -316,13 +317,31 @@ impl Bzip2Options {
     }
 
     /// Sets recursive block optimization passes, clamped to 1 through 10.
-    /// The default is one at levels 0–6, two at 7–8, and seven at 9.
+    /// The default is one at levels 0–6, two at 7–8, and seven at 9. Under
+    /// `bzip2-permissive` libbzip2 has no such passes and ignores this.
     pub fn set_passes(&mut self, passes: u32) {
         self.passes = Some(passes);
     }
+
+    /// The block size in units of 100,000 bytes, 1 through 9: the one set,
+    /// rounded down and clamped as `set_block_size` says, or else 7-Zip's
+    /// level mapping. libbzip2 takes the block size in this form.
+    #[cfg(any(test, all(feature = "bzip2-permissive", not(feature = "bzip2"))))]
+    pub(crate) fn block_size_100k(&self) -> u32 {
+        match self.block_size {
+            Some(bytes) => (bytes / 100_000).clamp(1, 9),
+            None => match self.level {
+                0 | 1 => 1,
+                2 => 3,
+                3 => 5,
+                4 => 7,
+                _ => 9,
+            },
+        }
+    }
 }
 
-#[cfg(feature = "bzip2")]
+#[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
 impl Default for Bzip2Options {
     /// Level 9 (900,000-byte blocks) with one optimization pass.
     fn default() -> Self {
@@ -672,7 +691,7 @@ pub enum EncoderOptions {
     #[cfg(feature = "brotli")]
     /// Brotli compression options.
     Brotli(BrotliOptions),
-    #[cfg(feature = "bzip2")]
+    #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
     /// BZIP2 compression options.
     Bzip2(Bzip2Options),
     #[cfg(feature = "deflate")]
@@ -727,7 +746,7 @@ impl From<Lzma2Options> for EncoderConfiguration {
     }
 }
 
-#[cfg(feature = "bzip2")]
+#[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
 impl From<Bzip2Options> for EncoderConfiguration {
     fn from(options: Bzip2Options) -> Self {
         Self::new(crate::EncoderMethod::BZIP2).with_options(EncoderOptions::Bzip2(options))
@@ -783,7 +802,7 @@ impl From<Lzma2Options> for EncoderOptions {
     }
 }
 
-#[cfg(feature = "bzip2")]
+#[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
 impl From<Bzip2Options> for EncoderOptions {
     fn from(o: Bzip2Options) -> Self {
         Self::Bzip2(o)
@@ -967,7 +986,19 @@ mod tests {
         assert!(delta.sized_for(1).is_none());
     }
 
-    #[cfg(feature = "bzip2")]
+    #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
+    #[test]
+    fn bzip2_block_size_follows_the_7zip_level_mapping() {
+        let size = |level: u32| Bzip2Options::from_level(level).block_size_100k();
+        assert_eq!([0, 1, 2, 3, 4, 5, 9].map(size), [1, 1, 3, 5, 7, 9, 9]);
+        let mut options = Bzip2Options::from_level(1);
+        for (bytes, expected) in [(0, 1), (199_999, 1), (450_000, 4), (2_000_000, 9)] {
+            options.set_block_size(bytes);
+            assert_eq!(options.block_size_100k(), expected, "{bytes}");
+        }
+    }
+
+    #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
     #[test]
     fn bzip2_defaults_to_level_9_with_one_pass() {
         let options = Bzip2Options::default();

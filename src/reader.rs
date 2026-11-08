@@ -5146,10 +5146,13 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
         // way when it has one: see `store_overlap`.
         // A lower LZMA2 coder owns the shared folding control. Its output is
         // still compressed BZip2 bytes, so final-file splits must not reach it.
-        let bzip2_output = !block
-            .coders
-            .iter()
-            .any(|coder| coder.encoder_method_id() == EncoderMethod::ID_LZMA2)
+        // Only `bzip2-turbo` folds at file boundaries; under
+        // `bzip2-permissive` such a chain is planned like any other.
+        let bzip2_output = cfg!(feature = "bzip2")
+            && !block
+                .coders
+                .iter()
+                .any(|coder| coder.encoder_method_id() == EncoderMethod::ID_LZMA2)
             && block.coders.iter().enumerate().any(|(index, coder)| {
                 coder.encoder_method_id() == EncoderMethod::ID_BZIP2
                     && !block

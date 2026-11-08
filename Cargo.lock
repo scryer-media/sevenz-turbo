@@ -1766,6 +1766,7 @@ dependencies = [
  "aes",
  "aws-lc-rs",
  "brotli 9.1.1",
+ "bzip2",
  "bzip2-turbo",
  "cap-std",
  "cbc",
