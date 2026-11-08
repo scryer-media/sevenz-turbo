@@ -10,13 +10,13 @@ Thanks for looking. A few things before you open a pull request:
   rebased onto upstream and nothing is sent back, so a fix lands here on its
   own terms.
 - Run `cargo fmt --all`,
-  `cargo clippy --locked --all-targets --features "$(bash .github/scripts/all-features.sh)" -- -D warnings`,
+  `cargo clippy --locked --all-targets --all-features -- -D warnings`,
   `cargo clippy --locked --all-targets --no-default-features -- -D warnings`,
-  `cargo nextest run --locked --features "$(bash .github/scripts/all-features.sh)" --no-fail-fast`
-  and `cargo test --doc --locked --features "$(bash .github/scripts/all-features.sh)" --no-fail-fast` locally.
-  `--all-features` does not build: `bzip2-permissive` excludes `bzip2`, and
-  the script lists every feature but it. For a change to BZip2 code, also run
-  `cargo clippy --locked --all-targets --no-default-features --features aes256,native-crypto,bzip2-permissive,compress,deflate,ppmd,util -- -D warnings`.
+  `cargo nextest run --locked --all-features --no-fail-fast`
+  and `cargo test --doc --locked --all-features --no-fail-fast` locally.
+  For a change to BZip2 code, also run
+  `cargo clippy --locked --all-targets --no-default-features --features aes256,native-crypto,bzip2-permissive,compress,deflate,ppmd,util -- -D warnings`:
+  under `--all-features` the faster `bzip2-turbo` is the one selected.
 - Record every change under its version heading in
   [CHANGELOG.md](../CHANGELOG.md), in the same change. The `## Fork`
   section is closed and takes no new entries.

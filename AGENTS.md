@@ -113,14 +113,12 @@ workstation.
 - The pre-commit hook (`.githooks/pre-commit`) rejects home paths, the local
   username and secrets. Keep it enabled: `git config core.hooksPath .githooks`.
 - Before a commit is proposed: `cargo fmt --all`, `cargo clippy --all-targets
-  --features "$(bash .github/scripts/all-features.sh)" -- -D warnings`,
-  `cargo nextest run --features "$(bash .github/scripts/all-features.sh)"
-  --no-fail-fast` and `cargo test --doc --features
-  "$(bash .github/scripts/all-features.sh)" --no-fail-fast`. The script
-  lists every feature but `bzip2-permissive`, which excludes `bzip2`, so
-  `--all-features` does not build. Lint a change to BZip2 code under
-  `--no-default-features --features
-  aes256,native-crypto,bzip2-permissive,compress,deflate,ppmd,util` too.
+  --all-features -- -D warnings`, `cargo nextest run --all-features
+  --no-fail-fast` and `cargo test --doc --all-features --no-fail-fast`.
+  For a change to BZip2 code, also lint `--no-default-features --features
+  aes256,native-crypto,bzip2-permissive,compress,deflate,ppmd,util`: under
+  `--all-features` `bzip2-turbo` wins and the permissive backend is not built
+  into the codec path.
   Install `cargo-nextest` 0.9.143 as in CI, keep `cargo miri test` for
   interpreter checks, and exclude `wasm-conformance` from ordinary workspace
   sweeps; its own CI job runs it.

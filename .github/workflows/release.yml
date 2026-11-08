@@ -170,9 +170,7 @@ jobs:
         with:
           tool: cargo-semver-checks@0.50.0
       - name: The public API changed no more than the version says
-        # Every feature but `bzip2-permissive`, which excludes `bzip2`; the
-        # tool's default turns both on and fails to compile.
-        run: cargo semver-checks -p "$CRATE" --only-explicit-features --features "$(bash .github/scripts/all-features.sh)"
+        run: cargo semver-checks -p "$CRATE"
       - name: Package
         run: cargo publish -p "$CRATE" --locked --dry-run
 

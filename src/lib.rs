@@ -50,17 +50,6 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 
-// One BZip2 backend per build. The two features bring code under different
-// licenses, so feature unification must never pick one silently. The
-// permissive backend's code is behind `not(feature = "bzip2")`, so with both
-// on this is the only error reported.
-#[cfg(all(feature = "bzip2", feature = "bzip2-permissive"))]
-compile_error!(
-    "features `bzip2` and `bzip2-permissive` are exclusive: `bzip2` (on by default) uses \
-     bzip2-turbo, LGPL-2.1-or-later; `bzip2-permissive` uses libbz2-rs-sys, bzip2-1.0.6. \
-     For `bzip2-permissive`, set `default-features = false` and list the features you need"
-);
-
 #[cfg(target_arch = "wasm32")]
 extern crate wasm_bindgen;
 
@@ -98,6 +87,24 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut sha = crypto_backend::Sha256::new();
     sha.update(data);
     sha.finalize()
+}
+
+/// Names the BZip2 backend this build of the crate selected: `"bzip2-turbo"`
+/// or `"libbz2-rs-sys"`.
+///
+/// The faster `bzip2-turbo` (the `bzip2` feature, on by default) wins
+/// whenever it is enabled; `libbz2-rs-sys` (the `bzip2-permissive` feature)
+/// is used only without it. A dependency can turn `bzip2` on without the
+/// top-level crate noticing, so a build that must not link LGPL code can
+/// assert on this in its own tests.
+#[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
+#[must_use]
+pub fn bzip2_backend() -> &'static str {
+    if cfg!(feature = "bzip2") {
+        "bzip2-turbo"
+    } else {
+        "libbz2-rs-sys"
+    }
 }
 
 /// Names the LZMA and LZMA2 encoder this crate writes archives with:

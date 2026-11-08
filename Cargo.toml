@@ -34,8 +34,9 @@ aes256 = ["dep:getrandom"]
 aes256_wasm = ["aes256", "getrandom/wasm_js"]
 # Cryptography backends for `aes256` — both SHA-256 *and* AES-256-CBC. See
 # `src/crypto_backend.rs`: the features are additive, so `native-crypto` does
-# not turn `aws-lc-crypto` off — it takes precedence over it. A build that
-# wants no AWS-LC asks for `default-features = false` plus `native-crypto`.
+# not turn `aws-lc-crypto` off, and the faster AWS-LC wins when both are on. A
+# build that wants no AWS-LC asks for `default-features = false` plus
+# `native-crypto`.
 # Enabling `aes256` with neither is a compile error, not a silent choice. The
 # encoder's AES follows the same choice: `aes`/`cbc` come in only through
 # `native-crypto`, so `compress` adds no RustCrypto AES to an AWS-LC build.
@@ -66,9 +67,11 @@ bzip2 = ["dep:bzip2-turbo"]
 # links no LGPL code: `bzip2` brings `bzip2-turbo`, which is
 # LGPL-2.1-or-later. The method and the archives are the same. Encoding and
 # decoding run on one thread at libbzip2's speed, and `Bzip2Options` keeps its
-# level and block size but ignores its thread count and passes. It excludes
-# `bzip2`: enabling both is a compile error, so turn the default `bzip2` off
-# with `default-features = false`.
+# level and block size but ignores its thread count and passes. Like every
+# alternative backend here it gives way to the fast one: with `bzip2` also on,
+# `bzip2-turbo` is used, so turn the default off with
+# `default-features = false`. `sevenz_turbo::bzip2_backend()` names the one a
+# build selected.
 bzip2-permissive = ["dep:libbzip2"]
 # Writing archives. LZMA and LZMA2 are encoded by `lzma-turbo`'s port of the
 # SDK encoder (see `src/codec/lzma_turbo/writer.rs`); with `aes256`, the
@@ -156,13 +159,7 @@ name = "wasm_host_extract_conformance"
 required-features = ["aes256", "crc-host", "crypto-host"]
 
 [package.metadata.docs.rs]
-# Every feature but `bzip2-permissive`, which excludes `bzip2`. Keep in step
-# with `ALL_FEATURES` in `.github/workflows/ci.yml`.
-features = [
-    "kernel-ab", "default", "default_wasm", "nt-time", "aes256", "aes256_wasm",
-    "aws-lc-crypto", "native-crypto", "crypto-host", "crc-host", "brotli",
-    "bzip2", "compress", "deflate", "lz4", "ppmd", "util", "zstd",
-]
+all-features = true
 
 [profile.release]
 lto = "fat"

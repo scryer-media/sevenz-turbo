@@ -15,7 +15,8 @@ sevenz-turbo = "0.29"
 ```
 
 It needs Rust 1.97.1 or newer. The default build uses AWS-LC for encryption,
-which needs a C compiler; [Encryption](#encryption) shows the pure-Rust build.
+which needs a C compiler; [Backends](#backends) shows the pure-Rust build and
+the build without LGPL code.
 
 ## Why a fork?
 
@@ -259,14 +260,30 @@ is meant to be fed; see
 Every test on every machine is in [docs/benchmarks.md](docs/benchmarks.md),
 and how to measure your own is in [docs/benchmarking.md](docs/benchmarking.md).
 
-## Encryption
+## Backends
 
-7z encryption is AES-256, with a SHA-256 key derivation. Both come from one
-backend, chosen by feature:
+The default features pick the fastest implementation of everything. Where a
+slower alternative exists for another reason, such as no C compiler or no
+LGPL code, it is a feature of its own:
 
-- `aws-lc-crypto`, the default: AWS-LC, which needs a C compiler.
-- `native-crypto`: RustCrypto, pure Rust, using AES-NI on x86-64 and the ARMv8
-  crypto instructions on aarch64. It wins when both are on.
+| Part | Default, fastest | Alternative | Choose the alternative for | Which one is in use |
+|------|------------------|-------------|----------------------------|---------------------|
+| AES-256 and SHA-256 (7z encryption) | `aws-lc-crypto`: AWS-LC, needs a C compiler | `native-crypto`: RustCrypto, pure Rust, AES-NI on x86-64 and the ARMv8 crypto instructions on aarch64 | A build with no C | `sevenz_turbo::crypto_backend()`: `"aws-lc"` or `"rustcrypto"` |
+| BZip2 | `bzip2`: `bzip2-turbo`, multi-threaded, LGPL-2.1-or-later | `bzip2-permissive`: the `bzip2` crate over `libbz2-rs-sys`, one thread, MIT OR Apache-2.0 and bzip2-1.0.6 | A build with no LGPL code | `sevenz_turbo::bzip2_backend()`: `"bzip2-turbo"` or `"libbz2-rs-sys"` |
+
+**When both are on, the fast one wins.** Cargo features only add, so an
+alternative cannot switch the default off. The alternative is used only when
+the default feature is off, which means `default-features = false`. If any
+crate in your dependency graph turns the default back on, Cargo unifies the
+features and the fast backend is used. A build that must not have it should
+assert on the functions above in its own tests. `--all-features` builds the
+fast backends.
+
+`aes256` with neither cryptography backend is a compile error rather than a
+silent choice.
+
+With the alternative, BZip2 keeps `Bzip2Options`' level and block size and
+ignores its thread count and passes. The archives are the same either way.
 
 A build with no C at all:
 
@@ -276,8 +293,20 @@ sevenz-turbo = { version = "0.29", default-features = false, features = [
 ] }
 ```
 
-`aes256` with neither backend is a compile error rather than a silent
-choice, and `sevenz_turbo::crypto_backend()` says which one a build uses.
+A build with no LGPL code:
+
+```toml
+sevenz-turbo = { version = "0.29", default-features = false, features = [
+    "aes256", "aws-lc-crypto", "bzip2-permissive", "compress", "ppmd", "util",
+] }
+```
+
+Both at once: `native-crypto` and `bzip2-permissive` together.
+
+## Encryption
+
+7z encryption is AES-256, with a SHA-256 key derivation. Both come from the
+one cryptography backend in [Backends](#backends).
 
 ## WebAssembly
 
@@ -367,16 +396,7 @@ The optional [`bzip2-turbo`](https://github.com/scryer-media/bzip2-turbo)
 dependency translates the 7-Zip BZip2 codec and retains LGPL-2.1-or-later
 licensing, with MIT notices on its compatibility adapters; see that
 package's license files. It is linked only when the `bzip2` feature is on.
-For a build without LGPL code, turn off the default features and enable
-`bzip2-permissive` instead: BZip2 then goes through the `bzip2` crate
-(MIT OR Apache-2.0) and `libbz2-rs-sys` (the bzip2-1.0.6 licence), on one
-thread, ignoring `Bzip2Options`' thread count and passes. The two features
-are exclusive and a build with both fails to compile.
-
-```toml
-sevenz-turbo = { version = "0.29", default-features = false, features = [
-    "aes256", "aws-lc-crypto", "bzip2-permissive", "compress", "ppmd", "util",
-] }
-```
+For a build without LGPL code, use `bzip2-permissive` in its place, as
+[Backends](#backends) shows.
 `lzma-turbo` is Apache-2.0 too, from its 0.7.0 release on; its earlier
 releases were published under GPL-3.0-or-later.
