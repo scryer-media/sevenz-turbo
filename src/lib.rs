@@ -89,6 +89,24 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     sha.finalize()
 }
 
+/// Names the BZip2 backend this build of the crate selected: `"bzip2-turbo"`
+/// or `"libbz2-rs-sys"`.
+///
+/// The faster `bzip2-turbo` (the `bzip2` feature, on by default) wins
+/// whenever it is enabled; `libbz2-rs-sys` (the `bzip2-permissive` feature)
+/// is used only without it. A dependency can turn `bzip2` on without the
+/// top-level crate noticing, so a build that must not link LGPL code can
+/// assert on this in its own tests.
+#[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
+#[must_use]
+pub fn bzip2_backend() -> &'static str {
+    if cfg!(feature = "bzip2") {
+        "bzip2-turbo"
+    } else {
+        "libbz2-rs-sys"
+    }
+}
+
 /// Names the LZMA and LZMA2 encoder this crate writes archives with:
 /// `"lzma-turbo"`.
 #[cfg(feature = "compress")]

@@ -497,6 +497,19 @@ arm, and this crate can add a variant without a breaking release.
 
 ## 0.29.7 - 2026-11-08
 
+- Added the `bzip2-permissive` feature, for builds that must not link LGPL
+  code: BZip2 decodes and encodes through the `bzip2` crate
+  (MIT OR Apache-2.0) over `libbz2-rs-sys` (bzip2-1.0.6), on one thread.
+  `Bzip2Options`' thread count and passes are ignored; its level or block
+  size picks libbzip2's block size as 7-Zip maps it. With `bzip2` (on by
+  default) also enabled, the faster `bzip2-turbo` is used, so a
+  permissive build sets `default-features = false`. Added
+  `bzip2_backend()`, which names the backend a build selected. CI lints,
+  tests and wasm-checks a `bzip2-permissive` build.
+- Changed: with both `aws-lc-crypto` and `native-crypto` enabled, AWS-LC is
+  now selected instead of RustCrypto, so every backend choice leans to the
+  faster implementation. A build that wants RustCrypto alone already turns
+  `aws-lc-crypto` off; one with both now gets `crypto_backend() == "aws-lc"`.
 - Bumped `bzip2-turbo` to 0.2.0. A large non-solid BZip2 coder the pipeline
   hands the spare threads to now decodes with up to that many workers instead
   of one second thread. Under a finite `memory_limit_bytes` each worker is

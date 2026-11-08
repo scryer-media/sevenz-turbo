@@ -14,6 +14,9 @@ Thanks for looking. A few things before you open a pull request:
   `cargo clippy --locked --all-targets --no-default-features -- -D warnings`,
   `cargo nextest run --locked --all-features --no-fail-fast`
   and `cargo test --doc --locked --all-features --no-fail-fast` locally.
+  For a change to BZip2 code, also run
+  `cargo clippy --locked --all-targets --no-default-features --features aes256,native-crypto,bzip2-permissive,compress,deflate,ppmd,util -- -D warnings`:
+  under `--all-features` the faster `bzip2-turbo` is the one selected.
 - Record every change under its version heading in
   [CHANGELOG.md](../CHANGELOG.md), in the same change. The `## Fork`
   section is closed and takes no new entries.

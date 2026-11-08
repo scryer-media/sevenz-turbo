@@ -1,6 +1,12 @@
 use std::io::{self, Read};
 
+#[cfg(feature = "bzip2")]
 use bzip2_turbo::Decoder;
+// Decodes exactly one stream and checks its CRC at the end-of-stream marker,
+// as `bzip2-turbo` does with multistream off.
+// `not(bzip2)`: with both on, only the exclusivity error is reported.
+#[cfg(all(feature = "bzip2-permissive", not(feature = "bzip2")))]
+use libbzip2::read::BzDecoder as Decoder;
 
 /// Verifies the codec trailer before a size-bounded archive reader can stop.
 pub struct Bzip2Decoder<R: Read> {
@@ -11,9 +17,16 @@ pub struct Bzip2Decoder<R: Read> {
 }
 
 impl<R: Read> Bzip2Decoder<R> {
+    #[cfg(all(feature = "bzip2-permissive", not(feature = "bzip2")))]
+    pub(super) fn single_threaded(input: R, size: u64) -> Self {
+        Self::new(Decoder::new(input), size)
+    }
+
+    #[cfg_attr(not(feature = "bzip2"), allow(unused_mut))]
     pub(super) fn new(mut inner: Decoder<R>, size: u64) -> Self {
         // A 7z coder contains one stream; AES can leave padding after it.
         // Match CDecoder::DecodeAllStreams = false while checking its trailer.
+        #[cfg(feature = "bzip2")]
         inner.set_multistream(false);
         Self {
             inner,

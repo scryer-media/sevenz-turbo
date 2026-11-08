@@ -1,4 +1,7 @@
-#![cfg(all(feature = "bzip2", feature = "compress"))]
+#![cfg(all(
+    any(feature = "bzip2", feature = "bzip2-permissive"),
+    feature = "compress"
+))]
 
 use std::io::Cursor;
 use std::process::Command;

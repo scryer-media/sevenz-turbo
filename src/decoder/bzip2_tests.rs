@@ -131,3 +131,29 @@ fn a_single_threaded_bzip2_coder_leaves_checksums_to_the_reader() {
         assert_eq!(actual, data);
     }
 }
+
+// With both BZip2 features on, `bzip2-turbo` is selected and `libbz2-rs-sys`
+// is built beside it; each must read the other's streams.
+#[cfg(feature = "bzip2-permissive")]
+#[test]
+fn bzip2_turbo_and_libbz2_rs_sys_read_each_others_streams() {
+    let data: Vec<_> = (0..250_003).map(|i| (i * 13 + i / 89) as u8).collect();
+
+    let mut turbo = bzip2_turbo::Encoder::new(Vec::new(), Default::default());
+    turbo.write_all(&data).unwrap();
+    let packed = turbo.finish().unwrap();
+    let mut decoded = Vec::new();
+    libbzip2::read::BzDecoder::new(packed.as_slice())
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, data, "libbz2-rs-sys reading bzip2-turbo");
+
+    let mut permissive = libbzip2::write::BzEncoder::new(Vec::new(), libbzip2::Compression::best());
+    permissive.write_all(&data).unwrap();
+    let packed = permissive.finish().unwrap();
+    let mut decoded = Vec::new();
+    bzip2_turbo::Decoder::new(packed.as_slice())
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, data, "bzip2-turbo reading libbz2-rs-sys");
+}

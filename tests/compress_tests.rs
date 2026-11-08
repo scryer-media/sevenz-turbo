@@ -373,7 +373,11 @@ fn compress_with_brotli_skippable_algorithm() {
         .into()]);
 }
 
-#[cfg(all(feature = "compress", feature = "util", feature = "bzip2"))]
+#[cfg(all(
+    feature = "compress",
+    feature = "util",
+    any(feature = "bzip2", feature = "bzip2-permissive")
+))]
 #[test]
 fn compress_with_bzip2_algorithm() {
     test_compression_method(&[EncoderMethod::BZIP2.into()]);

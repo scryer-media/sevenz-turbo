@@ -115,6 +115,10 @@ workstation.
 - Before a commit is proposed: `cargo fmt --all`, `cargo clippy --all-targets
   --all-features -- -D warnings`, `cargo nextest run --all-features
   --no-fail-fast` and `cargo test --doc --all-features --no-fail-fast`.
+  For a change to BZip2 code, also lint `--no-default-features --features
+  aes256,native-crypto,bzip2-permissive,compress,deflate,ppmd,util`: under
+  `--all-features` `bzip2-turbo` wins and the permissive backend is not built
+  into the codec path.
   Install `cargo-nextest` 0.9.143 as in CI, keep `cargo miri test` for
   interpreter checks, and exclude `wasm-conformance` from ordinary workspace
   sweeps; its own CI job runs it.

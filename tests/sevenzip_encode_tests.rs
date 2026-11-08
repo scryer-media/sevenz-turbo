@@ -142,7 +142,7 @@ fn seven_zip_tests_and_extracts_every_encode_method() {
     ];
     #[cfg(feature = "ppmd")]
     methods.push(("ppmd", vec![PpmdOptions::from_level(6).into()]));
-    #[cfg(feature = "bzip2")]
+    #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
     methods.push(("bzip2", vec![Bzip2Options::from_level(9).into()]));
     #[cfg(feature = "deflate")]
     methods.push(("deflate", vec![DeflateOptions::from_level(6).into()]));

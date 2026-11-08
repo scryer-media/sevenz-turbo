@@ -1,9 +1,9 @@
 use std::io::Read;
 use std::sync::Arc;
 
-#[cfg(feature = "bzip2")]
+#[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
 mod bzip2;
-#[cfg(feature = "bzip2")]
+#[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
 use bzip2::Bzip2Decoder;
 
 #[cfg(all(
@@ -401,7 +401,7 @@ pub enum Decoder<R: Read> {
     Delta(Box<DeltaReader<R>>),
     #[cfg(feature = "brotli")]
     Brotli(Box<BrotliDecoder<R>>),
-    #[cfg(feature = "bzip2")]
+    #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
     Bzip2(Box<Bzip2Decoder<R>>),
     #[cfg(feature = "deflate")]
     Deflate(DeflateDecoder<std::io::BufReader<R>>),
@@ -425,7 +425,7 @@ impl<R: Read> Read for Decoder<R> {
             Decoder::Delta(r) => r.read(buf),
             #[cfg(feature = "brotli")]
             Decoder::Brotli(r) => r.read(buf),
-            #[cfg(feature = "bzip2")]
+            #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
             Decoder::Bzip2(r) => r.read(buf),
             #[cfg(feature = "deflate")]
             Decoder::Deflate(r) => r.read(buf),
@@ -744,6 +744,13 @@ pub fn add_decoder<I: Read>(
                 uncompressed_len,
             ))))
         }
+        // One thread: the chain never plans BZip2 workers or hands this
+        // backend final-file splits, so the reader folds every file CRC.
+        #[cfg(all(feature = "bzip2-permissive", not(feature = "bzip2")))]
+        EncoderMethod::ID_BZIP2 => Ok(Decoder::Bzip2(Box::new(Bzip2Decoder::single_threaded(
+            input,
+            uncompressed_len,
+        )))),
         #[cfg(feature = "deflate")]
         EncoderMethod::ID_DEFLATE => {
             let buf_read = std::io::BufReader::new(input);

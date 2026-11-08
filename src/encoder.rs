@@ -14,7 +14,7 @@ use crate::codec::brotli::BrotliEncoder;
 use crate::codec::lz4::Lz4Encoder;
 #[cfg(feature = "brotli")]
 use crate::encoder_options::BrotliOptions;
-#[cfg(feature = "bzip2")]
+#[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
 use crate::encoder_options::Bzip2Options;
 #[cfg(feature = "deflate")]
 use crate::encoder_options::DeflateOptions;
@@ -37,6 +37,12 @@ use crate::{
 /// call and jump streams into coders of their own.
 pub(crate) type Bcj2ChainWriter<W> = Bcj2Writer<CountingWriter<W>, Box<dyn Write>>;
 
+#[cfg(feature = "bzip2")]
+type Bzip2Writer<W> = bzip2_turbo::Encoder<W>;
+// `not(bzip2)`: with both on, only the exclusivity error is reported.
+#[cfg(all(feature = "bzip2-permissive", not(feature = "bzip2")))]
+type Bzip2Writer<W> = libbzip2::write::BzEncoder<W>;
+
 // One of these is built per coder in a chain and boxed there as a
 // `dyn Write`; its variants range from a counting writer to a brotli state
 // of several KiB, and the difference costs nothing.
@@ -53,8 +59,8 @@ pub(crate) enum Encoder<W: Write> {
     Ppmd(Option<Box<ppmd_turbo::io::SevenZWriter<CountingWriter<W>>>>),
     #[cfg(feature = "brotli")]
     Brotli(BrotliEncoder<CountingWriter<W>>),
-    #[cfg(feature = "bzip2")]
-    Bzip2(Option<bzip2_turbo::Encoder<CountingWriter<W>>>),
+    #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
+    Bzip2(Option<Bzip2Writer<CountingWriter<W>>>),
     #[cfg(feature = "deflate")]
     Deflate(Option<flate2::write::DeflateEncoder<CountingWriter<W>>>),
     #[cfg(feature = "lz4")]
@@ -149,7 +155,7 @@ impl<W: Write> Write for Encoder<W> {
             // TODO: Also add a proper "finish" method here.
             #[cfg(feature = "brotli")]
             Encoder::Brotli(w) => w.write(buf),
-            #[cfg(feature = "bzip2")]
+            #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
             Encoder::Bzip2(w) => match buf.is_empty() {
                 true => {
                     let writer = w.take().unwrap();
@@ -209,7 +215,7 @@ impl<W: Write> Write for Encoder<W> {
             // and `7zz t` accepts it.
             #[cfg(feature = "ppmd")]
             Encoder::Ppmd(w) => w.as_mut().unwrap().flush(),
-            #[cfg(feature = "bzip2")]
+            #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
             Encoder::Bzip2(w) => w.as_mut().unwrap().flush(),
             #[cfg(feature = "deflate")]
             Encoder::Deflate(w) => w.as_mut().unwrap().flush(),
@@ -722,7 +728,7 @@ pub(crate) fn one_thread_each(methods: &[EncoderConfiguration]) -> Vec<EncoderCo
                     ..options.clone()
                 })),
             },
-            #[cfg(feature = "bzip2")]
+            #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
             Some(EncoderOptions::Bzip2(options)) if options.threads > 1 => EncoderConfiguration {
                 method: mc.method,
                 options: Some(EncoderOptions::Bzip2(Bzip2Options {
@@ -840,6 +846,18 @@ pub(crate) fn add_encoder<W: Write>(
             );
 
             Ok(Encoder::Bzip2(Some(bzip2_encoder)))
+        }
+        #[cfg(all(feature = "bzip2-permissive", not(feature = "bzip2")))]
+        EncoderMethod::ID_BZIP2 => {
+            let options = match method_config.options {
+                Some(EncoderOptions::Bzip2(options)) => options,
+                _ => Bzip2Options::default(),
+            };
+            let compression = libbzip2::Compression::new(options.block_size_100k());
+            Ok(Encoder::Bzip2(Some(libbzip2::write::BzEncoder::new(
+                input,
+                compression,
+            ))))
         }
         #[cfg(feature = "deflate")]
         EncoderMethod::ID_DEFLATE => {
@@ -1013,7 +1031,7 @@ mod tests {
             EncoderMethod::LZMA2,
             #[cfg(feature = "ppmd")]
             EncoderMethod::PPMD,
-            #[cfg(feature = "bzip2")]
+            #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
             EncoderMethod::BZIP2,
             #[cfg(feature = "deflate")]
             EncoderMethod::DEFLATE,

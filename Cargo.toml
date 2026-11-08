@@ -34,8 +34,9 @@ aes256 = ["dep:getrandom"]
 aes256_wasm = ["aes256", "getrandom/wasm_js"]
 # Cryptography backends for `aes256` — both SHA-256 *and* AES-256-CBC. See
 # `src/crypto_backend.rs`: the features are additive, so `native-crypto` does
-# not turn `aws-lc-crypto` off — it takes precedence over it. A build that
-# wants no AWS-LC asks for `default-features = false` plus `native-crypto`.
+# not turn `aws-lc-crypto` off, and the faster AWS-LC wins when both are on. A
+# build that wants no AWS-LC asks for `default-features = false` plus
+# `native-crypto`.
 # Enabling `aes256` with neither is a compile error, not a silent choice. The
 # encoder's AES follows the same choice: `aes`/`cbc` come in only through
 # `native-crypto`, so `compress` adds no RustCrypto AES to an AWS-LC build.
@@ -61,6 +62,17 @@ crypto-host = ["lzma-turbo/crypto-host"]
 crc-host = ["lzma-turbo/crc-host"]
 brotli = ["dep:brotli"]
 bzip2 = ["dep:bzip2-turbo"]
+# BZip2 through the `bzip2` crate and its pure-Rust port of libbzip2
+# (`libbz2-rs-sys`, under the BSD-style bzip2-1.0.6 license), for a build that
+# links no LGPL code: `bzip2` brings `bzip2-turbo`, which is
+# LGPL-2.1-or-later. The method and the archives are the same. Encoding and
+# decoding run on one thread at libbzip2's speed, and `Bzip2Options` keeps its
+# level and block size but ignores its thread count and passes. Like every
+# alternative backend here it gives way to the fast one: with `bzip2` also on,
+# `bzip2-turbo` is used, so turn the default off with
+# `default-features = false`. `sevenz_turbo::bzip2_backend()` names the one a
+# build selected.
+bzip2-permissive = ["dep:libbzip2"]
 # Writing archives. LZMA and LZMA2 are encoded by `lzma-turbo`'s port of the
 # SDK encoder (see `src/codec/lzma_turbo/writer.rs`); with `aes256`, the
 # AES-256 encryptor is the selected backend's (RustCrypto under
@@ -84,6 +96,8 @@ aes = { version = "0.9", features = ["zeroize"], optional = true }
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
 brotli = { version = ">= 7, < 10", default-features = false, optional = true, features = ["std"] }
 bzip2-turbo = { version = "0.2.0", default-features = false, optional = true }
+# Renamed so the crate's path never collides with this crate's `bzip2` modules.
+libbzip2 = { package = "bzip2", version = "0.6.1", optional = true }
 cbc = { version = "0.2", optional = true }
 flate2 = { version = "1", optional = true, features = ["zlib-rs"] }
 getrandom = { version = "0.4", optional = true }
