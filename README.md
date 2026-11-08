@@ -129,6 +129,12 @@ it needs first:
   each file in it.
 - `ArchiveReader::block_decoder(block)` decodes one block without using up
   the reader, so the header is read once.
+- `ArchiveReader::for_each_entries_unordered`, over a positional source
+  (`ArchiveReader::from_read_at`) with several threads, decodes the folders
+  of a non-solid archive side by side whatever their size, and hands each
+  file's bytes over with their offset as they are decoded. Each worker is
+  charged its share of `ArchiveLimits::memory`. `ArchiveReader::entry_order`
+  is the order `for_each_entries` would hand the same files over in.
 - `set_block_complete_hook` reports each block once it is decoded and
   checked, and `set_sub_stream_complete_hook` each file with its CRC-32, so
   nothing has to be read twice to report integrity.
