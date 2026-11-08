@@ -399,13 +399,16 @@ const LZ_STATE_BYTES: u64 = MIB;
 const PPMD_STATE_BYTES: u64 = MIB;
 /// What `bzip2-turbo` bounds its compact single-threaded decoder at: 6 MiB, or
 /// 8 MiB on Linux x86-64 and AArch64, where its tables are whole 2 MiB pages.
-/// A coder the pipeline gives a second thread charges the rest of the
-/// two-thread bound at decode time: see [`BZIP2_SECOND_THREAD_BYTES`].
+/// A coder the pipeline gives decode workers charges the rest of their bound
+/// at decode time: see [`bzip2_worker_bytes`].
 pub(crate) const BZIP2_BYTES: u64 = 8 * MIB;
-/// What a compact two-thread BZip2 decoder holds beyond [`BZIP2_BYTES`].
+/// What a compact BZip2 decoder with `workers` decode workers holds beyond
+/// [`BZIP2_BYTES`]. The bound grows with every worker.
 #[cfg(feature = "bzip2")]
-pub(crate) const BZIP2_SECOND_THREAD_BYTES: u64 =
-    bzip2_turbo::Decoder::<std::io::Empty>::low_memory_usage(2).saturating_sub(BZIP2_BYTES);
+pub(crate) const fn bzip2_worker_bytes(workers: u32) -> u64 {
+    bzip2_turbo::Decoder::<std::io::Empty>::low_memory_usage(workers as usize)
+        .saturating_sub(BZIP2_BYTES)
+}
 // The estimate must cover the codec's own bound wherever it is built.
 #[cfg(feature = "bzip2")]
 const _: () = assert!(BZIP2_BYTES >= bzip2_turbo::Decoder::<std::io::Empty>::low_memory_usage(1));

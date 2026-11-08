@@ -151,7 +151,7 @@ attacker-chosen. What bounds each:
 | PPMd | `mem_size` bytes of model | The format's own `PPMD7_MIN/MAX_MEM_SIZE` and `MIN/MAX_ORDER`, then `memory_limit_bytes`, summed over the chain. |
 | zstd | The back-reference window the frame declares | `window_log_max`, set from what the chain's sized coders leave of `memory_limit_bytes`, and otherwise the 128 MiB the reference decoder itself refuses to exceed. |
 | brotli | The window | Bounded by the format at 16 MiB; the large-window extension is not enabled. |
-| bzip2 | The BWT block and bounded output queue | At most 900,000 BWT bytes. Expanded runs stream into caller buffers. `bzip2-turbo` bounds its compact single-threaded decoder at 6 MiB (8 MiB on Linux x86-64 and AArch64, where its tables are whole 2 MiB pages) and its two-thread pipeline at 12 MiB (16 MiB in the ordinary layout on macOS ARM64). Finite-memory archive reads take the compact layout: the 8 MiB admission estimate covers the single-threaded decoder, and a coder given the reconstruction worker is charged the rest of the 12 MiB two-thread bound at decode time, decoding on one thread where the limit has no room for it. Compile-time checks keep both figures at or above the codec's bounds. |
+| bzip2 | The BWT block and bounded output queue | At most 900,000 BWT bytes. Expanded runs stream into caller buffers. `bzip2-turbo` bounds its compact single-threaded decoder at 6 MiB (8 MiB on Linux x86-64 and AArch64, where its tables are whole 2 MiB pages) and its multithreaded decoder at a bound that grows linearly with its workers. Finite-memory archive reads take the compact layout: the 8 MiB admission estimate covers the single-threaded decoder, and a coder given decode workers is charged the rest of their bound at decode time, taking as many workers as the limit has room for and decoding on one thread where it has no room for two. Compile-time checks keep both figures at or above the codec's bounds. |
 | deflate | The window | Fixed by the format at 32 KiB. |
 | lz4 | The frame block | Bounded by the format at 4 MiB. |
 | BCJ, BCJ2, Delta | Fixed-size buffers | Compile-time constants; no header field reaches them. The Delta distance is a single byte, widened before its `+1` so `0xFF` is 256 and not zero. |
@@ -165,7 +165,8 @@ report the difference rather than the consumer having to guess.
 
 The library does not extract; `util::decompress` does, and it joins each entry
 name to the destination itself with a component walk that refuses `..`, a root,
-and a drive prefix, treating `\` as a separator on every platform.
+and a drive at the start of any component, treating `\` as a separator on every
+platform.
 
 A consumer that writes files itself gets the same policy in queryable form:
 

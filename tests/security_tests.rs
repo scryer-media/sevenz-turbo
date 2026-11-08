@@ -1732,3 +1732,186 @@ fn a_zero_length_file_with_a_non_zero_crc_fails_verification() {
     }
     assert_eq!(extract(&bad, false).unwrap(), b"payload");
 }
+
+// Published advisories against other 7z readers, each as a crafted archive.
+// Every one must open or fail with an error: never panic, loop or escape.
+
+const K_EMPTY_STREAM: u8 = 0x0E;
+const K_EMPTY_FILE: u8 = 0x0F;
+const K_ENCODED_HEADER: u8 = 0x17;
+
+/// Opens and, when that succeeds, extracts every entry to a sink.
+fn open_and_drain(bytes: &[u8]) -> Result<(), String> {
+    decode_err(bytes)
+}
+
+/// CVE-2024-11612 (7-Zip's CopyCoder looped forever): a COPY coder that
+/// declares more output than its packed stream holds must end with an error.
+#[test]
+fn a_copy_coder_declaring_more_than_its_pack_stream_ends() {
+    for (packed, unpacked) in [
+        (&b"abc"[..], 10u64),
+        (&b""[..], 1),
+        (&b"abc"[..], u64::from(u32::MAX) + 7),
+    ] {
+        let mut h = vec![K_HEADER, K_MAIN_STREAMS_INFO];
+        h.extend(pack_info(&[packed.len() as u64]));
+        h.extend(copy_unpack_info(&[unpacked], None));
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        write_number(&mut h, 1);
+        h.extend(names_property(&["file"]));
+        h.extend_from_slice(&[K_END, K_END]);
+        assert!(
+            open_and_drain(&raw_7z_with_packed(packed, &h)).is_err(),
+            "{} packed bytes declared as {unpacked}",
+            packed.len()
+        );
+    }
+}
+
+/// CVE-2016-9296 (p7zip dereferenced the absent PackPositions): an encoded
+/// header whose streams info has no pack info.
+#[test]
+fn an_encoded_header_without_pack_info_is_rejected() {
+    let mut nh = vec![K_ENCODED_HEADER];
+    nh.extend(copy_unpack_info(&[4], None));
+    nh.push(K_END);
+    assert!(open_err(&raw_7z_exact(&nh)).is_err());
+    // And with an empty pack info: no pack streams for the folder to read.
+    let mut nh = vec![K_ENCODED_HEADER];
+    nh.extend(pack_info(&[]));
+    nh.extend(copy_unpack_info(&[4], None));
+    nh.push(K_END);
+    assert!(open_err(&raw_7z_exact(&nh)).is_err());
+}
+
+/// CVE-2015-8922 (libarchive dereferenced a folder with no streams): a coder
+/// declaring zero input or zero output streams.
+#[test]
+fn a_coder_with_no_streams_is_rejected() {
+    for (inputs, outputs) in [(0u8, 1u8), (1, 0), (0, 0)] {
+        let mut h = vec![K_HEADER, K_MAIN_STREAMS_INFO];
+        h.extend(pack_info(&[4]));
+        h.extend_from_slice(&[K_UNPACK_INFO, K_FOLDER, 1, 0]);
+        h.extend_from_slice(&[1, 0x11, 0x00, inputs, outputs]); // one complex COPY coder
+        h.push(K_CODERS_UNPACK_SIZE);
+        h.extend(std::iter::repeat_n(4, usize::from(outputs.max(1))));
+        h.push(K_END);
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        write_number(&mut h, 1);
+        h.extend(names_property(&["file"]));
+        h.extend_from_slice(&[K_END, K_END]);
+        assert!(
+            open_and_drain(&raw_7z_with_packed(b"data", &h)).is_err(),
+            "{inputs} in, {outputs} out"
+        );
+    }
+}
+
+/// CVE-2016-8689 (libarchive read out of bounds on repeated kEmptyStream):
+/// a second kEmptyStream after kEmptyFile, with a different number of empty
+/// streams than the first.
+#[test]
+fn repeated_empty_stream_properties_do_not_panic() {
+    for second in [0b1100_0000u8, 0b0000_0000, 0b1110_0000] {
+        let mut h = vec![K_HEADER, K_MAIN_STREAMS_INFO];
+        h.extend(pack_info(&[4]));
+        h.extend(copy_unpack_info(&[4], None));
+        h.push(K_END);
+        h.push(K_FILES_INFO);
+        write_number(&mut h, 3);
+        h.extend_from_slice(&[K_EMPTY_STREAM, 1, 0b0110_0000]);
+        h.extend_from_slice(&[K_EMPTY_FILE, 1, 0b1000_0000]);
+        h.extend_from_slice(&[K_EMPTY_STREAM, 1, second]);
+        h.extend(names_property(&["a", "b", "c"]));
+        h.extend_from_slice(&[K_END, K_END]);
+        let _ = open_and_drain(&raw_7z_with_packed(b"data", &h));
+    }
+}
+
+/// CVE-2019-1000019 and CVE-2016-4300 (libarchive read past a short header
+/// and overflowed on large counts): every prefix of a real header, and every
+/// single-byte change to it, opens or fails without panicking.
+#[test]
+fn every_cut_and_flipped_header_byte_is_survived() {
+    let mut h = vec![K_HEADER, K_MAIN_STREAMS_INFO];
+    h.extend(pack_info(&[4, 4]));
+    h.extend(copy_unpack_info(&[4, 4], None));
+    h.extend_from_slice(&[K_SUB_STREAMS_INFO, K_NUM_UNPACK_STREAM, 1, 1, K_END]);
+    h.push(K_END);
+    h.push(K_FILES_INFO);
+    write_number(&mut h, 3);
+    h.extend_from_slice(&[K_EMPTY_STREAM, 1, 0b0010_0000]);
+    h.extend_from_slice(&[K_EMPTY_FILE, 1, 0b1000_0000]);
+    h.extend(names_property(&["one", "two", "three"]));
+    h.extend_from_slice(&[K_END, K_END]);
+    open_and_drain(&raw_7z_with_packed(b"aaaabbbb", &h)).expect("the base archive is valid");
+    for cut in 0..h.len() {
+        let _ = open_and_drain(&raw_7z_with_packed(b"aaaabbbb", &h[..cut]));
+    }
+    for index in 0..h.len() {
+        for value in [0x00, 0x01, 0x7F, 0x80, 0xFF] {
+            let mut flipped = h.clone();
+            flipped[index] = value;
+            let _ = open_and_drain(&raw_7z_with_packed(b"aaaabbbb", &flipped));
+        }
+    }
+}
+
+/// CVE-2025-11001 and CVE-2025-11002 (7-Zip wrote outside the destination
+/// through a drive path): a drive later in a name is as unsafe as one at its
+/// start, because a Windows path component with a drive replaces the path
+/// it is pushed onto.
+#[test]
+fn a_drive_anywhere_in_a_name_is_unsafe() {
+    for name in ["a/C:/x", "a\\C:\\x", "a/c:x", "a/\\\\?\\C:\\x", "dir/D:"] {
+        let entry = ArchiveEntry::new_file(name);
+        assert_eq!(
+            entry.unsafe_path_reason(),
+            Some("the name names a drive"),
+            "{name}"
+        );
+        let dir = tempdir().unwrap();
+        assert!(
+            decompress(Cursor::new(archive_with_entry_name(name)), dir.path()).is_err(),
+            "{name}"
+        );
+    }
+    for name in ["a/12:30", "a/ab:c", "C/x", "a/:b"] {
+        assert!(!ArchiveEntry::new_file(name).is_unsafe_path(), "{name}");
+    }
+}
+
+/// CVE-2026-14966 (a symlink stored with DOS attributes below the Unix mode,
+/// as legacy p7zip writes it, passed a symlink guard): it is still a symlink.
+#[test]
+fn a_symlink_with_dos_attributes_below_its_mode_is_surfaced() {
+    let mut entry = ArchiveEntry::new_file("link");
+    entry.has_windows_attributes = true;
+    // FILE_ATTRIBUTE_ARCHIVE and the Unix extension bit, mode 0o120777 above.
+    entry.windows_attributes = 0x8000 | 0x20 | (0o120777u32 << 16);
+    assert!(entry.is_symlink());
+}
+
+/// CVE-2026-61725 (sevenz-rust2 before 0.21.1), CVE-2022-44900 (py7zr):
+/// the convenience extractors join names onto the destination unchecked.
+#[test]
+fn the_convenience_extractors_refuse_traversal() {
+    for name in [
+        "../escape",
+        "a/../../escape",
+        "/abs",
+        "\\abs",
+        "a\\..\\..\\escape",
+    ] {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("inner");
+        assert!(
+            decompress(Cursor::new(archive_with_entry_name(name)), &target).is_err(),
+            "{name}"
+        );
+        assert!(!dir.path().join("escape").exists(), "{name}");
+    }
+}
