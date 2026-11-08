@@ -236,9 +236,9 @@ dependencies = [
 
 [[package]]
 name = "bzip2-turbo"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f542fbec5f6cd891cb388b7e45670b56624a5e207ad507d830e64956aaf64a0"
+checksum = "dea2375497e8f23dc1c0e6c23088a2c6e025707ab9a362973a5d2d64785b8ae6"
 dependencies = [
  "crc-turbo",
 ]
@@ -1761,7 +1761,7 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.29.6"
+version = "0.29.7"
 dependencies = [
  "aes",
  "aws-lc-rs",

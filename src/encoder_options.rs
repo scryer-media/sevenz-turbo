@@ -324,8 +324,12 @@ impl Bzip2Options {
 
 #[cfg(feature = "bzip2")]
 impl Default for Bzip2Options {
+    /// Level 9 (900,000-byte blocks) with one optimization pass.
     fn default() -> Self {
-        Self::from_level(6)
+        Self {
+            passes: Some(1),
+            ..Self::from_level(9)
+        }
     }
 }
 
@@ -961,5 +965,15 @@ mod tests {
         );
         let delta: EncoderConfiguration = DeltaOptions::from_distance(4).into();
         assert!(delta.sized_for(1).is_none());
+    }
+
+    #[cfg(feature = "bzip2")]
+    #[test]
+    fn bzip2_defaults_to_level_9_with_one_pass() {
+        let options = Bzip2Options::default();
+        assert_eq!(
+            (options.level, options.passes, options.threads),
+            (9, Some(1), 1)
+        );
     }
 }

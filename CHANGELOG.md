@@ -495,6 +495,29 @@ arm, and this crate can add a variant without a breaking release.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.29.7 - 2026-11-08
+
+- Bumped `bzip2-turbo` to 0.2.0. A large non-solid BZip2 coder the pipeline
+  hands the spare threads to now decodes with up to that many workers instead
+  of one second thread. Under a finite `memory_limit_bytes` each worker is
+  charged its share of the decoder's bound, which grows with every worker, and
+  the coder starts as many as fit; when two don't fit it decodes on one thread.
+- `Bzip2Options::default()`, also used for a BZip2 method given no options,
+  is now level 9 with one optimization pass instead of level 6: the largest
+  blocks without the seven passes level 9 otherwise runs.
+- Fixed: a name with a drive at the start of a later component (`a/C:/x`,
+  `a\c:x`) is now unsafe. Windows reads a drive only at the start of a path,
+  but pushing such a component onto a path replaces the whole path, so the
+  name could escape the extraction directory on Windows (the
+  CVE-2025-11001/11002 class).
+- Added regression tests for the published 7z advisories that apply to this
+  crate: a copy coder longer than its pack stream (CVE-2024-11612), an encoded
+  header with no pack info (CVE-2016-9296), a coder with no streams
+  (CVE-2015-8922), repeated empty-stream properties (CVE-2016-8689), every
+  truncated and bit-flipped header byte (CVE-2019-1000019, CVE-2016-4300), a
+  symlink mode hidden under DOS attributes (CVE-2026-14966) and traversal in
+  the convenience extractors (CVE-2026-61725, CVE-2022-44900).
+
 ## 0.29.6 - 2026-11-07
 
 - Added `ArchiveReader::for_each_entries_unordered` and `UnorderedEntry`.

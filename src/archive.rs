@@ -366,15 +366,17 @@ pub(crate) fn unsafe_path_reason(name: &str) -> Option<&'static str> {
     if name.starts_with('/') || name.starts_with('\\') {
         return Some("the name is an absolute path");
     }
-    // `C:` anywhere a path can start: as the whole prefix, and after a
-    // separator is already covered by the component walk below.
-    let bytes = name.as_bytes();
-    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
-        return Some("the name names a drive");
-    }
     for component in name.split(['/', '\\']) {
         if component == ".." {
             return Some("the name walks out of the extraction directory");
+        }
+        // `C:` starting any component, not only the name: Windows parses a
+        // drive only at the start of a path, so a later `C:` is an ordinary
+        // component until it is pushed onto a `PathBuf`, where a component
+        // with a drive replaces the whole path.
+        let bytes = component.as_bytes();
+        if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+            return Some("the name names a drive");
         }
     }
     None
