@@ -495,6 +495,27 @@ arm, and this crate can add a variant without a breaking release.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.29.6 - 2026-11-07
+
+- Added `ArchiveReader::for_each_entries_unordered` and `UnorderedEntry`.
+  Over a positional source with several threads, the folders of a non-solid
+  archive decode side by side whatever their size, and each file's bytes are
+  handed over on the calling thread as `Begin`, `Data` (with its offset) and
+  `End` as they are decoded. Every checksum the ordered walk verifies is
+  verified, the error is the one the ordered walk returns, and each worker is
+  charged its share of `memory_limit_bytes`. Solid folders, folders of
+  several files and runs with room for one worker decode as
+  `for_each_entries` decodes them. Four 56 MiB `-mx5 -ms=off` members decode
+  in 0.93 s against 3.6 s on an 18-core arm64 Mac, and 1.5 s against 4.9 s
+  on a 12-core x86 host, with peak memory about 160 MB at a 1 GiB limit.
+- Added `ArchiveReader::entry_order`: the order `for_each_entries` hands the
+  entries over in, so a caller numbers them the same way on either walk.
+- A folder of one LZMA2 run decoded beside others decodes on one thread and
+  is charged one decoder: a second thread has no run to decode, and given one
+  the coder read its whole folder ahead looking for it.
+- A fuzz target, `unordered`, reads arbitrary headers through the unordered
+  walk with a positional source and four threads.
+
 ## 0.29.5 - 2026-11-06
 
 - A BZip2 coder decodes on two threads under a finite `memory_limit_bytes`

@@ -1,6 +1,9 @@
 //! Shared scaffolding for the fuzz targets: a container the fuzzer's bytes can
 //! be a header inside, and an allocator that says how much a single run asked
 //! for.
+//!
+//! Each target uses only part of this, so what one leaves unused is not dead.
+#![allow(dead_code)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -107,6 +110,33 @@ pub fn exercise(bytes: Vec<u8>) {
             let mut sink = std::io::sink();
             let _ = std::io::copy(&mut rd.take(1 << 24), &mut sink);
             Ok(true)
+        });
+    }
+    let peak = peak();
+    assert!(
+        peak <= MAX_RUN_BYTES,
+        "one archive allocated {peak} bytes, above the {MAX_RUN_BYTES}-byte ceiling"
+    );
+}
+
+/// [`exercise`] through [`sevenz_turbo::ArchiveReader::for_each_entries_unordered`]
+/// over a positional source with several threads, so folders the header
+/// describes as independent are decoded side by side.
+pub fn exercise_unordered(bytes: Vec<u8>) {
+    use sevenz_turbo::{ArchiveReader, Password, UnorderedEntry};
+
+    reset_peak();
+    if let Ok(reader) = ArchiveReader::from_read_at(bytes, Password::empty(), limits()) {
+        let mut reader = reader.with_threads(4);
+        let _ = reader.entry_order();
+        // Bounded as `exercise` bounds each entry: a run that hands over bytes
+        // forever is a hang, and the point of the limits is that it cannot.
+        let mut handed = 0u64;
+        let _ = reader.for_each_entries_unordered(|event| {
+            if let UnorderedEntry::Data { bytes, .. } = event {
+                handed += bytes.len() as u64;
+            }
+            Ok(handed <= 1 << 24)
         });
     }
     let peak = peak();

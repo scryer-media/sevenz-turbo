@@ -3936,6 +3936,357 @@ impl<R: Read + Seek> ArchiveReader<R> {
         }
     }
 
+    /// The indices into [`Archive::files`] in the order
+    /// [`ArchiveReader::for_each_entries`] hands the entries over: each
+    /// folder's files, folder after folder, then the entries with no bytes
+    /// that belong to no folder.
+    ///
+    /// [`ArchiveReader::for_each_entries_unordered`] names every entry by
+    /// its index, and this is how a caller numbers them as the ordered walk
+    /// would have met them.
+    pub fn entry_order(&self) -> Vec<usize> {
+        let archive = &self.archive;
+        let mut order = Vec::with_capacity(archive.files.len());
+        for block in 0..archive.blocks.len() {
+            order.extend(block_file_range(archive, block));
+        }
+        order.extend(
+            (0..archive.files.len())
+                .filter(|&file| archive.stream_map.file_block_index.get(file) == Some(&None)),
+        );
+        order
+    }
+
+    /// Decodes every entry, handing each folder's bytes over as they are
+    /// decoded rather than in archive order.
+    ///
+    /// The folders a [`ArchiveReader::for_each_entries`] decode would stage
+    /// or decode one after another are, where each holds at most one file
+    /// with bytes and the reader has a positional source and more than one
+    /// thread, decoded side by side whatever their size, and nothing waits
+    /// for a folder ahead of it. What each worker holds between it and the
+    /// callback is two pieces of at most 1 MiB, so a large folder costs no
+    /// more memory than a small one. Every other folder — a solid one, one
+    /// with several files, or any folder when there is no room for a second
+    /// worker — is decoded exactly as [`ArchiveReader::for_each_entries`]
+    /// decodes it, and its entries are handed over as they come.
+    ///
+    /// `each` runs on the calling thread and is handed, for every entry in
+    /// [`ArchiveReader::entry_order`], an [`UnorderedEntry::Begin`], the
+    /// entry's bytes in order as [`UnorderedEntry::Data`], and an
+    /// [`UnorderedEntry::End`]. One folder's entries come one after another;
+    /// the entries of folders decoding side by side interleave. Returning
+    /// `false` stops the decode, and returns `Ok`.
+    ///
+    /// - **Checks.** Every checksum the ordered walk verifies is verified. An
+    ///   entry of a folder decoded beside others ends once the folder's decode
+    ///   has finished and every checksum over it matched; an entry decoded on
+    ///   the calling thread ends as its reader does there, and a checksum its
+    ///   coder reports after that fails the call.
+    /// - **Errors.** The error is the one the ordered walk would have
+    ///   returned: the first failed folder in archive order, located in it.
+    ///   Once a folder fails no folder after it starts, those after it that
+    ///   are decoding stop at their next piece, and those before it run to
+    ///   their end. A folder after the failed one may have handed over bytes
+    ///   before the failure was known, and even ended entries.
+    /// - **Memory and threads.** The workers are as many as the thread count,
+    ///   the folders and the memory limit allow: under a limit each worker is
+    ///   charged its folder's decoder and what it holds, and its decoder is
+    ///   held to its share of the limit. Each folder's own coder gets the
+    ///   thread count divided among the workers, and the live ceiling
+    ///   ([`Lzma2Handle::set_threads`]) bounds how many folders decode at once
+    ///   from the next folder to start, as on the ordered path.
+    /// - **Hooks.** The sub-stream and block hooks are called on the calling
+    ///   thread, as each folder decoded beside others reports, so in the order
+    ///   the folders finish rather than archive order.
+    pub fn for_each_entries_unordered<F>(&mut self, mut each: F) -> Result<(), Error>
+    where
+        F: FnMut(UnorderedEntry<'_>) -> Result<bool, Error>,
+    {
+        let map = &self.archive.stream_map;
+        if map.file_block_index.len() != self.archive.files.len()
+            || map.block_first_file_index.len() != self.archive.blocks.len()
+            || map
+                .file_block_index
+                .iter()
+                .flatten()
+                .any(|&block| block >= self.archive.blocks.len())
+        {
+            return Err(Error::corrupted(
+                "the archive's stream map does not match it",
+            ));
+        }
+        for phase in self.unordered_phases() {
+            let go_on = match phase {
+                UnorderedPhase::Ordered(phase) => self.decode_phase_in_order(phase, &mut each)?,
+                #[cfg(not(target_arch = "wasm32"))]
+                UnorderedPhase::Unordered {
+                    blocks,
+                    workers,
+                    threads_per_folder,
+                    worker_memory,
+                } => self.decode_blocks_unordered(
+                    blocks,
+                    workers,
+                    threads_per_folder,
+                    worker_memory,
+                    &mut each,
+                )?,
+                #[cfg(target_arch = "wasm32")]
+                UnorderedPhase::Unordered { blocks, .. } => {
+                    let mut go_on = true;
+                    for block in blocks {
+                        go_on =
+                            self.decode_phase_in_order(FolderPhase::Alone { block }, &mut each)?;
+                        if !go_on {
+                            break;
+                        }
+                    }
+                    go_on
+                }
+            };
+            if !go_on {
+                return Ok(());
+            }
+        }
+        for file_index in 0..self.archive.files.len() {
+            if self.archive.stream_map.file_block_index[file_index].is_some() {
+                continue;
+            }
+            let file = &self.archive.files[file_index];
+            if empty_file_crc_mismatch(file, self.verify_checksums) {
+                return Err(Error::ChecksumVerificationFailed);
+            }
+            if !each(UnorderedEntry::Begin {
+                file_index,
+                entry: file,
+            })? || !each(UnorderedEntry::End { file_index })?
+            {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// How [`ArchiveReader::for_each_entries_unordered`] walks the folders.
+    fn unordered_phases(&self) -> Vec<UnorderedPhase> {
+        let folders: Vec<(u64, u64, bool, bool)> = self
+            .archive
+            .blocks
+            .iter()
+            .map(|block| {
+                let estimate = block.coders.iter().try_fold(0u64, |sum, coder| {
+                    crate::container::coder_memory_estimate(coder)
+                        .ok()
+                        .map(|bytes| sum.saturating_add(bytes))
+                });
+                (
+                    block.get_unpack_size(),
+                    estimate.unwrap_or(u64::MAX),
+                    block.num_unpack_sub_streams <= 1,
+                    is_one_lzma2_run(block),
+                )
+            })
+            .collect();
+        if self.positional.is_none() || self.thread_count <= 1 || cfg!(target_arch = "wasm32") {
+            return (0..folders.len())
+                .map(|block| UnorderedPhase::Ordered(FolderPhase::Alone { block }))
+                .collect();
+        }
+        plan_unordered(&folders, self.thread_count, self.limits.memory_limit_bytes)
+    }
+
+    /// One phase of the ordered plan, its entries handed to `each` as
+    /// [`UnorderedEntry`] events. Returns whether `each` let the walk go on.
+    fn decode_phase_in_order<F>(&mut self, phase: FolderPhase, each: &mut F) -> Result<bool, Error>
+    where
+        F: FnMut(UnorderedEntry<'_>) -> Result<bool, Error>,
+    {
+        let base = self.archive.files.as_ptr() as usize;
+        let count = self.archive.files.len();
+        let size = std::mem::size_of::<ArchiveEntry>().max(1);
+        let mut stopped = false;
+        let mut adapter = |entry: &ArchiveEntry, read: &mut dyn EntryRead| {
+            // Every entry the ordered walk hands over is one of the
+            // archive's own, so its index is where it lies among them.
+            let file_index = (entry as *const ArchiveEntry as usize).wrapping_sub(base) / size;
+            if file_index >= count {
+                return Err(Error::internal("an entry the archive does not hold"));
+            }
+            if !each(UnorderedEntry::Begin { file_index, entry })? {
+                stopped = true;
+                return Err(Error::Cancelled);
+            }
+            let mut out = EventWriter {
+                each: &mut *each,
+                file_index,
+                offset: 0,
+                stopped: false,
+                error: None,
+            };
+            let written = read.write_rest(&mut out);
+            if out.stopped {
+                stopped = true;
+                return Err(Error::Cancelled);
+            }
+            if let Some(error) = out.error.take() {
+                return Err(error);
+            }
+            written?;
+            if !each(UnorderedEntry::End { file_index })? {
+                stopped = true;
+                return Err(Error::Cancelled);
+            }
+            Ok(true)
+        };
+        let result = match phase {
+            FolderPhase::Alone { block } => self.decode_block_alone(block, &mut adapter),
+            #[cfg(not(target_arch = "wasm32"))]
+            FolderPhase::Parallel {
+                blocks,
+                workers,
+                threads_per_folder,
+            } => self.decode_blocks_parallel(blocks, workers, threads_per_folder, &mut adapter),
+            #[cfg(target_arch = "wasm32")]
+            FolderPhase::Parallel { blocks, .. } => {
+                let mut result = Ok(());
+                for block in blocks {
+                    result = self.decode_block_alone(block, &mut adapter);
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                result
+            }
+        };
+        match result {
+            Ok(()) => Ok(true),
+            Err(_) if stopped => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// A run of folders of at most one file each, decoded `workers` at a
+    /// time from the positional source, their entries handed to `each` as
+    /// they come. Returns whether `each` let the walk go on.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn decode_blocks_unordered<F>(
+        &mut self,
+        blocks: std::ops::Range<usize>,
+        workers: u32,
+        threads_per_folder: u32,
+        worker_memory: u64,
+        each: &mut F,
+    ) -> Result<bool, Error>
+    where
+        F: FnMut(UnorderedEntry<'_>) -> Result<bool, Error>,
+    {
+        let Some(source) = self.positional.clone() else {
+            for block in blocks {
+                if !self.decode_phase_in_order(FolderPhase::Alone { block }, each)? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        };
+        let first = blocks.start;
+        let count = blocks.len();
+        self.lzma2.set_block_index(first);
+        self.lzma2.set_threads(self.thread_count);
+        let worker_side = FolderWorker {
+            archive: &self.archive,
+            password: &self.password,
+            limits: ArchiveLimits {
+                memory_limit_bytes: worker_memory,
+                ..self.limits
+            },
+            verify_checksums: self.verify_checksums,
+            threads: threads_per_folder,
+            ceiling: &self.lzma2,
+            source: &source,
+        };
+        let archive = &self.archive;
+        let on_block = &mut self.on_block_complete;
+        let on_sub = &mut self.on_sub_stream_complete;
+        let mut folders: Vec<UnorderedFolder> =
+            (0..count).map(|_| UnorderedFolder::default()).collect();
+        // The earliest folder that failed, and the caller's own error or
+        // `false`, which end the walk whichever folder they came from.
+        let mut failed: Option<(usize, Error)> = None;
+        let mut caller: Option<Result<bool, Error>> = None;
+        let started = crate::ordered::run_unordered(
+            count,
+            workers as usize,
+            UNORDERED_QUEUE_BYTES,
+            &|| worker_side.folders_at_once(),
+            |job, tx| worker_side.decode(first + job, tx),
+            |job, message| {
+                let block_index = first + job;
+                let step = folders[job].take(
+                    archive,
+                    block_index,
+                    message,
+                    each,
+                    on_sub
+                        .as_mut()
+                        .map(|hook| &mut **hook as &mut (dyn FnMut(SubStreamCompletion) + Send)),
+                );
+                match step {
+                    Ok(Step::Go) => crate::ordered::Flow::Go,
+                    Ok(Step::Finished) => {
+                        Self::block_completed(
+                            archive,
+                            on_block.as_mut().map(|hook| {
+                                &mut **hook as &mut (dyn FnMut(BlockCompletion) + Send)
+                            }),
+                            block_index,
+                            BlockOutcome {
+                                finished: true,
+                                read_in_full: true,
+                            },
+                        );
+                        crate::ordered::Flow::Go
+                    }
+                    Ok(Step::Stop) => {
+                        caller = Some(Ok(false));
+                        crate::ordered::Flow::Stop
+                    }
+                    Err(Fail::Caller(error)) => {
+                        caller = Some(Err(error));
+                        crate::ordered::Flow::Stop
+                    }
+                    Err(Fail::Folder(error)) => {
+                        if failed.as_ref().is_none_or(|(at, _)| job < *at) {
+                            failed = Some((job, error));
+                        }
+                        crate::ordered::Flow::HaltAfter(job)
+                    }
+                }
+            },
+        );
+        if let Some(outcome) = caller {
+            return outcome;
+        }
+        if let Some((_, error)) = failed {
+            return Err(error);
+        }
+        if started.is_none() {
+            // Not one worker could be started: decode the run here instead.
+            for block in blocks {
+                if !self.decode_phase_in_order(FolderPhase::Alone { block }, each)? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+        // Every folder either finished or failed, unless the workers were
+        // all gone with folders left: those were never decoded.
+        if let Some(job) = folders.iter().position(|folder| !folder.finished) {
+            return Err(lost_folder(archive, first + job));
+        }
+        Ok(true)
+    }
+
     /// Returns the data of a file with the given path inside the archive.
     ///
     /// # Notice
@@ -4990,6 +5341,371 @@ pub(crate) fn plan_folders(
     phases
 }
 
+/// What [`ArchiveReader::for_each_entries_unordered`] hands its callback.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum UnorderedEntry<'a> {
+    /// The entry at `file_index` in [`Archive::files`] begins; its bytes
+    /// follow, then its [`UnorderedEntry::End`].
+    Begin {
+        /// Where the entry is in [`Archive::files`].
+        file_index: usize,
+        /// The entry.
+        entry: &'a ArchiveEntry,
+    },
+    /// The next bytes of the entry at `file_index`, at `offset` in it.
+    Data {
+        /// Where the entry is in [`Archive::files`].
+        file_index: usize,
+        /// Where these bytes start in the entry.
+        offset: u64,
+        /// The bytes.
+        bytes: &'a [u8],
+    },
+    /// The entry at `file_index` has been handed over in full.
+    End {
+        /// Where the entry is in [`Archive::files`].
+        file_index: usize,
+    },
+}
+
+/// One step of [`ArchiveReader::for_each_entries_unordered`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnorderedPhase {
+    /// A phase of the ordered plan, decoded as the ordered walk decodes it.
+    Ordered(FolderPhase),
+    /// Consecutive folders of at most one file each, decoded `workers` at a
+    /// time, each with `threads_per_folder` threads for its own coder and its
+    /// decoder held to `worker_memory`, their entries handed over as they
+    /// come.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Unordered {
+        blocks: std::ops::Range<usize>,
+        workers: u32,
+        threads_per_folder: u32,
+        worker_memory: u64,
+    },
+}
+
+/// What one folder decoded beside others may have queued for the callback:
+/// two pieces.
+#[cfg(not(target_arch = "wasm32"))]
+const UNORDERED_QUEUE_BYTES: usize = 2 * (FOLDER_CHUNK_BYTES + FOLDER_MESSAGE_WEIGHT);
+
+/// What an unordered worker holds beyond its folder's coders: their input
+/// buffer, its queue and the piece it is filling.
+const UNORDERED_WORKER_BYTES: u64 =
+    crate::container::BLOCK_INPUT_BYTES + 3 * (FOLDER_CHUNK_BYTES as u64 + 64);
+
+/// Whether `block`'s LZMA2 coder, the one that would decode on threads of its
+/// own, decodes to no more than one run as 7-Zip's encoder cuts them.
+///
+/// Such a coder has no second run for a second thread to decode, and given
+/// threads it reads its whole folder ahead looking for one before it hands the
+/// run to one worker: the packed folder held for nothing, on top of the
+/// dictionary. The dictionary is the one the coder declares, never smaller
+/// than the encoder's, so a stream cut shorter by a caller-chosen block size
+/// can be taken for one run; it then decodes on one thread, as it would alone.
+pub(crate) fn is_one_lzma2_run(block: &Block) -> bool {
+    let Some(index) = crate::pipeline::parallel_lzma2_coder(block) else {
+        return false;
+    };
+    let Ok(dict) =
+        crate::codec::lzma_turbo::lzma2_dictionary_size(block.coders[index].properties())
+    else {
+        return false;
+    };
+    block.get_unpack_size_at_index(index) <= crate::codec::lzma_turbo::lzma2_encoder_run_cap(dict)
+}
+
+/// Plans [`ArchiveReader::for_each_entries_unordered`], given each folder's
+/// unpacked size, decoder memory estimate (`u64::MAX` when it has none),
+/// whether it holds at most one file with bytes, and whether it is one LZMA2
+/// run ([`is_one_lzma2_run`]).
+///
+/// A run of at least two consecutive folders of one file each is decoded side
+/// by side, whatever their size, by as many workers as `threads`, the run and
+/// the memory limit allow; each folder's coder gets the threads divided among
+/// the workers, and under a limit each worker is charged its run's largest
+/// decoder and [`UNORDERED_WORKER_BYTES`], and its decoder is held to its
+/// share of the limit. A run whose folders are each one LZMA2 run gives each
+/// coder one thread: there is nothing in it for a second, and it is charged
+/// the one decoder it builds. Everything else — folders of several files, and a run
+/// with room for one worker — is planned as [`plan_folders`] plans it.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+pub(crate) fn plan_unordered(
+    folders: &[(u64, u64, bool, bool)],
+    threads: u32,
+    memory_limit_bytes: u64,
+) -> Vec<UnorderedPhase> {
+    let threads = threads.max(1);
+    let mut phases = Vec::new();
+    let ordered = |phases: &mut Vec<UnorderedPhase>, start: usize, end: usize| {
+        let stretch = folders[start..end]
+            .iter()
+            .map(|&(unpacked, estimate, _, _)| (unpacked, estimate));
+        phases.extend(
+            plan_folders(stretch, threads, memory_limit_bytes)
+                .into_iter()
+                .map(|phase| {
+                    UnorderedPhase::Ordered(match phase {
+                        FolderPhase::Alone { block } => FolderPhase::Alone {
+                            block: block + start,
+                        },
+                        FolderPhase::Parallel {
+                            blocks,
+                            workers,
+                            threads_per_folder,
+                        } => FolderPhase::Parallel {
+                            blocks: blocks.start + start..blocks.end + start,
+                            workers,
+                            threads_per_folder,
+                        },
+                    })
+                }),
+        );
+    };
+    let mut start = 0;
+    while start < folders.len() {
+        let free = folders[start].2;
+        let end = folders[start..]
+            .iter()
+            .position(|folder| folder.2 != free)
+            .map_or(folders.len(), |len| start + len);
+        let len = end - start;
+        let largest = folders[start..end]
+            .iter()
+            .map(|folder| folder.1)
+            .max()
+            .unwrap_or(0);
+        let shared = memory_limit_bytes.saturating_sub(FOLDER_CHUNK_BYTES as u64);
+        let by_memory = if memory_limit_bytes == u64::MAX {
+            u64::MAX
+        } else {
+            shared / largest.saturating_add(UNORDERED_WORKER_BYTES)
+        };
+        let workers = u64::from(threads).min(len as u64).min(by_memory) as u32;
+        if free && len >= 2 && workers >= 2 {
+            let worker_memory = if memory_limit_bytes == u64::MAX {
+                u64::MAX
+            } else {
+                // What the worker holds beside its decoder comes off its
+                // share; the decoder's own input buffer is the decoder's.
+                (shared / u64::from(workers))
+                    .saturating_sub(UNORDERED_WORKER_BYTES - crate::container::BLOCK_INPUT_BYTES)
+            };
+            let one_run = folders[start..end].iter().all(|folder| folder.3);
+            phases.push(UnorderedPhase::Unordered {
+                blocks: start..end,
+                workers,
+                threads_per_folder: if one_run {
+                    1
+                } else {
+                    (threads / workers).max(1)
+                },
+                worker_memory,
+            });
+        } else {
+            ordered(&mut phases, start, end);
+        }
+        start = end;
+    }
+    phases
+}
+
+/// The error of a folder whose worker stopped before it finished.
+#[cfg(not(target_arch = "wasm32"))]
+fn lost_folder(archive: &Archive, block_index: usize) -> Error {
+    let packed_offset = archive
+        .block_pack_streams(block_index)
+        .first()
+        .map_or(0, |range| range.offset);
+    Error::internal("the worker decoding this folder stopped before finishing it")
+        .in_block(block_index, packed_offset)
+}
+
+/// Where one folder decoded beside others stands on the calling thread.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct UnorderedFolder {
+    /// The file begun last and how much of it has been handed over.
+    open: Option<(usize, u64)>,
+    /// A file with bytes whose bytes are all handed over, ended once the
+    /// folder's decode has finished and its checksums with it.
+    ending: Option<usize>,
+    /// A file's failure, which the folder's end reports.
+    fault: Option<io::Error>,
+    finished: bool,
+    failed: bool,
+}
+
+/// What one message of a folder decoded beside others came to.
+#[cfg(not(target_arch = "wasm32"))]
+enum Step {
+    Go,
+    /// The folder's decode finished, every checksum over it matched, and
+    /// every file of it has ended.
+    Finished,
+    /// The callback asked to stop.
+    Stop,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+enum Fail {
+    /// The callback's own error.
+    Caller(Error),
+    /// The folder failed, located in it.
+    Folder(Error),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl UnorderedFolder {
+    /// Takes the folder's next message, `None` once its worker is done with
+    /// it, handing `each` what it says.
+    fn take<F>(
+        &mut self,
+        archive: &Archive,
+        block_index: usize,
+        message: Option<FolderMessage>,
+        each: &mut F,
+        on_sub_stream_complete: Option<&mut (dyn FnMut(SubStreamCompletion) + Send)>,
+    ) -> Result<Step, Fail>
+    where
+        F: FnMut(UnorderedEntry<'_>) -> Result<bool, Error>,
+    {
+        if self.failed {
+            return Ok(Step::Go);
+        }
+        let packed_offset = || {
+            archive
+                .block_pack_streams(block_index)
+                .first()
+                .map_or(0, |range| range.offset)
+        };
+        let encrypted = archive.blocks[block_index].is_encrypted();
+        let mut call = |event: UnorderedEntry<'_>| match each(event) {
+            Ok(true) => Ok(Step::Go),
+            Ok(false) => Ok(Step::Stop),
+            Err(error) => Err(Fail::Caller(error)),
+        };
+        let failure = match message {
+            None if self.finished => return Ok(Step::Go),
+            None => lost_folder(archive, block_index),
+            Some(FolderMessage::Begin(file_index)) => {
+                let Some(entry) = archive.files.get(file_index) else {
+                    self.failed = true;
+                    return Err(Fail::Folder(lost_folder(archive, block_index)));
+                };
+                self.open = Some((file_index, 0));
+                return call(UnorderedEntry::Begin { file_index, entry });
+            }
+            Some(FolderMessage::Data(bytes)) => match self.open.as_mut() {
+                Some((file_index, offset)) => {
+                    let at = *offset;
+                    *offset += bytes.len() as u64;
+                    return call(UnorderedEntry::Data {
+                        file_index: *file_index,
+                        offset: at,
+                        bytes: &bytes,
+                    });
+                }
+                None => lost_folder(archive, block_index),
+            },
+            Some(FolderMessage::End) => match self.open.take() {
+                Some((file_index, _)) => {
+                    let file = &archive.files[file_index];
+                    if file.has_stream && file.size > 0 {
+                        self.ending = Some(file_index);
+                        return Ok(Step::Go);
+                    }
+                    // A file with no bytes has nothing to fail on but its
+                    // CRC, which the worker compared before it sent it.
+                    return call(UnorderedEntry::End { file_index });
+                }
+                None => lost_folder(archive, block_index),
+            },
+            Some(FolderMessage::Fault(error)) => {
+                self.fault = Some(error);
+                return Ok(Step::Go);
+            }
+            Some(FolderMessage::Completion(completion)) => {
+                if let Some(hook) = on_sub_stream_complete {
+                    hook(completion);
+                }
+                return Ok(Step::Go);
+            }
+            Some(FolderMessage::Done(FolderEnd::Finished)) => {
+                self.finished = true;
+                if let Some(file_index) = self.ending.take() {
+                    match call(UnorderedEntry::End { file_index })? {
+                        Step::Go => {}
+                        stop => return Ok(stop),
+                    }
+                }
+                return Ok(Step::Finished);
+            }
+            Some(FolderMessage::Done(FolderEnd::Failed(error))) => error,
+            Some(FolderMessage::Done(FolderEnd::Stopped)) => {
+                let error = self
+                    .fault
+                    .take()
+                    .unwrap_or_else(|| io::Error::other("folder decode stopped"));
+                Error::from(error)
+                    .maybe_bad_password(encrypted)
+                    .in_block(block_index, packed_offset())
+            }
+        };
+        self.failed = true;
+        Err(Fail::Folder(failure))
+    }
+}
+
+/// The writer an entry decoded on the calling thread writes itself to,
+/// handing each piece to the callback as [`UnorderedEntry::Data`].
+struct EventWriter<'a, F> {
+    each: &'a mut F,
+    file_index: usize,
+    offset: u64,
+    /// The callback asked to stop.
+    stopped: bool,
+    /// The callback's own error, which the write could only report as an
+    /// `io::Error`.
+    error: Option<Error>,
+}
+
+impl<F> Write for EventWriter<'_, F>
+where
+    F: FnMut(UnorderedEntry<'_>) -> Result<bool, Error>,
+{
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        match (self.each)(UnorderedEntry::Data {
+            file_index: self.file_index,
+            offset: self.offset,
+            bytes,
+        }) {
+            Ok(true) => {
+                self.offset += bytes.len() as u64;
+                Ok(bytes.len())
+            }
+            Ok(false) => {
+                self.stopped = true;
+                Err(io::Error::other("the callback stopped the decode"))
+            }
+            Err(error) => {
+                self.error = Some(error);
+                Err(io::Error::other("the callback failed"))
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// What a folder worker hands the calling thread, in order.
 #[cfg(not(target_arch = "wasm32"))]
 enum FolderMessage {
@@ -5047,7 +5763,7 @@ impl FolderWorker<'_> {
 
     /// Decodes one folder through the ordinary [`BlockDecoder`] over a cursor
     /// of its own, sending what the callback would have been given.
-    fn decode(&self, block_index: usize, tx: &mut crate::ordered::Sender<'_, FolderMessage>) {
+    fn decode<T: crate::ordered::JobSender<FolderMessage>>(&self, block_index: usize, tx: &mut T) {
         let mut cursor = ReadAtCursor::new(Arc::clone(self.source));
         let completions = std::sync::Mutex::new(Vec::new());
         let mut hook = |completion: SubStreamCompletion| {
@@ -5074,7 +5790,7 @@ impl FolderWorker<'_> {
         // The hook fires after the callback returns for a file, so what it
         // left is sent before the next file begins: the order the caller's
         // own hook would have seen.
-        let flush = |tx: &mut crate::ordered::Sender<'_, FolderMessage>| {
+        let flush = |tx: &mut T| {
             let pending = std::mem::take(&mut *completions.lock().map_err(|_| ())?);
             for completion in pending {
                 tx.send(FolderMessage::Completion(completion), FOLDER_MESSAGE_WEIGHT)
@@ -5085,7 +5801,7 @@ impl FolderWorker<'_> {
         let result = decoder.for_each_entries(&mut |entry, rd| {
             let file_index = next_file;
             next_file += 1;
-            let send = |tx: &mut crate::ordered::Sender<'_, FolderMessage>, message, weight| {
+            let send = |tx: &mut T, message, weight| {
                 tx.send(message, weight).map_err(|_| Error::Cancelled)
             };
             if flush(tx).is_err() {
@@ -6354,5 +7070,223 @@ mod folder_plan_tests {
                 FolderPhase::Parallel { blocks: ref rest, workers: 3, threads_per_folder: 2 },
             ] if *blocks == (0..2) && *rest == (3..6)
         ));
+    }
+
+    #[test]
+    fn the_unordered_plan_never_exceeds_the_thread_or_memory_budget() {
+        let limits = [u64::MAX, 0, 1, 16 << 20, 40 << 20, 1 << 30, 64 << 30];
+        for (shape, folders) in shapes().into_iter().enumerate() {
+            // Every shape with all folders free, none free, and every third
+            // one holding several files.
+            for pattern in 0..3 {
+                let folders: Vec<(u64, u64, bool, bool)> = folders
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(unpacked, estimate))| {
+                        (
+                            unpacked,
+                            estimate,
+                            [true, false, i % 3 != 0][pattern],
+                            i % 2 == 0,
+                        )
+                    })
+                    .collect();
+                for threads in [0, 1, 2, 3, 4, 5, 7, 8, 13, 64, 255] {
+                    for limit in limits {
+                        let phases = plan_unordered(&folders, threads, limit);
+                        let mut next = 0;
+                        for phase in &phases {
+                            match phase {
+                                UnorderedPhase::Ordered(FolderPhase::Alone { block }) => {
+                                    assert_eq!(*block, next);
+                                    next += 1;
+                                }
+                                UnorderedPhase::Ordered(FolderPhase::Parallel {
+                                    blocks, ..
+                                }) => {
+                                    assert_eq!(blocks.start, next);
+                                    next = blocks.end;
+                                }
+                                UnorderedPhase::Unordered {
+                                    blocks,
+                                    workers,
+                                    threads_per_folder,
+                                    worker_memory,
+                                } => {
+                                    assert_eq!(blocks.start, next, "shape {shape}");
+                                    next = blocks.end;
+                                    assert!(blocks.len() >= 2);
+                                    assert!(*workers >= 2 && *workers as usize <= blocks.len());
+                                    assert!(*threads_per_folder >= 1);
+                                    assert!(
+                                        u64::from(*workers) * u64::from(*threads_per_folder)
+                                            <= u64::from(threads.max(1))
+                                    );
+                                    assert!(folders[blocks.clone()].iter().all(|f| f.2));
+                                    if folders[blocks.clone()].iter().all(|f| f.3) {
+                                        assert_eq!(*threads_per_folder, 1);
+                                    }
+                                    if limit != u64::MAX {
+                                        let largest = folders[blocks.clone()]
+                                            .iter()
+                                            .map(|f| f.1)
+                                            .max()
+                                            .unwrap();
+                                        // Everything the workers hold, and the
+                                        // piece the caller holds, fits.
+                                        assert!(
+                                            u64::from(*workers)
+                                                .saturating_mul(
+                                                    largest.saturating_add(UNORDERED_WORKER_BYTES)
+                                                )
+                                                .saturating_add(FOLDER_CHUNK_BYTES as u64)
+                                                <= limit
+                                        );
+                                        // Each decoder has room for itself and
+                                        // its input buffer, and no more than
+                                        // its share.
+                                        assert!(
+                                            *worker_memory
+                                                >= largest + crate::container::BLOCK_INPUT_BYTES
+                                        );
+                                        assert!(
+                                            u64::from(*workers) * *worker_memory <= limit,
+                                            "{workers} x {worker_memory} over {limit}"
+                                        );
+                                    } else {
+                                        assert_eq!(*worker_memory, u64::MAX);
+                                    }
+                                }
+                            }
+                        }
+                        assert_eq!(next, folders.len(), "every folder planned once, in order");
+                        if threads <= 1 {
+                            assert!(
+                                phases.iter().all(|p| matches!(
+                                    p,
+                                    UnorderedPhase::Ordered(FolderPhase::Alone { .. })
+                                )),
+                                "one thread decodes every folder alone"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_one_file_folders_are_planned_side_by_side() {
+        // Four 56 MiB folders of several LZMA2 runs each, a 16 MiB dictionary
+        // apiece: under Weaver's default 1 GiB, and its smallest 512 MiB, all
+        // four decode at once on eight threads, two each.
+        let folders = [(56 << 20, 17 << 20, true, false); 4];
+        for limit in [u64::MAX, 1 << 30, 512 << 20] {
+            let phases = plan_unordered(&folders, 8, limit);
+            assert!(
+                matches!(
+                    phases[..],
+                    [UnorderedPhase::Unordered {
+                        ref blocks,
+                        workers: 4,
+                        threads_per_folder: 2,
+                        ..
+                    }] if *blocks == (0..4)
+                ),
+                "{limit}: {phases:?}"
+            );
+        }
+        // Room for one worker only: the ordered plan, which decodes them
+        // alone with every thread.
+        let one = (17 << 20) + UNORDERED_WORKER_BYTES + FOLDER_CHUNK_BYTES as u64;
+        let phases = plan_unordered(&folders, 8, one);
+        assert_eq!(
+            phases,
+            (0..4)
+                .map(|block| UnorderedPhase::Ordered(FolderPhase::Alone { block }))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn folders_of_one_lzma2_run_get_one_thread_each() {
+        // What `7zz -mx5 -ms=off` writes for four 56 MiB files: a 32 MiB
+        // dictionary, so one run each. Every profile Weaver has decodes the
+        // four side by side on one thread apiece, each charged one decoder.
+        let estimate = (32 << 20) + 64 * 1024;
+        let folders = [(56 << 20, estimate, true, true); 4];
+        for limit in [u64::MAX, 4 << 30, 1 << 30, 512 << 20] {
+            let phases = plan_unordered(&folders, 8, limit);
+            let [
+                UnorderedPhase::Unordered {
+                    ref blocks,
+                    workers,
+                    threads_per_folder,
+                    worker_memory,
+                },
+            ] = phases[..]
+            else {
+                panic!("{limit}: {phases:?}");
+            };
+            assert_eq!(
+                (blocks.clone(), workers, threads_per_folder),
+                (0..4, 4, 1),
+                "{limit}"
+            );
+            if limit != u64::MAX {
+                assert!(worker_memory >= estimate + crate::container::BLOCK_INPUT_BYTES);
+                assert!(
+                    4 * (estimate + UNORDERED_WORKER_BYTES) + FOLDER_CHUNK_BYTES as u64 <= limit
+                );
+            }
+        }
+        // One folder longer than a run among them keeps the wider coders.
+        let mut mixed = folders;
+        mixed[2].3 = false;
+        assert!(matches!(
+            plan_unordered(&mixed, 8, 1 << 30)[..],
+            [UnorderedPhase::Unordered {
+                workers: 4,
+                threads_per_folder: 2,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn a_folder_within_one_encoder_run_is_one_lzma2_run() {
+        let block = |method: &[u8], dict_prop: u8, unpacked: u64| {
+            let mut coder = Coder::single_stream();
+            coder.set_id_size(method.len() as u8);
+            coder.decompression_method_id_mut().copy_from_slice(method);
+            coder.set_properties(vec![dict_prop].into());
+            let mut block = Block::with_coders(vec![coder]);
+            block.set_streams(1, 1, Box::new([]), vec![0].into(), vec![unpacked].into());
+            block
+        };
+        let lzma2 = |dict_prop, unpacked| block(EncoderMethod::ID_LZMA2, dict_prop, unpacked);
+        // Property 24 is 16 MiB, so 64 MiB runs; 25 is 24 MiB, so 96 MiB.
+        assert!(is_one_lzma2_run(&lzma2(24, 64 << 20)));
+        assert!(!is_one_lzma2_run(&lzma2(24, (64 << 20) + 1)));
+        assert!(is_one_lzma2_run(&lzma2(25, 96 << 20)));
+        assert!(!is_one_lzma2_run(&block(
+            EncoderMethod::ID_LZMA,
+            24,
+            1 << 20
+        )));
+    }
+
+    #[test]
+    fn folders_of_several_files_keep_the_ordered_plan() {
+        let folders: Vec<(u64, u64)> = (0..6).map(|i| (1 << 20, i << 10)).collect();
+        let solid: Vec<(u64, u64, bool, bool)> =
+            folders.iter().map(|&(u, e)| (u, e, false, true)).collect();
+        for limit in [u64::MAX, 1 << 30] {
+            let ordered: Vec<UnorderedPhase> = plan_folders(folders.iter().copied(), 8, limit)
+                .into_iter()
+                .map(UnorderedPhase::Ordered)
+                .collect();
+            assert_eq!(plan_unordered(&solid, 8, limit), ordered);
+        }
     }
 }

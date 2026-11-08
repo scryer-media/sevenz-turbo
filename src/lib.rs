@@ -144,7 +144,7 @@ pub use encryption::Password;
 pub use encryption::{AesKey, AesProperties};
 pub use error::{BlockErrorKind, Error, Limit};
 pub use positional::{ReadAt, ReadAtCursor, SerialReadAt};
-pub use reader::{ArchiveReader, BlockDecoder, EntryRead, PositionalBlockDecoder};
+pub use reader::{ArchiveReader, BlockDecoder, EntryRead, PositionalBlockDecoder, UnorderedEntry};
 pub use time::NtTime;
 #[cfg(all(feature = "compress", feature = "util", not(target_arch = "wasm32")))]
 pub use util::compress::*;
