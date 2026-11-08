@@ -186,10 +186,13 @@ A consumer that writes files itself gets the same policy in queryable form:
   bound that refused it — and, where the same archive is legitimate at the
   defaults, that it still opens.
 - **Fuzzing**, in `fuzz/`: `header` runs arbitrary bytes through the whole
-  header parser, and `folder_graph` places them where the coder graph goes.
-  Both wrap the input in a container whose signature header describes it
-  truthfully, so the fuzzer spends its time on structure rather than on
-  guessing a CRC. Both run under a counting global allocator that fails the run
+  header parser, `folder_graph` places them where the coder graph goes, and
+  `unordered` reads them through `for_each_entries_unordered` over a
+  positional source on four threads, so the plan that shares the memory limit
+  among side-by-side folders is sized by the fuzzer's numbers. All three wrap
+  the input in a container whose signature header describes it truthfully, so
+  the fuzzer spends its time on structure rather than on guessing a CRC. All
+  three run under a counting global allocator that fails the run
   if one archive allocates more than 256 MiB — far above what the limits allow
   the archive, low enough that a count believed without a bound trips it long
   before the machine notices. To run them:
@@ -197,6 +200,7 @@ A consumer that writes files itself gets the same policy in queryable form:
   ```
   cargo +nightly fuzz run header -- -max_total_time=600
   cargo +nightly fuzz run folder_graph -- -max_total_time=600
+  cargo +nightly fuzz run unordered -- -max_total_time=600
   ```
 
 - **The differential matrix** (`tests/differential_7zz_tests.rs`) is what says
