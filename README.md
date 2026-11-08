@@ -14,9 +14,9 @@ and can use several threads.
 sevenz-turbo = "0.29"
 ```
 
-It needs Rust 1.97.1 or newer. The default build uses AWS-LC for encryption,
-which needs a C compiler; [Backends](#backends) shows the pure-Rust build and
-the build without LGPL code.
+It needs Rust 1.97.1 or newer. The default build needs a C compiler, for
+AWS-LC; see [Features](#features) for a pure-Rust build or one without LGPL
+code.
 
 ## Why a fork?
 
@@ -199,13 +199,13 @@ writer.finish().expect("compress ok");
 | LZMA        | ✓            | ✓          | `lzma-turbo` |
 | LZMA2       | ✓            | ✓          | `lzma-turbo`, on one thread or several |
 | BROTLI (*)  | ✓            | ✓          | `brotli` crate |
-| BZIP2       | ✓            | ✓          | `bzip2-turbo` crate, single-threaded and multi-threaded; `bzip2` crate on one thread with `bzip2-permissive` |
+| BZIP2       | ✓            | ✓          | `bzip2-turbo` crate, on one thread or several; or the `bzip2` crate ([Features](#features)) |
 | DEFLATE (*) | ✓            | ✓          | `flate2` crate (`zlib-rs`) |
 | PPMD        | ✓            | ✓          | `ppmd-turbo` crate |
 | LZ4 (*)     | ✓            | ✓          | `lz4_flex` crate |
 | ZSTD (*)    | ✓            | ✓          | `zstd` crate, which builds C code |
 
-(*) Needs its cargo feature.
+(*) Off by default; turn on its feature.
 
 | Filter        | Decompression | Compression |
 |---------------|---------------|-------------|
@@ -220,10 +220,9 @@ writer.finish().expect("compress ok");
 | BCJ2          | ✓            | ✓          |
 | DELTA         | ✓            | ✓          |
 
-The filters themselves are `lzma-turbo`'s; this crate wraps them as readers
-and writers. The container's CRC-32 comes from `crc-turbo`, through
-`lzma-turbo`; BZip2's own CRC-32/BZIP2 stream checksum is `bzip2-turbo`'s,
-also from `crc-turbo` (with `bzip2-permissive`, it is `libbz2-rs-sys`'s).
+The filters are `lzma-turbo`'s; this crate wraps them as readers and
+writers. The 7z container's CRC-32 is `crc-turbo`'s, through `lzma-turbo`.
+BZip2 checks its own streams.
 
 ## Speed
 
@@ -260,32 +259,34 @@ is meant to be fed; see
 Every test on every machine is in [docs/benchmarks.md](docs/benchmarks.md),
 and how to measure your own is in [docs/benchmarking.md](docs/benchmarking.md).
 
-## Backends
+## Features
 
-The default features pick the fastest implementation of everything. Where a
-slower alternative exists for another reason, such as no C compiler or no
-LGPL code, it is a feature of its own:
+On by default: `aes256`, `aws-lc-crypto`, `bzip2`, `compress`, `ppmd` and
+`util`.
 
-| Part | Default, fastest | Alternative | Choose the alternative for | Which one is in use |
-|------|------------------|-------------|----------------------------|---------------------|
-| AES-256 and SHA-256 (7z encryption) | `aws-lc-crypto`: AWS-LC, needs a C compiler | `native-crypto`: RustCrypto, pure Rust, AES-NI on x86-64 and the ARMv8 crypto instructions on aarch64 | A build with no C | `sevenz_turbo::crypto_backend()`: `"aws-lc"` or `"rustcrypto"` |
-| BZip2 | `bzip2`: `bzip2-turbo`, multi-threaded, LGPL-2.1-or-later | `bzip2-permissive`: the `bzip2` crate over `libbz2-rs-sys`, one thread, MIT OR Apache-2.0 and bzip2-1.0.6 | A build with no LGPL code | `sevenz_turbo::bzip2_backend()`: `"bzip2-turbo"` or `"libbz2-rs-sys"` |
+- `aes256`: encrypted archives. Needs `aws-lc-crypto` or `native-crypto`.
+- `aws-lc-crypto`: AES-256 and SHA-256 from AWS-LC. Needs a C compiler.
+- `native-crypto`: AES-256 and SHA-256 from RustCrypto, in pure Rust.
+- `bzip2`: BZip2 through `bzip2-turbo`, on one thread or several.
+  LGPL-2.1-or-later.
+- `bzip2-permissive`: BZip2 through the `bzip2` crate and `libbz2-rs-sys`,
+  on one thread. MIT OR Apache-2.0, and bzip2-1.0.6.
+- `compress`: writing archives.
+- `ppmd`: PPMd, through `ppmd-turbo`.
+- `util`: `decompress_file`, `compress_to_path` and the other one-call
+  helpers.
+- `brotli`, `deflate`, `lz4`, `zstd`: those codecs. `zstd` builds C code.
+- `nt-time`: converts `NtTime` to and from `nt_time::FileTime`.
+- `default_wasm`, `aes256_wasm`, `crypto-host`, `crc-host`: see
+  [WebAssembly](#webassembly).
+- `kernel-ab`: internal kernel comparisons. Leave it off.
 
-**When both are on, the fast one wins.** Cargo features only add, so an
-alternative cannot switch the default off. The alternative is used only when
-the default feature is off, which means `default-features = false`. If any
-crate in your dependency graph turns the default back on, Cargo unifies the
-features and the fast backend is used. A build that must not have it should
-assert on the functions above in its own tests. `--all-features` builds the
-fast backends.
+### Choosing a backend
 
-`aes256` with neither cryptography backend is a compile error rather than a
-silent choice.
+The defaults are the fastest. The other backends are for builds that can't
+use them.
 
-With the alternative, BZip2 keeps `Bzip2Options`' level and block size and
-ignores its thread count and passes. The archives are the same either way.
-
-A build with no C at all:
+Without a C compiler:
 
 ```toml
 sevenz-turbo = { version = "0.29", default-features = false, features = [
@@ -293,7 +294,7 @@ sevenz-turbo = { version = "0.29", default-features = false, features = [
 ] }
 ```
 
-A build with no LGPL code:
+Without LGPL code:
 
 ```toml
 sevenz-turbo = { version = "0.29", default-features = false, features = [
@@ -301,17 +302,27 @@ sevenz-turbo = { version = "0.29", default-features = false, features = [
 ] }
 ```
 
-Both at once: `native-crypto` and `bzip2-permissive` together.
+For both, use `native-crypto` and `bzip2-permissive` together.
 
-## Encryption
+If both backends for the same thing are on, the faster one is used. Cargo
+features only add, so `bzip2-permissive` can't turn `bzip2` off; that takes
+`default-features = false`. And if another crate in your dependency graph
+uses sevenz-turbo with its default features, Cargo merges them and you get
+the default backend back. To catch that, check
+`sevenz_turbo::crypto_backend()` (`"aws-lc"` or `"rustcrypto"`) or
+`sevenz_turbo::bzip2_backend()` (`"bzip2-turbo"` or `"libbz2-rs-sys"`) in a
+test.
 
-7z encryption is AES-256, with a SHA-256 key derivation. Both come from the
-one cryptography backend in [Backends](#backends).
+With `bzip2-permissive`, `Bzip2Options` still sets the level and block size,
+but its thread count and passes are ignored. Both backends read and write the
+same archives.
+
+`aes256` without `aws-lc-crypto` or `native-crypto` doesn't compile.
 
 ## WebAssembly
 
-The `default_wasm` feature set builds for `wasm32-unknown-unknown`, with
-RustCrypto in place of AWS-LC:
+The `default_wasm` feature set builds for `wasm32-unknown-unknown`. It uses
+RustCrypto, since AWS-LC needs C:
 
 ```bash
 RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --target wasm32-unknown-unknown --no-default-features --features=default_wasm
@@ -392,11 +403,11 @@ named before the licence is.
 The archive code is licensed under the
 [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0),
 the same as upstream, and upstream's copyright notices are unchanged.
-The optional [`bzip2-turbo`](https://github.com/scryer-media/bzip2-turbo)
-dependency translates the 7-Zip BZip2 codec and retains LGPL-2.1-or-later
-licensing, with MIT notices on its compatibility adapters; see that
-package's license files. It is linked only when the `bzip2` feature is on.
-For a build without LGPL code, use `bzip2-permissive` in its place, as
-[Backends](#backends) shows.
-`lzma-turbo` is Apache-2.0 too, from its 0.7.0 release on; its earlier
-releases were published under GPL-3.0-or-later.
+`lzma-turbo` is Apache-2.0 too, from its 0.7.0 release on; earlier releases
+were GPL-3.0-or-later.
+
+[`bzip2-turbo`](https://github.com/scryer-media/bzip2-turbo), used by the
+default `bzip2` feature, is a translation of 7-Zip's BZip2 code and is
+LGPL-2.1-or-later, with MIT notices on its compatibility adapters; see its
+licence files. For a build without it, use `bzip2-permissive`
+([Features](#features)).
