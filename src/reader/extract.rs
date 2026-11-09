@@ -64,11 +64,17 @@ impl<R: Read + Seek> ArchiveReader<R> {
             return Ok(None);
         };
         let block = &self.archive.blocks[0];
-        if block.coders.len() != 1
-            || block.coders[0].encoder_method_id() != EncoderMethod::ID_LZMA2
-            || u64::from(crate::codec::lzma_turbo::lzma2_dictionary_size(
-                block.coders[0].properties(),
-            )?) >= block.get_unpack_size()
+        if block.coders.len() != 1 || block.coders[0].encoder_method_id() != EncoderMethod::ID_LZMA2
+        {
+            return Ok(None);
+        }
+        let dict = crate::codec::lzma_turbo::lzma2_dictionary_size(block.coders[0].properties())?;
+        // The ring's run decoders hold their dictionaries in RAM; a window
+        // the caller would lend decodes on the ordinary path, which lends it.
+        if u64::from(dict) >= block.get_unpack_size()
+            || self
+                .limits
+                .lends(crate::codec::lzma_turbo::lzma_window_bytes(dict))
         {
             return Ok(None);
         }
@@ -76,7 +82,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             Arc::new(self.archive.clone()),
             Arc::clone(source),
             0,
-            self.limits,
+            self.limits.clone(),
         )?
         else {
             return Ok(None);

@@ -389,7 +389,8 @@ fn finite_copy_push_keeps_crc_damage_and_sink_failure_separate() {
         let mut damaged = (*bytes).clone();
         damaged[archive.block_pack_streams(0)[0].offset as usize + 10] ^= 0x80;
         let mut reader =
-            ArchiveReader::with_limits(Cursor::new(damaged), (*password).clone(), limits).unwrap();
+            ArchiveReader::with_limits(Cursor::new(damaged), (*password).clone(), limits.clone())
+                .unwrap();
         let error = reader
             .for_each_entries_direct(|_, data| {
                 data.write_rest(&mut io::sink())?;

@@ -141,6 +141,7 @@ pub(crate) mod pipeline;
 mod time;
 #[cfg(feature = "util")]
 mod util;
+mod window_memory;
 
 use std::{
     io::{Read, Write},
@@ -170,6 +171,7 @@ pub use util::compress::*;
 pub use util::decompress::*;
 #[cfg(all(feature = "util", target_arch = "wasm32"))]
 pub use util::wasm::*;
+pub use window_memory::{WindowAllocator, WindowMemory};
 #[cfg(feature = "compress")]
 pub use writer::*;
 

@@ -20,15 +20,25 @@ fn every_convenience_api_checks_limits_before_output_or_callback() {
      -> Result<bool, Error> {
         panic!("limits must be checked before calling the extractor")
     };
-    assert!(decompress_with_limits(Cursor::new(ARCHIVE), &dest, limits).is_err());
-    assert!(decompress_file_with_limits(archive_path(), &dest, limits).is_err());
+    assert!(decompress_with_limits(Cursor::new(ARCHIVE), &dest, limits.clone()).is_err());
+    assert!(decompress_file_with_limits(archive_path(), &dest, limits.clone()).is_err());
     assert!(
-        decompress_with_extract_fn_and_limits(Cursor::new(ARCHIVE), &dest, limits, &mut callback)
-            .is_err()
+        decompress_with_extract_fn_and_limits(
+            Cursor::new(ARCHIVE),
+            &dest,
+            limits.clone(),
+            &mut callback
+        )
+        .is_err()
     );
     assert!(
-        decompress_file_with_extract_fn_and_limits(archive_path(), &dest, limits, &mut callback)
-            .is_err()
+        decompress_file_with_extract_fn_and_limits(
+            archive_path(),
+            &dest,
+            limits.clone(),
+            &mut callback
+        )
+        .is_err()
     );
     #[cfg(feature = "aes256")]
     {
@@ -37,7 +47,7 @@ fn every_convenience_api_checks_limits_before_output_or_callback() {
                 Cursor::new(ARCHIVE),
                 &dest,
                 Password::empty(),
-                limits
+                limits.clone()
             )
             .is_err()
         );
@@ -46,7 +56,7 @@ fn every_convenience_api_checks_limits_before_output_or_callback() {
                 archive_path(),
                 &dest,
                 Password::empty(),
-                limits
+                limits.clone()
             )
             .is_err()
         );
@@ -55,7 +65,7 @@ fn every_convenience_api_checks_limits_before_output_or_callback() {
                 Cursor::new(ARCHIVE),
                 &dest,
                 Password::empty(),
-                limits,
+                limits.clone(),
                 &mut callback
             )
             .is_err()

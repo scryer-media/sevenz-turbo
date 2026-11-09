@@ -314,7 +314,7 @@ jobs:
         run: |
           cargo +nightly-2026-09-01 miri nextest list --locked --lib \
             --no-default-features --features compress,bzip2 --message-format json \
-            -E '(test(/^writer::input_buffer::tests::/) & !test(/native_advice/))' > "$RUNNER_TEMP/miri-tests.json"
+            -E '((test(/^writer::input_buffer::tests::/) | test(/^window_memory::tests::/)) & !test(/native_advice/))' > "$RUNNER_TEMP/miri-tests.json"
           python3 .github/scripts/miri-matrix.py "$RUNNER_TEMP/miri-tests.json" "$GITHUB_OUTPUT"
 
   unsafe-miri:

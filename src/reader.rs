@@ -627,8 +627,13 @@ mod borrowed_delivery_tests {
         fault: Fault,
         report: Rc<Cell<Option<u32>>>,
     ) -> impl DecodeRead {
-        let decoder =
-            lzma2_decoder(io::Cursor::new(input), prop, Lzma2Plan::SingleThreaded).unwrap();
+        let decoder = lzma2_decoder(
+            io::Cursor::new(input),
+            prop,
+            Lzma2Plan::SingleThreaded,
+            None,
+        )
+        .unwrap();
         let inner: Box<dyn DecodeRead> = Box::new(DeclaredLength {
             inner: decoder,
             owed: len as u64,
@@ -2726,7 +2731,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
     /// - [`Archive::decoder_memory_estimate`], against
     ///   [`ArchiveLimits::memory_limit_bytes`], before any decoder is built
     ///   ([`Error::MemoryLimited`]). The same limit then bounds each block's
-    ///   coder chain, summed, before it is constructed.
+    ///   coder chain, summed, before it is constructed. A window
+    ///   [`ArchiveLimits::window_allocator`] would lend is left out of both.
     ///
     /// An archive whose coder chain has no memory model is refused too when a
     /// memory limit is set: a budget that cannot be computed has not been met.
@@ -2742,7 +2748,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let archive = Archive::read_with_limits(&mut source, &password, &limits)?;
 
         if limits.memory_limit_bytes < u64::MAX {
-            match archive.decoder_memory_estimate() {
+            match archive.resident_memory_estimate(&limits) {
                 Ok(required_bytes) if required_bytes > limits.memory_limit_bytes => {
                     return Err(Error::MemoryLimited {
                         limit_bytes: limits.memory_limit_bytes,
@@ -2894,7 +2900,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
     /// The limits this reader was built with.
     #[must_use]
     pub fn limits(&self) -> ArchiveLimits {
-        self.limits
+        self.limits.clone()
     }
 
     /// A decoder for one block, borrowing this reader rather than consuming it.
@@ -2923,7 +2929,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             archive: &self.archive,
             password: &self.password,
             source: &mut self.source,
-            limits: self.limits,
+            limits: self.limits.clone(),
             on_sub_stream_complete: self
                 .on_sub_stream_complete
                 .as_mut()
@@ -3756,7 +3762,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let planned = if self.positional.is_some() && self.thread_count > 1 {
             let folders = self.archive.blocks.iter().map(|block| {
                 let estimate = block.coders.iter().try_fold(0u64, |sum, coder| {
-                    crate::container::coder_memory_estimate(coder)
+                    crate::container::resident_coder_estimate(coder, &self.limits)
                         .ok()
                         .map(|bytes| sum.saturating_add(bytes))
                 });
@@ -3803,7 +3809,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             archive: &self.archive,
             password: &self.password,
             source: &mut self.source,
-            limits: self.limits,
+            limits: self.limits.clone(),
             on_sub_stream_complete: self
                 .on_sub_stream_complete
                 .as_mut()
@@ -3885,7 +3891,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let worker_side = FolderWorker {
             archive: &self.archive,
             password: &self.password,
-            limits: self.limits,
+            limits: self.limits.clone(),
             verify_checksums: self.verify_checksums,
             threads: threads_per_folder,
             ceiling: &self.lzma2,
@@ -4078,7 +4084,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             .iter()
             .map(|block| {
                 let estimate = block.coders.iter().try_fold(0u64, |sum, coder| {
-                    crate::container::coder_memory_estimate(coder)
+                    crate::container::resident_coder_estimate(coder, &self.limits)
                         .ok()
                         .map(|bytes| sum.saturating_add(bytes))
                 });
@@ -4200,7 +4206,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             password: &self.password,
             limits: ArchiveLimits {
                 memory_limit_bytes: worker_memory,
-                ..self.limits
+                ..self.limits.clone()
             },
             verify_checksums: self.verify_checksums,
             threads: threads_per_folder,
@@ -4322,7 +4328,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     archive: &self.archive,
                     password: &self.password,
                     source: &mut self.source,
-                    limits: self.limits,
+                    limits: self.limits.clone(),
                     on_sub_stream_complete: self.on_sub_stream_complete.as_mut().map(|hook| {
                         &mut **hook as &mut (dyn FnMut(SubStreamCompletion) + Send + '_)
                     }),
@@ -5784,7 +5790,7 @@ impl FolderWorker<'_> {
             self.archive,
             self.password,
             &mut cursor,
-            self.limits,
+            self.limits.clone(),
         )
         .with_verify_checksums(self.verify_checksums);
         decoder.on_sub_stream_complete = Some(&mut hook);
@@ -6932,6 +6938,70 @@ mod chain_plan_tests {
             .expect("decodes");
         assert!(out == data, "the chain decoded to other bytes");
         assert_eq!(crate::decoder::PARALLEL_LZMA2_PLANS.with(Cell::get), 1);
+    }
+
+    /// A lent dictionary never lowers the thread count: the block four
+    /// threads would decode in parallel plans a parallel reader with its
+    /// dictionary in RAM, is refused with the memory-limit error when the
+    /// dictionary would be lent, the allocator unasked, and decodes on the
+    /// caller's memory at one thread.
+    #[test]
+    fn a_lent_lzma2_dictionary_keeps_the_thread_count() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let data: Vec<u8> = (0..8 << 20)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 40) as u8 & 0x1F
+            })
+            .collect();
+        let mut options = Lzma2Options::from_level_mt(1, 4, 1 << 20);
+        options.set_dictionary_size(1 << 20);
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+        writer.set_content_methods(vec![options.into()]);
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("one"), Some(data.as_slice()))
+            .expect("push");
+        let mut source = writer.finish().expect("finish");
+        let archive = Archive::read(&mut source, &Password::empty()).expect("parse");
+        let password = Password::empty();
+        let heap = Arc::new(crate::window_memory::TestHeap {
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let lending = || {
+            ArchiveLimits::default()
+                .with_window_allocator(Arc::clone(&heap) as Arc<dyn crate::WindowAllocator>, 0)
+        };
+        let decode = |threads: u32, limits: ArchiveLimits, source: &mut Cursor<Vec<u8>>| {
+            crate::decoder::PARALLEL_LZMA2_PLANS.with(|plans| plans.set(0));
+            let mut out = Vec::new();
+            BlockDecoder::with_limits(threads, 0, &archive, &password, source, limits)
+                .for_each_entries(&mut |_, rd| {
+                    rd.read_to_end(&mut out)?;
+                    Ok(true)
+                })
+                .map(|_| out)
+        };
+
+        let out = decode(4, ArchiveLimits::default(), &mut source).expect("decodes in RAM");
+        assert!(out == data, "decoded to other bytes in RAM");
+        assert_eq!(crate::decoder::PARALLEL_LZMA2_PLANS.with(Cell::get), 1);
+
+        let refused = decode(4, lending(), &mut source).expect_err("a threaded lent window");
+        assert!(
+            matches!(
+                &refused,
+                Error::BlockDecode { cause, .. } if matches!(**cause, Error::MaxMemLimited { .. })
+            ),
+            "refused with {refused:?}"
+        );
+        assert_eq!(heap.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let out = decode(1, lending(), &mut source).expect("decodes on lent memory");
+        assert!(out == data, "decoded to other bytes on lent memory");
+        assert_eq!(crate::decoder::PARALLEL_LZMA2_PLANS.with(Cell::get), 0);
+        assert_eq!(heap.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
 

@@ -30,6 +30,11 @@ reader, the header parser or its limits, the public API, or the test corpus.
     `BLOCK_SIZE_SOLID`);
   - `src/decoder.rs`, which builds the single-threaded `LzmaReader`;
   - the filter wrappers in `src/codec/filter/` (below);
+  - `src/window_memory.rs`, which adapts the public `WindowAllocator` and
+    `WindowMemory` to `lzma_turbo`'s window traits (and to `ppmd_turbo`'s
+    arena traits), so a caller has one memory contract for both codecs and
+    no codec type enters the public API. Which window is lent is decided in
+    `src/decoder.rs` (`Window`) alone;
   - `src/crypto_backend.rs`, for SHA-256 (`lzma_turbo::crypto`);
   - `src/hooks.rs`, which re-exports `lzma_turbo::hooks`;
   - `src/container.rs`, which re-exports `lzma_turbo::crc::{crc32_combine,

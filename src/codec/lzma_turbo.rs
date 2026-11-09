@@ -170,15 +170,60 @@ pub(crate) fn lzma2_memory_usage_kb(dict_size: u32) -> usize {
     bytes.div_ceil(1024) as usize
 }
 
+/// The dictionary buffer an LZMA or LZMA2 decoder of `dict_size` allocates,
+/// and so the window asked of a caller's allocator: the size at least 4 KiB,
+/// rounded up as the LZMA SDK's `LzmaDec_Allocate` rounds it (to 4 MiB from
+/// 1 GiB, to 1 MiB from 4 MiB, to 4 KiB below), and left as it is when the
+/// rounding would overflow. `lzma-turbo` keeps the figure private; a test
+/// below pins this copy to what it asks for.
+pub(crate) fn lzma_window_bytes(dict_size: u32) -> u64 {
+    let dict = u64::from(dict_size.max(1 << 12));
+    let mask: u64 = if dict >= 1 << 30 {
+        (1 << 22) - 1
+    } else if dict >= 1 << 22 {
+        (1 << 20) - 1
+    } else {
+        (1 << 12) - 1
+    };
+    let rounded = (dict + mask) & !mask;
+    if usize::try_from(rounded).is_ok() {
+        rounded
+    } else {
+        dict
+    }
+}
+
+/// A coder's window on caller memory: the lender, and the ceiling on what
+/// it may be asked for.
+pub(crate) struct WindowLoan {
+    pub(crate) lender: Arc<crate::window_memory::Lender>,
+    pub(crate) max_bytes: u64,
+}
+
+impl WindowLoan {
+    /// The codec's backing over the lender. The in-RAM limit is zero: the
+    /// choice to lend was made by the caller of this module, once, and the
+    /// codec only carries it out.
+    fn backing(&self) -> lzma_turbo::WindowBacking {
+        lzma_turbo::WindowBacking::new(
+            Arc::clone(&self.lender) as Arc<dyn lzma_turbo::WindowAllocator>,
+            0,
+        )
+        .with_max_len(self.max_bytes)
+    }
+}
+
 /// Builds the LZMA1 decoder for a 7z coder.
 ///
 /// `uncompressed_len` is the coder's declared output size; a 7z LZMA1 stream
-/// carries no end marker, so the length is what stops the decode.
+/// carries no end marker, so the length is what stops the decode. With
+/// `window`, the dictionary is on the caller's memory.
 pub(crate) fn lzma_decoder<R: Read>(
     input: R,
     uncompressed_len: u64,
     properties: &[u8],
     dict_size: u32,
+    window: Option<&WindowLoan>,
 ) -> Result<LzmaReader<R>, std::io::Error> {
     // The caller has already rejected a properties field shorter than five
     // bytes; `LzmaProps::parse` wants exactly five.
@@ -189,8 +234,18 @@ pub(crate) fn lzma_decoder<R: Read>(
     raw[1..5].copy_from_slice(&dict_size.to_le_bytes());
     let props = LzmaProps::parse(&raw)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    LzmaReader::with_props(input, props, Some(uncompressed_len))
+    match window {
+        None => LzmaReader::with_props(input, props, Some(uncompressed_len)),
+        Some(window) => LzmaReader::with_props_and_window(
+            input,
+            props,
+            Some(uncompressed_len),
+            u64::MAX,
+            window.backing(),
+        ),
+    }
 }
+
 /// Bytes of input read from the coder below in one go when the adaptive
 /// decoder asks for more. `lzma-turbo`'s own single-threaded path reads in
 /// 1 MiB pieces (`IN_BUF_SIZE_ST`); matching it keeps the feed loop's
@@ -2972,16 +3027,25 @@ impl<R: Read> Lzma2MtReader<R> {
     }
 }
 
-/// Builds the LZMA2 decoder for a 7z coder.
+/// Builds the LZMA2 decoder for a 7z coder. With `window`, the dictionary is
+/// on the caller's memory.
+///
+/// The threaded decoders take no window yet; `add_decoder` refuses a lent
+/// window for an `Adaptive` plan before it gets here. When they do, the same
+/// [`WindowLoan::backing`] is handed to `Lzma2MtReader::new` below.
 pub(crate) fn lzma2_decoder<R: Read>(
     input: R,
     dict_prop: u8,
     plan: Lzma2Plan,
+    window: Option<&WindowLoan>,
 ) -> Result<Lzma2Coder<R>, std::io::Error> {
     match plan {
-        Lzma2Plan::SingleThreaded => Ok(Lzma2Coder::SingleThreaded(Box::new(Lzma2Reader::new(
-            input, dict_prop,
-        )?))),
+        Lzma2Plan::SingleThreaded => Ok(Lzma2Coder::SingleThreaded(Box::new(match window {
+            None => Lzma2Reader::new(input, dict_prop)?,
+            // The crate's own limit has already been checked; what is left in
+            // RAM is the decoder's state, which this limit cannot refuse.
+            Some(window) => Lzma2Reader::with_window(input, dict_prop, u64::MAX, window.backing())?,
+        }))),
         Lzma2Plan::Adaptive {
             threads,
             memory_limit,
@@ -2990,11 +3054,80 @@ pub(crate) fn lzma2_decoder<R: Read>(
             unpacked_len,
             widen_to,
         } => {
+            debug_assert!(
+                window.is_none(),
+                "a lent window reached the threaded decoder"
+            );
             let mut rd =
                 Lzma2MtReader::new(input, dict_prop, threads, memory_limit, control, &splits)?;
             rd.input_left = lzma2_packed_bound(unpacked_len);
             rd.widen_to = widen_to;
             Ok(Lzma2Coder::Adaptive(Box::new(rd)))
+        }
+    }
+}
+
+#[cfg(test)]
+mod window_bytes_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Records the length it is asked for and refuses, so no memory is
+    /// needed to learn what the codec would ask.
+    struct Recorder(Mutex<Vec<usize>>);
+
+    impl lzma_turbo::WindowAllocator for Recorder {
+        fn allocate(&self, len: usize) -> std::io::Result<Box<dyn lzma_turbo::WindowMemory>> {
+            self.0.lock().unwrap().push(len);
+            Err(std::io::ErrorKind::OutOfMemory.into())
+        }
+    }
+
+    fn asked(build: impl FnOnce(lzma_turbo::WindowBacking)) -> u64 {
+        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        build(lzma_turbo::WindowBacking::new(
+            Arc::clone(&recorder) as Arc<dyn lzma_turbo::WindowAllocator>,
+            0,
+        ));
+        let asked = recorder.0.lock().unwrap();
+        assert_eq!(asked.len(), 1);
+        asked[0] as u64
+    }
+
+    /// [`lzma_window_bytes`] is what `lzma-turbo` asks a window allocator
+    /// for, at every rounding boundary and for every LZMA2 property byte.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn the_window_size_is_what_the_codec_asks_for() {
+        for dict in [
+            0,
+            1,
+            4095,
+            4096,
+            4097,
+            (1 << 22) - 1,
+            1 << 22,
+            (1 << 22) + 1,
+            (1 << 30) - 1,
+            1 << 30,
+            (1 << 30) + 1,
+            u32::MAX,
+        ] {
+            let props = LzmaProps::new(3, 0, 2, dict).unwrap();
+            let got = asked(|backing| {
+                assert!(
+                    LzmaReader::with_props_and_window(&[][..], props, Some(1), u64::MAX, backing)
+                        .is_err()
+                );
+            });
+            assert_eq!(got, lzma_window_bytes(dict), "LZMA dictionary {dict}");
+        }
+        for prop in 0..=40u8 {
+            let dict = lzma2_dictionary_size(&[prop]).unwrap();
+            let got = asked(|backing| {
+                assert!(Lzma2Reader::with_window(&[][..], prop, u64::MAX, backing).is_err());
+            });
+            assert_eq!(got, lzma_window_bytes(dict), "LZMA2 property {prop}");
         }
     }
 }
@@ -3096,7 +3229,7 @@ mod tests {
             packed.push(0);
             let prop = lzma2_clamped_prop(24, len as u64);
             let mut reader =
-                lzma2_decoder(packed.as_slice(), prop, Lzma2Plan::SingleThreaded).unwrap();
+                lzma2_decoder(packed.as_slice(), prop, Lzma2Plan::SingleThreaded, None).unwrap();
             let mut delivered = Vec::new();
             let n = reader
                 .read_borrowed(len, &mut |bytes| {
@@ -3396,7 +3529,7 @@ mod stall_tests {
             inner: &packed,
             widest: std::rc::Rc::clone(&widest),
         };
-        let mut rd = super::lzma2_decoder(input, DICT_PROP, plan).expect("build the reader");
+        let mut rd = super::lzma2_decoder(input, DICT_PROP, plan, None).expect("build the reader");
         let mut out = Vec::new();
         rd.read_to_end(&mut out).expect("decode");
         assert!(out == plain, "the decode differs");

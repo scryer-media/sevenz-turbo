@@ -9,6 +9,9 @@
 //! the fork adds those, as read-only accessors over the parsed [`Archive`];
 //! nothing here changes how anything decodes.
 
+use std::sync::Arc;
+
+use crate::WindowAllocator;
 use crate::archive::{Archive, EncoderMethod};
 use crate::block::Coder;
 
@@ -35,7 +38,7 @@ const MIB: u64 = 1024 * KIB;
 ///
 /// [`Error::LimitExceeded`]: crate::Error::LimitExceeded
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ArchiveLimits {
     /// Largest decoder footprint the caller will allow, in bytes.
     ///
@@ -153,7 +156,112 @@ pub struct ArchiveLimits {
     ///
     /// [`ArchiveEntry::is_unsafe_path`]: crate::ArchiveEntry::is_unsafe_path
     pub reject_unsafe_paths: bool,
+    /// Where LZMA and LZMA2 dictionaries and PPMd model arenas larger than
+    /// `max_in_ram_window_bytes` come from.
+    ///
+    /// Default: none, and every window is allocated in RAM and counted
+    /// against `memory_limit_bytes`, as without this field. With an
+    /// allocator, a window over `max_in_ram_window_bytes` is asked of it
+    /// instead and counts nothing against `memory_limit_bytes`; the coder's
+    /// other state still does. See [`WindowAllocator`] for the contract and
+    /// for how many windows can be alive at once.
+    ///
+    /// A threaded LZMA2 decode cannot lend its dictionaries yet: a block the
+    /// reader's thread count would decode on several threads, with a
+    /// dictionary over `max_in_ram_window_bytes`, is refused with
+    /// [`crate::Error::MaxMemLimited`], as a dictionary over the memory limit
+    /// always was. The thread count is never lowered to lend it. A block
+    /// decoded on one thread, at a thread count of one or because it is too
+    /// small to split, lends its dictionary. The positional LZMA2 run API
+    /// ([`crate::PositionalLzma2Folder`]) takes no caller memory and refuses
+    /// a folder that does not fit `memory_limit_bytes` as before.
+    ///
+    /// [`WindowAllocator`]: crate::WindowAllocator
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(skip))]
+    pub window_allocator: Option<Arc<dyn WindowAllocator>>,
+    /// Largest window, in bytes, decoded in RAM when `window_allocator` is
+    /// set. A larger one is asked of the allocator.
+    ///
+    /// Default: no limit, so an allocator is never asked until this is
+    /// lowered. No effect without an allocator. The size compared is the
+    /// buffer the codec would allocate: an LZMA or LZMA2 dictionary, clamped
+    /// to the coder's output and rounded up as the LZMA SDK rounds it (to a
+    /// multiple of 4 KiB, 1 MiB or 4 MiB by size); a PPMd model's declared
+    /// size, rounded up to a multiple of four.
+    pub max_in_ram_window_bytes: u64,
+    /// Largest window, in bytes, the allocator may be asked for.
+    ///
+    /// Default: 4 GiB, the largest dictionary an LZMA or LZMA2 coder can
+    /// declare. The window size is a header field, so an archive of a few
+    /// hundred bytes can ask a caller's allocator for 4 GiB of disk; this
+    /// bounds that. A window over it is refused with
+    /// [`Error::LimitExceeded`] of [`Limit::LentWindowBytes`] before the
+    /// allocator is asked. No effect without an allocator.
+    ///
+    /// [`Error::LimitExceeded`]: crate::Error::LimitExceeded
+    /// [`Limit::LentWindowBytes`]: crate::Limit::LentWindowBytes
+    pub max_lent_window_bytes: u64,
 }
+
+impl std::fmt::Debug for ArchiveLimits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArchiveLimits")
+            .field("memory_limit_bytes", &self.memory_limit_bytes)
+            .field("max_end_header_bytes", &self.max_end_header_bytes)
+            .field("max_header_unpacked_bytes", &self.max_header_unpacked_bytes)
+            .field("max_header_depth", &self.max_header_depth)
+            .field("max_entries", &self.max_entries)
+            .field("max_name_bytes", &self.max_name_bytes)
+            .field("max_total_name_bytes", &self.max_total_name_bytes)
+            .field("max_coders_per_block", &self.max_coders_per_block)
+            .field("max_streams_per_coder", &self.max_streams_per_coder)
+            .field("max_total_coders", &self.max_total_coders)
+            .field("max_unpack_bytes", &self.max_unpack_bytes)
+            .field("max_unpack_ratio", &self.max_unpack_ratio)
+            .field("max_aes_cycles_power", &self.max_aes_cycles_power)
+            .field("max_aes_kdf_rounds", &self.max_aes_kdf_rounds)
+            .field("reject_unsafe_paths", &self.reject_unsafe_paths)
+            .field(
+                "window_allocator",
+                &self.window_allocator.as_ref().map(|_| "WindowAllocator"),
+            )
+            .field("max_in_ram_window_bytes", &self.max_in_ram_window_bytes)
+            .field("max_lent_window_bytes", &self.max_lent_window_bytes)
+            .finish()
+    }
+}
+
+/// Two limits are equal when every bound is, and both have no allocator or
+/// the same one (the same `Arc` allocation).
+impl PartialEq for ArchiveLimits {
+    fn eq(&self, other: &Self) -> bool {
+        let same_allocator = match (&self.window_allocator, &other.window_allocator) {
+            (None, None) => true,
+            (Some(a), Some(b)) => std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b)),
+            _ => false,
+        };
+        same_allocator
+            && self.memory_limit_bytes == other.memory_limit_bytes
+            && self.max_end_header_bytes == other.max_end_header_bytes
+            && self.max_header_unpacked_bytes == other.max_header_unpacked_bytes
+            && self.max_header_depth == other.max_header_depth
+            && self.max_entries == other.max_entries
+            && self.max_name_bytes == other.max_name_bytes
+            && self.max_total_name_bytes == other.max_total_name_bytes
+            && self.max_coders_per_block == other.max_coders_per_block
+            && self.max_streams_per_coder == other.max_streams_per_coder
+            && self.max_total_coders == other.max_total_coders
+            && self.max_unpack_bytes == other.max_unpack_bytes
+            && self.max_unpack_ratio == other.max_unpack_ratio
+            && self.max_aes_cycles_power == other.max_aes_cycles_power
+            && self.max_aes_kdf_rounds == other.max_aes_kdf_rounds
+            && self.reject_unsafe_paths == other.reject_unsafe_paths
+            && self.max_in_ram_window_bytes == other.max_in_ram_window_bytes
+            && self.max_lent_window_bytes == other.max_lent_window_bytes
+    }
+}
+
+impl Eq for ArchiveLimits {}
 
 impl Default for ArchiveLimits {
     fn default() -> Self {
@@ -173,9 +281,16 @@ impl Default for ArchiveLimits {
             max_aes_cycles_power: 24,
             max_aes_kdf_rounds: 1 << 28,
             reject_unsafe_paths: false,
+            window_allocator: None,
+            max_in_ram_window_bytes: u64::MAX,
+            max_lent_window_bytes: DEFAULT_MAX_LENT_WINDOW_BYTES,
         }
     }
 }
+
+/// The default [`ArchiveLimits::max_lent_window_bytes`]: a 4 GiB - 1
+/// dictionary, rounded up as the decoder rounds it.
+const DEFAULT_MAX_LENT_WINDOW_BYTES: u64 = 1 << 32;
 
 impl ArchiveLimits {
     /// Both of the caller-affordability limits at once, with every structural
@@ -237,13 +352,36 @@ impl ArchiveLimits {
             max_aes_cycles_power: 63,
             max_aes_kdf_rounds: u64::MAX,
             reject_unsafe_paths: false,
+            window_allocator: None,
+            max_in_ram_window_bytes: u64::MAX,
+            max_lent_window_bytes: u64::MAX,
         }
+    }
+
+    /// Takes every LZMA and LZMA2 dictionary and PPMd model arena over
+    /// `max_in_ram_window_bytes` from `allocator`, up to
+    /// [`max_lent_window_bytes`](Self::max_lent_window_bytes).
+    #[must_use]
+    pub fn with_window_allocator(
+        mut self,
+        allocator: Arc<dyn WindowAllocator>,
+        max_in_ram_window_bytes: u64,
+    ) -> Self {
+        self.window_allocator = Some(allocator);
+        self.max_in_ram_window_bytes = max_in_ram_window_bytes;
+        self
     }
 
     /// The decoder-memory limit in the kilobytes the internal decoder uses,
     /// saturating rather than wrapping on an unlimited budget.
     pub(crate) fn memory_limit_kb(&self) -> usize {
         usize::try_from(self.memory_limit_bytes.div_ceil(KIB)).unwrap_or(usize::MAX)
+    }
+
+    /// Whether a window of `bytes` is asked of the caller's allocator rather
+    /// than allocated in RAM. The one place that choice is made.
+    pub(crate) fn lends(&self, bytes: u64) -> bool {
+        self.window_allocator.is_some() && bytes > self.max_in_ram_window_bytes
     }
 }
 
@@ -504,16 +642,80 @@ impl Archive {
     /// [`UnsizedCoder`] for the first coder with no model, including one whose
     /// properties are too short to read a size out of.
     pub fn decoder_memory_estimate(&self) -> Result<u64, UnsizedCoder> {
+        self.resident_memory_estimate(&ArchiveLimits::default())
+    }
+
+    /// [`Archive::decoder_memory_estimate`], with each coder at
+    /// [`resident_coder_estimate`]: the windows `limits` would lend left out.
+    /// The same figure when `limits` has no window allocator.
+    pub(crate) fn resident_memory_estimate(
+        &self,
+        limits: &ArchiveLimits,
+    ) -> Result<u64, UnsizedCoder> {
         let mut largest_block = 0u64;
         for block in &self.blocks {
             let mut chain = BLOCK_INPUT_BYTES;
             for coder in &block.coders {
-                chain = chain.saturating_add(coder_memory_estimate(coder)?);
+                chain = chain.saturating_add(resident_coder_estimate(coder, limits)?);
             }
             largest_block = largest_block.max(chain);
         }
         Ok(largest_block)
     }
+}
+
+/// [`coder_memory_estimate`], less the window `limits` would lend: what the
+/// coder holds in RAM. The same figure when `limits` has no window
+/// allocator.
+///
+/// The window judged is the declared one, before the decoder clamps it to
+/// the coder's output. A declared window that is lent can be clamped to one
+/// that is not, so this can under-count a block by up to
+/// `max_in_ram_window_bytes`; the decode-time check, which judges the clamped
+/// window the decoder will allocate, is the one that refuses.
+pub(crate) fn resident_coder_estimate(
+    coder: &Coder,
+    limits: &ArchiveLimits,
+) -> Result<u64, UnsizedCoder> {
+    let full = coder_memory_estimate(coder)?;
+    if limits.window_allocator.is_none() {
+        return Ok(full);
+    }
+    let method_id = coder.encoder_method_id();
+    let properties = coder.properties();
+    let (dict, window) =
+        if method_id == EncoderMethod::ID_LZMA {
+            let dict = lzma_dictionary_bytes(method_id, properties)?;
+            (
+                dict,
+                crate::codec::lzma_turbo::lzma_window_bytes(dict as u32),
+            )
+        } else if method_id == EncoderMethod::ID_LZMA2 {
+            let dict = lzma2_dictionary_bytes(method_id, properties)?;
+            let declared = crate::codec::lzma_turbo::lzma2_dictionary_size(&properties[..1])
+                .map_err(|_| UnsizedCoder {
+                    method_id: method_id.to_vec(),
+                    reason: "LZMA2 property byte out of range",
+                })?;
+            (dict, crate::codec::lzma_turbo::lzma_window_bytes(declared))
+        } else if method_id == EncoderMethod::ID_PPMD {
+            let model = ppmd_model_bytes(method_id, properties)?;
+            (model, ppmd_arena_bytes(model as u32))
+        } else {
+            return Ok(full);
+        };
+    Ok(if limits.lends(window) {
+        full.saturating_sub(dict)
+    } else {
+        full
+    })
+}
+
+/// The arena a PPMd model of `memory_size` bytes is laid out in, and so the
+/// window asked of a caller's allocator: the size rounded up to a multiple of
+/// four, as `ppmd-turbo` lays it out.
+pub(crate) fn ppmd_arena_bytes(memory_size: u32) -> u64 {
+    u64::from(memory_size).next_multiple_of(4)
 }
 
 /// Bytes one coder's decoder needs.
