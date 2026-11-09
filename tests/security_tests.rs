@@ -1927,15 +1927,10 @@ impl sevenz_turbo::WindowAllocator for CountingAllocator {
     }
 }
 
-/// A few dozen bytes declaring an LZMA2 coder with the 4 GiB dictionary and
-/// eight gibibytes of output, so the dictionary is not clamped: without a
-/// ceiling, a caller's window allocator would be asked for 4 GiB of disk.
-/// `max_lent_window_bytes` refuses it as a limit before the allocator is
-/// asked; the default ceiling, which admits 4 GiB, asks once and reports the
-/// allocator's refusal.
-#[cfg(target_pointer_width = "64")]
-#[test]
-fn a_huge_declared_window_is_refused_before_the_allocator_is_asked() {
+/// A one-block archive whose block is one LZMA2 coder of `dict_prop`,
+/// declaring `unpack_size` bytes of output over a single packed byte, the
+/// LZMA2 end marker.
+fn one_lzma2_block(dict_prop: u8, unpack_size: u64) -> Vec<u8> {
     let mut nh = vec![
         K_HEADER,
         K_MAIN_STREAMS_INFO,
@@ -1953,10 +1948,10 @@ fn a_huge_declared_window_is_refused_before_the_allocator_is_asked() {
         0x21, // coder flags: id_size=1, simple, has_attributes
         0x21, // coder id = LZMA2
         0x01, // properties_size
-        40,   // the 4 GiB dictionary
+        dict_prop,
         K_CODERS_UNPACK_SIZE,
     ];
-    write_number(&mut nh, 8 << 30);
+    write_number(&mut nh, unpack_size);
     nh.extend_from_slice(&[
         K_END,
         K_SUB_STREAMS_INFO,
@@ -1967,7 +1962,19 @@ fn a_huge_declared_window_is_refused_before_the_allocator_is_asked() {
         K_END,
         K_END, // header end
     ]);
-    let bytes = raw_7z_with_packed(&[0x00], &nh);
+    raw_7z_with_packed(&[0x00], &nh)
+}
+
+/// A few dozen bytes declaring an LZMA2 coder with the 4 GiB dictionary and
+/// eight gibibytes of output, so the dictionary is not clamped: without a
+/// ceiling, a caller's window allocator would be asked for 4 GiB of disk.
+/// `max_lent_window_bytes` refuses it as a limit before the allocator is
+/// asked; the default ceiling, which admits 4 GiB, asks once and reports the
+/// allocator's refusal.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn a_huge_declared_window_is_refused_before_the_allocator_is_asked() {
+    let bytes = one_lzma2_block(40, 8 << 30);
 
     let decode = |limits: ArchiveLimits| -> Error {
         let mut reader =
@@ -2006,6 +2013,67 @@ fn a_huge_declared_window_is_refused_before_the_allocator_is_asked() {
             error,
             Error::WindowAllocatorFailed {
                 bytes: 0x1_0000_0000,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(allocator.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A 768 MiB LZMA2 dictionary on one thread is decided by `ArchiveLimits`
+/// alone. `lzma-turbo`'s own 512 MiB default is not applied: unlimited, the
+/// block gets past the dictionary and fails on its cut-short stream; under a
+/// 512 MiB `memory_limit_bytes`, sevenz-turbo's own limit refuses it; lent,
+/// the allocator is asked for the whole dictionary.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn an_lzma2_dictionary_over_512_mib_is_sevenz_turbos_to_refuse() {
+    // Property 35: 3 << 28 bytes. 1 GiB of output keeps it unclamped.
+    let bytes = one_lzma2_block(35, 1 << 30);
+    let decode = |limits: ArchiveLimits| -> Error {
+        let mut reader =
+            match ArchiveReader::with_limits(Cursor::new(bytes.clone()), Password::empty(), limits)
+            {
+                Ok(reader) => reader,
+                Err(error) => return error,
+            };
+        reader.set_threads(1);
+        reader
+            .for_each_entries(&mut |_e: &ArchiveEntry, rd: &mut dyn std::io::Read| {
+                std::io::copy(rd, &mut std::io::sink())?;
+                Ok(true)
+            })
+            .unwrap_err()
+    };
+    let is_memory_limit = |error: &Error| {
+        let mut current = Some(error as &dyn std::error::Error);
+        while let Some(error) = current {
+            if error.to_string().contains("limit") {
+                return true;
+            }
+            current = error.source();
+        }
+        false
+    };
+
+    let error = decode(ArchiveLimits::default());
+    assert!(
+        !is_memory_limit(&error),
+        "refused by a memory limit: {error:?}"
+    );
+    assert!(error.io_error().is_some(), "{error:?}");
+
+    let error = decode(ArchiveLimits::memory(512 << 20));
+    assert_eq!(error.limit_hit(), Some(Limit::MemoryBytes), "{error:?}");
+
+    let allocator = std::sync::Arc::new(CountingAllocator(Default::default()));
+    let error = decode(ArchiveLimits::default().with_window_allocator(allocator.clone(), 1 << 20));
+    assert!(
+        matches!(
+            error,
+            Error::WindowAllocatorFailed {
+                bytes: 0x3000_0000,
                 ..
             }
         ),

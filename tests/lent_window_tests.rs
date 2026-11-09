@@ -248,6 +248,24 @@ fn assert_decodes_on_lent_memory(bytes: &[u8], members: &[(&str, &[u8])], thread
         asked.len(),
         "a lent window was not released"
     );
+
+    // The split estimate covers what was asked, and what stays in RAM fits
+    // the limit the archive did not fit with its windows in RAM.
+    let in_ram = archive
+        .decoder_memory(&ArchiveLimits::memory(limit))
+        .unwrap();
+    assert_eq!(
+        (
+            in_ram.resident_bytes,
+            in_ram.lent_windows,
+            in_ram.lent_bytes
+        ),
+        (archive.decoder_memory_estimate().unwrap(), 0, 0)
+    );
+    let split = archive.decoder_memory(&lending(&allocator, limit)).unwrap();
+    assert!(split.resident_bytes <= limit && limit < in_ram.resident_bytes);
+    assert!(asked.len() <= split.lent_windows);
+    assert!(asked.iter().map(|&len| len as u64).sum::<u64>() <= split.lent_bytes);
 }
 
 #[test]
@@ -495,4 +513,188 @@ fn a_window_over_the_ceiling_is_refused_unasked() {
     );
     assert_eq!(Limit::LentWindowBytes.field(), "max_lent_window_bytes");
     assert!(allocator.asked().is_empty());
+}
+
+/// Every public read path decodes under the caller's limits and so reaches
+/// the one lending decision: each decode below asks the allocator for the
+/// folder's dictionary, gets the archive's bytes, and releases the window.
+#[test]
+fn every_public_read_path_lends_through_the_callers_limits() {
+    use sevenz_turbo::{BlockDecoder, PositionalBlockDecoder};
+
+    let data = text(3 << 20, 10);
+    let mut options = Lzma2Options::from_level(1);
+    options.set_dictionary_size(4 << 20);
+    let members = [("story.txt", data.as_slice())];
+    let bytes = write(vec![options.into()], &members);
+    let allocator = Recorder::new(Mode::Give);
+    let limits = lending(&allocator, u64::MAX);
+    let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty()).unwrap();
+    let mut asked = 0;
+    let mut check = |path: &str, out: Vec<u8>| {
+        assert!(out == data, "{path}: decoded to other bytes");
+        asked += 1;
+        assert_eq!(
+            allocator.asked().len(),
+            asked,
+            "{path}: the window was not lent"
+        );
+        assert_eq!(
+            allocator.drops(),
+            asked,
+            "{path}: the window was not released"
+        );
+    };
+    let read_all = |rd: &mut dyn io::Read| {
+        let mut out = Vec::new();
+        rd.read_to_end(&mut out).map(|_| out)
+    };
+
+    let mut reader = ArchiveReader::with_limits(
+        Cursor::new(bytes.clone()),
+        Password::empty(),
+        limits.clone(),
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    reader
+        .for_each_entries(|_, rd| {
+            out = read_all(rd)?;
+            Ok(true)
+        })
+        .unwrap();
+    check("ArchiveReader::for_each_entries", out);
+
+    let mut out = Vec::new();
+    reader
+        .for_each_entries_direct(|_, rd| {
+            out = read_all(rd)?;
+            Ok(true)
+        })
+        .unwrap();
+    check("ArchiveReader::for_each_entries_direct", out);
+
+    check(
+        "ArchiveReader::read_file",
+        reader.read_file("story.txt").unwrap(),
+    );
+
+    let mut out = Vec::new();
+    reader
+        .block_decoder(0)
+        .unwrap()
+        .for_each_entries(&mut |_, rd| {
+            out = read_all(rd)?;
+            Ok(true)
+        })
+        .unwrap();
+    check("ArchiveReader::block_decoder", out);
+
+    let mut source = Cursor::new(bytes.clone());
+    let password = Password::empty();
+    let mut out = Vec::new();
+    BlockDecoder::with_limits(1, 0, &archive, &password, &mut source, limits.clone())
+        .for_each_entries(&mut |_, rd| {
+            out = read_all(rd)?;
+            Ok(true)
+        })
+        .unwrap();
+    check("BlockDecoder::with_limits", out);
+
+    let mut out = Vec::new();
+    PositionalBlockDecoder::with_limits(
+        Arc::new(archive.clone()),
+        Arc::new(Password::empty()),
+        Arc::new(bytes.clone()),
+        0,
+        limits.clone(),
+    )
+    .unwrap()
+    .for_each_entries(&mut |_, rd| {
+        out = read_all(rd)?;
+        Ok(true)
+    })
+    .unwrap();
+    check("PositionalBlockDecoder::with_limits", out);
+
+    let mut reader = ArchiveReader::from_archive_with_limits(
+        archive.clone(),
+        Cursor::new(bytes.clone()),
+        Password::empty(),
+        limits.clone(),
+    )
+    .unwrap();
+    check(
+        "ArchiveReader::from_archive_with_limits",
+        reader.read_file("story.txt").unwrap(),
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("story.7z");
+    std::fs::write(&path, &bytes).unwrap();
+    let mut reader =
+        ArchiveReader::open_with_limits(&path, Password::empty(), limits.clone()).unwrap();
+    check(
+        "ArchiveReader::open_with_limits",
+        reader.read_file("story.txt").unwrap(),
+    );
+
+    #[cfg(feature = "util")]
+    {
+        let out_dir = dir.path().join("extract_to");
+        ArchiveReader::with_limits(
+            Cursor::new(bytes.clone()),
+            Password::empty(),
+            limits.clone(),
+        )
+        .unwrap()
+        .extract_to(&out_dir)
+        .unwrap();
+        check(
+            "ArchiveReader::extract_to",
+            std::fs::read(out_dir.join("story.txt")).unwrap(),
+        );
+
+        let out_dir = dir.path().join("decompress");
+        sevenz_turbo::decompress_with_limits(Cursor::new(bytes.clone()), &out_dir, limits.clone())
+            .unwrap();
+        check(
+            "decompress_with_limits",
+            std::fs::read(out_dir.join("story.txt")).unwrap(),
+        );
+    }
+}
+
+/// An encoded header is decoded under the caller's limits too, through the
+/// same decision: with every window lent, reading the archive's metadata
+/// asks for the header coder's dictionary, clamped to the header's size.
+#[test]
+fn an_encoded_header_is_lent_by_the_same_decision() {
+    // Enough names that the writer compresses the header rather than keep
+    // it raw.
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    writer.set_encrypt_header(false);
+    for index in 0..512 {
+        writer
+            .push_archive_entry(
+                ArchiveEntry::new_file(&format!("chapters/chapter-{index:04}.txt")),
+                Some(&b"story"[..]),
+            )
+            .unwrap();
+    }
+    let bytes = writer.finish().unwrap().into_inner();
+    let allocator = Recorder::new(Mode::Give);
+    let every_window = ArchiveLimits::default()
+        .with_window_allocator(Arc::clone(&allocator) as Arc<dyn WindowAllocator>, 0);
+    let archive =
+        Archive::read_with_limits(&mut Cursor::new(&bytes), &Password::empty(), &every_window)
+            .unwrap();
+    assert_eq!(archive.files[0].name(), "chapters/chapter-0000.txt");
+    let asked = allocator.asked();
+    assert_eq!(asked.len(), 1, "the header's window was not lent");
+    assert!(asked[0] <= 1 << 20, "a header window of {} bytes", asked[0]);
+    assert_eq!(allocator.drops(), 1);
+
+    let unlent = Archive::read(&mut Cursor::new(&bytes), &Password::empty()).unwrap();
+    assert_eq!(archive.files.len(), unlent.files.len());
 }

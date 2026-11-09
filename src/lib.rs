@@ -155,8 +155,8 @@ pub use codec::lzma_turbo::{
     PositionalLzma2Folder, PositionalLzma2Run, PositionalLzma2Scanner,
 };
 pub use container::{
-    ArchiveLimits, BlockCompletion, CrcFolder, PackStreamRange, SubStream, SubStreamCompletion,
-    UnsizedCoder, coder_memory_estimate, crc32_combine,
+    ArchiveLimits, BlockCompletion, CrcFolder, DecoderMemory, PackStreamRange, SubStream,
+    SubStreamCompletion, UnsizedCoder, coder_memory_estimate, crc32_combine,
 };
 pub use encryption::Password;
 #[cfg(feature = "aes256")]

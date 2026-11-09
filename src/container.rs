@@ -170,11 +170,14 @@ pub struct ArchiveLimits {
     /// reader's thread count would decode on several threads, with a
     /// dictionary over `max_in_ram_window_bytes`, is refused with
     /// [`crate::Error::MaxMemLimited`], as a dictionary over the memory limit
-    /// always was. The thread count is never lowered to lend it. A block
+    /// always was, reporting the window against `max_in_ram_window_bytes`.
+    /// The thread count is never lowered to lend it. A block
     /// decoded on one thread, at a thread count of one or because it is too
     /// small to split, lends its dictionary. The positional LZMA2 run API
-    /// ([`crate::PositionalLzma2Folder`]) takes no caller memory and refuses
-    /// a folder that does not fit `memory_limit_bytes` as before.
+    /// ([`crate::PositionalLzma2Folder`]) cannot lend yet either: a run whose
+    /// ring is over `max_in_ram_window_bytes` is refused with
+    /// [`crate::Error::MemoryLimited`], and one under it decodes in RAM
+    /// within `memory_limit_bytes` as before.
     ///
     /// [`WindowAllocator`]: crate::WindowAllocator
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen(skip))]
@@ -635,6 +638,10 @@ impl Archive {
     /// is decoded, beside every coder of its chain at this table's figures,
     /// and a block they do not fit decodes without them.
     ///
+    /// Every window is counted here as RAM. With a
+    /// [`crate::WindowAllocator`], [`Archive::decoder_memory`] gives the
+    /// figure held in RAM and the windows lent, apart.
+    ///
     /// [`ArchiveLimits::memory_limit_bytes`]: crate::ArchiveLimits::memory_limit_bytes
     ///
     /// # Errors
@@ -645,23 +652,71 @@ impl Archive {
         self.resident_memory_estimate(&ArchiveLimits::default())
     }
 
-    /// [`Archive::decoder_memory_estimate`], with each coder at
-    /// [`resident_coder_estimate`]: the windows `limits` would lend left out.
-    /// The same figure when `limits` has no window allocator.
+    /// What decoding this archive under `limits` holds, in RAM and on the
+    /// caller's [`crate::WindowAllocator`], for one folder decoded at a time.
+    ///
+    /// `resident_bytes` is [`Archive::decoder_memory_estimate`] with the
+    /// windows `limits` would lend left out: what is checked against
+    /// [`ArchiveLimits::memory_limit_bytes`]. `lent_windows` and `lent_bytes`
+    /// are the most windows, and the most bytes of them, one folder asks of
+    /// the allocator, so a caller can reserve scratch space before decoding.
+    /// Without an allocator, nothing is lent and `resident_bytes` is
+    /// [`Archive::decoder_memory_estimate`].
+    ///
+    /// Each figure is the largest over the folders, taken on its own, and
+    /// each window is the declared one: an upper bound, since the decoder
+    /// can clamp a window to its coder's output. A reader decoding folders
+    /// side by side ([`crate::ArchiveReader::for_each_entries_unordered`] on
+    /// a positional source) holds up to one folder per thread at once, so
+    /// multiply the lent figures by the thread count for that path. A
+    /// threaded LZMA2 decode cannot lend yet (see
+    /// [`ArchiveLimits::window_allocator`]).
+    ///
+    /// # Errors
+    ///
+    /// [`UnsizedCoder`], as for [`Archive::decoder_memory_estimate`].
+    pub fn decoder_memory(&self, limits: &ArchiveLimits) -> Result<DecoderMemory, UnsizedCoder> {
+        let mut memory = DecoderMemory::default();
+        for block in &self.blocks {
+            let mut resident = BLOCK_INPUT_BYTES;
+            let (mut windows, mut lent) = (0usize, 0u64);
+            for coder in &block.coders {
+                let (in_ram, window) = coder_memory_split(coder, limits)?;
+                resident = resident.saturating_add(in_ram);
+                if let Some(window) = window {
+                    windows += 1;
+                    lent = lent.saturating_add(window);
+                }
+            }
+            memory.resident_bytes = memory.resident_bytes.max(resident);
+            memory.lent_windows = memory.lent_windows.max(windows);
+            memory.lent_bytes = memory.lent_bytes.max(lent);
+        }
+        Ok(memory)
+    }
+
+    /// [`Archive::decoder_memory`]'s `resident_bytes`.
     pub(crate) fn resident_memory_estimate(
         &self,
         limits: &ArchiveLimits,
     ) -> Result<u64, UnsizedCoder> {
-        let mut largest_block = 0u64;
-        for block in &self.blocks {
-            let mut chain = BLOCK_INPUT_BYTES;
-            for coder in &block.coders {
-                chain = chain.saturating_add(resident_coder_estimate(coder, limits)?);
-            }
-            largest_block = largest_block.max(chain);
-        }
-        Ok(largest_block)
+        Ok(self.decoder_memory(limits)?.resident_bytes)
     }
+}
+
+/// What [`Archive::decoder_memory`] reports: the decoder memory of one
+/// folder decoded at a time, split between RAM and the caller's allocator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DecoderMemory {
+    /// Bytes held in RAM and checked against
+    /// [`ArchiveLimits::memory_limit_bytes`].
+    pub resident_bytes: u64,
+    /// The most windows one folder asks of the caller's allocator.
+    pub lent_windows: usize,
+    /// The most bytes one folder asks of the caller's allocator, its windows
+    /// summed.
+    pub lent_bytes: u64,
 }
 
 /// [`coder_memory_estimate`], less the window `limits` would lend: what the
@@ -677,9 +732,19 @@ pub(crate) fn resident_coder_estimate(
     coder: &Coder,
     limits: &ArchiveLimits,
 ) -> Result<u64, UnsizedCoder> {
+    Ok(coder_memory_split(coder, limits)?.0)
+}
+
+/// [`coder_memory_estimate`] split by `limits`: the bytes held in RAM, and
+/// the window asked of the caller's allocator, if one is. A window is
+/// judged, and counted, at its declared size.
+fn coder_memory_split(
+    coder: &Coder,
+    limits: &ArchiveLimits,
+) -> Result<(u64, Option<u64>), UnsizedCoder> {
     let full = coder_memory_estimate(coder)?;
     if limits.window_allocator.is_none() {
-        return Ok(full);
+        return Ok((full, None));
     }
     let method_id = coder.encoder_method_id();
     let properties = coder.properties();
@@ -702,12 +767,12 @@ pub(crate) fn resident_coder_estimate(
             let model = ppmd_model_bytes(method_id, properties)?;
             (model, ppmd_arena_bytes(model as u32))
         } else {
-            return Ok(full);
+            return Ok((full, None));
         };
     Ok(if limits.lends(window) {
-        full.saturating_sub(dict)
+        (full.saturating_sub(dict), Some(window))
     } else {
-        full
+        (full, None)
     })
 }
 
@@ -718,7 +783,8 @@ pub(crate) fn ppmd_arena_bytes(memory_size: u32) -> u64 {
     u64::from(memory_size).next_multiple_of(4)
 }
 
-/// Bytes one coder's decoder needs.
+/// Bytes one coder's decoder needs, its window counted as RAM; see
+/// [`Archive::decoder_memory`] for the split under a window allocator.
 ///
 /// # Errors
 ///

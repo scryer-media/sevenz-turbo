@@ -3041,9 +3041,11 @@ pub(crate) fn lzma2_decoder<R: Read>(
 ) -> Result<Lzma2Coder<R>, std::io::Error> {
     match plan {
         Lzma2Plan::SingleThreaded => Ok(Lzma2Coder::SingleThreaded(Box::new(match window {
-            None => Lzma2Reader::new(input, dict_prop)?,
-            // The crate's own limit has already been checked; what is left in
-            // RAM is the decoder's state, which this limit cannot refuse.
+            // The crate's own limit has already been checked, as it is for
+            // LZMA, so `lzma-turbo`'s 512 MiB default is not applied on top:
+            // `ArchiveLimits` alone decides. Lent, what is left in RAM is the
+            // decoder's state, which this limit cannot refuse either.
+            None => Lzma2Reader::with_memory_limit(input, dict_prop, u64::MAX)?,
             Some(window) => Lzma2Reader::with_window(input, dict_prop, u64::MAX, window.backing())?,
         }))),
         Lzma2Plan::Adaptive {

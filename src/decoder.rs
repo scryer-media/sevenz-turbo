@@ -787,10 +787,12 @@ pub fn add_decoder<I: Read>(
             }
             if loan.is_some() && !matches!(plan, Lzma2Plan::SingleThreaded) {
                 // The threaded decoders take no lent window yet: the window
-                // is refused as one over the memory limit always was.
+                // is refused as one over the memory limit always was, with
+                // the in-RAM window limit it is over.
                 return Err(Error::MaxMemLimited {
-                    max_kb: max_mem_limit_kb,
-                    actaul_kb: window.full_kb,
+                    max_kb: usize::try_from(opts.limits.max_in_ram_window_bytes / 1024)
+                        .unwrap_or(usize::MAX),
+                    actaul_kb: usize::try_from(window.bytes.div_ceil(1024)).unwrap_or(usize::MAX),
                 });
             }
             let mut lz = lzma2_decoder(input, dict_prop, plan, loan.as_ref()).map_err(|e| {

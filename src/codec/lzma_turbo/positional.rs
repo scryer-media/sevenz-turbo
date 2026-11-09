@@ -47,7 +47,7 @@ struct Folder {
     file_indexes: Vec<usize>,
     streams: Vec<SubStream>,
     prop: u8,
-    limit: u64,
+    limits: ArchiveLimits,
     plan: ChecksumPlan,
 }
 
@@ -249,7 +249,7 @@ impl PositionalLzma2Folder {
             file_indexes,
             streams,
             prop,
-            limit: limits.memory_limit_bytes,
+            limits,
             plan: ChecksumPlan::new(Checksum::Crc32).with_split_points(splits),
         }))))
     }
@@ -496,6 +496,10 @@ impl PositionalLzma2Run {
     }
     /// Ring, coder state and positional input buffer reservation. The caller
     /// charges shared archive metadata and destination buffers separately.
+    /// The ring is always counted here: a ring over
+    /// [`crate::ArchiveLimits::max_in_ram_window_bytes`] with a window
+    /// allocator set is not lent on this path yet, and
+    /// [`PositionalLzma2Run::decode`] refuses it.
     ///
     /// # Errors
     /// Invalid dictionary properties fail before allocation.
@@ -513,6 +517,15 @@ impl PositionalLzma2Run {
         Ok(ring + self.run.packed_len.min(INPUT_BYTES as u64) + checks * 2)
     }
 
+    /// The run's ring: its dictionary, clamped to the run's output, as the
+    /// codec allocates it. The window a caller's allocator would be asked
+    /// for, and judged by [`crate::ArchiveLimits::max_in_ram_window_bytes`].
+    fn ring_bytes(&self) -> Result<u64, Error> {
+        let declared = super::lzma2_dictionary_size(&[self.folder.0.prop])?;
+        let clamped = u64::from(declared).min(self.run.unpacked_len) as u32;
+        Ok(super::lzma_window_bytes(clamped))
+    }
+
     /// Decodes on the calling worker and writes at folder-relative offsets.
     /// Short writes and `Interrupted` are handled without copying output.
     /// Writes are provisional until completion, folder verification and the
@@ -527,10 +540,23 @@ impl PositionalLzma2Run {
     where
         F: FnMut(u64, &[u8]) -> io::Result<usize> + ?Sized,
     {
-        let required = self.memory_required()?;
-        if required > self.folder.0.limit {
+        let limits = &self.folder.0.limits;
+        // The run decoder takes no lent ring yet. When it does, a ring
+        // `limits.lends` is handed the folder's window backing here, and
+        // `memory_required` leaves it out; until then it is refused as one
+        // over the memory limit, and never decoded in RAM past the caller's
+        // in-RAM window limit.
+        let ring = self.ring_bytes()?;
+        if limits.lends(ring) {
             return Err(Error::MemoryLimited {
-                limit_bytes: self.folder.0.limit,
+                limit_bytes: limits.max_in_ram_window_bytes,
+                required_bytes: ring,
+            });
+        }
+        let required = self.memory_required()?;
+        if required > limits.memory_limit_bytes {
+            return Err(Error::MemoryLimited {
+                limit_bytes: limits.memory_limit_bytes,
                 required_bytes: required,
             });
         }
@@ -541,7 +567,7 @@ impl PositionalLzma2Run {
             self.index,
             self.folder.0.prop,
             self.run,
-            self.folder.0.limit - input_size as u64,
+            limits.memory_limit_bytes - input_size as u64,
         )
         .map_err(|e| locate(Error::from(std::io::Error::from(e))))?;
         decoder
@@ -844,5 +870,76 @@ mod tests {
             folder.verify_runs(&[completion]).unwrap()[0].len,
             expected.len() as u64
         );
+    }
+
+    /// The run decoder takes no lent ring yet: with a window allocator set, a
+    /// run whose ring is over the in-RAM window limit is refused with the
+    /// memory-limit error, the allocator unasked, and one under it decodes
+    /// in RAM as before.
+    #[test]
+    fn a_ring_over_the_in_ram_window_limit_is_refused_until_it_can_be_lent() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let expected: Vec<u8> = (0..2 << 20)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 40) as u8 & 0x1F
+            })
+            .collect();
+        let mut options = Lzma2Options::from_level(1);
+        options.set_dictionary_size(4 << 20);
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        writer.set_content_methods(vec![options.into()]);
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("member"), Some(expected.as_slice()))
+            .unwrap();
+        let bytes = Arc::new(writer.finish().unwrap().into_inner());
+        let archive = Arc::new(
+            Archive::read(&mut Cursor::new(bytes.as_slice()), &Password::empty()).unwrap(),
+        );
+        let heap = Arc::new(crate::window_memory::TestHeap {
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let decode = |in_ram: u64| {
+            let limits = ArchiveLimits::default().with_window_allocator(
+                Arc::clone(&heap) as Arc<dyn crate::WindowAllocator>,
+                in_ram,
+            );
+            let folder = PositionalLzma2Folder::new(archive.clone(), bytes.clone(), 0, limits)
+                .unwrap()
+                .unwrap();
+            let pack = folder.packed_range();
+            let mut scanner = folder.scanner();
+            scanner
+                .feed(&bytes[pack.offset as usize..pack.end() as usize])
+                .unwrap();
+            let run = scanner.next_run().unwrap();
+            assert!(scanner.next_run().is_none(), "one run");
+            let ring = run.ring_bytes().unwrap();
+            assert!(run.memory_required().unwrap() >= ring);
+            let mut decoded = Vec::new();
+            let result = run.decode(&AtomicBool::new(false), &mut |_, data: &[u8]| {
+                decoded.extend_from_slice(data);
+                Ok(data.len())
+            });
+            (ring, result.map(|_| decoded))
+        };
+
+        let (ring, refused) = decode(1 << 20);
+        assert_eq!(ring, 2 << 20);
+        assert!(
+            matches!(
+                refused,
+                Err(Error::MemoryLimited {
+                    limit_bytes: 0x10_0000,
+                    required_bytes: 0x20_0000,
+                })
+            ),
+            "{refused:?}"
+        );
+        let (_, decoded) = decode(ring);
+        assert!(decoded.unwrap() == expected, "decoded to other bytes");
+        assert_eq!(heap.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
