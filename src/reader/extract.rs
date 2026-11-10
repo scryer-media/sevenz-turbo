@@ -277,6 +277,21 @@ mod tests {
         reader.clear_block_complete_hook();
         reader.set_verify_checksums(false);
         assert!(reader.ring_extraction_plan().unwrap().is_none());
+        reader.set_verify_checksums(true);
+        assert!(reader.ring_extraction_plan().unwrap().is_some());
+        // A dictionary the caller's limits lend decodes on the ordinary
+        // path; one they keep in RAM still takes the rings.
+        let heap = Arc::new(crate::window_memory::TestHeap {
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        reader.limits = reader
+            .limits
+            .clone()
+            .with_window_allocator(Arc::clone(&heap) as Arc<dyn crate::WindowAllocator>, 0);
+        assert!(reader.ring_extraction_plan().unwrap().is_none());
+        reader.limits.max_in_ram_window_bytes = u64::MAX;
+        assert!(reader.ring_extraction_plan().unwrap().is_some());
+        assert_eq!(heap.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

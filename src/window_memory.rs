@@ -81,7 +81,10 @@ pub unsafe trait WindowMemory: Send {
 pub trait WindowAllocator: Send + Sync {
     /// Returns `len` bytes for a window, or the error that stopped it. The
     /// error reaches the caller as [`Error::WindowAllocatorFailed`], kept
-    /// whole.
+    /// whole. A panic here, or in the returned memory's
+    /// [`WindowMemory::as_mut_ptr`] or [`WindowMemory::len`], is caught and
+    /// reaches the caller the same way, as an [`io::ErrorKind::Other`] error
+    /// naming the panic, and the decode holds no window of it.
     ///
     /// # Errors
     ///
@@ -135,12 +138,31 @@ impl Lender {
     /// Asks the caller's allocator for `len` bytes and checks what it gave
     /// back against the part of the [`WindowMemory`] contract that can be
     /// checked. Memory that fails the check is dropped before the error
-    /// returns. The error is the allocator's own, or an `InvalidInput` one
-    /// for memory that failed the check.
+    /// returns. The error is the allocator's own, an `InvalidInput` one for
+    /// memory that failed the check, or an `Other` one for a panic in the
+    /// caller's code, which is caught here so that every codec reports it
+    /// as the allocator's failure; memory it had handed out before the
+    /// panic is dropped as the panic unwinds.
     fn lend(&self, len: usize) -> io::Result<LentWindow> {
-        let mut memory = self.allocator.allocate(len)?;
-        let ptr = memory.as_mut_ptr();
-        let got = memory.len();
+        let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut memory = self.allocator.allocate(len)?;
+            let ptr = memory.as_mut_ptr();
+            let got = memory.len();
+            Ok::<_, io::Error>((memory, ptr, got))
+        }));
+        let (memory, ptr, got) = match asked {
+            Ok(asked) => asked?,
+            Err(payload) => {
+                let what = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("no message");
+                return Err(io::Error::other(format!(
+                    "window allocator panicked: {what}"
+                )));
+            }
+        };
         // A length over `isize::MAX` cannot describe real memory.
         if ptr.is_null() || got < len || isize::try_from(got).is_err() {
             drop(memory);

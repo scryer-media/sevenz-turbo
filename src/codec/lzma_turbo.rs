@@ -216,21 +216,36 @@ pub(crate) fn lzma2_worker_window_bytes(dict_prop: u8) -> Result<u64, Error> {
         .map_err(|_| Error::corrupted("LZMA2 dictionary property out of range"))
 }
 
-/// A coder's window on caller memory: the lender, and the ceiling on what
-/// it may be asked for.
+/// A coder's access to caller memory: the lender, the largest buffer kept in
+/// RAM, and the ceiling on what the lender may be asked for.
 pub(crate) struct WindowLoan {
     pub(crate) lender: Arc<crate::window_memory::Lender>,
+    /// [`crate::ArchiveLimits::max_in_ram_window_bytes`].
+    pub(crate) in_ram_bytes: u64,
+    /// [`crate::ArchiveLimits::max_lent_window_bytes`].
     pub(crate) max_bytes: u64,
 }
 
 impl WindowLoan {
-    /// The codec's backing over the lender. The in-RAM limit is zero: the
-    /// choice to lend was made by the caller of this module, once, and the
-    /// codec only carries it out.
-    fn backing(&self) -> lzma_turbo::WindowBacking {
+    /// The loan `limits` make, `None` without a window allocator.
+    pub(crate) fn of(limits: &crate::ArchiveLimits) -> Option<Self> {
+        let allocator = limits.window_allocator.as_ref()?;
+        Some(Self {
+            lender: crate::window_memory::Lender::new(Arc::clone(&allocator.0)),
+            in_ram_bytes: limits.max_in_ram_window_bytes,
+            max_bytes: limits.max_lent_window_bytes,
+        })
+    }
+
+    /// The codec's backing over the lender. `lzma-turbo` lends a buffer
+    /// exactly when it is over the in-RAM limit, the rule
+    /// [`crate::ArchiveLimits::lends`] states, so each buffer a decoder
+    /// allocates, its dictionary and every buffer of a threaded decoder's
+    /// workers, is lent or kept in RAM by its own length.
+    pub(crate) fn backing(&self) -> lzma_turbo::WindowBacking {
         lzma_turbo::WindowBacking::new(
             Arc::clone(&self.lender) as Arc<dyn lzma_turbo::WindowAllocator>,
-            0,
+            self.in_ram_bytes,
         )
         .with_max_len(self.max_bytes)
     }
@@ -1304,10 +1319,11 @@ impl<R: Read> Lzma2MtReader<R> {
             threads: threads as usize,
             memory_limit,
         };
-        // Lent, every run's output and the chase dictionary are on the
-        // caller's memory, and count nothing against `memory_limit`: what it
-        // governs is then what stays in RAM, the input and the reader's
-        // queue. The thread count is the caller's either way.
+        // With a loan, each run's output and the chase dictionary over the
+        // in-RAM limit are on the caller's memory and count nothing against
+        // `memory_limit`; one at or under it stays in RAM and is charged, as
+        // the input and the reader's queue are. The thread count is the
+        // caller's either way.
         let mut decoder = match window {
             None => Lzma2AdaptiveDecoder::new(dict_prop, &options),
             Some(window) => {
@@ -3083,11 +3099,12 @@ impl<R: Read> Lzma2MtReader<R> {
     }
 }
 
-/// Builds the LZMA2 decoder for a 7z coder. With `window`, the dictionary is
-/// on the caller's memory: the one dictionary of a single-threaded decode,
-/// or, for an `Adaptive` plan, each worker's run buffer and the chase
-/// dictionary, at most `max_windows()` of them at once, each at most
-/// [`lzma2_worker_window_bytes`].
+/// Builds the LZMA2 decoder for a 7z coder. With `window`, every buffer over
+/// its in-RAM limit is on the caller's memory: the one dictionary of a
+/// single-threaded decode, or, for an `Adaptive` plan, each worker's run
+/// buffer and the chase dictionary, each at most
+/// [`lzma2_worker_window_bytes`]. A buffer at or under the limit is
+/// allocated in RAM.
 pub(crate) fn lzma2_decoder<R: Read>(
     input: R,
     dict_prop: u8,

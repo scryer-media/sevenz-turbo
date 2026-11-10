@@ -543,9 +543,9 @@ impl PositionalLzma2Run {
     /// did.
     fn loan(&self) -> Result<Option<super::WindowLoan>, Error> {
         let limits = &self.folder.0.limits;
-        let Some(allocator) = &limits.window_allocator else {
+        if limits.window_allocator.is_none() {
             return Ok(None);
-        };
+        }
         let ring = self.ring_bytes()?;
         if !limits.lends(ring) {
             return Ok(None);
@@ -557,10 +557,7 @@ impl PositionalLzma2Run {
                 ring,
             ));
         }
-        Ok(Some(super::WindowLoan {
-            lender: crate::window_memory::Lender::new(Arc::clone(allocator)),
-            max_bytes: limits.max_lent_window_bytes,
-        }))
+        Ok(super::WindowLoan::of(limits))
     }
 
     /// Decodes on the calling worker and writes at folder-relative offsets.

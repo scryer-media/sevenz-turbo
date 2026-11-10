@@ -39,7 +39,6 @@ use crate::codec::{
 use crate::container::{ArchiveLimits, coder_memory_estimate};
 #[cfg(feature = "aes256")]
 use crate::encryption::Aes256Sha256Decoder;
-use crate::window_memory::Lender;
 use crate::{Password, archive::EncoderMethod, block::Coder, error::Error};
 
 /// Bytes a decoder that reads its input in small pieces is given at a time.
@@ -455,10 +454,15 @@ struct Window {
     /// The buffer the codec allocates, in bytes: what the caller's allocator
     /// is asked for when the window is lent.
     bytes: u64,
+    /// The dictionary or model as [`Window::full_kb`] charges it, in bytes.
+    size: u64,
     /// Kilobytes the coder holds in RAM with the window in RAM.
     full_kb: usize,
     /// Kilobytes the coder holds in RAM with the window lent.
     rest_kb: usize,
+    /// For LZMA2, the most one buffer of a threaded decoder's workers can
+    /// be: `lzma-turbo`'s `Lzma2Decoder::max_worker_window_len`.
+    worker: Option<u64>,
 }
 
 impl Window {
@@ -466,8 +470,10 @@ impl Window {
     fn lzma(dict_size: u32) -> Self {
         Self {
             bytes: crate::codec::lzma_turbo::lzma_window_bytes(dict_size),
+            size: u64::from(dict_size),
             full_kb: lzma2_memory_usage_kb(dict_size),
             rest_kb: lzma2_memory_usage_kb(0),
+            worker: None,
         }
     }
 
@@ -477,8 +483,12 @@ impl Window {
         let dict_size = lzma2_dictionary_size(&[dict_prop])?;
         Ok(Self {
             bytes: crate::codec::lzma_turbo::lzma2_window_bytes(dict_prop)?,
+            size: u64::from(dict_size),
             full_kb: lzma2_memory_usage_kb(dict_size),
             rest_kb: lzma2_memory_usage_kb(0),
+            worker: Some(crate::codec::lzma_turbo::lzma2_worker_window_bytes(
+                dict_prop,
+            )?),
         })
     }
 
@@ -487,9 +497,20 @@ impl Window {
     fn ppmd(memory_size: u32) -> Self {
         Self {
             bytes: crate::container::ppmd_arena_bytes(memory_size),
+            size: u64::from(memory_size),
             full_kb: ppmd_memory_kb(memory_size),
             rest_kb: ppmd_memory_kb(0),
+            worker: None,
         }
+    }
+
+    /// The largest buffer a threaded LZMA2 decoder's workers can be lent
+    /// under `limits`: [`Window::worker`] held to the ceiling, when that is
+    /// over the in-RAM limit. `None` when no worker buffer is lent, for a
+    /// coder that has no workers, or without an allocator.
+    fn lent_worker(self, limits: &ArchiveLimits) -> Option<u64> {
+        let worker = self.worker?.min(limits.max_lent_window_bytes);
+        limits.lends(worker).then_some(worker)
     }
 
     /// Kilobytes the coder holds in RAM under `limits`.
@@ -521,13 +542,31 @@ impl Window {
     /// The loan of this window from the caller's allocator, when
     /// [`Window::lent`] says it is lent.
     fn loan(self, limits: &ArchiveLimits) -> Result<Option<WindowLoan>, Error> {
-        Ok(match (self.lent(limits)?, &limits.window_allocator) {
-            (true, Some(allocator)) => Some(WindowLoan {
-                lender: Lender::new(Arc::clone(allocator)),
-                max_bytes: limits.max_lent_window_bytes,
-            }),
-            _ => None,
+        Ok(if self.lent(limits)? {
+            WindowLoan::of(limits)
+        } else {
+            None
         })
+    }
+
+    /// The loan an LZMA2 decoder of this window is built with: whenever
+    /// `limits` set an allocator, since the decoder lends each of its
+    /// buffers by its own length, and a threaded decoder's workers can lend
+    /// theirs when the dictionary itself stays in RAM. The dictionary over
+    /// the ceiling is still refused here first.
+    fn lzma2_loan(self, limits: &ArchiveLimits) -> Result<Option<WindowLoan>, Error> {
+        self.lent(limits)?;
+        Ok(WindowLoan::of(limits))
+    }
+
+    /// This window under `limits`, decided as [`add_decoder`] decides it.
+    fn split(self, limits: &ArchiveLimits) -> WindowSplit {
+        let lent = limits.lends(self.bytes);
+        WindowSplit {
+            in_ram: if lent { 0 } else { self.size },
+            lent: lent.then_some(self.bytes),
+            worker: self.lent_worker(limits),
+        }
     }
 
     /// The error a coder's construction failed with: the caller's allocator's
@@ -585,6 +624,29 @@ fn coder_window(coder: &Coder, uncompressed_len: u64) -> Option<Window> {
         }
         None
     }
+}
+
+/// One coder's window under a set of limits, by the decision [`add_decoder`]
+/// makes when it builds the coder: on the window clamped to the coder's
+/// output.
+pub(crate) struct WindowSplit {
+    /// The dictionary or model held in RAM, in bytes: zero when it is lent.
+    pub(crate) in_ram: u64,
+    /// The window asked of the caller's allocator, when it is lent.
+    pub(crate) lent: Option<u64>,
+    /// The largest buffer a threaded LZMA2 decoder's workers can be lent,
+    /// when they can be lent any.
+    pub(crate) worker: Option<u64>,
+}
+
+/// [`WindowSplit`] for `coder` decoding to `uncompressed_len` bytes under
+/// `limits`; `None` for a coder with no window, as for [`coder_window`].
+pub(crate) fn coder_window_split(
+    coder: &Coder,
+    uncompressed_len: u64,
+    limits: &ArchiveLimits,
+) -> Option<WindowSplit> {
+    coder_window(coder, uncompressed_len).map(|window| window.split(limits))
 }
 
 /// What a PPMd coder holds: its model, and the [`INPUT_BUF_SIZE`] buffer
@@ -779,20 +841,25 @@ pub fn add_decoder<I: Read>(
                     actaul_kb: mem_size,
                 });
             }
-            let loan = window.loan(opts.limits)?;
-            // The plan is sized against what stays in RAM. Lent, the
-            // dictionary and every worker's run buffer are on the caller's
-            // memory, so neither is charged: `mem_size` is then the coder's
-            // state alone, and the plan is told it holds no dictionary. What
-            // the budget governs is the input and the queues, which are RAM
-            // either way. The thread count is the caller's.
+            let loan = window.lzma2_loan(opts.limits)?;
+            // The plan is sized against what stays in RAM, buffer by buffer.
+            // A lent dictionary is not charged: `mem_size` is then the
+            // coder's state alone, and the plan is told it holds no
+            // dictionary. A worker's run buffer over the in-RAM limit is lent
+            // and `lzma-turbo` charges it nothing; one at or under it is RAM
+            // and charged against the budget, as the input and the queues
+            // are. The thread count is the caller's.
             let budget = lzma2_plan_budget(
                 opts.limits.memory_limit_bytes,
                 opts.reserved_kb,
                 opts.unsized_kb,
                 mem_size,
             );
-            let dict_in_ram = if loan.is_some() { 0 } else { dic_size };
+            let dict_in_ram = if window.lent(opts.limits)? {
+                0
+            } else {
+                dic_size
+            };
             let plan = match opts.lzma2_control {
                 Some(control) => Lzma2Plan::for_block(
                     opts.threads,

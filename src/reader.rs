@@ -3785,11 +3785,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         #[cfg(not(target_arch = "wasm32"))]
         let planned = if self.positional.is_some() && self.thread_count > 1 {
             let folders = self.archive.blocks.iter().map(|block| {
-                let estimate = block.coders.iter().try_fold(0u64, |sum, coder| {
-                    crate::container::resident_coder_estimate(coder, &self.limits)
-                        .ok()
-                        .map(|bytes| sum.saturating_add(bytes))
-                });
+                let estimate = crate::container::block_coders_resident(block, &self.limits);
                 (block.get_unpack_size(), estimate.unwrap_or(u64::MAX))
             });
             Some(plan_folders(
@@ -4107,11 +4103,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             .blocks
             .iter()
             .map(|block| {
-                let estimate = block.coders.iter().try_fold(0u64, |sum, coder| {
-                    crate::container::resident_coder_estimate(coder, &self.limits)
-                        .ok()
-                        .map(|bytes| sum.saturating_add(bytes))
-                });
+                let estimate = crate::container::block_coders_resident(block, &self.limits);
                 (
                     block.get_unpack_size(),
                     estimate.unwrap_or(u64::MAX),
@@ -7074,15 +7066,7 @@ mod chain_plan_tests {
             archive
                 .blocks
                 .iter()
-                .map(|block| {
-                    block
-                        .coders
-                        .iter()
-                        .map(|coder| {
-                            crate::container::resident_coder_estimate(coder, limits).unwrap()
-                        })
-                        .sum::<u64>()
-                })
+                .map(|block| crate::container::block_coders_resident(block, limits).unwrap())
                 .max()
                 .unwrap()
         };
@@ -7144,6 +7128,78 @@ mod chain_plan_tests {
         assert_eq!(heap.asked.load(std::sync::atomic::Ordering::SeqCst), 3);
         drop(reader);
         assert_eq!(Arc::strong_count(&heap), 2, "a worker kept a loan alive");
+    }
+
+    /// Four folders of 6 MiB whose coders declare 64 MiB dictionaries, under
+    /// a 24 MiB limit with a 16 MiB in-RAM limit: the decoder clamps each
+    /// window to 6 MiB and keeps it in RAM, and both plans count it so, not
+    /// as lent, keeping every worker's share within the limit.
+    #[test]
+    fn plans_count_a_declared_window_the_decoder_clamps_into_ram() {
+        let mut options = Lzma2Options::from_level(1);
+        options.set_dictionary_size(64 << 20);
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+        writer.set_content_methods(vec![options.into()]);
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for index in 0..4 {
+            let data: Vec<u8> = (0..6 << 20)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 40) as u8 & 0x1F
+                })
+                .collect();
+            writer
+                .push_archive_entry(
+                    ArchiveEntry::new_file(&format!("{index}")),
+                    Some(data.as_slice()),
+                )
+                .expect("push");
+        }
+        let bytes = writer.finish().expect("finish").into_inner();
+        let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty()).expect("parse");
+        assert_eq!(archive.blocks.len(), 4);
+        let declared = archive.blocks[0].coders[0].properties()[0];
+        assert!(lzma_turbo::Lzma2Decoder::window_len(declared).unwrap() >= 64 << 20);
+        let heap = Arc::new(crate::window_memory::TestHeap {
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let limit = 24u64 << 20;
+        let limits = ArchiveLimits::memory(limit).with_window_allocator(
+            Arc::clone(&heap) as Arc<dyn crate::WindowAllocator>,
+            16 << 20,
+        );
+        let per_folder = archive
+            .blocks
+            .iter()
+            .map(|block| crate::container::block_coders_resident(block, &limits).unwrap())
+            .max()
+            .unwrap();
+        assert!(per_folder >= 6 << 20, "{per_folder}");
+
+        let mut reader =
+            ArchiveReader::from_read_at(bytes.clone(), Password::empty(), limits.clone()).unwrap();
+        reader.set_threads(4);
+        for phase in reader.folder_phases() {
+            if let FolderPhase::Parallel { workers, .. } = phase {
+                let planned = FOLDER_CHUNK_BYTES as u64
+                    + u64::from(workers) * (per_folder + FOLDER_WORKER_BYTES);
+                assert!(planned <= limit, "{phase:?} plans {planned} over {limit}");
+            }
+        }
+        for phase in reader.unordered_phases() {
+            if let UnorderedPhase::Unordered {
+                workers,
+                worker_memory,
+                ..
+            } = phase
+            {
+                assert!(worker_memory >= per_folder + crate::container::BLOCK_INPUT_BYTES);
+                assert!(u64::from(workers) * worker_memory <= limit);
+            }
+        }
+        assert_eq!(heap.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
 
