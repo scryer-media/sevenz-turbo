@@ -6963,6 +6963,9 @@ mod chain_plan_tests {
     /// dictionary is in RAM or lent, and lent it decodes on the caller's
     /// memory, its workers' buffers asked of the allocator; at one thread
     /// it decodes on one lent dictionary.
+    // Built unthreaded, the writer makes one solid LZMA2 stream, which has no
+    // runs to share among threads.
+    #[cfg(not(sevenz_turbo_unthreaded))]
     #[test]
     fn a_lent_lzma2_dictionary_keeps_the_thread_count() {
         let mut x = 0x2545_F491_4F6C_DD1Du64;

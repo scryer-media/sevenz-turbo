@@ -67,6 +67,8 @@ enum Mode {
     Give,
     Refuse(io::ErrorKind),
     /// Gives the first `n` windows asked for, then refuses every one after.
+    /// Only the threaded tests use it.
+    #[cfg_attr(sevenz_turbo_unthreaded, allow(dead_code))]
     RefuseAfter(usize, io::ErrorKind),
     Short,
     /// Panics on every ask.
@@ -431,6 +433,9 @@ fn a_filter_chain_decodes_on_lent_memory() {
 /// threads: the output is the owned decode's, the thread count is the
 /// caller's, more than one window is out at once, and never more than
 /// `decoder_memory` reports.
+// Built unthreaded, the writer makes one solid LZMA2 stream, which has no
+// runs to share among threads.
+#[cfg(not(sevenz_turbo_unthreaded))]
 #[test]
 fn threaded_lzma2_decodes_on_lent_memory() {
     let (bytes, data) = multi_run(6);
@@ -463,6 +468,9 @@ fn threaded_lzma2_decodes_on_lent_memory() {
 
 /// On four threads, a refusal on the k-th window asked fails the decode with
 /// the allocator's own error, and every window lent before it is released.
+// Built unthreaded, the writer makes one solid LZMA2 stream, which has no
+// runs to share among threads.
+#[cfg(not(sevenz_turbo_unthreaded))]
 #[test]
 fn threaded_lzma2_refusal_on_any_ask_releases_everything() {
     let (bytes, _) = multi_run(15);
@@ -609,6 +617,9 @@ fn a_refusing_allocator_fails_a_threaded_decode_with_its_own_error() {
 /// [`sevenz_turbo::PositionalLzma2Folder`] on several threads: each run
 /// lends one ring, the output is the archive's, and never more is out at
 /// once than `decoder_memory` reports for that many runs at a time.
+// Built unthreaded, the writer makes one solid LZMA2 stream, which has no
+// runs to share among threads.
+#[cfg(not(sevenz_turbo_unthreaded))]
 #[test]
 fn positional_runs_decode_on_lent_memory() {
     use sevenz_turbo::PositionalLzma2Folder;
@@ -1236,6 +1247,9 @@ fn runs_over_the_dictionary() -> (Vec<u8>, Vec<u8>) {
 /// in RAM, charged, and lends every run buffer over the limit and nothing
 /// under it; `decoder_memory` charges the dictionary as RAM and covers the
 /// buffers lent.
+// Built unthreaded, the writer makes one solid LZMA2 stream, which has no
+// runs to share among threads.
+#[cfg(not(sevenz_turbo_unthreaded))]
 #[test]
 fn a_dictionary_in_ram_does_not_stop_the_workers_lending() {
     let (bytes, data) = runs_over_the_dictionary();

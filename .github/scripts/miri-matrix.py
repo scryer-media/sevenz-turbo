@@ -18,7 +18,7 @@ required = {
     "aligned_storage_keeps_ownership_when_moved_between_threads",
     "small_unknown_and_non_lzma_inputs_keep_the_existing_memory_bound",
     "a_lent_window_is_the_callers_memory_and_is_freed_once",
-    "a_refusal_is_kept_for_the_builder",
+    "a_refusal_goes_to_lzma_turbo_whole",
     "memory_that_does_not_fit_is_refused_and_dropped",
 }
 prefixes = ("writer::input_buffer::tests::", "window_memory::tests::")
