@@ -17,11 +17,15 @@ required = {
     "panicking_advice_releases_the_uninitialized_allocation",
     "aligned_storage_keeps_ownership_when_moved_between_threads",
     "small_unknown_and_non_lzma_inputs_keep_the_existing_memory_bound",
+    "a_lent_window_is_the_callers_memory_and_is_freed_once",
+    "a_refusal_goes_to_lzma_turbo_whole",
+    "memory_that_does_not_fit_is_refused_and_dropped",
 }
+prefixes = ("writer::input_buffer::tests::", "window_memory::tests::")
 if (
     len(tests) != len(set(tests))
     or not required.issubset({name.rsplit("::", 1)[-1] for name in tests})
-    or any(not name.startswith("writer::input_buffer::tests::") for name in tests)
+    or any(not name.startswith(prefixes) for name in tests)
     or any("native_advice" in name for name in tests)
 ):
     raise SystemExit("Miri discovery lost required unsafe tests or selected native/unrelated tests")

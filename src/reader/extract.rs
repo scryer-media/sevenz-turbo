@@ -64,11 +64,20 @@ impl<R: Read + Seek> ArchiveReader<R> {
             return Ok(None);
         };
         let block = &self.archive.blocks[0];
-        if block.coders.len() != 1
-            || block.coders[0].encoder_method_id() != EncoderMethod::ID_LZMA2
-            || u64::from(crate::codec::lzma_turbo::lzma2_dictionary_size(
-                block.coders[0].properties(),
-            )?) >= block.get_unpack_size()
+        if block.coders.len() != 1 || block.coders[0].encoder_method_id() != EncoderMethod::ID_LZMA2
+        {
+            return Ok(None);
+        }
+        let dict = crate::codec::lzma_turbo::lzma2_dictionary_size(block.coders[0].properties())?;
+        // A run decoder asks for a fresh ring each run, where the ordinary
+        // threaded decoder keeps its workers' lent windows from run to run;
+        // a dictionary the caller would lend decodes on the ordinary path.
+        if u64::from(dict) >= block.get_unpack_size()
+            || self
+                .limits
+                .lends(crate::codec::lzma_turbo::lzma2_window_bytes(
+                    block.coders[0].properties()[0],
+                )?)
         {
             return Ok(None);
         }
@@ -76,7 +85,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             Arc::new(self.archive.clone()),
             Arc::clone(source),
             0,
-            self.limits,
+            self.limits.clone(),
         )?
         else {
             return Ok(None);
@@ -268,6 +277,21 @@ mod tests {
         reader.clear_block_complete_hook();
         reader.set_verify_checksums(false);
         assert!(reader.ring_extraction_plan().unwrap().is_none());
+        reader.set_verify_checksums(true);
+        assert!(reader.ring_extraction_plan().unwrap().is_some());
+        // A dictionary the caller's limits lend decodes on the ordinary
+        // path; one they keep in RAM still takes the rings.
+        let heap = Arc::new(crate::window_memory::TestHeap {
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        reader.limits = reader
+            .limits
+            .clone()
+            .with_window_allocator(Arc::clone(&heap) as Arc<dyn crate::WindowAllocator>, 0);
+        assert!(reader.ring_extraction_plan().unwrap().is_none());
+        reader.limits.max_in_ram_window_bytes = u64::MAX;
+        assert!(reader.ring_extraction_plan().unwrap().is_some());
+        assert_eq!(heap.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -20,17 +20,20 @@ use bzip2_turbo::Decoder as BzDecoder;
 use flate2::bufread::DeflateDecoder;
 use lzma_turbo::LzmaReader;
 #[cfg(feature = "ppmd")]
-use ppmd_turbo::{Params as PpmdParams, SevenZDecoder as PpmdDecoder, io::SevenZReader};
+use ppmd_turbo::{
+    Arena as PpmdArena, Params as PpmdParams, SevenZDecoder as PpmdDecoder, io::SevenZReader,
+};
 
 #[cfg(feature = "brotli")]
 use crate::codec::brotli::BrotliDecoder;
 #[cfg(feature = "lz4")]
 use crate::codec::lz4::Lz4Decoder;
+use crate::codec::lzma_turbo::WindowLoan;
 use crate::codec::{
     filter::{bcj::BcjReader, delta::DeltaReader},
     lzma_turbo::{
         Lzma2Coder, Lzma2Control, Lzma2Plan, lzma2_clamped_prop, lzma2_decoder,
-        lzma2_dictionary_size, lzma2_memory_usage_kb,
+        lzma2_dictionary_size,
     },
 };
 use crate::container::{ArchiveLimits, coder_memory_estimate};
@@ -439,43 +442,214 @@ impl<R: Read> Read for Decoder<R> {
     }
 }
 
-/// Kilobytes of decoder state one coder's decoder holds, by the same model
-/// [`add_decoder`] checks it against the limit with: the dictionary, clamped to
-/// the coder's output the way the decoder clamps it, plus the LZ state for
-/// LZMA and LZMA2; the declared model for PPMd.
+/// The window a sized coder decodes into, the LZMA or LZMA2 dictionary or the
+/// PPMd model arena, and what the coder holds with and without it.
+///
+/// Where the window comes from, RAM or the caller's
+/// [`crate::WindowAllocator`], is decided here and nowhere else: by
+/// [`ArchiveLimits::lends`] on [`Window::bytes`]. The chain check, the
+/// per-coder check, the coder's construction and
+/// [`crate::Archive::decoder_memory`] all ask the same value, and charge
+/// the same figure, [`Window::ram_kb`], rounded the same way.
+#[derive(Clone, Copy)]
+struct Window {
+    /// The buffer the codec allocates, in bytes: what the caller's allocator
+    /// is asked for when the window is lent, and what is charged when it is
+    /// not.
+    bytes: u64,
+    /// Bytes the coder holds in RAM beyond its window, lent or not.
+    state: u64,
+    /// For LZMA2, the most one buffer of a threaded decoder's workers can
+    /// be: `lzma-turbo`'s `Lzma2Decoder::max_worker_window_len`.
+    worker: Option<u64>,
+}
+
+impl Window {
+    /// An LZMA dictionary of `dict_size`, already clamped, for a coder whose
+    /// first property byte is `lclppb`: the probability table it sizes is
+    /// state, see [`crate::codec::lzma_turbo::lzma_state_bytes`].
+    fn lzma(lclppb: u8, dict_size: u32) -> Self {
+        Self {
+            bytes: crate::codec::lzma_turbo::lzma_window_bytes(dict_size),
+            state: crate::codec::lzma_turbo::lzma_state_bytes(lclppb),
+            worker: None,
+        }
+    }
+
+    /// An LZMA2 dictionary of property `dict_prop`, already clamped: the
+    /// window `lzma-turbo`'s `Lzma2Decoder::window_len` gives for it.
+    fn lzma2(dict_prop: u8) -> Result<Self, Error> {
+        Ok(Self {
+            bytes: crate::codec::lzma_turbo::lzma2_window_bytes(dict_prop)?,
+            state: crate::codec::lzma_turbo::LZ_STATE_BYTES,
+            worker: Some(crate::codec::lzma_turbo::lzma2_worker_window_bytes(
+                dict_prop,
+            )?),
+        })
+    }
+
+    /// A PPMd model of `memory_size` bytes, with the decoder's tables and the
+    /// [`INPUT_BUF_SIZE`] buffer [`add_decoder`] reads its input through
+    /// charged at `crate::container`'s PPMd margin.
+    #[cfg(feature = "ppmd")]
+    fn ppmd(memory_size: u32) -> Self {
+        Self {
+            bytes: crate::container::ppmd_arena_bytes(memory_size),
+            state: crate::container::PPMD_STATE_BYTES,
+            worker: None,
+        }
+    }
+
+    /// The largest buffer a threaded LZMA2 decoder's workers can be lent
+    /// under `limits`: [`Window::worker`] held to the ceiling, when that is
+    /// over the in-RAM limit. `None` when no worker buffer is lent, for a
+    /// coder that has no workers, or without an allocator.
+    fn lent_worker(self, limits: &ArchiveLimits) -> Option<u64> {
+        let worker = self.worker?.min(limits.max_lent_window_bytes);
+        limits.lends(worker).then_some(worker)
+    }
+
+    /// Kilobytes the coder holds in RAM under `limits`: its state, and its
+    /// window unless `limits` lend it, rounded up to a whole kilobyte. The one
+    /// figure every check charges a sized coder.
+    fn ram_kb(self, limits: &ArchiveLimits) -> usize {
+        let bytes = if limits.lends(self.bytes) {
+            self.state
+        } else {
+            self.bytes.saturating_add(self.state)
+        };
+        usize::try_from(bytes.div_ceil(1024)).unwrap_or(usize::MAX)
+    }
+
+    /// Whether `limits` lend this window. A lent window over
+    /// `max_lent_window_bytes` is refused here, before the allocator can be
+    /// asked for it.
+    fn lent(self, limits: &ArchiveLimits) -> Result<bool, Error> {
+        if !limits.lends(self.bytes) {
+            return Ok(false);
+        }
+        if self.bytes > limits.max_lent_window_bytes {
+            return Err(Error::limit(
+                crate::Limit::LentWindowBytes,
+                limits.max_lent_window_bytes,
+                self.bytes,
+            ));
+        }
+        Ok(true)
+    }
+
+    /// The loan of this window from the caller's allocator, when
+    /// [`Window::lent`] says it is lent.
+    fn loan(self, limits: &ArchiveLimits) -> Result<Option<WindowLoan>, Error> {
+        Ok(if self.lent(limits)? {
+            WindowLoan::of(limits)
+        } else {
+            None
+        })
+    }
+
+    /// The loan an LZMA2 decoder of this window is built with: whenever
+    /// `limits` set an allocator, since the decoder lends each of its
+    /// buffers by its own length, and a threaded decoder's workers can lend
+    /// theirs when the dictionary itself stays in RAM. The dictionary over
+    /// the ceiling is still refused here first.
+    fn lzma2_loan(self, limits: &ArchiveLimits) -> Result<Option<WindowLoan>, Error> {
+        self.lent(limits)?;
+        Ok(WindowLoan::of(limits))
+    }
+
+    /// This window under `limits`, decided as [`add_decoder`] decides it.
+    fn split(self, limits: &ArchiveLimits) -> WindowSplit {
+        let lent = limits.lends(self.bytes);
+        WindowSplit {
+            in_ram: (self.ram_kb(limits) as u64).saturating_mul(1024),
+            lent: lent.then_some(self.bytes),
+            worker: self.lent_worker(limits),
+        }
+    }
+
+    /// The error a coder's construction failed with: the caller's allocator's
+    /// own when it could not supply the window, otherwise `other`'s.
+    ///
+    /// `lzma-turbo` hands the allocator's error back inside the `io::Error`
+    /// it fails with, a panic in the allocator included; `ppmd-turbo` keeps
+    /// only its kind, so the lender keeps the error itself for that codec.
+    fn failure(
+        self,
+        loan: Option<&WindowLoan>,
+        error: std::io::Error,
+        other: impl FnOnce(std::io::Error) -> Error,
+    ) -> Error {
+        let error = match crate::codec::lzma_turbo::window_failure(error) {
+            Ok(failed) => return failed,
+            Err(error) => error,
+        };
+        match loan.and_then(|loan| loan.lender.take_refusal()) {
+            Some(error) => Error::WindowAllocatorFailed {
+                bytes: self.bytes,
+                error,
+            },
+            None => other(error),
+        }
+    }
+}
+
+/// The window one coder's decoder holds, by the same model [`add_decoder`]
+/// builds it with: the dictionary, clamped to the coder's output the way the
+/// decoder clamps it, for LZMA and LZMA2; the declared model for PPMd.
 ///
 /// `None` for every other coder: filters and the fixed-size codecs are not
 /// sized against the limit, and Zstandard's window is fitted to whatever the
 /// limit leaves (see [`DecodeOptions::reserved_kb`]). `None` too for
 /// properties too short to read a size out of, so that [`add_decoder`] still
 /// reports them in its own words when it reaches the coder.
-fn sized_coder_memory_kb(coder: &Coder, uncompressed_len: u64) -> Option<usize> {
+fn coder_window(coder: &Coder, uncompressed_len: u64) -> Option<Window> {
     let method_id = coder.encoder_method_id();
     if method_id == EncoderMethod::ID_LZMA {
-        let dict_size = crate::codec::lzma_turbo::clamp_dictionary(
-            crate::codec::lzma_turbo::lzma_dictionary_size(coder.properties()).ok()?,
-            uncompressed_len,
-        );
-        Some(lzma2_memory_usage_kb(dict_size))
+        Some(Window::lzma(
+            *coder.properties().first()?,
+            crate::codec::lzma_turbo::clamp_dictionary(
+                crate::codec::lzma_turbo::lzma_dictionary_size(coder.properties()).ok()?,
+                uncompressed_len,
+            ),
+        ))
     } else if method_id == EncoderMethod::ID_LZMA2 {
         let dict_prop = lzma2_clamped_prop(*coder.properties().first()?, uncompressed_len);
-        Some(lzma2_memory_usage_kb(
-            lzma2_dictionary_size(&[dict_prop]).ok()?,
-        ))
-    } else if cfg!(feature = "ppmd") && method_id == EncoderMethod::ID_PPMD {
-        let size = coder.properties().get(1..5)?;
-        let memory_size = u32::from_le_bytes([size[0], size[1], size[2], size[3]]);
-        Some(ppmd_memory_kb(memory_size))
+        Window::lzma2(dict_prop).ok()
     } else {
+        #[cfg(feature = "ppmd")]
+        if method_id == EncoderMethod::ID_PPMD {
+            let size = coder.properties().get(1..5)?;
+            return Some(Window::ppmd(u32::from_le_bytes([
+                size[0], size[1], size[2], size[3],
+            ])));
+        }
         None
     }
 }
 
-/// What a PPMd coder holds: its model, and the [`INPUT_BUF_SIZE`] buffer
-/// [`add_decoder`] reads its input through. One figure, so the chain check
-/// and the per-coder check charge the same thing.
-fn ppmd_memory_kb(memory_size: u32) -> usize {
-    (memory_size.div_ceil(1024) as usize).saturating_add(INPUT_BUF_SIZE.div_ceil(1024))
+/// One coder's window under a set of limits, by the decision [`add_decoder`]
+/// makes when it builds the coder: on the window clamped to the coder's
+/// output.
+pub(crate) struct WindowSplit {
+    /// The bytes the coder holds in RAM: [`Window::ram_kb`] in bytes, its
+    /// state and, unless it is lent, its window as allocated.
+    pub(crate) in_ram: u64,
+    /// The window asked of the caller's allocator, when it is lent.
+    pub(crate) lent: Option<u64>,
+    /// The largest buffer a threaded LZMA2 decoder's workers can be lent,
+    /// when they can be lent any.
+    pub(crate) worker: Option<u64>,
+}
+
+/// [`WindowSplit`] for `coder` decoding to `uncompressed_len` bytes under
+/// `limits`; `None` for a coder with no window, as for [`coder_window`].
+pub(crate) fn coder_window_split(
+    coder: &Coder,
+    uncompressed_len: u64,
+    limits: &ArchiveLimits,
+) -> Option<WindowSplit> {
+    coder_window(coder, uncompressed_len).map(|window| window.split(limits))
 }
 
 /// The memory limit a block's LZMA2 plan is sized against: the caller's
@@ -538,10 +712,17 @@ pub(crate) fn check_chain_memory<'c>(
     base_kb: usize,
 ) -> Result<usize, Error> {
     let max_kb = limits.memory_limit_kb();
-    let total_kb = coders
+    let mut total_kb = base_kb;
+    for window in coders
         .into_iter()
-        .filter_map(|(coder, len)| sized_coder_memory_kb(coder, len))
-        .fold(base_kb, usize::saturating_add);
+        .filter_map(|(coder, len)| coder_window(coder, len))
+    {
+        // A lent window over the ceiling is refused before any coder of the
+        // chain is built, so no allocator is asked for a window of a chain
+        // that cannot be decoded.
+        window.lent(limits)?;
+        total_kb = total_kb.saturating_add(window.ram_kb(limits));
+    }
     if total_kb > max_kb {
         return Err(Error::MaxMemLimited {
             max_kb,
@@ -571,7 +752,7 @@ pub(crate) fn unsized_coders_memory_kb<'c>(
 ) -> usize {
     coders
         .into_iter()
-        .filter(|&(coder, len)| sized_coder_memory_kb(coder, len).is_none())
+        .filter(|&(coder, len)| coder_window(coder, len).is_none())
         .filter_map(|(coder, _)| coder_memory_estimate(coder).ok())
         .map(|bytes| usize::try_from(bytes.div_ceil(1024)).unwrap_or(usize::MAX))
         .fold(0, usize::saturating_add)
@@ -616,20 +797,25 @@ pub fn add_decoder<I: Read>(
                 crate::codec::lzma_turbo::lzma_dictionary_size(coder.properties())?,
                 uncompressed_len,
             );
-            let mem_size = lzma2_memory_usage_kb(dict_size);
+            let window = Window::lzma(coder.properties()[0], dict_size);
+            let mem_size = window.ram_kb(opts.limits);
             if mem_size > max_mem_limit_kb {
                 return Err(Error::MaxMemLimited {
                     max_kb: max_mem_limit_kb,
                     actaul_kb: mem_size,
                 });
             }
+            let loan = window.loan(opts.limits)?;
             let lz = crate::codec::lzma_turbo::lzma_decoder(
                 input,
                 uncompressed_len,
                 coder.properties(),
                 dict_size,
+                loan.as_ref(),
             )
-            .map_err(|e| Error::bad_password(e, opts.encrypted))?;
+            .map_err(|e| {
+                window.failure(loan.as_ref(), e, |e| Error::bad_password(e, opts.encrypted))
+            })?;
             Ok(Decoder::Lzma(Box::new(lz)))
         }
         EncoderMethod::ID_LZMA2 => {
@@ -642,25 +828,39 @@ pub fn add_decoder<I: Read>(
                 .ok_or_else(|| Error::corrupted("LZMA2 properties too short"))?;
             let dict_prop = lzma2_clamped_prop(dict_prop, uncompressed_len);
             let dic_size = lzma2_dictionary_size(&[dict_prop])?;
-            let mem_size = lzma2_memory_usage_kb(dic_size);
+            let window = Window::lzma2(dict_prop)?;
+            let mem_size = window.ram_kb(opts.limits);
             if mem_size > max_mem_limit_kb {
                 return Err(Error::MaxMemLimited {
                     max_kb: max_mem_limit_kb,
                     actaul_kb: mem_size,
                 });
             }
-
+            let loan = window.lzma2_loan(opts.limits)?;
+            // The plan is sized against what stays in RAM, buffer by buffer.
+            // A lent dictionary is not charged: `mem_size` is then the
+            // coder's state alone, and the plan is told it holds no
+            // dictionary. A worker's run buffer over the in-RAM limit is lent
+            // and `lzma-turbo` charges it nothing; one at or under it is RAM
+            // and charged against the budget, as the input and the queues
+            // are. The thread count is the caller's.
+            let budget = lzma2_plan_budget(
+                opts.limits.memory_limit_bytes,
+                opts.reserved_kb,
+                opts.unsized_kb,
+                mem_size,
+            );
+            let dict_in_ram = if window.lent(opts.limits)? {
+                0
+            } else {
+                dic_size
+            };
             let plan = match opts.lzma2_control {
                 Some(control) => Lzma2Plan::for_block(
                     opts.threads,
                     opts.adaptive_lzma2,
-                    lzma2_plan_budget(
-                        opts.limits.memory_limit_bytes,
-                        opts.reserved_kb,
-                        opts.unsized_kb,
-                        mem_size,
-                    ),
-                    dic_size,
+                    budget,
+                    dict_in_ram,
                     uncompressed_len,
                     control,
                     opts.checksum_splits,
@@ -671,8 +871,9 @@ pub fn add_decoder<I: Read>(
             if !matches!(plan, Lzma2Plan::SingleThreaded) {
                 PARALLEL_LZMA2_PLANS.with(|plans| plans.set(plans.get() + 1));
             }
-            let mut lz = lzma2_decoder(input, dict_prop, plan)
-                .map_err(|e| Error::bad_password(e, opts.encrypted))?;
+            let mut lz = lzma2_decoder(input, dict_prop, plan, loan.as_ref()).map_err(|e| {
+                window.failure(loan.as_ref(), e, |e| Error::bad_password(e, opts.encrypted))
+            })?;
             if opts.single_run_lzma2 {
                 lz.use_single_run_ring();
             }
@@ -680,7 +881,7 @@ pub fn add_decoder<I: Read>(
         }
         #[cfg(feature = "ppmd")]
         EncoderMethod::ID_PPMD => {
-            let params = get_ppmd_params(coder, max_mem_limit_kb)?;
+            let params = get_ppmd_params(coder, opts.limits)?;
             // Buffered here rather than at the bottom of the chain only, so a
             // PPMd coder anywhere - under AES, inside a BCJ2 graph, in the
             // header - reads its input in large pieces, and an AES coder
@@ -691,8 +892,23 @@ pub fn add_decoder<I: Read>(
             // stream. A stream that is corrupt or cut short fails its read as
             // an I/O error of kind `InvalidData` or `UnexpectedEof`, the same
             // classes the LZMA decoders report.
-            let decoder = PpmdDecoder::new(params, Some(uncompressed_len))
-                .map_err(|err| Error::from(std::io::Error::from(err)))?;
+            let window = Window::ppmd(params.mem_size());
+            let loan = window.loan(opts.limits)?;
+            let decoder = match &loan {
+                None => PpmdDecoder::new(params, Some(uncompressed_len)),
+                Some(loan) => PpmdDecoder::with_arena(
+                    params,
+                    Some(uncompressed_len),
+                    // An in-RAM limit of zero: the choice to lend was made
+                    // here, and the codec only carries it out.
+                    PpmdArena::with_allocator(
+                        0,
+                        Arc::clone(&loan.lender) as Arc<dyn ppmd_turbo::ArenaAllocator>,
+                    )
+                    .with_max_lent(loan.max_bytes),
+                ),
+            }
+            .map_err(|err| window.failure(loan.as_ref(), std::io::Error::from(err), Error::from))?;
             Ok(Decoder::Ppmd(Box::new(SevenZReader::from_decoder(
                 input, decoder,
             ))))
@@ -850,7 +1066,8 @@ pub fn add_decoder<I: Read>(
 }
 
 #[cfg(feature = "ppmd")]
-fn get_ppmd_params(coder: &Coder, max_mem_limit_kb: usize) -> Result<PpmdParams, Error> {
+fn get_ppmd_params(coder: &Coder, limits: &ArchiveLimits) -> Result<PpmdParams, Error> {
+    let max_mem_limit_kb = limits.memory_limit_kb();
     // 7-Zip reads the first five property bytes and ignores any after them.
     let props = coder
         .properties()
@@ -864,8 +1081,9 @@ fn get_ppmd_params(coder: &Coder, max_mem_limit_kb: usize) -> Result<PpmdParams,
         ))
     })?;
 
-    // Checked before the decoder allocates its model.
-    let memory_size_kb = ppmd_memory_kb(params.mem_size());
+    // Checked before the decoder allocates its model, which counts only
+    // when it is in RAM.
+    let memory_size_kb = Window::ppmd(params.mem_size()).ram_kb(limits);
     if memory_size_kb > max_mem_limit_kb {
         return Err(Error::MaxMemLimited {
             max_kb: max_mem_limit_kb,

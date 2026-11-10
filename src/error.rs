@@ -161,6 +161,24 @@ pub enum Error {
     /// and `finish` returns this instead of writing; the string is the
     /// earlier failure, rendered.
     WriterPoisoned(String),
+    /// The caller's [`WindowAllocator`] could not supply a window a coder
+    /// needed: an LZMA or LZMA2 dictionary, or a PPMd model arena, over
+    /// [`ArchiveLimits::max_in_ram_window_bytes`]. The archive is not at
+    /// fault.
+    ///
+    /// `error` is the allocator's own, kept whole. The memory it handed back
+    /// is refused here too when it was shorter than asked, at a null
+    /// address, or longer than `isize::MAX` bytes: `error` is then of kind
+    /// [`std::io::ErrorKind::InvalidInput`], and the memory has been dropped.
+    ///
+    /// [`WindowAllocator`]: crate::WindowAllocator
+    /// [`ArchiveLimits::max_in_ram_window_bytes`]: crate::ArchiveLimits::max_in_ram_window_bytes
+    WindowAllocatorFailed {
+        /// The window asked for, in bytes.
+        bytes: u64,
+        /// Why the allocator could not supply it.
+        error: std::io::Error,
+    },
 }
 
 /// Which bound an [`Error::LimitExceeded`] hit.
@@ -201,6 +219,9 @@ pub enum Limit {
     AesCyclesPower,
     /// `max_aes_kdf_rounds`, across the archive and encoded header.
     AesKdfRounds,
+    /// `max_lent_window_bytes`, in bytes of one window asked of the caller's
+    /// window allocator.
+    LentWindowBytes,
     /// The archive's own structure, rather than a caller's limit: a count,
     /// size or offset that the bytes present cannot possibly support.
     ///
@@ -230,6 +251,7 @@ impl Limit {
             Self::UnpackRatio => "max_unpack_ratio",
             Self::AesCyclesPower => "max_aes_cycles_power",
             Self::AesKdfRounds => "max_aes_kdf_rounds",
+            Self::LentWindowBytes => "max_lent_window_bytes",
             Self::ArchiveBytes => "the bytes the archive has",
         }
     }
@@ -285,6 +307,7 @@ impl Error {
                 std::io::ErrorKind::InvalidData
             }
             Self::InvalidArgument(_) => std::io::ErrorKind::InvalidInput,
+            Self::WindowAllocatorFailed { ref error, .. } => error.kind(),
             _ => std::io::ErrorKind::Other,
         };
         std::io::Error::new(kind, self)
@@ -378,6 +401,7 @@ impl Error {
     /// a cancellation or a failed worker is reported the same way on every
     /// path. A result that is not damage in the block is returned as it is:
     /// a block error already, [`Error::LimitExceeded`] (the caller's budget),
+    /// [`Error::WindowAllocatorFailed`] (the caller's allocator),
     /// [`Error::Cancelled`], [`Error::InvalidArgument`] and
     /// [`Error::Internal`].
     #[must_use]
@@ -387,6 +411,7 @@ impl Error {
             error,
             Self::BlockDecode { .. }
                 | Self::LimitExceeded { .. }
+                | Self::WindowAllocatorFailed { .. }
                 | Self::Cancelled
                 | Self::InvalidArgument(_)
                 | Self::Internal(_)
@@ -421,18 +446,34 @@ impl Error {
         match self {
             Self::Io(io, context) => match io.downcast::<Error>() {
                 Ok(error) => error.out_of_io(),
-                Err(io) => Self::from_coder(&io).unwrap_or(Self::Io(io, context)),
+                Err(io) => match crate::codec::lzma_turbo::window_failure(io) {
+                    Ok(error) => error,
+                    Err(io) => Self::from_coder(&io).unwrap_or(Self::Io(io, context)),
+                },
             },
             Self::MaybeBadPassword(io) => {
+                // No password causes a cancellation, a failed invariant or
+                // the caller's allocator failing.
                 let own_fault = io
                     .get_ref()
                     .and_then(|inner| inner.downcast_ref::<Error>())
-                    .is_some_and(|error| matches!(error, Self::Cancelled | Self::Internal(_)));
+                    .is_some_and(|error| {
+                        matches!(
+                            error,
+                            Self::Cancelled
+                                | Self::Internal(_)
+                                | Self::WindowAllocatorFailed { .. }
+                        )
+                    });
                 if own_fault {
                     return io
                         .downcast::<Error>()
                         .unwrap_or_else(Self::MaybeBadPassword);
                 }
+                let io = match crate::codec::lzma_turbo::window_failure(io) {
+                    Ok(error) => return error,
+                    Err(io) => io,
+                };
                 Self::from_coder(&io).unwrap_or(Self::MaybeBadPassword(io))
             }
             error => error,
@@ -467,6 +508,7 @@ impl Error {
                 Some(error)
             }
             Self::BlockDecode { cause, .. } => cause.io_error(),
+            Self::WindowAllocatorFailed { error, .. } => Some(error),
             _ => None,
         }
     }
@@ -643,6 +685,10 @@ impl Error {
                 cause: Box::new(cause.copy()),
             },
             Self::WriterPoisoned(message) => Self::WriterPoisoned(message.clone()),
+            Self::WindowAllocatorFailed { bytes, error } => Self::WindowAllocatorFailed {
+                bytes: *bytes,
+                error: copy_io(error),
+            },
         }
     }
 }
@@ -667,6 +713,12 @@ impl Display for Error {
             Self::InvalidArgument(detail) => write!(f, "invalid argument: {detail}"),
             Self::Cancelled => f.write_str("cancelled"),
             Self::Internal(detail) => write!(f, "internal error: {detail}"),
+            Self::WindowAllocatorFailed { bytes, error } => {
+                write!(
+                    f,
+                    "window allocator could not supply {bytes} bytes: {error}"
+                )
+            }
             _ => std::fmt::Debug::fmt(&self, f),
         }
     }

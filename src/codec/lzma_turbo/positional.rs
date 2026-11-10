@@ -47,7 +47,7 @@ struct Folder {
     file_indexes: Vec<usize>,
     streams: Vec<SubStream>,
     prop: u8,
-    limit: u64,
+    limits: ArchiveLimits,
     plan: ChecksumPlan,
 }
 
@@ -249,7 +249,7 @@ impl PositionalLzma2Folder {
             file_indexes,
             streams,
             prop,
-            limit: limits.memory_limit_bytes,
+            limits,
             plan: ChecksumPlan::new(Checksum::Crc32).with_split_points(splits),
         }))))
     }
@@ -496,12 +496,24 @@ impl PositionalLzma2Run {
     }
     /// Ring, coder state and positional input buffer reservation. The caller
     /// charges shared archive metadata and destination buffers separately.
+    /// A ring the folder's limits lend, one over
+    /// [`crate::ArchiveLimits::max_in_ram_window_bytes`] with a window
+    /// allocator set, is on the caller's memory and counts nothing here.
     ///
     /// # Errors
-    /// Invalid dictionary properties fail before allocation.
+    /// Invalid dictionary properties fail before allocation, and a lent ring
+    /// over [`crate::ArchiveLimits::max_lent_window_bytes`] is refused as
+    /// [`crate::Limit::LentWindowBytes`].
     pub fn memory_required(&self) -> Result<u64, Error> {
-        let ring = Lzma2RunDecoder::memory_required(self.folder.0.prop, self.run.unpacked_len)
-            .map_err(|e| Error::from(std::io::Error::from(e)))?;
+        let ring = match self.loan()? {
+            None => Lzma2RunDecoder::memory_required(self.folder.0.prop, self.run.unpacked_len),
+            Some(loan) => Lzma2RunDecoder::memory_required_with_window(
+                self.folder.0.prop,
+                self.run.unpacked_len,
+                &loan.backing(),
+            ),
+        }
+        .map_err(|e| Error::from(std::io::Error::from(e)))?;
         let checks = Lzma2RunDecoder::checksum_memory_required(
             &self.folder.0.plan,
             self.run.out_offset,
@@ -511,6 +523,41 @@ impl PositionalLzma2Run {
         // At completion the codec records and public records may briefly
         // coexist. Both layouts fit in this doubled codec-record reservation.
         Ok(ring + self.run.packed_len.min(INPUT_BYTES as u64) + checks * 2)
+    }
+
+    /// The run's ring: its dictionary, clamped to the run's output, as the
+    /// codec allocates it (`lzma-turbo`'s `Lzma2Decoder::capped_window_len`).
+    /// The window a caller's allocator is asked for, and judged by
+    /// [`crate::ArchiveLimits::max_in_ram_window_bytes`].
+    fn ring_bytes(&self) -> Result<u64, Error> {
+        let cap = self.run.unpacked_len.min(u64::from(u32::MAX)) as u32;
+        lzma_turbo::Lzma2Decoder::capped_window_len(self.folder.0.prop, cap)
+            .map(|len| len as u64)
+            .map_err(|e| Error::from(std::io::Error::from(e)))
+    }
+
+    /// The loan of this run's ring from the caller's allocator, when the
+    /// folder's limits lend it; a lent ring over the ceiling is refused here,
+    /// before the allocator can be asked. `None` with no allocator, or for a
+    /// ring at or under the in-RAM limit, which decodes in RAM as it always
+    /// did.
+    fn loan(&self) -> Result<Option<super::WindowLoan>, Error> {
+        let limits = &self.folder.0.limits;
+        if limits.window_allocator.is_none() {
+            return Ok(None);
+        }
+        let ring = self.ring_bytes()?;
+        if !limits.lends(ring) {
+            return Ok(None);
+        }
+        if ring > limits.max_lent_window_bytes {
+            return Err(Error::limit(
+                crate::Limit::LentWindowBytes,
+                limits.max_lent_window_bytes,
+                ring,
+            ));
+        }
+        Ok(super::WindowLoan::of(limits))
     }
 
     /// Decodes on the calling worker and writes at folder-relative offsets.
@@ -527,23 +574,39 @@ impl PositionalLzma2Run {
     where
         F: FnMut(u64, &[u8]) -> io::Result<usize> + ?Sized,
     {
+        let limits = &self.folder.0.limits;
+        // A ring the limits lend is asked of the caller's allocator once,
+        // as the run decoder is built, and released when it drops at the end
+        // of this run; `memory_required` leaves it out.
+        let loan = self.loan()?;
         let required = self.memory_required()?;
-        if required > self.folder.0.limit {
+        if required > limits.memory_limit_bytes {
             return Err(Error::MemoryLimited {
-                limit_bytes: self.folder.0.limit,
+                limit_bytes: limits.memory_limit_bytes,
                 required_bytes: required,
             });
         }
         let packed = self.packed_range();
         let locate = |error: Error| error.in_block(self.folder.0.block, packed.offset);
         let input_size = self.run.packed_len.min(INPUT_BYTES as u64) as usize;
-        let mut decoder = Lzma2RunDecoder::new(
-            self.index,
-            self.folder.0.prop,
-            self.run,
-            self.folder.0.limit - input_size as u64,
-        )
-        .map_err(|e| locate(Error::from(std::io::Error::from(e))))?;
+        let room = limits.memory_limit_bytes - input_size as u64;
+        let mut decoder = match &loan {
+            None => Lzma2RunDecoder::new(self.index, self.folder.0.prop, self.run, room)
+                .map_err(|e| locate(Error::from(std::io::Error::from(e))))?,
+            Some(loan) => Lzma2RunDecoder::with_window(
+                self.index,
+                self.folder.0.prop,
+                self.run,
+                room,
+                loan.backing(),
+            )
+            // The allocator's own error, whole, is the caller's and not
+            // damage in the block.
+            .map_err(|e| match super::window_failure(e) {
+                Ok(failed) => failed,
+                Err(e) => locate(Error::from(e)),
+            })?,
+        };
         decoder
             .set_checksum_plan(&self.folder.0.plan)
             .map_err(|e| locate(Error::from(std::io::Error::from(e))))?;
@@ -844,5 +907,123 @@ mod tests {
             folder.verify_runs(&[completion]).unwrap()[0].len,
             expected.len() as u64
         );
+    }
+
+    /// With a window allocator set, a run whose ring is over the in-RAM
+    /// window limit decodes on one lent ring, asked once and not counted in
+    /// `memory_required`; one at or under it decodes in RAM, the allocator
+    /// unasked; a ring over the lent ceiling is refused before any ask; and
+    /// an allocator's refusal reaches the caller whole.
+    #[test]
+    fn a_ring_over_the_in_ram_window_limit_decodes_on_lent_memory() {
+        struct Refuses;
+        impl crate::WindowAllocator for Refuses {
+            fn allocate(&self, _: usize) -> io::Result<Box<dyn crate::WindowMemory>> {
+                Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "positional says no",
+                ))
+            }
+        }
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let expected: Vec<u8> = (0..2 << 20)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 40) as u8 & 0x1F
+            })
+            .collect();
+        let mut options = Lzma2Options::from_level(1);
+        options.set_dictionary_size(4 << 20);
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        writer.set_content_methods(vec![options.into()]);
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("member"), Some(expected.as_slice()))
+            .unwrap();
+        let bytes = Arc::new(writer.finish().unwrap().into_inner());
+        let archive = Arc::new(
+            Archive::read(&mut Cursor::new(bytes.as_slice()), &Password::empty()).unwrap(),
+        );
+        let heap = Arc::new(crate::window_memory::TestHeap {
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let asked = || heap.asked.load(std::sync::atomic::Ordering::SeqCst);
+        let decode = |limits: ArchiveLimits| {
+            let folder = PositionalLzma2Folder::new(archive.clone(), bytes.clone(), 0, limits)
+                .unwrap()
+                .unwrap();
+            let pack = folder.packed_range();
+            let mut scanner = folder.scanner();
+            scanner
+                .feed(&bytes[pack.offset as usize..pack.end() as usize])
+                .unwrap();
+            let run = scanner.next_run().unwrap();
+            assert!(scanner.next_run().is_none(), "one run");
+            let ring = run.ring_bytes().unwrap();
+            let required = run.memory_required();
+            let mut decoded = Vec::new();
+            let result = run.decode(&AtomicBool::new(false), &mut |_, data: &[u8]| {
+                decoded.extend_from_slice(data);
+                Ok(data.len())
+            });
+            (ring, required, result.map(|_| decoded))
+        };
+        let lending = |in_ram: u64| {
+            ArchiveLimits::default()
+                .with_window_allocator(Arc::clone(&heap) as Arc<dyn crate::WindowAllocator>, in_ram)
+        };
+
+        // Unlent, the ring is counted, as on origin.
+        let (ring, owned_required, owned) = decode(ArchiveLimits::default());
+        assert_eq!(ring, 2 << 20);
+        let owned_required = owned_required.unwrap();
+        assert!(owned_required >= ring);
+        assert!(owned.unwrap() == expected, "decoded to other bytes");
+
+        // Lent: asked once, the ring left out of the count.
+        let (_, lent_required, lent) = decode(lending(1 << 20));
+        assert_eq!(lent_required.unwrap(), owned_required - ring);
+        assert!(
+            lent.unwrap() == expected,
+            "decoded to other bytes on lent memory"
+        );
+        assert_eq!(asked(), 1);
+
+        // At the in-RAM limit, decoded in RAM and nothing asked.
+        let (_, in_ram_required, in_ram) = decode(lending(ring));
+        assert_eq!(in_ram_required.unwrap(), owned_required);
+        assert!(in_ram.unwrap() == expected, "decoded to other bytes in RAM");
+        assert_eq!(asked(), 1);
+
+        // Over the lent ceiling: refused, nothing asked.
+        let mut capped = lending(1 << 20);
+        capped.max_lent_window_bytes = ring - 1;
+        let (_, capped_required, capped) = decode(capped);
+        for refused in [capped_required.map(|_| ()), capped.map(|_| ())] {
+            assert!(
+                matches!(
+                    refused,
+                    Err(Error::LimitExceeded {
+                        what: crate::Limit::LentWindowBytes,
+                        ..
+                    })
+                ),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(asked(), 1);
+
+        // A refusal is the allocator's own error.
+        let refusing = ArchiveLimits::default().with_window_allocator(Arc::new(Refuses), 1 << 20);
+        let (_, _, refused) = decode(refusing);
+        match refused {
+            Err(Error::WindowAllocatorFailed { bytes, error }) => {
+                assert_eq!(bytes, ring);
+                assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+                assert_eq!(error.to_string(), "positional says no");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

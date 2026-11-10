@@ -15,6 +15,17 @@ initializing an aligned allocation before `assume_init`, and the Linux
 this inventory and the focused selectors rather than run the whole archive
 suite under Miri.
 
+The caller-memory windows are in `src/window_memory.rs`. The public
+`WindowMemory` trait is `unsafe` to implement: its implementer promises a
+pointer valid for `len` bytes, stable and exclusive while the value lives.
+The crate's own unsafe code there is the private `LentWindow` that carries a
+caller's memory into the codecs: `Send`, and the `lzma_turbo::WindowMemory`
+and `ppmd_turbo::ArenaMemory` implementations. `Lender::lend` reads the
+pointer and length once, and refuses memory that is null, shorter than asked
+or longer than `isize::MAX` bytes before any codec sees it. The test-only
+heap windows (`TestHeap` and the integration tests' `Heap`) implement the
+public trait over a boxed slice.
+
 The crate's own threading has no unsafe code, but it is where a data race or
 a use after free across threads would come from: the ordered job queue
 (`src/ordered.rs`, which the folder-parallel decode and the parallel encoders
@@ -27,7 +38,7 @@ tests of those as well.
 | `guard-pages` | Source, codec and output allocations during pull, Send and prepared-block APIs; short reads, failure and teardown. Parallel LZMA2 decode at two threads (cursor and positional source), BCJ2 written and committed, AES-256 encode and decode with a wrong-password refusal, PPMd encode and decode | `compress,aes256,aws-lc-crypto,ppmd` | All four native platforms |
 | `unsafe-valgrind` | The allocation unit tests and source-buffer lifecycle integration tests, on separate runners | `compress` | Linux x86-64 and ARM64 |
 | `unsafe-sanitizer` | The allocation and lifecycle tests above (`compress`); `ordered::tests`, `pipeline::tests` and `reader::store_overlap::tests`; `tests/parallel_decode_tests.rs` and `tests/store_overlap_tests.rs`. Each under AddressSanitizer and ThreadSanitizer, with instrumented std | `compress`; `compress,aes256,native-crypto,ppmd` for the concurrency tests | Linux x86-64 and ARM64 |
-| `unsafe-miri` | Initialization, unsupported advice, panic cleanup, independent allocations, movement between threads, and allocation-policy boundaries | `compress` | One Linux runner per discovered portable test |
+| `unsafe-miri` | Initialization, unsupported advice, panic cleanup, independent allocations, movement between threads, and allocation-policy boundaries; `window_memory::tests`: a lent window written and read through its pointer, moved between threads and freed once, a refusal kept for the builder, and memory that does not fit refused and dropped | `compress` | One Linux runner per discovered portable test |
 
 The sanitizer selectors, exactly:
 
@@ -96,6 +107,11 @@ What no lane above runs, so that a pass is not read as more than it is:
   threads) are exercised only as far as the guard cases and the
   concurrency tests write archives; no sanitizer test targets their
   teardown and error paths directly.
+- The PPMd arena adapter over lent memory is not under Miri, whose lane
+  builds without `ppmd`; its test (`a_lent_arena_is_the_callers_memory_and_is_freed_once`)
+  and the lent-window decodes in `tests/lent_window_tests.rs` run in the
+  ordinary test matrix only. The adapter shares `LentWindow` with the LZMA
+  window Miri does run.
 - The positional run API (`PositionalLzma2Folder`, its scanner and run
   decoder), the adaptive coder widening while a decode runs, and
   `decode_blocks_parallel` across a folder too large to stage are covered by

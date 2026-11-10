@@ -627,8 +627,13 @@ mod borrowed_delivery_tests {
         fault: Fault,
         report: Rc<Cell<Option<u32>>>,
     ) -> impl DecodeRead {
-        let decoder =
-            lzma2_decoder(io::Cursor::new(input), prop, Lzma2Plan::SingleThreaded).unwrap();
+        let decoder = lzma2_decoder(
+            io::Cursor::new(input),
+            prop,
+            Lzma2Plan::SingleThreaded,
+            None,
+        )
+        .unwrap();
         let inner: Box<dyn DecodeRead> = Box::new(DeclaredLength {
             inner: decoder,
             owed: len as u64,
@@ -2666,10 +2671,24 @@ impl ArchiveReader<File> {
     /// default of one thread that handle is never read.
     #[inline]
     pub fn open(path: impl AsRef<std::path::Path>, password: Password) -> Result<Self, Error> {
+        Self::open_with_limits(path, password, ArchiveLimits::default())
+    }
+
+    /// [`ArchiveReader::open`] under `limits`, as [`ArchiveReader::with_limits`]
+    /// checks them.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveReader::with_limits`], and the file's own open error.
+    pub fn open_with_limits(
+        path: impl AsRef<std::path::Path>,
+        password: Password,
+        limits: ArchiveLimits,
+    ) -> Result<Self, Error> {
         let file = File::open(path.as_ref())
             .map_err(|e| Error::file_open(e, path.as_ref().to_string_lossy().to_string()))?;
         let positional = file.try_clone().ok();
-        let mut reader = Self::new(file, password)?;
+        let mut reader = Self::with_limits(file, password, limits)?;
         reader.set_input_complete(true);
         #[cfg(any(unix, windows))]
         if let Some(positional) = positional {
@@ -2726,7 +2745,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
     /// - [`Archive::decoder_memory_estimate`], against
     ///   [`ArchiveLimits::memory_limit_bytes`], before any decoder is built
     ///   ([`Error::MemoryLimited`]). The same limit then bounds each block's
-    ///   coder chain, summed, before it is constructed.
+    ///   coder chain, summed, before it is constructed. A window
+    ///   [`ArchiveLimits::window_allocator`] would lend is left out of both.
     ///
     /// An archive whose coder chain has no memory model is refused too when a
     /// memory limit is set: a budget that cannot be computed has not been met.
@@ -2740,9 +2760,25 @@ impl<R: Read + Seek> ArchiveReader<R> {
         limits: ArchiveLimits,
     ) -> Result<Self, Error> {
         let archive = Archive::read_with_limits(&mut source, &password, &limits)?;
+        Self::from_archive_with_limits(archive, source, password, limits)
+    }
 
+    /// [`ArchiveReader::from_archive`] under `limits`: the decoder memory
+    /// check of [`ArchiveReader::with_limits`] is made here, and the reader
+    /// decodes under `limits`, its window allocator included. `archive`'s
+    /// header was parsed under whatever limits it was read with.
+    ///
+    /// # Errors
+    ///
+    /// The decoder memory refusals of [`ArchiveReader::with_limits`].
+    pub fn from_archive_with_limits(
+        archive: Archive,
+        source: R,
+        password: Password,
+        limits: ArchiveLimits,
+    ) -> Result<Self, Error> {
         if limits.memory_limit_bytes < u64::MAX {
-            match archive.decoder_memory_estimate() {
+            match archive.resident_memory_estimate(&limits) {
                 Ok(required_bytes) if required_bytes > limits.memory_limit_bytes => {
                     return Err(Error::MemoryLimited {
                         limit_bytes: limits.memory_limit_bytes,
@@ -2758,7 +2794,12 @@ impl<R: Read + Seek> ArchiveReader<R> {
             }
         }
 
-        Ok(Self {
+        Ok(Self::assemble(archive, source, password, limits))
+    }
+
+    /// A reader over `archive`, with nothing checked.
+    fn assemble(archive: Archive, source: R, password: Password, limits: ArchiveLimits) -> Self {
+        Self {
             source,
             archive,
             password,
@@ -2777,7 +2818,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             on_block_complete: None,
             on_sub_stream_complete: None,
             positional: None,
-        })
+        }
     }
 
     /// Allows bounded framing inspection anywhere in a complete input.
@@ -2894,7 +2935,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
     /// The limits this reader was built with.
     #[must_use]
     pub fn limits(&self) -> ArchiveLimits {
-        self.limits
+        self.limits.clone()
     }
 
     /// A decoder for one block, borrowing this reader rather than consuming it.
@@ -2923,7 +2964,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             archive: &self.archive,
             password: &self.password,
             source: &mut self.source,
-            limits: self.limits,
+            limits: self.limits.clone(),
             on_sub_stream_complete: self
                 .on_sub_stream_complete
                 .as_mut()
@@ -2955,23 +2996,12 @@ impl<R: Read + Seek> ArchiveReader<R> {
     /// * `archive` - An existing parsed archive instance
     /// * `source` - The reader providing access to the archive data
     /// * `password` - Password for encrypted archives
+    ///
+    /// It decodes under the default limits; [`ArchiveReader::from_archive_with_limits`]
+    /// takes others, a window allocator among them.
     #[inline]
     pub fn from_archive(archive: Archive, source: R, password: Password) -> Self {
-        Self {
-            source,
-            archive,
-            password,
-            thread_count: 1,
-            adaptive_lzma2: false,
-            input_complete: false,
-            verify_checksums: true,
-            lzma2: Arc::new(Lzma2Control::new(1)),
-            index: OnceLock::new(),
-            limits: ArchiveLimits::default(),
-            on_block_complete: None,
-            on_sub_stream_complete: None,
-            positional: None,
-        }
+        Self::assemble(archive, source, password, ArchiveLimits::default())
     }
 
     /// Sets how many threads one block's LZMA2 or BZip2 coder may decode on,
@@ -3134,9 +3164,11 @@ impl<R: Read + Seek> ArchiveReader<R> {
         crate::container::check_aes_coders(block.coders.iter(), opts.limits)?;
         // The chain as a whole against the memory limit, before any coder is
         // built; see `read_encoded_header`. Under `ArchiveReader::with_limits`
-        // this never refuses anything, because `decoder_memory_estimate` has
-        // already bounded the same sum from above; it is what bounds a
-        // `BlockDecoder` built with limits of its own.
+        // this never refuses anything: the up-front check charges each sized
+        // coder the same figure this does, rounded to the same whole KiB (see
+        // `container::coder_memory_split`), and every other coder and the
+        // pack-stream buffer at no less. It is what bounds a `BlockDecoder`
+        // built with limits of its own.
         let (reserved_kb, unsized_kb) = if block.total_input_streams()
             > block.total_output_streams()
         {
@@ -3755,11 +3787,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         #[cfg(not(target_arch = "wasm32"))]
         let planned = if self.positional.is_some() && self.thread_count > 1 {
             let folders = self.archive.blocks.iter().map(|block| {
-                let estimate = block.coders.iter().try_fold(0u64, |sum, coder| {
-                    crate::container::coder_memory_estimate(coder)
-                        .ok()
-                        .map(|bytes| sum.saturating_add(bytes))
-                });
+                let estimate = crate::container::block_coders_resident(block, &self.limits);
                 (block.get_unpack_size(), estimate.unwrap_or(u64::MAX))
             });
             Some(plan_folders(
@@ -3803,7 +3831,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             archive: &self.archive,
             password: &self.password,
             source: &mut self.source,
-            limits: self.limits,
+            limits: self.limits.clone(),
             on_sub_stream_complete: self
                 .on_sub_stream_complete
                 .as_mut()
@@ -3885,7 +3913,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let worker_side = FolderWorker {
             archive: &self.archive,
             password: &self.password,
-            limits: self.limits,
+            limits: self.limits.clone(),
             verify_checksums: self.verify_checksums,
             threads: threads_per_folder,
             ceiling: &self.lzma2,
@@ -4077,11 +4105,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             .blocks
             .iter()
             .map(|block| {
-                let estimate = block.coders.iter().try_fold(0u64, |sum, coder| {
-                    crate::container::coder_memory_estimate(coder)
-                        .ok()
-                        .map(|bytes| sum.saturating_add(bytes))
-                });
+                let estimate = crate::container::block_coders_resident(block, &self.limits);
                 (
                     block.get_unpack_size(),
                     estimate.unwrap_or(u64::MAX),
@@ -4200,7 +4224,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             password: &self.password,
             limits: ArchiveLimits {
                 memory_limit_bytes: worker_memory,
-                ..self.limits
+                ..self.limits.clone()
             },
             verify_checksums: self.verify_checksums,
             threads: threads_per_folder,
@@ -4322,7 +4346,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     archive: &self.archive,
                     password: &self.password,
                     source: &mut self.source,
-                    limits: self.limits,
+                    limits: self.limits.clone(),
                     on_sub_stream_complete: self.on_sub_stream_complete.as_mut().map(|hook| {
                         &mut **hook as &mut (dyn FnMut(SubStreamCompletion) + Send + '_)
                     }),
@@ -5784,7 +5808,7 @@ impl FolderWorker<'_> {
             self.archive,
             self.password,
             &mut cursor,
-            self.limits,
+            self.limits.clone(),
         )
         .with_verify_checksums(self.verify_checksums);
         decoder.on_sub_stream_complete = Some(&mut hook);
@@ -6932,6 +6956,255 @@ mod chain_plan_tests {
             .expect("decodes");
         assert!(out == data, "the chain decoded to other bytes");
         assert_eq!(crate::decoder::PARALLEL_LZMA2_PLANS.with(Cell::get), 1);
+    }
+
+    /// A lent dictionary never lowers the thread count: the block four
+    /// threads would decode in parallel plans a parallel reader whether its
+    /// dictionary is in RAM or lent, and lent it decodes on the caller's
+    /// memory, its workers' buffers asked of the allocator; at one thread
+    /// it decodes on one lent dictionary.
+    // Built unthreaded, the writer makes one solid LZMA2 stream, which has no
+    // runs to share among threads.
+    #[cfg(not(sevenz_turbo_unthreaded))]
+    #[test]
+    fn a_lent_lzma2_dictionary_keeps_the_thread_count() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let data: Vec<u8> = (0..8 << 20)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 40) as u8 & 0x1F
+            })
+            .collect();
+        let mut options = Lzma2Options::from_level_mt(1, 4, 1 << 20);
+        options.set_dictionary_size(1 << 20);
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+        writer.set_content_methods(vec![options.into()]);
+        writer
+            .push_archive_entry(ArchiveEntry::new_file("one"), Some(data.as_slice()))
+            .expect("push");
+        let mut source = writer.finish().expect("finish");
+        let archive = Archive::read(&mut source, &Password::empty()).expect("parse");
+        let password = Password::empty();
+        let heap = Arc::new(crate::window_memory::TestHeap {
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let lending = || {
+            ArchiveLimits::default()
+                .with_window_allocator(Arc::clone(&heap) as Arc<dyn crate::WindowAllocator>, 0)
+        };
+        let decode = |threads: u32, limits: ArchiveLimits, source: &mut Cursor<Vec<u8>>| {
+            crate::decoder::PARALLEL_LZMA2_PLANS.with(|plans| plans.set(0));
+            let mut out = Vec::new();
+            BlockDecoder::with_limits(threads, 0, &archive, &password, source, limits)
+                .for_each_entries(&mut |_, rd| {
+                    rd.read_to_end(&mut out)?;
+                    Ok(true)
+                })
+                .map(|_| out)
+        };
+
+        let out = decode(4, ArchiveLimits::default(), &mut source).expect("decodes in RAM");
+        assert!(out == data, "decoded to other bytes in RAM");
+        assert_eq!(crate::decoder::PARALLEL_LZMA2_PLANS.with(Cell::get), 1);
+
+        let asked = || heap.asked.load(std::sync::atomic::Ordering::SeqCst);
+        let out = decode(4, lending(), &mut source).expect("decodes threaded on lent memory");
+        assert!(
+            out == data,
+            "decoded to other bytes threaded on lent memory"
+        );
+        assert_eq!(crate::decoder::PARALLEL_LZMA2_PLANS.with(Cell::get), 1);
+        let threaded = asked();
+        assert!(threaded > 1, "asked {threaded} windows on four threads");
+
+        let out = decode(1, lending(), &mut source).expect("decodes on lent memory");
+        assert!(out == data, "decoded to other bytes on lent memory");
+        assert_eq!(crate::decoder::PARALLEL_LZMA2_PLANS.with(Cell::get), 0);
+        assert_eq!(asked(), threaded + 1);
+    }
+
+    /// Folders decoded side by side each lend their own window, and a lent
+    /// window costs a worker nothing of the limit: under a limit that holds
+    /// fewer than three workers with the dictionaries in RAM, lending them
+    /// plans three, each held to a share that still covers its decoder, and
+    /// the decode asks for one window per folder and releases each.
+    #[test]
+    fn unordered_workers_each_lend_a_window_counted_as_nothing() {
+        let mut options = Lzma2Options::from_level(1);
+        options.set_dictionary_size(4 << 20);
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+        writer.set_content_methods(vec![options.into()]);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let members: Vec<Vec<u8>> = (0..3)
+            .map(|_| {
+                (0..3 << 20)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        (x >> 40) as u8 & 0x1F
+                    })
+                    .collect()
+            })
+            .collect();
+        for (index, data) in members.iter().enumerate() {
+            writer
+                .push_archive_entry(
+                    ArchiveEntry::new_file(&format!("{index}")),
+                    Some(data.as_slice()),
+                )
+                .expect("push");
+        }
+        let bytes = writer.finish().expect("finish").into_inner();
+        let heap = Arc::new(crate::window_memory::TestHeap {
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let lending = ArchiveLimits::default().with_window_allocator(
+            Arc::clone(&heap) as Arc<dyn crate::WindowAllocator>,
+            1 << 20,
+        );
+        let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty()).expect("parse");
+        assert_eq!(archive.blocks.len(), 3);
+        let resident = |limits: &ArchiveLimits| {
+            archive
+                .blocks
+                .iter()
+                .map(|block| crate::container::block_coders_resident(block, limits).unwrap())
+                .max()
+                .unwrap()
+        };
+        let lent = resident(&lending);
+        let in_ram = resident(&ArchiveLimits::default());
+        assert!(in_ram >= lent + (3 << 20), "{in_ram} {lent}");
+        let limit = FOLDER_CHUNK_BYTES as u64 + 3 * (lent + UNORDERED_WORKER_BYTES);
+        let workers = |limits: ArchiveLimits| {
+            let mut reader =
+                ArchiveReader::from_read_at(bytes.clone(), Password::empty(), limits).unwrap();
+            reader.set_threads(3);
+            let phases = reader.unordered_phases();
+            (reader, phases)
+        };
+
+        let (_, phases) = workers(ArchiveLimits::memory(limit));
+        assert!(
+            !phases
+                .iter()
+                .any(|phase| matches!(phase, UnorderedPhase::Unordered { workers: 3, .. })),
+            "{phases:?}"
+        );
+
+        let (mut reader, phases) = workers(ArchiveLimits {
+            memory_limit_bytes: limit,
+            ..lending.clone()
+        });
+        let [
+            UnorderedPhase::Unordered {
+                workers: 3,
+                worker_memory,
+                ..
+            },
+        ] = phases[..]
+        else {
+            panic!("{phases:?}");
+        };
+        assert!(worker_memory >= lent + crate::container::BLOCK_INPUT_BYTES);
+        assert!(worker_memory < in_ram);
+
+        let mut out = std::collections::BTreeMap::<usize, Vec<u8>>::new();
+        reader
+            .for_each_entries_unordered(|event| {
+                match event {
+                    UnorderedEntry::Begin { file_index, .. } => {
+                        out.insert(file_index, Vec::new());
+                    }
+                    UnorderedEntry::Data {
+                        file_index, bytes, ..
+                    } => out.get_mut(&file_index).unwrap().extend_from_slice(bytes),
+                    _ => {}
+                }
+                Ok(true)
+            })
+            .expect("decodes");
+        for (index, data) in members.iter().enumerate() {
+            assert!(out[&index] == *data, "{index} decoded to other bytes");
+        }
+        assert_eq!(heap.asked.load(std::sync::atomic::Ordering::SeqCst), 3);
+        drop(reader);
+        assert_eq!(Arc::strong_count(&heap), 2, "a worker kept a loan alive");
+    }
+
+    /// Four folders of 6 MiB whose coders declare 64 MiB dictionaries, under
+    /// a 24 MiB limit with a 16 MiB in-RAM limit: the decoder clamps each
+    /// window to 6 MiB and keeps it in RAM, and both plans count it so, not
+    /// as lent, keeping every worker's share within the limit.
+    #[test]
+    fn plans_count_a_declared_window_the_decoder_clamps_into_ram() {
+        let mut options = Lzma2Options::from_level(1);
+        options.set_dictionary_size(64 << 20);
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+        writer.set_content_methods(vec![options.into()]);
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for index in 0..4 {
+            let data: Vec<u8> = (0..6 << 20)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 40) as u8 & 0x1F
+                })
+                .collect();
+            writer
+                .push_archive_entry(
+                    ArchiveEntry::new_file(&format!("{index}")),
+                    Some(data.as_slice()),
+                )
+                .expect("push");
+        }
+        let bytes = writer.finish().expect("finish").into_inner();
+        let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty()).expect("parse");
+        assert_eq!(archive.blocks.len(), 4);
+        let declared = archive.blocks[0].coders[0].properties()[0];
+        assert!(lzma_turbo::Lzma2Decoder::window_len(declared).unwrap() >= 64 << 20);
+        let heap = Arc::new(crate::window_memory::TestHeap {
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let limit = 24u64 << 20;
+        let limits = ArchiveLimits::memory(limit).with_window_allocator(
+            Arc::clone(&heap) as Arc<dyn crate::WindowAllocator>,
+            16 << 20,
+        );
+        let per_folder = archive
+            .blocks
+            .iter()
+            .map(|block| crate::container::block_coders_resident(block, &limits).unwrap())
+            .max()
+            .unwrap();
+        assert!(per_folder >= 6 << 20, "{per_folder}");
+
+        let mut reader =
+            ArchiveReader::from_read_at(bytes.clone(), Password::empty(), limits.clone()).unwrap();
+        reader.set_threads(4);
+        for phase in reader.folder_phases() {
+            if let FolderPhase::Parallel { workers, .. } = phase {
+                let planned = FOLDER_CHUNK_BYTES as u64
+                    + u64::from(workers) * (per_folder + FOLDER_WORKER_BYTES);
+                assert!(planned <= limit, "{phase:?} plans {planned} over {limit}");
+            }
+        }
+        for phase in reader.unordered_phases() {
+            if let UnorderedPhase::Unordered {
+                workers,
+                worker_memory,
+                ..
+            } = phase
+            {
+                assert!(worker_memory >= per_folder + crate::container::BLOCK_INPUT_BYTES);
+                assert!(u64::from(workers) * worker_memory <= limit);
+            }
+        }
+        assert_eq!(heap.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
 

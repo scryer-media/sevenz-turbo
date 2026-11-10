@@ -9,6 +9,10 @@
 //! the fork adds those, as read-only accessors over the parsed [`Archive`];
 //! nothing here changes how anything decodes.
 
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+
+use crate::WindowAllocator;
 use crate::archive::{Archive, EncoderMethod};
 use crate::block::Coder;
 
@@ -35,7 +39,6 @@ const MIB: u64 = 1024 * KIB;
 ///
 /// [`Error::LimitExceeded`]: crate::Error::LimitExceeded
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchiveLimits {
     /// Largest decoder footprint the caller will allow, in bytes.
     ///
@@ -153,7 +156,160 @@ pub struct ArchiveLimits {
     ///
     /// [`ArchiveEntry::is_unsafe_path`]: crate::ArchiveEntry::is_unsafe_path
     pub reject_unsafe_paths: bool,
+    /// Where LZMA and LZMA2 dictionaries and PPMd model arenas larger than
+    /// `max_in_ram_window_bytes` come from.
+    ///
+    /// Default: none, and every window is allocated in RAM and counted
+    /// against `memory_limit_bytes`, as without this field. With an
+    /// allocator, the rule is per buffer: each decode buffer over
+    /// `max_in_ram_window_bytes` is asked of it instead and counts nothing
+    /// against `memory_limit_bytes`; each one at or under it is allocated in
+    /// RAM and counted. The coder's other state is always RAM. See
+    /// [`WindowAllocator`] for the contract and for how many windows can be
+    /// alive at once.
+    ///
+    /// Every LZMA2 decoder takes the allocator. A threaded LZMA2 decode
+    /// holds a buffer per worker, each up to `lzma-turbo`'s worker bound for
+    /// the dictionary (four dictionaries, held to 1 MiB..=256 MiB, or the
+    /// dictionary if larger) and to `max_lent_window_bytes`, on the caller's
+    /// thread count: those over the in-RAM limit are lent whether or not the
+    /// dictionary is. A positional LZMA2 run
+    /// ([`crate::PositionalLzma2Folder`]) lends its ring, asked once per run.
+    /// [`crate::Archive::decoder_memory`] bounds the windows out at once.
+    /// The Zstandard window is never lent: it is fitted to what
+    /// `memory_limit_bytes` leaves and stays in RAM.
+    ///
+    /// In a build that unwinds on panic, a panic in the allocator is caught
+    /// and reported as [`Error::WindowAllocatorFailed`], with nothing left
+    /// lent; with `panic = "abort"` (the default on
+    /// `wasm32-unknown-unknown`) it ends the process. The allocator may be
+    /// called again after either, see [`WindowAllocator::allocate`]. The field is
+    /// wrapped in [`AssertUnwindSafe`] so that `ArchiveLimits` stays
+    /// [`UnwindSafe`](std::panic::UnwindSafe) and
+    /// [`RefUnwindSafe`](std::panic::RefUnwindSafe) with any allocator: the
+    /// decoder only holds it and calls it.
+    ///
+    /// On `wasm32` this field is skipped by `wasm-bindgen`: it exists, and
+    /// [`ArchiveLimits::with_window_allocator`] sets it from Rust, but a
+    /// JavaScript caller has no way to set it and decodes every window in
+    /// RAM.
+    ///
+    /// [`WindowAllocator`]: crate::WindowAllocator
+    /// [`Error::WindowAllocatorFailed`]: crate::Error::WindowAllocatorFailed
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(skip))]
+    pub window_allocator: Option<AssertUnwindSafe<Arc<dyn WindowAllocator>>>,
+    /// Largest decode buffer, in bytes, allocated in RAM when
+    /// `window_allocator` is set. A larger one is asked of the allocator.
+    ///
+    /// Default: no limit, so an allocator is never asked until this is
+    /// lowered. No effect without an allocator. Each buffer is judged alone,
+    /// at the size the codec would allocate: an LZMA or LZMA2 dictionary,
+    /// clamped to the coder's output and rounded up as the LZMA SDK rounds it
+    /// (to a multiple of 4 KiB, 1 MiB or 4 MiB by size); a threaded LZMA2
+    /// worker's run buffer; a positional LZMA2 run's ring; a PPMd model's
+    /// declared size, rounded up to a multiple of four.
+    pub max_in_ram_window_bytes: u64,
+    /// Largest window, in bytes, the allocator may be asked for.
+    ///
+    /// Default: 4 GiB, the largest dictionary an LZMA or LZMA2 coder can
+    /// declare. The window size is a header field, so an archive of a few
+    /// hundred bytes can ask a caller's allocator for 4 GiB of disk; this
+    /// bounds that. A window over it is refused with
+    /// [`Error::LimitExceeded`] of [`Limit::LentWindowBytes`] before the
+    /// allocator is asked. No effect without an allocator.
+    ///
+    /// A ceiling under `lzma-turbo`'s `Lzma2Decoder::max_worker_window_len`
+    /// for an LZMA2 dictionary that fits it does not refuse a threaded
+    /// decode: a run longer than the ceiling is not given to a worker but
+    /// decoded on one thread, by the decoder that follows the stream, into
+    /// the dictionary. Such a run completes and does not fail; it decodes no
+    /// faster than a single-threaded decode would.
+    ///
+    /// [`Error::LimitExceeded`]: crate::Error::LimitExceeded
+    /// [`Limit::LentWindowBytes`]: crate::Limit::LentWindowBytes
+    pub max_lent_window_bytes: u64,
 }
+
+impl std::fmt::Debug for ArchiveLimits {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArchiveLimits")
+            .field("memory_limit_bytes", &self.memory_limit_bytes)
+            .field("max_end_header_bytes", &self.max_end_header_bytes)
+            .field("max_header_unpacked_bytes", &self.max_header_unpacked_bytes)
+            .field("max_header_depth", &self.max_header_depth)
+            .field("max_entries", &self.max_entries)
+            .field("max_name_bytes", &self.max_name_bytes)
+            .field("max_total_name_bytes", &self.max_total_name_bytes)
+            .field("max_coders_per_block", &self.max_coders_per_block)
+            .field("max_streams_per_coder", &self.max_streams_per_coder)
+            .field("max_total_coders", &self.max_total_coders)
+            .field("max_unpack_bytes", &self.max_unpack_bytes)
+            .field("max_unpack_ratio", &self.max_unpack_ratio)
+            .field("max_aes_cycles_power", &self.max_aes_cycles_power)
+            .field("max_aes_kdf_rounds", &self.max_aes_kdf_rounds)
+            .field("reject_unsafe_paths", &self.reject_unsafe_paths)
+            .field(
+                "window_allocator",
+                &self.window_allocator.as_ref().map(|_| "WindowAllocator"),
+            )
+            .field("max_in_ram_window_bytes", &self.max_in_ram_window_bytes)
+            .field("max_lent_window_bytes", &self.max_lent_window_bytes)
+            .finish()
+    }
+}
+
+// `ArchiveLimits` keeps the auto traits it had before it held an allocator:
+// a caller can still send it across threads or hold it across a
+// `catch_unwind`.
+const _: () = {
+    const fn auto_traits<T: std::panic::UnwindSafe + std::panic::RefUnwindSafe + Send + Sync>() {}
+    auto_traits::<ArchiveLimits>();
+};
+
+/// A clone shares the allocator: the same `Arc`.
+impl Clone for ArchiveLimits {
+    fn clone(&self) -> Self {
+        Self {
+            window_allocator: self
+                .window_allocator
+                .as_ref()
+                .map(|allocator| AssertUnwindSafe(Arc::clone(&allocator.0))),
+            ..*self
+        }
+    }
+}
+
+/// Two limits are equal when every bound is, and both have no allocator or
+/// the same one (the same `Arc` allocation).
+impl PartialEq for ArchiveLimits {
+    fn eq(&self, other: &Self) -> bool {
+        let same_allocator = match (&self.window_allocator, &other.window_allocator) {
+            (None, None) => true,
+            (Some(a), Some(b)) => std::ptr::addr_eq(Arc::as_ptr(&a.0), Arc::as_ptr(&b.0)),
+            _ => false,
+        };
+        same_allocator
+            && self.memory_limit_bytes == other.memory_limit_bytes
+            && self.max_end_header_bytes == other.max_end_header_bytes
+            && self.max_header_unpacked_bytes == other.max_header_unpacked_bytes
+            && self.max_header_depth == other.max_header_depth
+            && self.max_entries == other.max_entries
+            && self.max_name_bytes == other.max_name_bytes
+            && self.max_total_name_bytes == other.max_total_name_bytes
+            && self.max_coders_per_block == other.max_coders_per_block
+            && self.max_streams_per_coder == other.max_streams_per_coder
+            && self.max_total_coders == other.max_total_coders
+            && self.max_unpack_bytes == other.max_unpack_bytes
+            && self.max_unpack_ratio == other.max_unpack_ratio
+            && self.max_aes_cycles_power == other.max_aes_cycles_power
+            && self.max_aes_kdf_rounds == other.max_aes_kdf_rounds
+            && self.reject_unsafe_paths == other.reject_unsafe_paths
+            && self.max_in_ram_window_bytes == other.max_in_ram_window_bytes
+            && self.max_lent_window_bytes == other.max_lent_window_bytes
+    }
+}
+
+impl Eq for ArchiveLimits {}
 
 impl Default for ArchiveLimits {
     fn default() -> Self {
@@ -173,9 +329,16 @@ impl Default for ArchiveLimits {
             max_aes_cycles_power: 24,
             max_aes_kdf_rounds: 1 << 28,
             reject_unsafe_paths: false,
+            window_allocator: None,
+            max_in_ram_window_bytes: u64::MAX,
+            max_lent_window_bytes: DEFAULT_MAX_LENT_WINDOW_BYTES,
         }
     }
 }
+
+/// The default [`ArchiveLimits::max_lent_window_bytes`]: a 4 GiB - 1
+/// dictionary, rounded up as the decoder rounds it.
+const DEFAULT_MAX_LENT_WINDOW_BYTES: u64 = 1 << 32;
 
 impl ArchiveLimits {
     /// Both of the caller-affordability limits at once, with every structural
@@ -237,13 +400,36 @@ impl ArchiveLimits {
             max_aes_cycles_power: 63,
             max_aes_kdf_rounds: u64::MAX,
             reject_unsafe_paths: false,
+            window_allocator: None,
+            max_in_ram_window_bytes: u64::MAX,
+            max_lent_window_bytes: u64::MAX,
         }
+    }
+
+    /// Takes every LZMA and LZMA2 dictionary and PPMd model arena over
+    /// `max_in_ram_window_bytes` from `allocator`, up to
+    /// [`max_lent_window_bytes`](Self::max_lent_window_bytes).
+    #[must_use]
+    pub fn with_window_allocator(
+        mut self,
+        allocator: Arc<dyn WindowAllocator>,
+        max_in_ram_window_bytes: u64,
+    ) -> Self {
+        self.window_allocator = Some(AssertUnwindSafe(allocator));
+        self.max_in_ram_window_bytes = max_in_ram_window_bytes;
+        self
     }
 
     /// The decoder-memory limit in the kilobytes the internal decoder uses,
     /// saturating rather than wrapping on an unlimited budget.
     pub(crate) fn memory_limit_kb(&self) -> usize {
         usize::try_from(self.memory_limit_bytes.div_ceil(KIB)).unwrap_or(usize::MAX)
+    }
+
+    /// Whether a window of `bytes` is asked of the caller's allocator rather
+    /// than allocated in RAM. The one place that choice is made.
+    pub(crate) fn lends(&self, bytes: u64) -> bool {
+        self.window_allocator.is_some() && bytes > self.max_in_ram_window_bytes
     }
 }
 
@@ -396,7 +582,7 @@ pub use lzma_turbo::crc::CrcFolder;
 const LZ_STATE_BYTES: u64 = MIB;
 /// The PPMd model is one allocation of exactly the declared size; this covers
 /// the decoder's own tables around it.
-const PPMD_STATE_BYTES: u64 = MIB;
+pub(crate) const PPMD_STATE_BYTES: u64 = MIB;
 /// What `bzip2-turbo` bounds its compact single-threaded decoder at: 6 MiB, or
 /// 8 MiB on Linux x86-64 and AArch64, where its tables are whole 2 MiB pages.
 /// A coder the pipeline gives decode workers charges the rest of their bound
@@ -476,8 +662,13 @@ impl Archive {
     /// | --- | --- |
     /// | every block, under its coders | 64 KiB (the pack stream's read buffer) |
     /// | Copy | 0 (owned push is disabled under finite memory limits) |
-    /// | LZMA, LZMA2 | declared dictionary + 1 MiB |
+    /// | LZMA | dictionary buffer, clamped to the coder's output and rounded as the decoder allocates it, + 1 MiB, or its probability table and input buffer when larger (`lc + lp` of 10 or more: about 6 MiB at `lc = 8, lp = 4`) |
+    /// | LZMA2 | dictionary buffer, clamped to the coder's output and rounded as the decoder allocates it, + 1 MiB |
     /// | PPMd | declared model size + 1 MiB |
+    ///
+    /// Each LZMA, LZMA2 and PPMd coder is rounded up to a whole KiB, the
+    /// figure the reader checks each block's chain with as it decodes it, so
+    /// a limit this estimate fits is never refused there.
     /// | BZip2 | 8 MiB |
     /// | Deflate | 1 MiB |
     /// | Brotli | 32 MiB |
@@ -497,6 +688,10 @@ impl Archive {
     /// is decoded, beside every coder of its chain at this table's figures,
     /// and a block they do not fit decodes without them.
     ///
+    /// Every window is counted here as RAM. With a
+    /// [`crate::WindowAllocator`], [`Archive::decoder_memory`] gives the
+    /// figure held in RAM and the windows lent, apart.
+    ///
     /// [`ArchiveLimits::memory_limit_bytes`]: crate::ArchiveLimits::memory_limit_bytes
     ///
     /// # Errors
@@ -504,19 +699,193 @@ impl Archive {
     /// [`UnsizedCoder`] for the first coder with no model, including one whose
     /// properties are too short to read a size out of.
     pub fn decoder_memory_estimate(&self) -> Result<u64, UnsizedCoder> {
-        let mut largest_block = 0u64;
+        self.resident_memory_estimate(&ArchiveLimits::default())
+    }
+
+    /// What decoding this archive under `limits` on up to `threads` threads
+    /// holds, in RAM and on the caller's [`crate::WindowAllocator`].
+    ///
+    /// `resident_bytes` is [`Archive::decoder_memory_estimate`] with the
+    /// windows `limits` would lend left out, for one folder: what is checked
+    /// against [`ArchiveLimits::memory_limit_bytes`] as each folder is
+    /// decoded. `lent_windows` and `lent_bytes` are the most windows, and the
+    /// most bytes of them, the allocator can have out at once over the whole
+    /// decode, so a caller can reserve scratch space before decoding. Without
+    /// an allocator, nothing is lent and `resident_bytes` is
+    /// [`Archive::decoder_memory_estimate`].
+    ///
+    /// `threads` is the most threads the reader decodes on: its own thread
+    /// count, or a higher ceiling set through
+    /// [`crate::Lzma2Handle::set_threads`] while it decodes; for a
+    /// [`crate::PositionalLzma2Folder`], the most runs decoded at once. The
+    /// lent figures cover every path the reader takes on that many threads:
+    /// one folder with a threaded LZMA2 coder (one window per thread, each up
+    /// to `lzma-turbo`'s `max_worker_window_len`, and one for the decoder
+    /// that follows the stream), folders decoded side by side
+    /// ([`crate::ArchiveReader::for_each_entries_unordered`], or small folders
+    /// on a positional source), and runs of one folder decoded on their own.
+    ///
+    /// Each window is the one the decoder allocates: the dictionary clamped
+    /// to its coder's output, judged against `max_in_ram_window_bytes` by
+    /// the decision the decoder makes, and charged as the decoder charges it:
+    /// the buffer as allocated, its state (an LZMA coder's probability table
+    /// at its `lc + lp`), each coder to a whole KiB. Every figure is an upper
+    /// bound: threads are counted as if each could hold the largest buffer a
+    /// worker can be lent. A limit `resident_bytes` fits is never refused by
+    /// the check made as each folder is decoded.
+    ///
+    /// # Errors
+    ///
+    /// [`UnsizedCoder`], as for [`Archive::decoder_memory_estimate`].
+    pub fn decoder_memory(
+        &self,
+        limits: &ArchiveLimits,
+        threads: u32,
+    ) -> Result<DecoderMemory, UnsizedCoder> {
+        let threads = threads.clamp(1, 256);
+        // A threaded LZMA2 decoder runs on at least two workers where it can
+        // start them, and holds one more window than it has workers.
+        let lzma2_threads = if cfg!(target_arch = "wasm32") {
+            u64::from(threads)
+        } else {
+            u64::from(threads.max(2))
+        };
+        let mut memory = DecoderMemory::default();
+        // Per folder: its windows and their bytes, each coder lent once.
+        let mut folders: Vec<(usize, u64)> = Vec::with_capacity(self.blocks.len());
+        let mut worker_window = None::<u64>;
         for block in &self.blocks {
-            let mut chain = BLOCK_INPUT_BYTES;
-            for coder in &block.coders {
-                chain = chain.saturating_add(coder_memory_estimate(coder)?);
+            let mut resident = BLOCK_INPUT_BYTES;
+            let (mut windows, mut lent) = (0usize, 0u64);
+            for (index, coder) in block.coders.iter().enumerate() {
+                let split =
+                    coder_memory_split(coder, block.get_unpack_size_at_index(index), limits)?;
+                resident = resident.saturating_add(split.in_ram);
+                if let Some(window) = split.lent {
+                    windows += 1;
+                    lent = lent.saturating_add(window);
+                }
+                if let Some(worker) = split.worker {
+                    worker_window = Some(worker_window.map_or(worker, |w| w.max(worker)));
+                }
             }
-            largest_block = largest_block.max(chain);
+            memory.resident_bytes = memory.resident_bytes.max(resident);
+            folders.push((windows, lent));
         }
-        Ok(largest_block)
+        // As many folders as threads can be live at once, each with its
+        // coders' windows.
+        let live = (threads as usize).min(folders.len());
+        let mut by_windows: Vec<usize> = folders.iter().map(|f| f.0).collect();
+        by_windows.sort_unstable_by(|a, b| b.cmp(a));
+        let mut by_bytes: Vec<u64> = folders.iter().map(|f| f.1).collect();
+        by_bytes.sort_unstable_by(|a, b| b.cmp(a));
+        memory.lent_windows = by_windows[..live].iter().sum();
+        memory.lent_bytes = by_bytes[..live]
+            .iter()
+            .fold(0u64, |sum, b| sum.saturating_add(*b));
+        // And every thread may hold one lent buffer of a threaded LZMA2
+        // coder's workers, or one run's ring, each at most the largest.
+        if let Some(worker) = worker_window {
+            memory.lent_windows = memory.lent_windows.saturating_add(lzma2_threads as usize);
+            memory.lent_bytes = memory
+                .lent_bytes
+                .saturating_add(worker.saturating_mul(lzma2_threads));
+        }
+        Ok(memory)
+    }
+
+    /// [`Archive::decoder_memory`]'s `resident_bytes`.
+    pub(crate) fn resident_memory_estimate(
+        &self,
+        limits: &ArchiveLimits,
+    ) -> Result<u64, UnsizedCoder> {
+        Ok(self.decoder_memory(limits, 1)?.resident_bytes)
     }
 }
 
-/// Bytes one coder's decoder needs.
+/// What [`Archive::decoder_memory`] reports: the decoder memory held in RAM
+/// for one folder, and the most a whole decode asks of the caller's
+/// allocator at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DecoderMemory {
+    /// Bytes held in RAM and checked against
+    /// [`ArchiveLimits::memory_limit_bytes`].
+    pub resident_bytes: u64,
+    /// The most windows the caller's allocator can have lent at once.
+    pub lent_windows: usize,
+    /// The most bytes the caller's allocator can have lent at once, its
+    /// windows summed.
+    pub lent_bytes: u64,
+}
+
+/// What the coders of `block` hold in RAM under `limits`, summed: each sized
+/// coder at its state plus its dictionary or model, clamped to the coder's
+/// output and allocated as the decoder allocates it, unless `limits` lend
+/// it, to a whole KiB; every other coder at [`coder_memory_estimate`]. The
+/// decoder makes the same decision, and charges the same figure, when it
+/// builds each coder.
+pub(crate) fn block_coders_resident(
+    block: &crate::block::Block,
+    limits: &ArchiveLimits,
+) -> Result<u64, UnsizedCoder> {
+    block
+        .coders
+        .iter()
+        .enumerate()
+        .try_fold(0u64, |sum, (index, coder)| {
+            let split = coder_memory_split(coder, block.get_unpack_size_at_index(index), limits)?;
+            Ok(sum.saturating_add(split.in_ram))
+        })
+}
+
+/// One coder's memory split by `limits`.
+struct CoderSplit {
+    /// The bytes held in RAM.
+    in_ram: u64,
+    /// The window asked of the caller's allocator, if one is.
+    lent: Option<u64>,
+    /// For LZMA2, the largest buffer one worker of a threaded decoder of it
+    /// can be lent, if any can.
+    worker: Option<u64>,
+}
+
+/// `coder`, decoding to `unpack_len` bytes, split by `limits`: a coder with
+/// a window at [`crate::decoder::coder_window_split`]'s figure, the decision
+/// and the charge the decoder makes, to the same whole kilobyte; a coder with
+/// none in RAM at [`coder_memory_estimate`].
+fn coder_memory_split(
+    coder: &Coder,
+    unpack_len: u64,
+    limits: &ArchiveLimits,
+) -> Result<CoderSplit, UnsizedCoder> {
+    let full = coder_memory_estimate(coder)?;
+    Ok(
+        match crate::decoder::coder_window_split(coder, unpack_len, limits) {
+            Some(window) => CoderSplit {
+                in_ram: window.in_ram,
+                lent: window.lent,
+                worker: window.worker,
+            },
+            None => CoderSplit {
+                in_ram: full,
+                lent: None,
+                worker: None,
+            },
+        },
+    )
+}
+
+/// The arena a PPMd model of `memory_size` bytes is laid out in, and so the
+/// window asked of a caller's allocator: the size rounded up to a multiple of
+/// four, as `ppmd-turbo` lays it out.
+#[cfg(feature = "ppmd")]
+pub(crate) fn ppmd_arena_bytes(memory_size: u32) -> u64 {
+    u64::from(memory_size).next_multiple_of(4)
+}
+
+/// Bytes one coder's decoder needs, its window counted as RAM; see
+/// [`Archive::decoder_memory`] for the split under a window allocator.
 ///
 /// # Errors
 ///
@@ -528,7 +897,11 @@ pub fn coder_memory_estimate(coder: &Coder) -> Result<u64, UnsizedCoder> {
     if method_id == EncoderMethod::ID_COPY {
         Ok(0)
     } else if method_id == EncoderMethod::ID_LZMA {
-        Ok(lzma_dictionary_bytes(method_id, properties)?.saturating_add(LZ_STATE_BYTES))
+        let dict = lzma_dictionary_bytes(method_id, properties)?;
+        Ok(
+            crate::codec::lzma_turbo::lzma_window_bytes(u32::try_from(dict).unwrap_or(u32::MAX))
+                .saturating_add(crate::codec::lzma_turbo::lzma_state_bytes(properties[0])),
+        )
     } else if method_id == EncoderMethod::ID_LZMA2 {
         Ok(lzma2_dictionary_bytes(method_id, properties)?.saturating_add(LZ_STATE_BYTES))
     } else if method_id == EncoderMethod::ID_PPMD {
@@ -754,5 +1127,145 @@ mod aes_budget_tests {
                 .limit_hit(),
             Some(crate::Limit::AesCyclesPower)
         );
+    }
+}
+
+#[cfg(all(test, feature = "compress"))]
+mod lzma_charge_tests {
+    use super::*;
+    use crate::block::{BindPair, Block};
+    use crate::decoder::check_chain_memory;
+
+    fn lzma(lclppb: u8, dict: u32) -> Coder {
+        let mut coder = Coder::default();
+        coder.set_id_size(3);
+        coder
+            .decompression_method_id_mut()
+            .copy_from_slice(EncoderMethod::ID_LZMA);
+        coder.set_stream_counts(1, 1);
+        let mut props = vec![lclppb];
+        props.extend_from_slice(&dict.to_le_bytes());
+        coder.set_properties(props.into());
+        coder
+    }
+
+    /// One folder: `coders` chained, each reading the next, the first on
+    /// top, with `sizes` their outputs.
+    fn chain(coders: Vec<Coder>, sizes: &[u64]) -> Archive {
+        let count = coders.len();
+        let mut block = Block::with_coders(coders);
+        block.set_streams(
+            count,
+            count,
+            (1..count as u64)
+                .map(|index| BindPair {
+                    in_index: index - 1,
+                    out_index: index,
+                })
+                .collect(),
+            vec![count as u64 - 1].into(),
+            sizes.to_vec().into(),
+        );
+        Archive {
+            blocks: vec![block],
+            ..Archive::default()
+        }
+    }
+
+    fn lending(memory: u64) -> ArchiveLimits {
+        ArchiveLimits::memory(memory).with_window_allocator(
+            Arc::new(crate::window_memory::TestHeap {
+                asked: std::sync::atomic::AtomicUsize::new(0),
+            }) as Arc<dyn crate::WindowAllocator>,
+            0,
+        )
+    }
+
+    /// The chain check the reader makes as it decodes the folder, with the
+    /// pack stream's buffer under it.
+    fn chain_check(archive: &Archive, limits: &ArchiveLimits) -> Result<usize, crate::Error> {
+        let block = &archive.blocks[0];
+        check_chain_memory(
+            block
+                .coders
+                .iter()
+                .enumerate()
+                .map(|(index, coder)| (coder, block.get_unpack_size_at_index(index))),
+            limits,
+            crate::decoder::INPUT_BUF_SIZE.div_ceil(1024),
+        )
+    }
+
+    /// `lc = 8, lp = 4` with its dictionary lent: the probability table, about
+    /// 6 MiB, stays in RAM and is charged, up front and as the folder is
+    /// decoded, so a 2 MiB limit is refused by both.
+    #[test]
+    fn an_lzma_probability_table_is_charged_at_its_size() {
+        let lclppb = (2 * 5 + 4) * 9 + 8;
+        let archive = chain(vec![lzma(lclppb, 4 << 20)], &[4 << 20]);
+        let table = crate::codec::lzma_turbo::lzma_state_bytes(lclppb);
+        assert!(table > 6 << 20);
+        let memory = archive.decoder_memory(&lending(2 << 20), 1).unwrap();
+        assert_eq!(memory.lent_windows, 1);
+        assert_eq!(
+            memory.resident_bytes,
+            BLOCK_INPUT_BYTES + table.next_multiple_of(1024)
+        );
+        assert!(chain_check(&archive, &lending(2 << 20)).is_err());
+        assert!(coder_memory_estimate(&archive.blocks[0].coders[0]).unwrap() >= (4 << 20) + table);
+
+        // Three such coders in one folder: three tables.
+        let archive = chain(
+            vec![
+                lzma(lclppb, 4 << 20),
+                lzma(lclppb, 4 << 20),
+                lzma(lclppb, 4 << 20),
+            ],
+            &[4 << 20, 4 << 20, 4 << 20],
+        );
+        let memory = archive.decoder_memory(&lending(u64::MAX), 1).unwrap();
+        assert_eq!(
+            memory.resident_bytes,
+            BLOCK_INPUT_BYTES + 3 * table.next_multiple_of(1024)
+        );
+    }
+
+    /// A dictionary is charged as the decoder allocates it: 1.5 GiB declared
+    /// for 1 GiB and a byte of output is clamped to 1 GiB + 1 and allocated
+    /// as 1 GiB + 4 MiB.
+    #[test]
+    fn an_lzma_dictionary_is_charged_as_allocated() {
+        let len = (1u64 << 30) + 1;
+        let archive = chain(vec![lzma(93, 3 << 29)], &[len]);
+        let allocated = crate::codec::lzma_turbo::lzma_window_bytes(len as u32);
+        assert_eq!(allocated, (1 << 30) + (4 << 20));
+        assert_eq!(
+            archive.decoder_memory_estimate().unwrap(),
+            BLOCK_INPUT_BYTES + allocated + crate::codec::lzma_turbo::LZ_STATE_BYTES
+        );
+    }
+
+    /// Two LZMA coders whose clamped dictionaries are not whole kilobytes
+    /// and whose tables are not either: at a limit of exactly
+    /// `resident_bytes` the chain check passes, and a kilobyte under it
+    /// refuses, so the two figures are one.
+    #[test]
+    fn the_up_front_figure_is_the_chain_checks_to_the_kilobyte() {
+        let big = (2 * 5 + 4) * 9 + 6;
+        let archive = chain(vec![lzma(93, 1 << 20), lzma(big, 1 << 20)], &[5000, 70_001]);
+        for limits in [ArchiveLimits::default(), lending(u64::MAX)] {
+            let resident = archive.decoder_memory(&limits, 1).unwrap().resident_bytes;
+            assert_eq!(resident % 1024, 0);
+            let at = ArchiveLimits {
+                memory_limit_bytes: resident,
+                ..limits.clone()
+            };
+            assert_eq!(chain_check(&archive, &at).unwrap() as u64 * 1024, resident);
+            let under = ArchiveLimits {
+                memory_limit_bytes: resident - 1024,
+                ..limits
+            };
+            assert!(chain_check(&archive, &under).is_err());
+        }
     }
 }

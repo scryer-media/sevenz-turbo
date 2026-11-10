@@ -141,6 +141,7 @@ pub(crate) mod pipeline;
 mod time;
 #[cfg(feature = "util")]
 mod util;
+mod window_memory;
 
 use std::{
     io::{Read, Write},
@@ -154,8 +155,8 @@ pub use codec::lzma_turbo::{
     PositionalLzma2Folder, PositionalLzma2Run, PositionalLzma2Scanner,
 };
 pub use container::{
-    ArchiveLimits, BlockCompletion, CrcFolder, PackStreamRange, SubStream, SubStreamCompletion,
-    UnsizedCoder, coder_memory_estimate, crc32_combine,
+    ArchiveLimits, BlockCompletion, CrcFolder, DecoderMemory, PackStreamRange, SubStream,
+    SubStreamCompletion, UnsizedCoder, coder_memory_estimate, crc32_combine,
 };
 pub use encryption::Password;
 #[cfg(feature = "aes256")]
@@ -170,6 +171,7 @@ pub use util::compress::*;
 pub use util::decompress::*;
 #[cfg(all(feature = "util", target_arch = "wasm32"))]
 pub use util::wasm::*;
+pub use window_memory::{WindowAllocator, WindowMemory};
 #[cfg(feature = "compress")]
 pub use writer::*;
 
