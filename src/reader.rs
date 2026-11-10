@@ -6965,10 +6965,10 @@ mod chain_plan_tests {
     }
 
     /// A lent dictionary never lowers the thread count: the block four
-    /// threads would decode in parallel plans a parallel reader with its
-    /// dictionary in RAM, is refused with the memory-limit error when the
-    /// dictionary would be lent, the allocator unasked, and decodes on the
-    /// caller's memory at one thread.
+    /// threads would decode in parallel plans a parallel reader whether its
+    /// dictionary is in RAM or lent, and lent it decodes on the caller's
+    /// memory, its workers' buffers asked of the allocator; at one thread
+    /// it decodes on one lent dictionary.
     #[test]
     fn a_lent_lzma2_dictionary_keeps_the_thread_count() {
         let mut x = 0x2545_F491_4F6C_DD1Du64;
@@ -7012,20 +7012,20 @@ mod chain_plan_tests {
         assert!(out == data, "decoded to other bytes in RAM");
         assert_eq!(crate::decoder::PARALLEL_LZMA2_PLANS.with(Cell::get), 1);
 
-        let refused = decode(4, lending(), &mut source).expect_err("a threaded lent window");
+        let asked = || heap.asked.load(std::sync::atomic::Ordering::SeqCst);
+        let out = decode(4, lending(), &mut source).expect("decodes threaded on lent memory");
         assert!(
-            matches!(
-                &refused,
-                Error::BlockDecode { cause, .. } if matches!(**cause, Error::MaxMemLimited { .. })
-            ),
-            "refused with {refused:?}"
+            out == data,
+            "decoded to other bytes threaded on lent memory"
         );
-        assert_eq!(heap.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(crate::decoder::PARALLEL_LZMA2_PLANS.with(Cell::get), 1);
+        let threaded = asked();
+        assert!(threaded > 1, "asked {threaded} windows on four threads");
 
         let out = decode(1, lending(), &mut source).expect("decodes on lent memory");
         assert!(out == data, "decoded to other bytes on lent memory");
         assert_eq!(crate::decoder::PARALLEL_LZMA2_PLANS.with(Cell::get), 0);
-        assert_eq!(heap.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(asked(), threaded + 1);
     }
 
     /// Folders decoded side by side each lend their own window, and a lent

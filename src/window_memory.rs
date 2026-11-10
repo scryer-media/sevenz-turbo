@@ -56,21 +56,25 @@ pub unsafe trait WindowMemory: Send {
 /// A source of caller memory for LZMA and LZMA2 dictionaries and PPMd model
 /// arenas.
 ///
-/// Asked once for each window over
-/// [`ArchiveLimits::max_in_ram_window_bytes`] and at or under
-/// [`ArchiveLimits::max_lent_window_bytes`], when the coder that needs it is
-/// built. A window over the ceiling is refused with
-/// [`Error::LimitExceeded`] and the allocator is never asked for it.
+/// Asked for each window over [`ArchiveLimits::max_in_ram_window_bytes`]
+/// and at or under [`ArchiveLimits::max_lent_window_bytes`]. A window over
+/// the ceiling is refused with [`Error::LimitExceeded`] and the allocator is
+/// never asked for it.
 ///
 /// # Concurrency
 ///
 /// [`WindowAllocator::allocate`] can be called from several threads at once.
-/// One coder holds at most one window, but a reader decoding folders in
-/// parallel builds one chain per folder in flight, so with `n` threads up to
-/// `n` folders' windows can be alive together. A folder's windows are dropped
-/// when its decode ends. A caller that wants one window at a time decodes on
-/// one thread.
+/// A coder decoded on one thread holds one window, asked as it is built. A
+/// threaded LZMA2 coder whose dictionary is lent asks again as its workers
+/// take runs: one window per worker and one for the decoder that follows
+/// the stream, each kept for the worker's next run while it fits. A
+/// positional LZMA2 run asks for its ring as it starts, and drops it when it
+/// ends. A reader decoding folders in parallel builds one chain per folder in
+/// flight. [`Archive::decoder_memory`] gives the most windows, and bytes,
+/// out at once for a thread count. A caller that wants one window at a time
+/// decodes on one thread.
 ///
+/// [`Archive::decoder_memory`]: crate::Archive::decoder_memory
 /// [`ArchiveLimits::max_in_ram_window_bytes`]: crate::ArchiveLimits::max_in_ram_window_bytes
 /// [`ArchiveLimits::max_lent_window_bytes`]: crate::ArchiveLimits::max_lent_window_bytes
 /// [`Error::LimitExceeded`]: crate::Error::LimitExceeded
@@ -91,9 +95,11 @@ pub trait WindowAllocator: Send + Sync {
 /// failed.
 ///
 /// The codec crates report an allocator's failure in their own shapes:
-/// `lzma-turbo` wraps the error, `ppmd-turbo` keeps only its kind. The
-/// adapter keeps the caller's own error here instead, and the coder's builder
-/// takes it back out ([`Lender::take_refusal`]) to report it whole.
+/// `lzma-turbo` hands the error back whole, inside the error it fails with
+/// or from the threaded decoder's `take_window_error`, so the LZMA adapter
+/// passes it on as it is. `ppmd-turbo` keeps only its kind, so the PPMd
+/// adapter keeps the caller's own error here instead, and the coder's
+/// builder takes it back out ([`Lender::take_refusal`]) to report it whole.
 pub(crate) struct Lender {
     allocator: Arc<dyn WindowAllocator>,
     refusal: Mutex<Option<io::Error>>,
@@ -115,6 +121,8 @@ impl Lender {
             .take()
     }
 
+    /// Keeps `error` for the builder, and hands the codec one of its kind.
+    #[cfg(feature = "ppmd")]
     fn refuse(&self, error: io::Error) -> io::Error {
         let reply = io::Error::new(error.kind(), "window allocator refused");
         *self
@@ -127,18 +135,19 @@ impl Lender {
     /// Asks the caller's allocator for `len` bytes and checks what it gave
     /// back against the part of the [`WindowMemory`] contract that can be
     /// checked. Memory that fails the check is dropped before the error
-    /// returns.
+    /// returns. The error is the allocator's own, or an `InvalidInput` one
+    /// for memory that failed the check.
     fn lend(&self, len: usize) -> io::Result<LentWindow> {
-        let mut memory = self.allocator.allocate(len).map_err(|e| self.refuse(e))?;
+        let mut memory = self.allocator.allocate(len)?;
         let ptr = memory.as_mut_ptr();
         let got = memory.len();
         // A length over `isize::MAX` cannot describe real memory.
         if ptr.is_null() || got < len || isize::try_from(got).is_err() {
             drop(memory);
-            return Err(self.refuse(io::Error::new(
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("window allocator returned {got} bytes at {ptr:p} for a {len}-byte window"),
-            )));
+            ));
         }
         Ok(LentWindow {
             ptr,
@@ -202,7 +211,7 @@ impl ppmd_turbo::ArenaAllocator for Lender {
         &self,
         len: usize,
     ) -> Result<Box<dyn ppmd_turbo::ArenaMemory>, ppmd_turbo::ArenaAllocError> {
-        Ok(Box::new(self.lend(len)?))
+        Ok(Box::new(self.lend(len).map_err(|e| self.refuse(e))?))
     }
 }
 
@@ -340,10 +349,10 @@ mod tests {
         assert!(lender.take_refusal().is_none());
     }
 
-    /// The allocator's own error is kept whole for the coder's builder, and
-    /// the codec is told only its kind.
+    /// The allocator's own error goes to `lzma-turbo` as it is, which hands
+    /// it back whole; nothing is kept for the builder.
     #[test]
-    fn a_refusal_is_kept_for_the_builder() {
+    fn a_refusal_goes_to_lzma_turbo_whole() {
         let mut alloc = Alloc::new();
         alloc.refuse = Some(io::ErrorKind::StorageFull);
         let lender = Lender::new(Arc::new(alloc));
@@ -351,6 +360,19 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+        assert_eq!(error.to_string(), "quota");
+        assert!(lender.take_refusal().is_none());
+    }
+
+    /// For PPMd, whose codec keeps only the kind, the allocator's own error
+    /// is kept whole for the coder's builder.
+    #[cfg(feature = "ppmd")]
+    #[test]
+    fn a_ppmd_refusal_is_kept_for_the_builder() {
+        let mut alloc = Alloc::new();
+        alloc.refuse = Some(io::ErrorKind::StorageFull);
+        let lender = Lender::new(Arc::new(alloc));
+        assert!(ppmd_turbo::ArenaAllocator::allocate(&*lender, 64).is_err());
         let kept = lender.take_refusal().unwrap();
         assert_eq!(kept.kind(), io::ErrorKind::StorageFull);
         assert_eq!(kept.to_string(), "quota");
@@ -375,10 +397,7 @@ mod tests {
                 .unwrap();
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert_eq!(drops.load(Ordering::SeqCst), 1);
-            assert_eq!(
-                lender.take_refusal().unwrap().kind(),
-                io::ErrorKind::InvalidInput
-            );
+            assert!(lender.take_refusal().is_none());
         }
 
         struct Huge(Arc<AtomicUsize>);

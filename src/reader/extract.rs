@@ -69,12 +69,15 @@ impl<R: Read + Seek> ArchiveReader<R> {
             return Ok(None);
         }
         let dict = crate::codec::lzma_turbo::lzma2_dictionary_size(block.coders[0].properties())?;
-        // The ring's run decoders hold their dictionaries in RAM; a window
-        // the caller would lend decodes on the ordinary path, which lends it.
+        // A run decoder asks for a fresh ring each run, where the ordinary
+        // threaded decoder keeps its workers' lent windows from run to run;
+        // a dictionary the caller would lend decodes on the ordinary path.
         if u64::from(dict) >= block.get_unpack_size()
             || self
                 .limits
-                .lends(crate::codec::lzma_turbo::lzma_window_bytes(dict))
+                .lends(crate::codec::lzma_turbo::lzma2_window_bytes(
+                    block.coders[0].properties()[0],
+                )?)
         {
             return Ok(None);
         }

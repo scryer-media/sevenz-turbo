@@ -446,18 +446,34 @@ impl Error {
         match self {
             Self::Io(io, context) => match io.downcast::<Error>() {
                 Ok(error) => error.out_of_io(),
-                Err(io) => Self::from_coder(&io).unwrap_or(Self::Io(io, context)),
+                Err(io) => match crate::codec::lzma_turbo::window_failure(io) {
+                    Ok(error) => error,
+                    Err(io) => Self::from_coder(&io).unwrap_or(Self::Io(io, context)),
+                },
             },
             Self::MaybeBadPassword(io) => {
+                // No password causes a cancellation, a failed invariant or
+                // the caller's allocator failing.
                 let own_fault = io
                     .get_ref()
                     .and_then(|inner| inner.downcast_ref::<Error>())
-                    .is_some_and(|error| matches!(error, Self::Cancelled | Self::Internal(_)));
+                    .is_some_and(|error| {
+                        matches!(
+                            error,
+                            Self::Cancelled
+                                | Self::Internal(_)
+                                | Self::WindowAllocatorFailed { .. }
+                        )
+                    });
                 if own_fault {
                     return io
                         .downcast::<Error>()
                         .unwrap_or_else(Self::MaybeBadPassword);
                 }
+                let io = match crate::codec::lzma_turbo::window_failure(io) {
+                    Ok(error) => return error,
+                    Err(io) => io,
+                };
                 Self::from_coder(&io).unwrap_or(Self::MaybeBadPassword(io))
             }
             error => error,

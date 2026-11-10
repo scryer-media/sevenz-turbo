@@ -22,10 +22,21 @@ use sevenz_turbo::{
     EncoderMethod, Error, Limit, Password, UnorderedEntry, WindowAllocator, WindowMemory,
 };
 
-/// Heap memory filled with a pattern that is not zero, counting its drops.
+/// What a recorder has out, and the most it has had out at once.
+#[derive(Default)]
+struct Live {
+    windows: usize,
+    bytes: u64,
+    peak_windows: usize,
+    peak_bytes: u64,
+}
+
+/// Heap memory filled with a pattern that is not zero, counting its drops
+/// and handing its bytes back to the recorder's live count.
 struct Heap {
     bytes: Box<[u8]>,
     drops: Arc<AtomicUsize>,
+    live: Arc<Mutex<Live>>,
 }
 
 // SAFETY: the boxed slice is owned and initialized, its address does not
@@ -43,6 +54,10 @@ unsafe impl WindowMemory for Heap {
 
 impl Drop for Heap {
     fn drop(&mut self) {
+        let mut live = self.live.lock().unwrap();
+        live.windows -= 1;
+        live.bytes -= self.bytes.len() as u64;
+        drop(live);
         self.drops.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -51,15 +66,18 @@ impl Drop for Heap {
 enum Mode {
     Give,
     Refuse(io::ErrorKind),
+    /// Gives the first `n` windows asked for, then refuses every one after.
+    RefuseAfter(usize, io::ErrorKind),
     Short,
 }
 
-/// Lends heap memory, records what it was asked for, and counts the memory
-/// it handed out that has been dropped.
+/// Lends heap memory, records what it was asked for, counts the memory it
+/// handed out that has been dropped, and keeps the most it had out at once.
 struct Recorder {
     mode: Mode,
     asked: Mutex<Vec<usize>>,
     drops: Arc<AtomicUsize>,
+    live: Arc<Mutex<Live>>,
 }
 
 impl Recorder {
@@ -68,6 +86,7 @@ impl Recorder {
             mode,
             asked: Mutex::new(Vec::new()),
             drops: Arc::new(AtomicUsize::new(0)),
+            live: Arc::new(Mutex::new(Live::default())),
         })
     }
 
@@ -78,21 +97,72 @@ impl Recorder {
     fn drops(&self) -> usize {
         self.drops.load(Ordering::SeqCst)
     }
+
+    /// The windows and bytes out now.
+    fn out(&self) -> (usize, u64) {
+        let live = self.live.lock().unwrap();
+        (live.windows, live.bytes)
+    }
+
+    /// The most windows, and the most bytes, out at once.
+    fn peak(&self) -> (usize, u64) {
+        let live = self.live.lock().unwrap();
+        (live.peak_windows, live.peak_bytes)
+    }
 }
 
 impl WindowAllocator for Recorder {
     fn allocate(&self, len: usize) -> io::Result<Box<dyn WindowMemory>> {
-        self.asked.lock().unwrap().push(len);
+        let nth = {
+            let mut asked = self.asked.lock().unwrap();
+            asked.push(len);
+            asked.len()
+        };
         let len = match self.mode {
             Mode::Give => len,
             Mode::Short => len - 1,
             Mode::Refuse(kind) => return Err(io::Error::new(kind, "scratch disk full")),
+            Mode::RefuseAfter(n, kind) if nth > n => {
+                return Err(io::Error::new(kind, "scratch disk full"));
+            }
+            Mode::RefuseAfter(..) => len,
         };
+        {
+            let mut live = self.live.lock().unwrap();
+            live.windows += 1;
+            live.bytes += len as u64;
+            live.peak_windows = live.peak_windows.max(live.windows);
+            live.peak_bytes = live.peak_bytes.max(live.bytes);
+        }
         Ok(Box::new(Heap {
             bytes: vec![0xA5; len].into_boxed_slice(),
             drops: Arc::clone(&self.drops),
+            live: Arc::clone(&self.live),
         }))
     }
+}
+
+/// What `archive` reports for `limits` on `threads` covers the most
+/// `allocator` had out at once, and nothing is out now.
+fn assert_within_reported(
+    archive: &Archive,
+    limits: &ArchiveLimits,
+    threads: u32,
+    allocator: &Recorder,
+) {
+    let reported = archive.decoder_memory(limits, threads).unwrap();
+    let (windows, bytes) = allocator.peak();
+    assert!(
+        windows <= reported.lent_windows,
+        "{windows} windows out at once on {threads} threads, {} reported",
+        reported.lent_windows
+    );
+    assert!(
+        bytes <= reported.lent_bytes,
+        "{bytes} bytes out at once on {threads} threads, {} reported",
+        reported.lent_bytes
+    );
+    assert_eq!(allocator.out(), (0, 0), "a lent window was not released");
 }
 
 /// Text-like bytes: compressible, but not a run.
@@ -225,8 +295,8 @@ fn lending(allocator: &Arc<Recorder>, memory_limit_bytes: u64) -> ArchiveLimits 
 }
 
 /// The archive is refused under the tight limit without an allocator, and
-/// with one decodes to `members` on lent memory, every window lent once and
-/// dropped by the end.
+/// with one decodes to `members` on lent memory, every window released by
+/// the end and never more out at once than `decoder_memory` reports.
 fn assert_decodes_on_lent_memory(bytes: &[u8], members: &[(&str, &[u8])], threads: u32) {
     let limit = tight_limit(bytes);
     let refused = decode(bytes, ArchiveLimits::memory(limit), threads).unwrap_err();
@@ -234,25 +304,29 @@ fn assert_decodes_on_lent_memory(bytes: &[u8], members: &[(&str, &[u8])], thread
 
     let archive = Archive::read(&mut Cursor::new(bytes), &Password::empty()).unwrap();
     let allocator = Recorder::new(Mode::Give);
-    let out = decode(bytes, lending(&allocator, limit), threads).unwrap();
+    let limits = lending(&allocator, limit);
+    let out = decode(bytes, limits.clone(), threads).unwrap();
     assert_eq!(out.len(), members.len());
     for (name, data) in members {
         assert!(out[*name] == *data, "{name} decoded to other bytes");
     }
     let asked = allocator.asked();
     assert!(!asked.is_empty());
-    assert!(asked.len() <= windowed_coders(&archive));
+    if threads == 1 {
+        assert!(asked.len() <= windowed_coders(&archive));
+    }
     assert!(asked.iter().all(|&len| len > 1 << 20));
     assert_eq!(
         allocator.drops(),
         asked.len(),
         "a lent window was not released"
     );
+    assert_within_reported(&archive, &limits, threads, &allocator);
 
-    // The split estimate covers what was asked, and what stays in RAM fits
-    // the limit the archive did not fit with its windows in RAM.
+    // What stays in RAM fits the limit the archive did not fit with its
+    // windows in RAM.
     let in_ram = archive
-        .decoder_memory(&ArchiveLimits::memory(limit))
+        .decoder_memory(&ArchiveLimits::memory(limit), threads)
         .unwrap();
     assert_eq!(
         (
@@ -262,10 +336,25 @@ fn assert_decodes_on_lent_memory(bytes: &[u8], members: &[(&str, &[u8])], thread
         ),
         (archive.decoder_memory_estimate().unwrap(), 0, 0)
     );
-    let split = archive.decoder_memory(&lending(&allocator, limit)).unwrap();
+    let split = archive.decoder_memory(&limits, threads).unwrap();
     assert!(split.resident_bytes <= limit && limit < in_ram.resident_bytes);
-    assert!(asked.len() <= split.lent_windows);
-    assert!(asked.iter().map(|&len| len as u64).sum::<u64>() <= split.lent_bytes);
+}
+
+/// An LZMA2 archive of several runs, each starting with a dictionary reset,
+/// so a threaded decoder has runs to hand its workers: 6 MiB of text in
+/// 1 MiB blocks over a 2 MiB dictionary.
+fn multi_run(seed: u64) -> (Vec<u8>, Vec<u8>) {
+    let data = text(6 << 20, seed);
+    let mut options = Lzma2Options::from_level_mt(1, 4, 1 << 20);
+    options.set_dictionary_size(2 << 20);
+    let bytes = write(vec![options.into()], &[("story.txt", data.as_slice())]);
+    (bytes, data)
+}
+
+/// Every window, on every path below, is lent from the start.
+fn lending_all(allocator: &Arc<Recorder>) -> ArchiveLimits {
+    ArchiveLimits::default()
+        .with_window_allocator(Arc::clone(allocator) as Arc<dyn WindowAllocator>, 0)
 }
 
 #[test]
@@ -335,30 +424,307 @@ fn a_filter_chain_decodes_on_lent_memory() {
     assert_decodes_on_lent_memory(&bytes, &members, 1);
 }
 
-/// A threaded LZMA2 decode does not lend its dictionaries yet, and the
-/// thread count is not lowered so that one could: the block four threads
-/// would split is refused with the memory-limit error, the allocator
-/// unasked. On one thread the same block decodes on lent memory.
+/// A threaded LZMA2 decode lends every worker's buffer, on two and on four
+/// threads: the output is the owned decode's, the thread count is the
+/// caller's, more than one window is out at once, and never more than
+/// `decoder_memory` reports.
 #[test]
-fn threaded_lzma2_refuses_a_lent_dictionary() {
-    let data = text(6 << 20, 6);
-    let mut options = Lzma2Options::from_level_mt(1, 4, 1 << 20);
-    options.set_dictionary_size(2 << 20);
-    let members = [("story.txt", data.as_slice())];
-    let bytes = write(vec![options.into()], &members);
+fn threaded_lzma2_decodes_on_lent_memory() {
+    let (bytes, data) = multi_run(6);
+    let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty()).unwrap();
+    let owned = decode(&bytes, ArchiveLimits::default(), 4).unwrap();
+    assert!(owned["story.txt"] == data);
+    for threads in [2, 4] {
+        let allocator = Recorder::new(Mode::Give);
+        let limits = lending(&allocator, u64::MAX);
+        let out = decode(&bytes, limits.clone(), threads).unwrap();
+        assert!(
+            out["story.txt"] == owned["story.txt"],
+            "decoded to other bytes on {threads} threads"
+        );
+        let asked = allocator.asked();
+        assert!(asked.len() > 1, "{threads} threads asked {asked:?}");
+        assert_eq!(allocator.drops(), asked.len());
+        assert_within_reported(&archive, &limits, threads, &allocator);
+        // Every buffer a worker holds is on the caller's memory: what the
+        // limit is checked against is the coder's state alone.
+        assert!(
+            archive
+                .decoder_memory(&limits, threads)
+                .unwrap()
+                .resident_bytes
+                < 2 << 20
+        );
+    }
+}
+
+/// On four threads, a refusal on the k-th window asked fails the decode with
+/// the allocator's own error, and every window lent before it is released.
+#[test]
+fn threaded_lzma2_refusal_on_any_ask_releases_everything() {
+    let (bytes, _) = multi_run(15);
+    let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty()).unwrap();
+    let total = {
+        let allocator = Recorder::new(Mode::Give);
+        decode(&bytes, lending(&allocator, u64::MAX), 4).unwrap();
+        allocator.asked().len()
+    };
+    assert!(total > 1);
+    for given in 0..total {
+        let allocator = Recorder::new(Mode::RefuseAfter(given, io::ErrorKind::StorageFull));
+        let limits = lending(&allocator, u64::MAX);
+        match decode(&bytes, limits.clone(), 4) {
+            Err(Error::WindowAllocatorFailed { bytes, error }) => {
+                assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+                assert_eq!(error.to_string(), "scratch disk full");
+                let asked = allocator.asked();
+                assert!(asked.len() > given);
+                // One of the asks refused; which one first fails the
+                // decode is the workers' race.
+                assert!(
+                    asked[given..].iter().any(|&len| len as u64 == bytes),
+                    "refused after {given}: {bytes} not among {asked:?}"
+                );
+            }
+            // A schedule that needs fewer windows than the one counted can
+            // finish before the refusal: everything is still released.
+            Ok(_) => assert!(allocator.asked().len() <= given),
+            Err(other) => panic!("refused after {given}: {other:?}"),
+        }
+        assert_within_reported(&archive, &limits, 4, &allocator);
+        assert_eq!(allocator.drops(), allocator.asked().len().min(given));
+    }
+}
+
+/// A damaged LZMA2 stream decoded on four threads fails, and every lent
+/// window is released.
+#[test]
+fn a_damaged_threaded_stream_releases_everything() {
+    let (mut bytes, _) = multi_run(16);
+    let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty()).unwrap();
+    let range = archive.block_pack_streams(0)[0];
+    let (pack, packed) = (range.offset as usize, range.size as usize);
+    for at in [packed / 3, packed / 2, packed * 5 / 6] {
+        bytes[pack + at] ^= 0x55;
+    }
+    let allocator = Recorder::new(Mode::Give);
+    let limits = lending(&allocator, u64::MAX);
+    assert!(decode(&bytes, limits.clone(), 4).is_err());
+    assert_within_reported(&archive, &limits, 4, &allocator);
+    assert_eq!(allocator.drops(), allocator.asked().len());
+}
+
+/// A small dictionary over one huge run: no window a threaded decoder asks
+/// for is over `lzma-turbo`'s worker bound for the dictionary, however much
+/// the run decodes to.
+#[test]
+fn a_small_dictionary_with_a_huge_run_never_asks_over_the_bound() {
+    let data = text(12 << 20, 17);
+    let mut options = Lzma2Options::from_level_mt(1, 4, 12 << 20);
+    options.set_dictionary_size(64 << 10);
+    let bytes = write(vec![options.into()], &[("story.txt", data.as_slice())]);
+    let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty()).unwrap();
+    let prop = archive.blocks[0].coders[0].properties()[0];
+    let bound = lzma_turbo::Lzma2Decoder::max_worker_window_len(prop).unwrap();
+    assert!(bound < 12 << 20);
+    for threads in [1, 2, 4] {
+        let allocator = Recorder::new(Mode::Give);
+        let limits = lending_all(&allocator);
+        let out = decode(&bytes, limits.clone(), threads).unwrap();
+        assert!(out["story.txt"] == data);
+        let asked = allocator.asked();
+        assert!(!asked.is_empty());
+        assert!(
+            asked.iter().all(|&len| len <= bound),
+            "{threads} threads asked {asked:?} over {bound}"
+        );
+        assert_within_reported(&archive, &limits, threads, &allocator);
+    }
+}
+
+/// On four threads, a dictionary over `max_lent_window_bytes` is refused as
+/// a limit before the allocator is asked; a ceiling over the dictionary but
+/// under the worker bound decodes, every window held to the ceiling.
+#[test]
+fn threaded_lzma2_respects_the_lent_ceiling() {
+    let (bytes, data) = multi_run(18);
+    let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty()).unwrap();
+    let prop = archive.blocks[0].coders[0].properties()[0];
+    let dictionary = lzma_turbo::Lzma2Decoder::window_len(prop).unwrap();
+    let worker = lzma_turbo::Lzma2Decoder::max_worker_window_len(prop).unwrap();
+    assert!(dictionary < worker);
 
     let allocator = Recorder::new(Mode::Give);
-    let refused = decode(&bytes, lending(&allocator, u64::MAX), 4).unwrap_err();
+    let mut limits = lending(&allocator, u64::MAX);
+    limits.max_lent_window_bytes = dictionary as u64 - 1;
+    let error = decode(&bytes, limits, 4).unwrap_err();
     assert!(
-        matches!(&refused, Error::BlockDecode { cause, .. } if matches!(**cause, Error::MaxMemLimited { .. })),
-        "{refused:?}"
+        matches!(
+            error,
+            Error::LimitExceeded {
+                what: Limit::LentWindowBytes,
+                ..
+            }
+        ),
+        "{error:?}"
     );
     assert!(allocator.asked().is_empty());
 
-    let out = decode(&bytes, lending(&allocator, u64::MAX), 1).unwrap();
-    assert!(out["story.txt"] == data, "decoded to other bytes");
-    assert_eq!(allocator.asked().len(), 1);
-    assert_eq!(allocator.drops(), 1, "the lent window was not released");
+    let allocator = Recorder::new(Mode::Give);
+    let mut limits = lending(&allocator, u64::MAX);
+    limits.max_lent_window_bytes = dictionary as u64;
+    let out = decode(&bytes, limits.clone(), 4).unwrap();
+    assert!(out["story.txt"] == data);
+    let asked = allocator.asked();
+    assert!(
+        asked.iter().all(|&len| len <= dictionary),
+        "asked {asked:?} over the ceiling {dictionary}"
+    );
+    assert_within_reported(&archive, &limits, 4, &allocator);
+}
+
+/// A refusing allocator fails a threaded decode with its own error.
+#[test]
+fn a_refusing_allocator_fails_a_threaded_decode_with_its_own_error() {
+    let (bytes, _) = multi_run(19);
+    for threads in [2, 4] {
+        let allocator = Recorder::new(Mode::Refuse(io::ErrorKind::QuotaExceeded));
+        let error = decode(&bytes, lending(&allocator, u64::MAX), threads).unwrap_err();
+        match &error {
+            Error::WindowAllocatorFailed { bytes, error } => {
+                assert_eq!(error.kind(), io::ErrorKind::QuotaExceeded);
+                assert_eq!(error.to_string(), "scratch disk full");
+                assert!(allocator.asked().contains(&(*bytes as usize)));
+            }
+            other => panic!("not the allocator's error on {threads} threads: {other:?}"),
+        }
+        assert_eq!(allocator.out(), (0, 0));
+    }
+}
+
+/// Runs of one folder decoded on their own, as a caller drives a
+/// [`sevenz_turbo::PositionalLzma2Folder`] on several threads: each run
+/// lends one ring, the output is the archive's, and never more is out at
+/// once than `decoder_memory` reports for that many runs at a time.
+#[test]
+fn positional_runs_decode_on_lent_memory() {
+    use sevenz_turbo::PositionalLzma2Folder;
+    use std::sync::atomic::AtomicBool;
+
+    let (bytes, data) = multi_run(20);
+    let bytes = Arc::new(bytes);
+    let archive = Arc::new(Archive::read(&mut Cursor::new(&*bytes), &Password::empty()).unwrap());
+    for (mode, threads) in [
+        (Mode::Give, 2u32),
+        (Mode::Give, 4),
+        (Mode::Refuse(io::ErrorKind::StorageFull), 2),
+    ] {
+        let allocator = Recorder::new(mode);
+        let limits = lending_all(&allocator);
+        let folder = PositionalLzma2Folder::new(archive.clone(), bytes.clone(), 0, limits.clone())
+            .unwrap()
+            .unwrap();
+        let pack = folder.packed_range();
+        let mut scanner = folder.scanner();
+        let mut packed = &bytes[pack.offset as usize..pack.end() as usize];
+        let mut runs = Vec::new();
+        while !packed.is_empty() {
+            let used = scanner.feed(packed).unwrap();
+            packed = &packed[used..];
+            while let Some(run) = scanner.next_run() {
+                runs.push(run);
+            }
+        }
+        scanner.finish().unwrap();
+        assert!(runs.len() > 1);
+        let out = Mutex::new(vec![0u8; data.len()]);
+        let failed = Mutex::new(Vec::new());
+        let next = AtomicUsize::new(0);
+        let cancel = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::SeqCst);
+                        let Some(run) = runs.get(i) else { break };
+                        let result = run.clone().decode(&cancel, &mut |offset, piece: &[u8]| {
+                            let at = offset as usize;
+                            out.lock().unwrap()[at..at + piece.len()].copy_from_slice(piece);
+                            Ok(piece.len())
+                        });
+                        if let Err(error) = result {
+                            failed.lock().unwrap().push(error);
+                        }
+                    }
+                });
+            }
+        });
+        let failed = failed.into_inner().unwrap();
+        match mode {
+            Mode::Give => {
+                assert!(failed.is_empty(), "{failed:?}");
+                assert!(out.into_inner().unwrap() == data);
+                assert_eq!(allocator.asked().len(), runs.len());
+            }
+            _ => {
+                assert_eq!(failed.len(), runs.len());
+                for error in failed {
+                    assert!(
+                        matches!(&error, Error::WindowAllocatorFailed { error, .. } if error.kind() == io::ErrorKind::StorageFull && error.to_string() == "scratch disk full"),
+                        "{error:?}"
+                    );
+                }
+            }
+        }
+        assert_within_reported(&archive, &limits, threads, &allocator);
+    }
+}
+
+/// BCJ2's coders on four threads, and a PPMd model on two: the windows out
+/// at once are within what `decoder_memory` reports.
+#[test]
+fn bcj2_on_threads_stays_within_what_is_reported() {
+    let data = x86(6 << 20, 21);
+    let mut options = Lzma2Options::from_level_mt(1, 4, 1 << 20);
+    options.set_dictionary_size(2 << 20);
+    let members = [("tool.exe", data.as_slice())];
+    let bytes = write(
+        vec![options.into(), EncoderMethod::BCJ2_FILTER.into()],
+        &members,
+    );
+    let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty()).unwrap();
+    for threads in [1, 4] {
+        let allocator = Recorder::new(Mode::Give);
+        let limits = lending_all(&allocator);
+        let out = decode(&bytes, limits.clone(), threads).unwrap();
+        assert!(out["tool.exe"] == data);
+        assert!(!allocator.asked().is_empty());
+        assert_within_reported(&archive, &limits, threads, &allocator);
+    }
+}
+
+#[cfg(feature = "ppmd")]
+#[test]
+fn ppmd_on_threads_stays_within_what_is_reported() {
+    let first = text(1 << 20, 22);
+    let second = text(1 << 20, 23);
+    let members = [
+        ("one.txt", first.as_slice()),
+        ("two.txt", second.as_slice()),
+    ];
+    let bytes = write(
+        vec![PpmdOptions::from_order_memory_size(6, 8 << 20).into()],
+        &members,
+    );
+    let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty()).unwrap();
+    for threads in [1, 2] {
+        let allocator = Recorder::new(Mode::Give);
+        let limits = lending_all(&allocator);
+        let out = decode(&bytes, limits.clone(), threads).unwrap();
+        assert!(out["one.txt"] == first && out["two.txt"] == second);
+        assert!(!allocator.asked().is_empty());
+        assert_within_reported(&archive, &limits, threads, &allocator);
+    }
 }
 
 /// Folders decoded side by side each lend their own window, from several
@@ -405,6 +771,10 @@ fn folders_decoded_in_parallel_each_lend_their_window() {
     }
     assert_eq!(allocator.asked().len(), 3);
     assert_eq!(allocator.drops(), 3);
+    let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty()).unwrap();
+    let limits = ArchiveLimits::default()
+        .with_window_allocator(Arc::clone(&allocator) as Arc<dyn WindowAllocator>, 1 << 20);
+    assert_within_reported(&archive, &limits, 3, &allocator);
 }
 
 /// A window at or under the in-RAM limit is allocated as before, and the

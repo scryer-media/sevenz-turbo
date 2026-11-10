@@ -462,13 +462,24 @@ struct Window {
 }
 
 impl Window {
-    /// An LZMA or LZMA2 dictionary of `dict_size`, already clamped.
+    /// An LZMA dictionary of `dict_size`, already clamped.
     fn lzma(dict_size: u32) -> Self {
         Self {
             bytes: crate::codec::lzma_turbo::lzma_window_bytes(dict_size),
             full_kb: lzma2_memory_usage_kb(dict_size),
             rest_kb: lzma2_memory_usage_kb(0),
         }
+    }
+
+    /// An LZMA2 dictionary of property `dict_prop`, already clamped: the
+    /// window `lzma-turbo`'s `Lzma2Decoder::window_len` gives for it.
+    fn lzma2(dict_prop: u8) -> Result<Self, Error> {
+        let dict_size = lzma2_dictionary_size(&[dict_prop])?;
+        Ok(Self {
+            bytes: crate::codec::lzma_turbo::lzma2_window_bytes(dict_prop)?,
+            full_kb: lzma2_memory_usage_kb(dict_size),
+            rest_kb: lzma2_memory_usage_kb(0),
+        })
     }
 
     /// A PPMd model of `memory_size` bytes.
@@ -520,14 +531,27 @@ impl Window {
     }
 
     /// The error a coder's construction failed with: the caller's allocator's
-    /// own when it refused the window, otherwise `other`'s.
-    fn failure(self, loan: Option<&WindowLoan>, other: impl FnOnce() -> Error) -> Error {
+    /// own when it could not supply the window, otherwise `other`'s.
+    ///
+    /// `lzma-turbo` hands the allocator's error back inside the `io::Error`
+    /// it fails with, a panic in the allocator included; `ppmd-turbo` keeps
+    /// only its kind, so the lender keeps the error itself for that codec.
+    fn failure(
+        self,
+        loan: Option<&WindowLoan>,
+        error: std::io::Error,
+        other: impl FnOnce(std::io::Error) -> Error,
+    ) -> Error {
+        let error = match crate::codec::lzma_turbo::window_failure(error) {
+            Ok(failed) => return failed,
+            Err(error) => error,
+        };
         match loan.and_then(|loan| loan.lender.take_refusal()) {
             Some(error) => Error::WindowAllocatorFailed {
                 bytes: self.bytes,
                 error,
             },
-            None => other(),
+            None => other(error),
         }
     }
 }
@@ -550,7 +574,7 @@ fn coder_window(coder: &Coder, uncompressed_len: u64) -> Option<Window> {
         )))
     } else if method_id == EncoderMethod::ID_LZMA2 {
         let dict_prop = lzma2_clamped_prop(*coder.properties().first()?, uncompressed_len);
-        Some(Window::lzma(lzma2_dictionary_size(&[dict_prop]).ok()?))
+        Window::lzma2(dict_prop).ok()
     } else {
         #[cfg(feature = "ppmd")]
         if method_id == EncoderMethod::ID_PPMD {
@@ -733,7 +757,7 @@ pub fn add_decoder<I: Read>(
                 loan.as_ref(),
             )
             .map_err(|e| {
-                window.failure(loan.as_ref(), || Error::bad_password(e, opts.encrypted))
+                window.failure(loan.as_ref(), e, |e| Error::bad_password(e, opts.encrypted))
             })?;
             Ok(Decoder::Lzma(Box::new(lz)))
         }
@@ -747,7 +771,7 @@ pub fn add_decoder<I: Read>(
                 .ok_or_else(|| Error::corrupted("LZMA2 properties too short"))?;
             let dict_prop = lzma2_clamped_prop(dict_prop, uncompressed_len);
             let dic_size = lzma2_dictionary_size(&[dict_prop])?;
-            let window = Window::lzma(dic_size);
+            let window = Window::lzma2(dict_prop)?;
             let mem_size = window.ram_kb(opts.limits);
             if mem_size > max_mem_limit_kb {
                 return Err(Error::MaxMemLimited {
@@ -756,25 +780,25 @@ pub fn add_decoder<I: Read>(
                 });
             }
             let loan = window.loan(opts.limits)?;
-            // A lent window is planned on the caller's thread request alone,
-            // so the dictionaries the in-RAM budget cannot hold never turn a
-            // threaded decode into a single-threaded one.
-            let budget = if loan.is_some() {
-                u64::MAX
-            } else {
-                lzma2_plan_budget(
-                    opts.limits.memory_limit_bytes,
-                    opts.reserved_kb,
-                    opts.unsized_kb,
-                    mem_size,
-                )
-            };
+            // The plan is sized against what stays in RAM. Lent, the
+            // dictionary and every worker's run buffer are on the caller's
+            // memory, so neither is charged: `mem_size` is then the coder's
+            // state alone, and the plan is told it holds no dictionary. What
+            // the budget governs is the input and the queues, which are RAM
+            // either way. The thread count is the caller's.
+            let budget = lzma2_plan_budget(
+                opts.limits.memory_limit_bytes,
+                opts.reserved_kb,
+                opts.unsized_kb,
+                mem_size,
+            );
+            let dict_in_ram = if loan.is_some() { 0 } else { dic_size };
             let plan = match opts.lzma2_control {
                 Some(control) => Lzma2Plan::for_block(
                     opts.threads,
                     opts.adaptive_lzma2,
                     budget,
-                    dic_size,
+                    dict_in_ram,
                     uncompressed_len,
                     control,
                     opts.checksum_splits,
@@ -785,18 +809,8 @@ pub fn add_decoder<I: Read>(
             if !matches!(plan, Lzma2Plan::SingleThreaded) {
                 PARALLEL_LZMA2_PLANS.with(|plans| plans.set(plans.get() + 1));
             }
-            if loan.is_some() && !matches!(plan, Lzma2Plan::SingleThreaded) {
-                // The threaded decoders take no lent window yet: the window
-                // is refused as one over the memory limit always was, with
-                // the in-RAM window limit it is over.
-                return Err(Error::MaxMemLimited {
-                    max_kb: usize::try_from(opts.limits.max_in_ram_window_bytes / 1024)
-                        .unwrap_or(usize::MAX),
-                    actaul_kb: usize::try_from(window.bytes.div_ceil(1024)).unwrap_or(usize::MAX),
-                });
-            }
             let mut lz = lzma2_decoder(input, dict_prop, plan, loan.as_ref()).map_err(|e| {
-                window.failure(loan.as_ref(), || Error::bad_password(e, opts.encrypted))
+                window.failure(loan.as_ref(), e, |e| Error::bad_password(e, opts.encrypted))
             })?;
             if opts.single_run_lzma2 {
                 lz.use_single_run_ring();
@@ -832,9 +846,7 @@ pub fn add_decoder<I: Read>(
                     .with_max_lent(loan.max_bytes),
                 ),
             }
-            .map_err(|err| {
-                window.failure(loan.as_ref(), || Error::from(std::io::Error::from(err)))
-            })?;
+            .map_err(|err| window.failure(loan.as_ref(), std::io::Error::from(err), Error::from))?;
             Ok(Decoder::Ppmd(Box::new(SevenZReader::from_decoder(
                 input, decoder,
             ))))
