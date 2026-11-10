@@ -495,6 +495,99 @@ arm, and this crate can add a variant without a breaking release.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.30.0 - 2026-11-09
+
+- Added decoding on caller memory. `WindowAllocator` and the unsafe trait
+  `WindowMemory` lend the memory for LZMA and LZMA2 dictionaries and PPMd
+  model arenas, for example a mapped scratch file. Set one with
+  `ArchiveLimits::with_window_allocator(allocator, max_in_ram_window_bytes)`:
+  a window over `max_in_ram_window_bytes` is asked of the allocator and
+  counts nothing against `memory_limit_bytes`. New `ArchiveLimits` fields
+  `window_allocator`, `max_in_ram_window_bytes` (default: no limit, so
+  nothing is lent until it is lowered) and `max_lent_window_bytes` (default
+  4 GiB; a window over it is refused as `Limit::LentWindowBytes` before the
+  allocator is asked). Without an allocator nothing is lent; the changes
+  below to the memory figures and to single-threaded LZMA2 apply with or
+  without one.
+- The rule is per buffer: each decode buffer over `max_in_ram_window_bytes`
+  is lent, and each one at or under it is allocated in RAM and counted
+  against `memory_limit_bytes`. Every LZMA2 decoder takes the allocator, so
+  a threaded decode lends each worker buffer over the limit whether or not
+  its dictionary is, each at most `lzma-turbo`'s worker bound for the
+  dictionary and at most `max_lent_window_bytes`, on the caller's thread
+  count. A positional LZMA2 run (`PositionalLzma2Folder`) lends its ring,
+  asked once per run. An encoded header takes the same decision. The
+  Zstandard window is never lent: it is fitted to what `memory_limit_bytes`
+  leaves and stays in RAM.
+- A `max_lent_window_bytes` under `lzma-turbo`'s
+  `Lzma2Decoder::max_worker_window_len` for a dictionary that fits it does
+  not refuse a threaded LZMA2 decode: a run longer than the ceiling is
+  decoded on one thread, by the decoder that follows the stream, into the
+  dictionary. It completes; it does not fail.
+- In a build that unwinds on panic, a panic in the allocator, or in the
+  memory it returns, is caught and reported as
+  `Error::WindowAllocatorFailed` for every codec, with nothing left lent.
+  With `panic = "abort"`, the default on `wasm32-unknown-unknown`, nothing
+  is caught. After an error or a caught panic the same allocator may be
+  called again, by other workers of the decode or by a later decode given
+  the same limits, so it must stay usable.
+- Added `Error::WindowAllocatorFailed { bytes, error }`, carrying the
+  allocator's own `io::Error` on every path, threaded and positional
+  included. Memory shorter than asked, null, or longer than `isize::MAX` is
+  dropped and reported as `InvalidInput` in the same variant.
+- Added `Archive::decoder_memory(&limits, threads)` and `DecoderMemory`: the
+  bytes one folder holds in RAM, and the most windows and bytes the
+  allocator can have out at once on `threads` threads, so a caller can
+  reserve scratch space before decoding. Each figure is an upper bound,
+  judged on the window the decoder allocates.
+- Changed: `Archive::decoder_memory_estimate`, the check
+  `ArchiveReader::with_limits` makes before decoding, and the plans for
+  folders decoded side by side count an LZMA or LZMA2 dictionary clamped to
+  its coder's output, as the decoder clamps and charges it, instead of the
+  declared one. An archive whose declared dictionary is larger than its
+  data is no longer refused up front when its decode fits.
+- Changed: the same figures, `coder_memory_estimate` for an LZMA coder,
+  and the check each folder is decoded under,
+  charge an LZMA or LZMA2 dictionary at the buffer the decoder allocates
+  (an LZMA dictionary of 1 GiB or more is rounded up to 4 MiB, under that
+  to 1 MiB or 4 KiB), not at its size, and an LZMA coder's probability
+  table at its size when it is over the 1 MiB state margin: `lc + lp` of 10
+  or more, about 6 MiB at `lc = 8, lp = 4`. Each such coder is rounded to a
+  whole KiB in both, so a limit of exactly the reported `resident_bytes`
+  decodes. A PPMd coder is charged its 1 MiB margin at decode time too, as
+  it already was up front. These figures can be higher than before, and
+  an archive refused up front that used to start decoding was then over
+  its limit.
+- Added `ArchiveReader::open_with_limits` and
+  `ArchiveReader::from_archive_with_limits`, so every public read path can
+  be given the caller's limits.
+- Changed (behaviour): a single-threaded LZMA2 decode is held to
+  `ArchiveLimits` alone, no longer also to `lzma-turbo`'s default 512 MiB
+  limit. With the default limits, which set no memory limit, an archive
+  declaring an LZMA2 dictionary over 512 MiB with as much output, even a
+  tiny one declaring 4 GiB of each, is now allocated instead of refused, as
+  an LZMA dictionary already was. A caller who wants a cap sets
+  `memory_limit_bytes`.
+- Changed (behaviour): `PositionalLzma2Run::memory_required` leaves out a
+  ring the folder's limits lend, and can now fail with
+  `Error::LimitExceeded` for `Limit::LentWindowBytes`, a lent ring over
+  `max_lent_window_bytes`.
+- Breaking: `ArchiveLimits` is no longer `Copy`, and its `Clone`, `Debug`,
+  `PartialEq` and `Eq` are written by hand (two limits with allocators are
+  equal only when they share one). It stays `Send`, `Sync`, `UnwindSafe` and
+  `RefUnwindSafe`: `window_allocator` is an
+  `Option<AssertUnwindSafe<Arc<dyn WindowAllocator>>>`. Its new public
+  fields break code that builds it with a struct literal; build it from
+  `ArchiveLimits::default()` or a constructor instead.
+- Bumped `lzma-turbo` from 0.10 to 0.12.0. The re-exported `CrcFolder`,
+  `crc32_combine` and the `hooks` hash types are now 0.12's, so code that
+  uses them together with its own `lzma-turbo` 0.10 types needs 0.12.
+- Raised the `ppmd-turbo` floor from 0.2.0 to 0.2.2, the first with caller
+  memory for the model arena.
+- On `wasm32`, `ArchiveLimits::window_allocator` is skipped by
+  `wasm-bindgen`: Rust callers set it as on any target, JavaScript callers
+  cannot, and decode every window in RAM.
+
 ## 0.29.7 - 2026-11-08
 
 - Added the `bzip2-permissive` feature, for builds that must not link LGPL
