@@ -20,6 +20,8 @@ required = {
     "a_lent_window_is_the_callers_memory_and_is_freed_once",
     "a_refusal_goes_to_lzma_turbo_whole",
     "memory_that_does_not_fit_is_refused_and_dropped",
+    "a_lent_arena_is_the_callers_memory_and_is_freed_once",
+    "a_ppmd_refusal_is_kept_for_the_builder",
 }
 prefixes = ("writer::input_buffer::tests::", "window_memory::tests::")
 if (

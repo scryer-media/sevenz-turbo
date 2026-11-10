@@ -313,7 +313,7 @@ jobs:
         id: plan
         run: |
           cargo +nightly-2026-09-01 miri nextest list --locked --lib \
-            --no-default-features --features compress,bzip2 --message-format json \
+            --no-default-features --features compress,bzip2,ppmd --message-format json \
             -E '((test(/^writer::input_buffer::tests::/) | test(/^window_memory::tests::/)) & !test(/native_advice/))' > "$RUNNER_TEMP/miri-tests.json"
           python3 .github/scripts/miri-matrix.py "$RUNNER_TEMP/miri-tests.json" "$GITHUB_OUTPUT"
 
@@ -340,7 +340,7 @@ jobs:
         with:
           tool: cargo-nextest@0.9.143
       - name: Check one portable allocation invariant
-        run: cargo +nightly-2026-09-01 miri nextest run --locked --lib --no-default-features --features compress,bzip2 --no-fail-fast -- --exact "$MIRI_TEST"
+        run: cargo +nightly-2026-09-01 miri nextest run --locked --lib --no-default-features --features compress,bzip2,ppmd --no-fail-fast -- --exact "$MIRI_TEST"
 
   unsafe-complete:
     name: unsafe-complete
