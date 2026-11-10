@@ -1014,6 +1014,20 @@ fn every_public_read_path_lends_through_the_callers_limits() {
 
     #[cfg(feature = "util")]
     {
+        let out_dir = dir.path().join("extract_to");
+        ArchiveReader::with_limits(
+            Cursor::new(bytes.clone()),
+            Password::empty(),
+            limits.clone(),
+        )
+        .unwrap()
+        .extract_to(&out_dir)
+        .unwrap();
+        check(
+            "ArchiveReader::extract_to",
+            std::fs::read(out_dir.join("story.txt")).unwrap(),
+        );
+
         let out_dir = dir.path().join("decompress");
         sevenz_turbo::decompress_with_limits(Cursor::new(bytes.clone()), &out_dir, limits.clone())
             .unwrap();
@@ -1158,8 +1172,12 @@ fn a_declared_dictionary_clamped_into_ram_is_counted_as_ram() {
 
 /// Four folders of 6 MiB declaring 64 MiB dictionaries, decoded side by
 /// side from a positional source under a 24 MiB limit with a 16 MiB in-RAM
-/// limit: each dictionary is clamped into RAM, so the plan counts it, and
-/// both walks decode every folder in RAM, none refused.
+/// limit: each dictionary is clamped into RAM, so the unordered plan counts
+/// it, gives each worker a share that covers it, and decodes every folder
+/// in RAM, none refused. (The ordered plan's share is pinned by
+/// `reader::tests::plans_count_a_declared_window_the_decoder_clamps_into_ram`:
+/// there each folder is checked against the whole limit, so a decode passes
+/// however the plan counted it.)
 #[test]
 fn small_folders_with_dictionaries_clamped_into_ram_fit_side_by_side() {
     let members: Vec<(String, Vec<u8>)> = (0..4)
@@ -1177,22 +1195,6 @@ fn small_folders_with_dictionaries_clamped_into_ram_fit_side_by_side() {
     let allocator = Recorder::new(Mode::Give);
     let limits = ArchiveLimits::memory(24 << 20)
         .with_window_allocator(Arc::clone(&allocator) as Arc<dyn WindowAllocator>, 16 << 20);
-
-    let mut reader =
-        ArchiveReader::from_read_at(bytes.clone(), Password::empty(), limits.clone()).unwrap();
-    reader.set_threads(4);
-    let mut out = BTreeMap::new();
-    reader
-        .for_each_entries(|entry, read| {
-            let mut data = Vec::new();
-            read.read_to_end(&mut data)?;
-            out.insert(entry.name().to_string(), data);
-            Ok(true)
-        })
-        .unwrap();
-    for (name, data) in &members {
-        assert!(out[name] == *data, "{name} decoded to other bytes");
-    }
 
     let mut reader = ArchiveReader::from_read_at(bytes, Password::empty(), limits).unwrap();
     reader.set_threads(4);
@@ -1269,11 +1271,13 @@ fn a_dictionary_in_ram_does_not_stop_the_workers_lending() {
 }
 
 /// A `max_lent_window_bytes` over the dictionary but under the worker
-/// bound, with runs longer than it: the threaded decode is not refused.
-/// Those runs decode on one thread into the dictionary; the decode
-/// completes to the archive's bytes and nothing over the ceiling is asked.
+/// bound, with every run longer than it: the threaded decode is not
+/// refused. No worker can be lent a buffer for such a run, so the runs are
+/// decoded by the one decoder that follows the stream, into its dictionary:
+/// the decode completes to the archive's bytes, every ask is that
+/// dictionary, and no more than one window is ever out at once.
 #[test]
-fn runs_longer_than_the_lent_ceiling_decode_on_one_thread() {
+fn runs_longer_than_the_lent_ceiling_decode_in_the_dictionary_alone() {
     let (bytes, data) = runs_over_the_dictionary();
     let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty()).unwrap();
     let prop = archive.blocks[0].coders[0].properties()[0];
@@ -1289,9 +1293,11 @@ fn runs_longer_than_the_lent_ceiling_decode_on_one_thread() {
     let asked = allocator.asked();
     assert!(!asked.is_empty());
     assert!(
-        asked.iter().all(|&len| len <= ceiling),
-        "asked {asked:?} over the ceiling {ceiling}"
+        asked.iter().all(|&len| len == dictionary),
+        "asked {asked:?}, not the {dictionary} dictionary alone"
     );
+    assert_eq!(allocator.peak(), (1, dictionary as u64));
+    assert_eq!(allocator.drops(), asked.len());
     assert_within_reported(&archive, &limits, 4, &allocator);
 }
 
@@ -1345,4 +1351,43 @@ fn a_panicking_allocator_fails_ppmd_with_its_error() {
     );
     assert_eq!(allocator.asked().len(), 1);
     assert_eq!(allocator.out(), (0, 0));
+}
+
+/// Two LZMA coders chained, their clamped dictionaries not whole kilobytes:
+/// a memory limit of exactly the `resident_bytes` `decoder_memory` reports
+/// opens and decodes, the check each folder is decoded under charging the
+/// same figure; a kilobyte under it is refused up front.
+#[test]
+fn a_limit_of_exactly_the_reported_figure_decodes() {
+    let data = text(5000, 27);
+    let bytes = write(
+        vec![
+            LzmaOptions::from_level(1).into(),
+            LzmaOptions::from_level(1).into(),
+        ],
+        &[("story.txt", data.as_slice())],
+    );
+    let archive = Archive::read(&mut Cursor::new(&bytes), &Password::empty()).unwrap();
+    assert_eq!(archive.blocks[0].coders.len(), 2);
+    for allocator in [None, Some(Recorder::new(Mode::Give))] {
+        let limits = match &allocator {
+            None => ArchiveLimits::default(),
+            Some(allocator) => lending(allocator, u64::MAX),
+        };
+        let resident = archive.decoder_memory(&limits, 1).unwrap().resident_bytes;
+        let at = ArchiveLimits {
+            memory_limit_bytes: resident,
+            ..limits.clone()
+        };
+        let out = decode(&bytes, at, 1).unwrap();
+        assert!(out["story.txt"] == data);
+        let under = ArchiveLimits {
+            memory_limit_bytes: resident - 1024,
+            ..limits
+        };
+        assert!(matches!(
+            decode(&bytes, under, 1),
+            Err(Error::MemoryLimited { .. })
+        ));
+    }
 }

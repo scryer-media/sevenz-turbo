@@ -3164,9 +3164,11 @@ impl<R: Read + Seek> ArchiveReader<R> {
         crate::container::check_aes_coders(block.coders.iter(), opts.limits)?;
         // The chain as a whole against the memory limit, before any coder is
         // built; see `read_encoded_header`. Under `ArchiveReader::with_limits`
-        // this never refuses anything, because `decoder_memory_estimate` has
-        // already bounded the same sum from above; it is what bounds a
-        // `BlockDecoder` built with limits of its own.
+        // this never refuses anything: the up-front check charges each sized
+        // coder the same figure this does, rounded to the same whole KiB (see
+        // `container::coder_memory_split`), and every other coder and the
+        // pack-stream buffer at no less. It is what bounds a `BlockDecoder`
+        // built with limits of its own.
         let (reserved_kb, unsized_kb) = if block.total_input_streams()
             > block.total_output_streams()
         {

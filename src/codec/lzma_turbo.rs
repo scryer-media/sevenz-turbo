@@ -180,11 +180,26 @@ pub(crate) fn lzma2_clamped_prop(prop: u8, unpacked_size: u64) -> u8 {
     prop
 }
 
-/// Kilobytes an LZMA2 decode of `dict_size` needs, for the reader's
-/// `max_mem_limit_kb` check.
-pub(crate) fn lzma2_memory_usage_kb(dict_size: u32) -> usize {
-    let bytes = u64::from(dict_size).saturating_add(LZ_STATE_BYTES);
-    bytes.div_ceil(1024) as usize
+/// Bytes an LZMA decoder whose first property byte is `lclppb` holds beyond
+/// its dictionary: `lzma-turbo`'s own figure for its probability table and
+/// input buffer ([`LzmaReader::memory_required`] less the window), never less
+/// than [`LZ_STATE_BYTES`].
+///
+/// The table is `NUM_BASE_PROBS + (0x300 << (lc + lp))` two-byte entries, so
+/// it grows with `lc + lp`: about 6 MiB at `lc = 8, lp = 4`, which a 7z LZMA
+/// coder may declare. Up to `lc + lp = 9` it is under 1 MiB, and LZMA2 caps
+/// `lc + lp` at 4, so [`LZ_STATE_BYTES`] covers every LZMA2 decoder.
+/// A byte of 225 or more declares no `lc/lp/pb`; the decoder refuses it
+/// before allocating anything, and it is charged the margin.
+pub(crate) fn lzma_state_bytes(lclppb: u8) -> u64 {
+    let (lc, lp, pb) = (lclppb % 9, (lclppb / 9) % 5, lclppb / 45);
+    match LzmaProps::new(lc, lp, pb, 1 << 12) {
+        Ok(props) => LZ_STATE_BYTES.max(
+            LzmaReader::<std::io::Empty>::memory_required(props)
+                .saturating_sub(props.window_len() as u64),
+        ),
+        Err(_) => LZ_STATE_BYTES,
+    }
 }
 
 /// The dictionary buffer an LZMA decoder of `dict_size` allocates, and so
@@ -3148,6 +3163,44 @@ pub(crate) fn lzma2_decoder<R: Read>(
 mod window_bytes_tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// An LZMA coder's state is `lzma-turbo`'s own figure for its
+    /// probability table and input buffer, `NUM_BASE_PROBS + (0x300 <<
+    /// (lc + lp))` two-byte entries and 64 KiB, whenever that is over the
+    /// 1 MiB margin: from `lc + lp = 10`, and about 6 MiB at `lc = 8, lp =
+    /// 4`. Under it, and for every LZMA2 decoder (`lc + lp <= 4`), the
+    /// margin covers it.
+    #[test]
+    fn lzma_state_is_lzma_turbos_table_and_input_buffer() {
+        for (lc, lp, pb) in [
+            (3u8, 0u8, 2u8),
+            (0, 4, 0),
+            (4, 0, 2),
+            (4, 4, 4),
+            (5, 4, 0),
+            (6, 4, 2),
+            (8, 3, 1),
+            (8, 4, 4),
+        ] {
+            let lclppb = (pb * 5 + lp) * 9 + lc;
+            let table = (1984 + (0x300usize << (lc + lp))) as u64 * 2;
+            let props = LzmaProps::new(lc, lp, pb, 64 << 20).unwrap();
+            let turbo =
+                LzmaReader::<std::io::Empty>::memory_required(props) - props.window_len() as u64;
+            assert_eq!(turbo, table + (64 << 10), "lc {lc} lp {lp}");
+            assert_eq!(
+                lzma_state_bytes(lclppb),
+                turbo.max(LZ_STATE_BYTES),
+                "lc {lc} lp {lp}"
+            );
+            assert_eq!(lzma_state_bytes(lclppb) > LZ_STATE_BYTES, lc + lp >= 10);
+        }
+        assert!(lzma_state_bytes((4 * 5 + 4) * 9 + 8) > 6 << 20);
+        let lzma2 = lzma_turbo::Lzma2Reader::<std::io::Empty>::memory_required(18)
+            .unwrap()
+            .saturating_sub(lzma2_window_bytes(18).unwrap());
+        assert!(lzma2 <= LZ_STATE_BYTES, "{lzma2}");
+    }
 
     /// Records the length it is asked for and refuses, so no memory is
     /// needed to learn what the codec would ask.

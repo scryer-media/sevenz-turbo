@@ -81,10 +81,21 @@ pub unsafe trait WindowMemory: Send {
 pub trait WindowAllocator: Send + Sync {
     /// Returns `len` bytes for a window, or the error that stopped it. The
     /// error reaches the caller as [`Error::WindowAllocatorFailed`], kept
-    /// whole. A panic here, or in the returned memory's
+    /// whole.
+    ///
+    /// In a build that unwinds on panic (`panic = "unwind"`, the default on
+    /// most targets), a panic here, or in the returned memory's
     /// [`WindowMemory::as_mut_ptr`] or [`WindowMemory::len`], is caught and
     /// reaches the caller the same way, as an [`io::ErrorKind::Other`] error
-    /// naming the panic, and the decode holds no window of it.
+    /// naming the panic, and the decode holds no window of it. With
+    /// `panic = "abort"`, and on `wasm32-unknown-unknown`, where that is the
+    /// default, nothing is caught and a panic here ends the process.
+    ///
+    /// After an error or a caught panic the same allocator may be called
+    /// again: by the other workers of the same decode, which can be asking
+    /// at the same moment, and by any later decode given the same
+    /// [`crate::ArchiveLimits`]. It must stay usable, or keep failing with
+    /// an error, rather than be left in a state that breaks the next call.
     ///
     /// # Errors
     ///
@@ -140,9 +151,10 @@ impl Lender {
     /// checked. Memory that fails the check is dropped before the error
     /// returns. The error is the allocator's own, an `InvalidInput` one for
     /// memory that failed the check, or an `Other` one for a panic in the
-    /// caller's code, which is caught here so that every codec reports it
-    /// as the allocator's failure; memory it had handed out before the
-    /// panic is dropped as the panic unwinds.
+    /// caller's code, which is caught here, in a build that unwinds, so that
+    /// every codec reports it as the allocator's failure; memory it had
+    /// handed out before the panic is dropped as the panic unwinds. With
+    /// `panic = "abort"` there is nothing to catch.
     fn lend(&self, len: usize) -> io::Result<LentWindow> {
         let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut memory = self.allocator.allocate(len)?;

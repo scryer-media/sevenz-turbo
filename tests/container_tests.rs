@@ -102,8 +102,10 @@ fn memory_estimate_follows_the_declared_dictionary() {
 
         // The LZMA2 property byte quantises the dictionary, so the estimate is
         // at least the requested size plus the state margin, and never more
-        // than one quantisation step above it.
-        let dictionary = u64::from(dictionary_size);
+        // than one quantisation step above it. The decoder clamps the
+        // dictionary to the block's output, and the estimate with it.
+        let dictionary =
+            u64::from(dictionary_size).min(archive.blocks[0].get_unpack_size().max(4096));
         assert!(
             estimate >= dictionary + MIB,
             "estimate {estimate} below dictionary {dictionary}"

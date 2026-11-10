@@ -33,7 +33,7 @@ use crate::codec::{
     filter::{bcj::BcjReader, delta::DeltaReader},
     lzma_turbo::{
         Lzma2Coder, Lzma2Control, Lzma2Plan, lzma2_clamped_prop, lzma2_decoder,
-        lzma2_dictionary_size, lzma2_memory_usage_kb,
+        lzma2_dictionary_size,
     },
 };
 use crate::container::{ArchiveLimits, coder_memory_estimate};
@@ -448,31 +448,30 @@ impl<R: Read> Read for Decoder<R> {
 /// Where the window comes from, RAM or the caller's
 /// [`crate::WindowAllocator`], is decided here and nowhere else: by
 /// [`ArchiveLimits::lends`] on [`Window::bytes`]. The chain check, the
-/// per-coder check and the coder's construction all ask the same value.
+/// per-coder check, the coder's construction and
+/// [`crate::Archive::decoder_memory`] all ask the same value, and charge
+/// the same figure, [`Window::ram_kb`], rounded the same way.
 #[derive(Clone, Copy)]
 struct Window {
     /// The buffer the codec allocates, in bytes: what the caller's allocator
-    /// is asked for when the window is lent.
+    /// is asked for when the window is lent, and what is charged when it is
+    /// not.
     bytes: u64,
-    /// The dictionary or model as [`Window::full_kb`] charges it, in bytes.
-    size: u64,
-    /// Kilobytes the coder holds in RAM with the window in RAM.
-    full_kb: usize,
-    /// Kilobytes the coder holds in RAM with the window lent.
-    rest_kb: usize,
+    /// Bytes the coder holds in RAM beyond its window, lent or not.
+    state: u64,
     /// For LZMA2, the most one buffer of a threaded decoder's workers can
     /// be: `lzma-turbo`'s `Lzma2Decoder::max_worker_window_len`.
     worker: Option<u64>,
 }
 
 impl Window {
-    /// An LZMA dictionary of `dict_size`, already clamped.
-    fn lzma(dict_size: u32) -> Self {
+    /// An LZMA dictionary of `dict_size`, already clamped, for a coder whose
+    /// first property byte is `lclppb`: the probability table it sizes is
+    /// state, see [`crate::codec::lzma_turbo::lzma_state_bytes`].
+    fn lzma(lclppb: u8, dict_size: u32) -> Self {
         Self {
             bytes: crate::codec::lzma_turbo::lzma_window_bytes(dict_size),
-            size: u64::from(dict_size),
-            full_kb: lzma2_memory_usage_kb(dict_size),
-            rest_kb: lzma2_memory_usage_kb(0),
+            state: crate::codec::lzma_turbo::lzma_state_bytes(lclppb),
             worker: None,
         }
     }
@@ -480,26 +479,23 @@ impl Window {
     /// An LZMA2 dictionary of property `dict_prop`, already clamped: the
     /// window `lzma-turbo`'s `Lzma2Decoder::window_len` gives for it.
     fn lzma2(dict_prop: u8) -> Result<Self, Error> {
-        let dict_size = lzma2_dictionary_size(&[dict_prop])?;
         Ok(Self {
             bytes: crate::codec::lzma_turbo::lzma2_window_bytes(dict_prop)?,
-            size: u64::from(dict_size),
-            full_kb: lzma2_memory_usage_kb(dict_size),
-            rest_kb: lzma2_memory_usage_kb(0),
+            state: crate::codec::lzma_turbo::LZ_STATE_BYTES,
             worker: Some(crate::codec::lzma_turbo::lzma2_worker_window_bytes(
                 dict_prop,
             )?),
         })
     }
 
-    /// A PPMd model of `memory_size` bytes.
+    /// A PPMd model of `memory_size` bytes, with the decoder's tables and the
+    /// [`INPUT_BUF_SIZE`] buffer [`add_decoder`] reads its input through
+    /// charged at `crate::container`'s PPMd margin.
     #[cfg(feature = "ppmd")]
     fn ppmd(memory_size: u32) -> Self {
         Self {
             bytes: crate::container::ppmd_arena_bytes(memory_size),
-            size: u64::from(memory_size),
-            full_kb: ppmd_memory_kb(memory_size),
-            rest_kb: ppmd_memory_kb(0),
+            state: crate::container::PPMD_STATE_BYTES,
             worker: None,
         }
     }
@@ -513,13 +509,16 @@ impl Window {
         limits.lends(worker).then_some(worker)
     }
 
-    /// Kilobytes the coder holds in RAM under `limits`.
+    /// Kilobytes the coder holds in RAM under `limits`: its state, and its
+    /// window unless `limits` lend it, rounded up to a whole kilobyte. The one
+    /// figure every check charges a sized coder.
     fn ram_kb(self, limits: &ArchiveLimits) -> usize {
-        if limits.lends(self.bytes) {
-            self.rest_kb
+        let bytes = if limits.lends(self.bytes) {
+            self.state
         } else {
-            self.full_kb
-        }
+            self.bytes.saturating_add(self.state)
+        };
+        usize::try_from(bytes.div_ceil(1024)).unwrap_or(usize::MAX)
     }
 
     /// Whether `limits` lend this window. A lent window over
@@ -563,7 +562,7 @@ impl Window {
     fn split(self, limits: &ArchiveLimits) -> WindowSplit {
         let lent = limits.lends(self.bytes);
         WindowSplit {
-            in_ram: if lent { 0 } else { self.size },
+            in_ram: (self.ram_kb(limits) as u64).saturating_mul(1024),
             lent: lent.then_some(self.bytes),
             worker: self.lent_worker(limits),
         }
@@ -607,10 +606,13 @@ impl Window {
 fn coder_window(coder: &Coder, uncompressed_len: u64) -> Option<Window> {
     let method_id = coder.encoder_method_id();
     if method_id == EncoderMethod::ID_LZMA {
-        Some(Window::lzma(crate::codec::lzma_turbo::clamp_dictionary(
-            crate::codec::lzma_turbo::lzma_dictionary_size(coder.properties()).ok()?,
-            uncompressed_len,
-        )))
+        Some(Window::lzma(
+            *coder.properties().first()?,
+            crate::codec::lzma_turbo::clamp_dictionary(
+                crate::codec::lzma_turbo::lzma_dictionary_size(coder.properties()).ok()?,
+                uncompressed_len,
+            ),
+        ))
     } else if method_id == EncoderMethod::ID_LZMA2 {
         let dict_prop = lzma2_clamped_prop(*coder.properties().first()?, uncompressed_len);
         Window::lzma2(dict_prop).ok()
@@ -630,7 +632,8 @@ fn coder_window(coder: &Coder, uncompressed_len: u64) -> Option<Window> {
 /// makes when it builds the coder: on the window clamped to the coder's
 /// output.
 pub(crate) struct WindowSplit {
-    /// The dictionary or model held in RAM, in bytes: zero when it is lent.
+    /// The bytes the coder holds in RAM: [`Window::ram_kb`] in bytes, its
+    /// state and, unless it is lent, its window as allocated.
     pub(crate) in_ram: u64,
     /// The window asked of the caller's allocator, when it is lent.
     pub(crate) lent: Option<u64>,
@@ -647,14 +650,6 @@ pub(crate) fn coder_window_split(
     limits: &ArchiveLimits,
 ) -> Option<WindowSplit> {
     coder_window(coder, uncompressed_len).map(|window| window.split(limits))
-}
-
-/// What a PPMd coder holds: its model, and the [`INPUT_BUF_SIZE`] buffer
-/// [`add_decoder`] reads its input through. One figure, so the chain check
-/// and the per-coder check charge the same thing.
-#[cfg(feature = "ppmd")]
-fn ppmd_memory_kb(memory_size: u32) -> usize {
-    (memory_size.div_ceil(1024) as usize).saturating_add(INPUT_BUF_SIZE.div_ceil(1024))
 }
 
 /// The memory limit a block's LZMA2 plan is sized against: the caller's
@@ -802,7 +797,7 @@ pub fn add_decoder<I: Read>(
                 crate::codec::lzma_turbo::lzma_dictionary_size(coder.properties())?,
                 uncompressed_len,
             );
-            let window = Window::lzma(dict_size);
+            let window = Window::lzma(coder.properties()[0], dict_size);
             let mem_size = window.ram_kb(opts.limits);
             if mem_size > max_mem_limit_kb {
                 return Err(Error::MaxMemLimited {
