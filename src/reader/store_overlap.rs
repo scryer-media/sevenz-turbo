@@ -38,6 +38,8 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::thread::JoinHandle;
 
 use lzma_turbo::crc::Crc32;
+#[cfg(feature = "bzip2")]
+use lzma_turbo::crc::{crc32, crc32_combine};
 
 use crate::codec::lzma_turbo::Lzma2Control;
 use crate::decoder::DecodeRead;
@@ -79,6 +81,10 @@ pub(crate) struct Checksums {
     pos: u64,
     end: u64,
     crc: Crc32,
+    /// The CRC-32 of `[start, pos)` when the bytes come with their checksums;
+    /// see [`Checksums::update_checked`].
+    #[cfg(feature = "bzip2")]
+    acc: u32,
 }
 
 impl Checksums {
@@ -91,34 +97,84 @@ impl Checksums {
             pos: 0,
             end,
             crc: Crc32::new(),
+            #[cfg(feature = "bzip2")]
+            acc: 0,
         }
     }
 
     pub(crate) fn update(&mut self, mut bytes: &[u8]) {
         while !bytes.is_empty() && self.pos < self.end {
-            let boundary = self
-                .splits
-                .get(self.next)
-                .copied()
-                .filter(|&split| split > self.pos && split < self.end)
-                .unwrap_or(self.end);
+            let boundary = self.boundary();
             let take = (boundary - self.pos).min(bytes.len() as u64) as usize;
             self.crc.update(&bytes[..take]);
             self.pos += take as u64;
             bytes = &bytes[take..];
             if self.pos == boundary {
                 let crc = std::mem::replace(&mut self.crc, Crc32::new()).finalize();
-                self.control
-                    .fold_piece(self.start, self.pos - self.start, crc);
-                self.start = self.pos;
-                while self
-                    .splits
-                    .get(self.next)
-                    .is_some_and(|&split| split <= self.pos)
-                {
-                    self.next += 1;
-                }
+                self.finish_piece(crc);
             }
+        }
+    }
+
+    /// Where the piece at `pos` ends: the next file boundary, or the end.
+    fn boundary(&self) -> u64 {
+        self.splits
+            .get(self.next)
+            .copied()
+            .filter(|&split| split > self.pos && split < self.end)
+            .unwrap_or(self.end)
+    }
+
+    /// Folds the piece `[start, pos)`, whose CRC-32 is `crc`, and starts the
+    /// next one.
+    fn finish_piece(&mut self, crc: u32) {
+        self.control
+            .fold_piece(self.start, self.pos - self.start, crc);
+        self.start = self.pos;
+        while self
+            .splits
+            .get(self.next)
+            .is_some_and(|&split| split <= self.pos)
+        {
+            self.next += 1;
+        }
+    }
+
+    /// [`Checksums::update`] for bytes whose CRC-32 their producer already
+    /// took, on the worker that decoded them. A chunk inside one file is
+    /// folded in by a combine, whose cost does not grow with its length; only
+    /// a chunk a file boundary cuts is checksummed here, and only up to its
+    /// last boundary: the part after it is the chunk's CRC with that prefix's
+    /// contribution taken out. Not mixed with [`Checksums::update`] on one
+    /// instance.
+    #[cfg(feature = "bzip2")]
+    pub(crate) fn update_checked(&mut self, bytes: &[u8], crc: u32) {
+        let mut rest = bytes;
+        // The CRC-32 of the part of `bytes` already used.
+        let mut used = 0u32;
+        while !rest.is_empty() && self.pos < self.end {
+            let boundary = self.boundary();
+            let len = rest.len() as u64;
+            if boundary - self.pos >= len {
+                // The rest of the chunk is inside one piece: its CRC is the
+                // chunk's with the used prefix's taken out.
+                let tail = crc ^ crc32_combine(used, 0, len);
+                self.acc = crc32_combine(self.acc, tail, len);
+                self.pos += len;
+                if self.pos == boundary {
+                    let piece = std::mem::take(&mut self.acc);
+                    self.finish_piece(piece);
+                }
+                return;
+            }
+            let take = (boundary - self.pos) as usize;
+            let part = crc32(&rest[..take]);
+            used = crc32_combine(used, part, take as u64);
+            self.acc = crc32_combine(self.acc, part, take as u64);
+            self.pos += take as u64;
+            rest = &rest[take..];
+            let piece = std::mem::take(&mut self.acc);
+            self.finish_piece(piece);
         }
     }
 }

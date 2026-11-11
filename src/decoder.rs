@@ -931,18 +931,23 @@ pub fn add_decoder<I: Read>(
                 && let Some(control) = opts.lzma2_control
             {
                 // The chain gives final-file splits only to an output BZip2
-                // coder. Compute container CRCs there, before queueing output,
-                // and reuse the reader's existing per-file folding protocol.
+                // coder. Its workers take each chunk's CRC-32 where they
+                // reconstruct it, in parallel; the in-order callback only
+                // folds those into the reader's per-file pieces before the
+                // chunk is queued.
                 let mut checksums = crate::reader::store_overlap::Checksums::new(
                     Arc::clone(control),
                     opts.checksum_splits,
                     uncompressed_len,
                 );
-                let fold = move |bytes: &[u8]| checksums.update(bytes);
+                let fold = move |bytes: &[u8], crc: u32| {
+                    checksums.update_checked(bytes, crc);
+                    Ok(())
+                };
                 let de = if compact {
-                    BzDecoder::with_low_memory_output_callback(input, threads, fold)
+                    BzDecoder::with_low_memory_crc32_output_callback(input, threads, fold)
                 } else {
-                    BzDecoder::with_output_callback(input, threads, fold)
+                    BzDecoder::with_crc32_output_callback(input, threads, fold)
                 };
                 control.fold_elsewhere();
                 return Ok(Decoder::Bzip2(Box::new(Bzip2Decoder::new(

@@ -104,7 +104,7 @@ jobs:
             echo "::error::$VERSION is below $newest, the newest version on crates.io; bump Cargo.toml"
             exit 1
           fi
-      - name: The changelog has a dated section for this version
+      - name: The changelog has a section for this version
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |

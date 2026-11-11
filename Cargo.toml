@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/scryer-media/sevenz-turbo"
 # Raised from upstream's 1.93: `lzma-turbo` requires 1.97.1.
 rust-version = "1.97.1"
-version = "0.30.0"
+version = "0.30.1"
 # Repository scaffolding that has no business in the crate archive.
 exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml"]
 
@@ -95,7 +95,7 @@ aes = { version = "0.9", features = ["zeroize"], optional = true }
 # cryptography is not `lzma-turbo`'s job), so the dependency is direct.
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
 brotli = { version = ">= 7, < 10", default-features = false, optional = true, features = ["std"] }
-bzip2-turbo = { version = "0.2.0", default-features = false, optional = true }
+bzip2-turbo = { version = "0.2.1", default-features = false, optional = true }
 # Renamed so the crate's path never collides with this crate's `bzip2` modules.
 libbzip2 = { package = "bzip2", version = "0.6.1", optional = true }
 cbc = { version = "0.2", optional = true }
