@@ -495,6 +495,17 @@ arm, and this crate can add a variant without a breaking release.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.30.1
+
+- Multithreaded BZip2 with checksum verification on is as fast as with it
+  off. It requires `bzip2-turbo` 0.2.1, whose workers now reconstruct every
+  block's output in parallel when a callback is set and take each chunk's
+  CRC-32 themselves. The per-file checksum fold only combines those CRCs; a
+  chunk that a file boundary cuts is hashed again only up to its last
+  boundary, at most 64 KiB per boundary. The bytes, the files they reach,
+  and where a damaged block or a wrong file checksum stops the decode are
+  unchanged.
+
 ## 0.30.0 - 2026-11-09
 
 - Added decoding on caller memory. `WindowAllocator` and the unsafe trait

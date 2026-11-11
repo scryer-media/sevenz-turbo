@@ -157,3 +157,101 @@ fn bzip2_turbo_and_libbz2_rs_sys_read_each_others_streams() {
         .unwrap();
     assert_eq!(decoded, data, "bzip2-turbo reading libbz2-rs-sys");
 }
+
+/// The plain length of each block of `packed`: the workers cut every block's
+/// output into 64 KiB chunks and end it with a shorter one.
+fn block_lengths(packed: &[u8]) -> Vec<u64> {
+    let chunks = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&chunks);
+    let mut decoder = bzip2_turbo::Decoder::with_output_callback(packed, 2, move |bytes| {
+        sink.lock().unwrap().push(bytes.len() as u64);
+    });
+    decoder.read_to_end(&mut Vec::new()).unwrap();
+    drop(decoder);
+    let mut blocks = Vec::new();
+    let mut length = 0;
+    for &chunk in chunks.lock().unwrap().iter() {
+        length += chunk;
+        if chunk < 65536 {
+            blocks.push(length);
+            length = 0;
+        }
+    }
+    assert_eq!(length, 0);
+    blocks
+}
+
+#[test]
+fn bzip2_worker_checksums_fold_at_splits_inside_and_on_block_boundaries() {
+    let data: Vec<_> = (0..520_003).map(|i| (i * 31 + i / 251) as u8).collect();
+    let mut encoder = bzip2_turbo::Encoder::new(
+        Vec::new(),
+        bzip2_turbo::EncoderOptions {
+            block_size: Some(100_000),
+            ..Default::default()
+        },
+    );
+    encoder.write_all(&data).unwrap();
+    let packed = encoder.finish().unwrap();
+    let blocks = block_lengths(&packed);
+    assert!(blocks.len() >= 5);
+    let first = blocks[0];
+    let second = first + blocks[1];
+    let mut splits = vec![
+        // Several files inside one 64 KiB chunk of the first block.
+        10,
+        11,
+        4_000,
+        // On the first block's chunk boundary, and one byte either side.
+        65_535,
+        65_536,
+        65_537,
+        // One byte before, exactly on and one byte after a block boundary.
+        first - 1,
+        first,
+        first + 1,
+        // Exactly on the next block boundary.
+        second,
+        // A file spanning two whole blocks and a part of a third.
+        second + blocks[2] + blocks[3] + 1_234,
+    ];
+    splits.push(u64::MAX);
+    let mut coder = Coder::single_stream();
+    coder.set_id_size(3);
+    coder
+        .decompression_method_id_mut()
+        .copy_from_slice(EncoderMethod::ID_BZIP2);
+    for threads in [2, 3, 8] {
+        for limit in [u64::MAX, 32 << 20] {
+            let control = Arc::new(Lzma2Control::new(threads));
+            let limits = ArchiveLimits::memory(limit);
+            let mut opts = DecodeOptions::header(&limits);
+            opts.threads = threads;
+            opts.lzma2_control = Some(&control);
+            opts.checksum_splits = &splits;
+            let mut decoder = add_decoder(
+                packed.as_slice(),
+                data.len() as u64,
+                &coder,
+                &Password::empty(),
+                &opts,
+            )
+            .unwrap();
+            assert!(opts.folding_checksums(), "limit {limit}");
+            let mut actual = Vec::new();
+            decoder.read_to_end(&mut actual).unwrap();
+            assert!(actual == data, "threads {threads} limit {limit}");
+            let mut bounds = vec![0];
+            bounds.extend(splits.iter().copied().filter(|&s| s != u64::MAX));
+            bounds.push(data.len() as u64);
+            for pair in bounds.windows(2) {
+                let (start, stop) = (pair[0], pair[1]);
+                assert_eq!(
+                    control.folded(start, stop - start),
+                    Some(lzma_turbo::crc::crc32(&data[start as usize..stop as usize])),
+                    "file {start}..{stop}, threads {threads}, limit {limit}"
+                );
+            }
+        }
+    }
+}
