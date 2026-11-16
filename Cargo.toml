@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/scryer-media/sevenz-turbo"
 # Raised from upstream's 1.93: `lzma-turbo` requires 1.97.1.
 rust-version = "1.97.1"
-version = "0.30.1"
+version = "0.30.2"
 # Repository scaffolding that has no business in the crate archive.
 exclude = [".github/", ".githooks/", ".gitleaks.toml", ".gitattributes", "renovate.json", "AGENTS.md", ".cargo/", "xtask/", "rust-toolchain.toml"]
 
@@ -113,7 +113,9 @@ zstd = { version = "0.14.3", optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cap-std = { version = "4.0.3", optional = true }
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The JavaScript bindings exist for the browser target only: WASI and
+# Emscripten builds are wasm32 too, but have no JavaScript host to bind to.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 js-sys = "0.3"
 wasm-bindgen = "0.2"
 
@@ -157,6 +159,13 @@ required-features = ["default"]
 [[example]]
 name = "wasm_host_extract_conformance"
 required-features = ["aes256", "crc-host", "crypto-host"]
+
+# The same question with nothing delegated: a report of what the crate
+# extracts and writes, which CI compares between the native build and each
+# wasm target that can run a program on its own.
+[[example]]
+name = "wasm_portable_check"
+required-features = ["aes256"]
 
 [package.metadata.docs.rs]
 all-features = true

@@ -50,7 +50,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_docs)]
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 extern crate wasm_bindgen;
 
 pub mod container;
@@ -169,7 +169,7 @@ pub use time::NtTime;
 pub use util::compress::*;
 #[cfg(all(feature = "util", not(target_arch = "wasm32")))]
 pub use util::decompress::*;
-#[cfg(all(feature = "util", target_arch = "wasm32"))]
+#[cfg(all(feature = "util", target_arch = "wasm32", target_os = "unknown"))]
 pub use util::wasm::*;
 pub use window_memory::{WindowAllocator, WindowMemory};
 #[cfg(feature = "compress")]

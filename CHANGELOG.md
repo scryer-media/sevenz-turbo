@@ -495,6 +495,24 @@ arm, and this crate can add a variant without a breaking release.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.30.2
+
+- The `wasm-bindgen` and `js-sys` dependencies, the `util` JavaScript
+  exports and `ArchiveLimits`' `wasm-bindgen` class are built for
+  `wasm32-unknown-unknown` only. Every `wasm32` target linked them before,
+  so a `wasm32-unknown-emscripten` build failed to link on undefined
+  `__wbindgen_*` symbols; WASI and Emscripten builds have no JavaScript host
+  to bind to. Every other `wasm32` gate (no threads, no positional file
+  reads) still applies to all of them, and `wasm32-unknown-unknown` builds
+  are unchanged.
+- CI now runs the crate with nothing delegated to a host on `wasm32-wasip1`
+  and `wasm32-wasip2` under wasmtime and on `wasm32-unknown-emscripten` under
+  Node, with `--no-default-features --features
+  aes256,native-crypto,bzip2,compress,ppmd`. The new
+  `examples/wasm_portable_check.rs` extracts every `.7z` fixture and writes
+  and reads back an archive with LZMA2, BZip2, PPMd and AES-256 with LZMA2;
+  each target's report must equal the native one byte for byte.
+
 ## 0.30.1
 
 - Multithreaded BZip2 with checksum verification on is as fast as with it
