@@ -329,7 +329,23 @@ RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo build --target wasm32-unknow
 ```
 
 With `util`, the module exports `decompress`, and `compress` as well when
-the `compress` feature is on.
+the `compress` feature is on. These `wasm-bindgen` exports, and
+`ArchiveLimits` as a JavaScript class, exist on `wasm32-unknown-unknown`
+only.
+
+The crate also runs as an ordinary program on `wasm32-wasip1` and
+`wasm32-wasip2` (under wasmtime, for example) and on
+`wasm32-unknown-emscripten` (under Node), with nothing delegated to a host:
+
+```bash
+cargo build --target wasm32-wasip2 --no-default-features --features=aes256,native-crypto,bzip2,compress,ppmd
+```
+
+CI builds
+[`examples/wasm_portable_check.rs`](examples/wasm_portable_check.rs) with
+that feature set for all three targets, extracts every test archive and
+writes and reads back one per method, and requires each report to equal the
+native one byte for byte.
 
 The program that embeds the module can usually decrypt and checksum much
 faster than code inside it. Two features hand that work over, on `wasm32`

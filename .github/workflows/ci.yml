@@ -464,6 +464,129 @@ jobs:
       - name: Run doctests
         run: cargo test --doc --no-fail-fast --locked -p wasm-conformance
 
+  # The crate with nothing delegated to a host, on every wasm target that runs
+  # a program on its own: WASI 0.1 and 0.2 under wasmtime, Emscripten under
+  # Node. `examples/wasm_portable_check.rs` extracts every .7z fixture and
+  # writes and reads back an archive with each method, and each target's
+  # report must equal the native one byte for byte. The host-delegation
+  # harness above stays wasip1-only: its raw `host` imports are a core-module
+  # ABI, which a wasip2 component and an Emscripten module do not link.
+  wasm-portable:
+    name: wasm-portable
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    env:
+      # Pinned: the lanes are only comparable if they ran on one runtime.
+      WASMTIME_VERSION: 50.0.1
+      # Bump the emsdk release and the commit its tag names together.
+      EMSDK_VERSION: 7.0.0
+      EMSDK_COMMIT: 1693ce7359fc9694f198694f902a2cc061239b86
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-wasip1,wasm32-wasip2,wasm32-unknown-emscripten
+      - name: Set up wasmtime
+        uses: bytecodealliance/actions/wasmtime/setup@9152e710e9f7182e4c29ad218e4f335a7b203613 # v1.1.3
+        with:
+          version: ${{ env.WASMTIME_VERSION }}
+      - name: Verify the pinned wasmtime is the one on PATH
+        run: |
+          set -euo pipefail
+          reported="$(wasmtime --version)"
+          echo "$reported"
+          grep -qF "wasmtime $WASMTIME_VERSION" <<<"$reported"
+      - name: Set up Emscripten
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/emsdk"
+          # Fetched by commit, not by tag: a tag can be moved, a commit cannot.
+          git init -q "$root"
+          git -C "$root" fetch -q --depth 1 \
+            https://github.com/emscripten-core/emsdk.git "$EMSDK_COMMIT"
+          git -C "$root" checkout -q FETCH_HEAD
+          "$root/emsdk" install "$EMSDK_VERSION"
+          "$root/emsdk" activate "$EMSDK_VERSION"
+          emsdk_version="$EMSDK_VERSION"
+          # emsdk_env.sh reads variables that may be unset.
+          set +u
+          # shellcheck disable=SC1091
+          source "$root/emsdk_env.sh"
+          set -u
+          # emsdk_env.sh clears EMSDK_VERSION, so the pin is read from the copy.
+          # Read whole before matching: a reader that closes the pipe early
+          # fails emcc under pipefail.
+          reported="$(emcc --version)"
+          grep -qF "$emsdk_version" <<<"$reported"
+          node --version
+          {
+            echo "$EMSDK/upstream/emscripten"
+            dirname "$EMSDK_NODE"
+          } >> "$GITHUB_PATH"
+          {
+            echo "EMSDK=$EMSDK"
+            echo "EM_CONFIG=$EMSDK/.emscripten"
+          } >> "$GITHUB_ENV"
+      - name: Build the report natively and for every wasm target
+        run: |
+          set -euo pipefail
+          build() {
+            local lane="$1" target="$2" flags="$3"
+            local -a target_arg=()
+            if [ -n "$target" ]; then
+              target_arg=(--target "$target")
+            fi
+            # One target directory per lane: cargo does not separate builds
+            # by RUSTFLAGS.
+            CARGO_TARGET_DIR="$PWD/target-wasm/$lane" RUSTFLAGS="$flags" \
+              cargo build --release --locked --no-default-features \
+                --features aes256,native-crypto,bzip2,compress,ppmd \
+                ${target_arg[@]+"${target_arg[@]}"} --example wasm_portable_check
+          }
+          build native "" ""
+          build wasip1 wasm32-wasip1 ""
+          build wasip2 wasm32-wasip2 ""
+          # The host filesystem through Node, a heap that grows past the fixed
+          # 16 MiB default, and a 1 MiB stack in place of the 64 KiB default.
+          build emscripten wasm32-unknown-emscripten \
+            "-C link-arg=-sNODERAWFS=1 -C link-arg=-sALLOW_MEMORY_GROWTH=1 -C link-arg=-sSTACK_SIZE=1MB"
+      - name: Every target's report equals the native one
+        run: |
+          set -euo pipefail
+          fixtures="$PWD/tests/resources"
+          lanes="$PWD/target-wasm"
+          reports="$RUNNER_TEMP/reports"
+          ex=release/examples/wasm_portable_check
+          mkdir -p "$reports"
+          "$lanes/native/$ex" "$fixtures" | tee "$reports/native.txt"
+          # A reference with no rows would make every lane trivially equal.
+          extracted="$(grep -c '^extract ' "$reports/native.txt")"
+          written="$(grep -c '^write ' "$reports/native.txt")"
+          [ "$extracted" -ge 30 ] && [ "$written" -ge 10 ] \
+            || { echo "::error::native report has $extracted extract and $written write rows"; exit 1; }
+          failures=0
+          compare() {
+            local lane="$1"
+            if diff -u "$reports/native.txt" "$reports/$lane.txt"; then
+              echo "lane $lane: report is identical to native"
+            else
+              failures=$((failures + 1))
+              echo "::error::wasm lane $lane diverged from the native run"
+            fi
+          }
+          for lane in wasip1 wasip2; do
+            wasmtime run --dir "$fixtures::/fixtures" \
+              "$lanes/$lane/wasm32-$lane/$ex.wasm" /fixtures > "$reports/$lane.txt" || true
+            compare "$lane"
+          done
+          node "$lanes/emscripten/wasm32-unknown-emscripten/$ex.js" "$fixtures" \
+            > "$reports/emscripten.txt" || true
+          compare emscripten
+          [ "$failures" -eq 0 ]
+
   msrv:
     name: msrv
     runs-on: ubuntu-26.04
@@ -543,7 +666,7 @@ jobs:
   ci-complete:
     name: ci-complete
     if: always()
-    needs: [hygiene, fmt, clippy, docs, test, bzip2-conformance, unsafe-complete, sdk-functional, unthreaded, wasm, msrv, package]
+    needs: [hygiene, fmt, clippy, docs, test, bzip2-conformance, unsafe-complete, sdk-functional, unthreaded, wasm, wasm-portable, msrv, package]
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     steps:

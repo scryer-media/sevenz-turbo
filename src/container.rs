@@ -38,7 +38,10 @@ const MIB: u64 = 1024 * KIB;
 /// behalf would change what well-formed archives do.
 ///
 /// [`Error::LimitExceeded`]: crate::Error::LimitExceeded
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen::prelude::wasm_bindgen)]
+#[cfg_attr(
+    all(target_arch = "wasm32", target_os = "unknown"),
+    wasm_bindgen::prelude::wasm_bindgen
+)]
 pub struct ArchiveLimits {
     /// Largest decoder footprint the caller will allow, in bytes.
     ///
@@ -189,14 +192,14 @@ pub struct ArchiveLimits {
     /// [`RefUnwindSafe`](std::panic::RefUnwindSafe) with any allocator: the
     /// decoder only holds it and calls it.
     ///
-    /// On `wasm32` this field is skipped by `wasm-bindgen`: it exists, and
-    /// [`ArchiveLimits::with_window_allocator`] sets it from Rust, but a
-    /// JavaScript caller has no way to set it and decodes every window in
-    /// RAM.
+    /// On `wasm32-unknown-unknown` this field is skipped by `wasm-bindgen`:
+    /// it exists, and [`ArchiveLimits::with_window_allocator`] sets it from
+    /// Rust, but a JavaScript caller has no way to set it and decodes every
+    /// window in RAM.
     ///
     /// [`WindowAllocator`]: crate::WindowAllocator
     /// [`Error::WindowAllocatorFailed`]: crate::Error::WindowAllocatorFailed
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen(skip))]
+    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), wasm_bindgen(skip))]
     pub window_allocator: Option<AssertUnwindSafe<Arc<dyn WindowAllocator>>>,
     /// Largest decode buffer, in bytes, allocated in RAM when
     /// `window_allocator` is set. A larger one is asked of the allocator.
