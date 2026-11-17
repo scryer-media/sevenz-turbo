@@ -249,7 +249,7 @@ impl<'a, R: Read + Seek> Read for SharedBoundedReader<'a, R> {
 
         inner.seek(SeekFrom::Start(self.cur))?;
 
-        let bound = buf.len().min((self.bounds.1 - self.cur) as usize);
+        let bound = capped(buf.len(), self.bounds.1 - self.cur);
         let size = inner.read(&mut buf[..bound])?;
         if size == 0 {
             return Err(ended_early());
@@ -7565,6 +7565,42 @@ mod folder_plan_tests {
                 .map(UnorderedPhase::Ordered)
                 .collect();
             assert_eq!(plan_unordered(&solid, 8, limit), ordered);
+        }
+    }
+}
+
+#[cfg(test)]
+mod wide_shared_reader_tests {
+    use super::*;
+    struct Sparse {
+        position: u64,
+    }
+    impl Read for Sparse {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            bytes.fill(0x5a);
+            self.position += bytes.len() as u64;
+            Ok(bytes.len())
+        }
+    }
+    impl Seek for Sparse {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            match position {
+                SeekFrom::Start(position) => self.position = position,
+                _ => unreachable!("shared reader seeks its source absolutely"),
+            }
+            Ok(self.position)
+        }
+    }
+    #[test]
+    fn shared_stream_with_exact_4_gib_remaining_does_not_report_eof() {
+        let mut source = Sparse { position: 0 };
+        let shared = Rc::new(RefCell::new(&mut source));
+        for size in [1u64 << 32, (1u64 << 32) + 3] {
+            let mut reader = SharedBoundedReader::new(Rc::clone(&shared), (17, 17 + size));
+            let mut bytes = [0; 8];
+            assert_eq!(reader.read(&mut bytes).unwrap(), 8);
+            assert_eq!(bytes, [0x5a; 8]);
+            assert_eq!(reader.cur, 25);
         }
     }
 }

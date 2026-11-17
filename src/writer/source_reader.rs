@@ -8,7 +8,7 @@ use lzma_turbo::crc::Crc32;
 /// the CRC32 checksum of the data.
 pub struct SourceReader<R> {
     reader: R,
-    size: usize,
+    size: u64,
     crc: Crc32,
     crc_value: u32,
     finished: bool,
@@ -25,9 +25,12 @@ impl<R: Read> Read for SourceReader<R> {
         if buf.is_empty() || self.finished {
             return Ok(0);
         }
+        self.size
+            .checked_add(buf.len() as u64)
+            .ok_or_else(|| std::io::Error::other("7z source byte count overflow"))?;
         let n = self.reader.read(buf)?;
         if n > 0 {
-            self.size += n;
+            self.size += n as u64;
             self.crc.update(&buf[..n]);
         } else {
             let crc = std::mem::take(&mut self.crc);
@@ -53,8 +56,15 @@ impl<R> SourceReader<R> {
         }
     }
 
-    /// Returns the total number of bytes read so far.
+    /// Returns the byte count, saturating at the platform's `usize::MAX`.
+    ///
+    /// Use [`Self::read_count_u64`] for exact counts beyond 4 GiB on 32-bit targets.
     pub fn read_count(&self) -> usize {
+        usize::try_from(self.size).unwrap_or(usize::MAX)
+    }
+
+    /// Returns the exact total number of bytes read on every target.
+    pub fn read_count_u64(&self) -> u64 {
         self.size
     }
 
@@ -95,6 +105,25 @@ mod tests {
             assert_eq!(reader.crc_value(), crc32(part));
             assert!(reader.finished);
         }
+    }
+
+    #[test]
+    fn source_counts_cross_32_bit_without_truncating_and_refuse_overflow() {
+        let mut reader = SourceReader::new(b"abcdefgh".as_slice());
+        reader.size = u32::MAX as u64 - 2;
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).unwrap();
+        let expected = u32::MAX as u64 + 6;
+        assert_eq!(reader.read_count_u64(), expected);
+        assert_eq!(
+            reader.read_count(),
+            usize::try_from(expected).unwrap_or(usize::MAX)
+        );
+        assert_eq!(reader.crc_value(), crc32(b"abcdefgh"));
+        let mut reader = SourceReader::new(b"x".as_slice());
+        reader.size = u64::MAX;
+        assert!(reader.read(&mut [0; 1]).is_err());
+        assert_eq!(reader.reader, b"x");
     }
 
     #[test]
