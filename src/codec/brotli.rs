@@ -279,9 +279,10 @@ impl<W: Write> BrotliEncoder<W> {
             return Ok(());
         }
 
+        let packed_size = super::packed_frame_size(compressed_data.len())?;
         writer.write_u32(SKIPPABLE_FRAME_MAGIC)?;
         writer.write_u32(8)?;
-        writer.write_u32(compressed_data.len() as u32)?;
+        writer.write_u32(packed_size)?;
         writer.write_u16(BROTLI_MAGIC)?;
 
         let hint_value = uncompressed_bytes.div_ceil(HINT_UNIT_SIZE);

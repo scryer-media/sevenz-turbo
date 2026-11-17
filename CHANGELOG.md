@@ -495,6 +495,25 @@ arm, and this crate can add a variant without a breaking release.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.30.3
+
+### Fixed
+
+- Keep cumulative packed, unpacked, intermediate-coder and source lengths in
+  checked 64-bit counters. On 32-bit targets, writing more than 4 GiB no longer
+  stores wrapped sizes beside a checksum for the complete input. The pull,
+  solid, prepared-block and encoded-header paths use the same counters.
+- Cap shared packed-stream reads before narrowing a chunk length to `usize`,
+  including when exactly 4 GiB remains. Reject LZ4 and Brotli framed output
+  whose compressed size cannot fit its 32-bit on-wire length before writing
+  any frame header.
+
+### Added
+
+- `SourceReader::read_count_u64` reports exact source lengths on every target.
+  The existing `read_count` method keeps its return type and saturates at the
+  platform's `usize::MAX` instead of wrapping.
+
 ## 0.30.2
 
 - The `wasm-bindgen` and `js-sys` dependencies, the `util` JavaScript

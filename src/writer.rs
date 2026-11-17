@@ -1158,7 +1158,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
             .map_err(|e| Error::io_msg(e, format!("Encode entries:{}", entries_names(&entries))))?;
         let mut out = std::io::BufWriter::with_capacity(output_buffer_len(folder), &mut compressed);
         let content_methods = &folder_methods(&self.content_methods, folder)?;
-        let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(content_methods.len() - 1);
+        let mut more_sizes: Vec<Rc<Cell<u64>>> = Vec::with_capacity(content_methods.len() - 1);
         let mut bcj2 = None;
         let mut input = wrap(&mut r);
         let pulled = match content_methods.split_last() {
@@ -1230,8 +1230,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let compressed_crc = compressed.crc_value();
         let (sub_stream_sizes, sub_stream_crcs) = sub_streams(&mut entries, &r)?;
 
-        self.pack_info
-            .add_stream(compressed_len as u64, compressed_crc);
+        self.pack_info.add_stream(compressed_len, compressed_crc);
         let content_methods = Arc::clone(content_methods);
         let bcj2 = Bcj2Packed::take(bcj2);
         if let Some(bcj2) = &bcj2 {
@@ -1239,8 +1238,8 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         }
 
         let mut sizes = Vec::with_capacity(more_sizes.len() + 1);
-        sizes.extend(more_sizes.iter().map(|s| s.get() as u64));
-        sizes.push(size as u64);
+        sizes.extend(more_sizes.iter().map(|s| s.get()));
+        sizes.push(size);
 
         self.unpack_info
             .add_multiple(
@@ -1267,7 +1266,7 @@ impl<W: Write + Seek> ArchiveWriter<W> {
     fn create_writer<'a, O: Write + 'a>(
         methods: &[EncoderConfiguration],
         out: O,
-        more_sized: &mut Vec<Rc<Cell<usize>>>,
+        more_sized: &mut Vec<Rc<Cell<u64>>>,
         bcj2: &mut Option<encoder::Bcj2Slot>,
         sides: encoder::Bcj2Sides,
     ) -> Result<Box<dyn Write + 'a>> {
@@ -1453,19 +1452,19 @@ impl<W: Write + Seek> ArchiveWriter<W> {
         let compress_crc = compressed.crc_value();
         let compress_size = *compressed.bytes_written;
 
-        if !must_encrypt_header && compress_size as u64 + 20 >= size {
+        if !must_encrypt_header && compress_size + 20 >= size {
             // We have an unencrypted header and the compression made increased the data size,
             // so we write the raw header data without compressing it to save space.
             header.write_all(&raw_header)?;
             return Ok(());
         }
-        self.output.write_all(&encoded_data[..compress_size])?;
+        self.output.write_all(&encoded_data)?;
 
-        pack_info.add_stream(compress_size as u64, compress_crc);
+        pack_info.add_stream(compress_size, compress_crc);
 
         let mut unpack_info = UnpackInfo::default();
         let mut sizes = Vec::with_capacity(1 + more_sizes.len());
-        sizes.extend(more_sizes.iter().map(|s| s.get() as u64));
+        sizes.extend(more_sizes.iter().map(|s| s.get()));
         sizes.push(size);
         unpack_info.add(methods, sizes, crc32);
 
@@ -1681,11 +1680,11 @@ fn sub_streams<R>(
     let mut crcs = Vec::with_capacity(entries.len());
     for (entry, reader) in entries.iter_mut().zip(readers) {
         if !entry.has_stream {
-            if reader.read_count() != 0 {
+            if reader.read_count_u64() != 0 {
                 return Err(Error::invalid_argument(format!(
                     "entry '{}' has no stream, but its reader returned {} bytes",
                     entry.name,
-                    reader.read_count()
+                    reader.read_count_u64()
                 )));
             }
             entry.crc = 0;
@@ -1694,7 +1693,7 @@ fn sub_streams<R>(
             continue;
         }
         entry.crc = reader.crc_value() as u64;
-        entry.size = reader.read_count() as u64;
+        entry.size = reader.read_count_u64();
         entry.has_crc = true;
         sizes.push(entry.size);
         crcs.push(entry.crc as u32);
@@ -1709,7 +1708,7 @@ fn fold_source_crcs<R>(readers: &[SourceReader<R>]) -> u32 {
         return 0;
     };
     rest.iter().fold(first.crc_value(), |crc, source| {
-        crc32_combine(crc, source.crc_value(), source.read_count() as u64)
+        crc32_combine(crc, source.crc_value(), source.read_count_u64())
     })
 }
 
@@ -1743,7 +1742,7 @@ impl FolderInput<'_> {
         coder: &mut encoder::FolderCoder,
         plan: &encoder::PulledCoder,
         out: &mut dyn Write,
-    ) -> std::io::Result<(u32, usize)> {
+    ) -> std::io::Result<(u32, u64)> {
         let mut read_len = 0;
         let crc = match self {
             Self::Local(reader) => {
@@ -1795,11 +1794,11 @@ fn encode_pulled<const CHECKSUM: bool, W: Write>(
     input: &mut FolderInput<'_>,
     prefix: &[u8],
     out: &mut W,
-    more_sizes: &mut Vec<Rc<Cell<usize>>>,
+    more_sizes: &mut Vec<Rc<Cell<u64>>>,
     bcj2: &mut Option<encoder::Bcj2Slot>,
     sides: encoder::Bcj2Sides,
     error: impl Fn(std::io::Error) -> Error,
-) -> Result<(u32, usize)> {
+) -> Result<(u32, u64)> {
     // The data meets the last method first. The chain after it is built as
     // `create_writer` builds it, and the counter `create_writer` would put
     // under the pulled coder - the size of what it codes into the next
@@ -1907,7 +1906,7 @@ fn encode_sized_entry<O: Write>(
     } = sized;
     let mut compressed_len = 0;
     let mut compressed = CompressWrapWriter::new(output, &mut compressed_len);
-    let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(content_methods.len() - 1);
+    let mut more_sizes: Vec<Rc<Cell<u64>>> = Vec::with_capacity(content_methods.len() - 1);
     let mut out = std::io::BufWriter::with_capacity(output_buffer_len(folder), &mut compressed);
     let methods = folder_methods(content_methods, folder)?;
     let mut bcj2 = None;
@@ -1973,10 +1972,10 @@ fn encode_sized_entry<O: Write>(
     Ok(EncodedFolder {
         entry,
         methods,
-        size: size as u64,
-        more_sizes: more_sizes.iter().map(|s| s.get() as u64).collect(),
+        size,
+        more_sizes: more_sizes.iter().map(|s| s.get()).collect(),
         crc,
-        compressed_len: compressed_len as u64,
+        compressed_len,
         compressed_crc,
         bcj2: Bcj2Packed::take(bcj2),
     })
@@ -2093,16 +2092,19 @@ impl Write for StageSink<'_, '_> {
 struct CrcReader<'a, R> {
     inner: R,
     crc: Option<Crc32>,
-    read: &'a mut usize,
+    read: &'a mut u64,
 }
 
 impl<R: Read> Read for CrcReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read
+            .checked_add(buf.len() as u64)
+            .ok_or_else(|| std::io::Error::other("7z input byte count overflow"))?;
         let n = self.inner.read(buf)?;
         if let Some(crc) = &mut self.crc {
             crc.update(&buf[..n]);
         }
-        *self.read += n;
+        *self.read += n as u64;
         Ok(n)
     }
 }
@@ -2110,11 +2112,11 @@ impl<R: Read> Read for CrcReader<'_, R> {
 struct CompressWrapWriter<'a, W> {
     writer: W,
     crc: Crc32,
-    bytes_written: &'a mut usize,
+    bytes_written: &'a mut u64,
 }
 
 impl<'a, W: Write> CompressWrapWriter<'a, W> {
-    pub fn new(writer: W, bytes_written: &'a mut usize) -> Self {
+    pub fn new(writer: W, bytes_written: &'a mut u64) -> Self {
         Self {
             writer,
             crc: Crc32::new(),
@@ -2130,9 +2132,12 @@ impl<'a, W: Write> CompressWrapWriter<'a, W> {
 
 impl<W: Write> Write for CompressWrapWriter<'_, W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes_written
+            .checked_add(buf.len() as u64)
+            .ok_or_else(|| std::io::Error::other("7z compressed byte count overflow"))?;
         let len = self.writer.write(buf)?;
         self.crc.update(&buf[..len]);
-        *self.bytes_written += len;
+        *self.bytes_written += len as u64;
         Ok(len)
     }
 
@@ -2264,7 +2269,7 @@ pub fn prepare_block<R: Read>(
     })?;
     let methods = folder_methods(&methods, folder)?;
     let mut out: Vec<u8> = Vec::new();
-    let mut more_sizes: Vec<Rc<Cell<usize>>> = Vec::with_capacity(methods.len() - 1);
+    let mut more_sizes: Vec<Rc<Cell<u64>>> = Vec::with_capacity(methods.len() - 1);
     let mut bcj2 = None;
 
     let (size, compressed_crc) = {
@@ -2328,8 +2333,8 @@ pub fn prepare_block<R: Read>(
     let (sub_stream_sizes, sub_stream_crcs) = sub_streams(&mut entries, &r)?;
 
     let mut sizes = Vec::with_capacity(more_sizes.len() + 1);
-    sizes.extend(more_sizes.iter().map(|s| s.get() as u64));
-    sizes.push(size as u64);
+    sizes.extend(more_sizes.iter().map(|s| s.get()));
+    sizes.push(size);
 
     Ok(PreparedBlock {
         compressed: out,
@@ -2550,7 +2555,7 @@ mod header_coder_tests {
         for chain in chains {
             for len in [0, 1, 17, 65_537, 524_289] {
                 let raw: Vec<u8> = (0..len).map(|i| (i ^ (i >> 9)) as u8).collect();
-                let methods = sized_methods(&Arc::new(chain.clone()), Some(len as u64));
+                let methods = sized_methods(&Arc::new(chain.clone()), Some(len));
                 let mut old = Vec::new();
                 let mut old_sizes = Vec::new();
                 {
@@ -2822,11 +2827,51 @@ mod send_request_tests {
             assert_eq!(destination, data);
             counted.crc.unwrap().finalize()
         };
-        assert_eq!(count, data.len());
+        assert_eq!(count, data.len() as u64);
         assert_eq!(crc, crc32_of(&data));
-        assert_eq!(source.read_count(), data.len());
+        assert_eq!(source.read_count_u64(), data.len() as u64);
         assert_eq!(source.crc_value(), crc);
         assert!(observed.requests.iter().all(|n| *n == 1 << 20));
         assert_eq!(observed.requests.len(), 5);
+    }
+}
+
+#[cfg(test)]
+mod wide_counter_tests {
+    use super::*;
+    #[test]
+    fn crc_wrappers_count_past_32_bit_and_reject_overflow_before_io() {
+        let mut count = u32::MAX as u64 - 1;
+        let mut output = Vec::new();
+        {
+            let mut writer = CompressWrapWriter::new(&mut output, &mut count);
+            writer.write_all(b"abcd").unwrap();
+            assert_eq!(writer.crc_value(), crc32_of(b"abcd"));
+        }
+        assert_eq!(count, u32::MAX as u64 + 3);
+        count = u64::MAX;
+        assert!(
+            CompressWrapWriter::new(&mut output, &mut count)
+                .write(b"x")
+                .is_err()
+        );
+        assert_eq!(output, b"abcd");
+        let mut read = u32::MAX as u64 - 1;
+        let mut reader = CrcReader {
+            inner: b"abcd".as_slice(),
+            crc: Some(Crc32::new()),
+            read: &mut read,
+        };
+        assert_eq!(reader.read(&mut [0; 8]).unwrap(), 4);
+        assert_eq!(reader.crc.unwrap().finalize(), crc32_of(b"abcd"));
+        assert_eq!(read, u32::MAX as u64 + 3);
+        let mut read = u64::MAX;
+        let mut reader = CrcReader {
+            inner: b"x".as_slice(),
+            crc: None,
+            read: &mut read,
+        };
+        assert!(reader.read(&mut [0; 1]).is_err());
+        assert_eq!(reader.inner, b"x");
     }
 }
