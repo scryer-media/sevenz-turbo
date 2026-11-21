@@ -36,7 +36,7 @@ use crate::{
 /// Upper bound for eagerly pre-allocating an output buffer from an archive-declared
 /// (untrusted) uncompressed size. The buffer still grows to the real size as data is
 /// read; this only stops a tiny archive from forcing a huge up-front allocation.
-const MAX_PREALLOC_BYTES: usize = 4 << 20;
+pub(crate) const MAX_PREALLOC_BYTES: usize = 4 << 20;
 
 /// 7-Zip's ceiling on a block's coders and on its input streams
 /// (`k_NumCodersStreams_in_Folder_MAX`). It holds whatever [`ArchiveLimits`] say: the decode
@@ -1260,7 +1260,109 @@ impl Archive {
         Ok(())
     }
 
+    /// Looks for the end header back from the end of a file whose start header
+    /// is zeroed, trying each byte that could begin one, last first.
+    ///
+    /// The bytes searched are read once. A candidate's header runs from it to
+    /// the end of the file, so it is parsed from a slice of that buffer,
+    /// rather than read out of the file again for each of up to a megabyte of
+    /// candidates. The buffer stops where a candidate's header would pass
+    /// [`ArchiveLimits::max_end_header_bytes`]: below that, the first
+    /// candidate met is refused as too large, as [`Self::init_archive`]
+    /// refuses it, and the bytes there are only looked at.
     fn try_to_locale_end_header<R: Read + Seek>(
+        reader: &mut R,
+        reader_len: u64,
+        password: &Password,
+        opts: &DecodeOptions<'_>,
+    ) -> Result<Self, Error> {
+        const SEARCH_LIMIT: u64 = 1024 * 1024;
+        let start = reader.stream_position()?;
+        let prev_data_size = start + 20;
+        let min_pos = if start + SEARCH_LIMIT > reader_len {
+            start
+        } else {
+            reader_len - SEARCH_LIMIT
+        };
+        let corrupt = || Error::corrupted("Start header corrupt and unable to guess end header");
+        // Candidates are `min_pos..=reader_len - 2`, highest first.
+        if reader_len.saturating_sub(1) <= min_pos {
+            return Err(corrupt());
+        }
+        let window_start = min_pos.max(reader_len.saturating_sub(opts.limits.max_end_header_bytes));
+        let mut window = vec![0; (reader_len - window_start) as usize];
+        reader.seek(SeekFrom::Start(window_start))?;
+        reader.read_exact(&mut window)?;
+
+        for pos in (window_start..reader_len - 1).rev() {
+            let nid = window[(pos - window_start) as usize];
+            if nid != K_ENCODED_HEADER && nid != K_HEADER {
+                continue;
+            }
+            // `pos` scans down and can fall below `prev_data_size`; skip such candidates
+            // instead of underflowing the subtraction.
+            let Some(next_header_offset) = pos.checked_sub(prev_data_size) else {
+                continue;
+            };
+            let next_header_size = reader_len - pos;
+            // Where `init_archive` would read this candidate's header from.
+            let header = SIGNATURE_HEADER_SIZE
+                .checked_add(next_header_offset)
+                .filter(|header_pos| *header_pos >= window_start)
+                .and_then(|header_pos| header_pos.checked_add(next_header_size))
+                .filter(|header_end| *header_end <= reader_len)
+                .map(|header_end| {
+                    &window[(header_end - next_header_size - window_start) as usize
+                        ..(header_end - window_start) as usize]
+                });
+            let result = match header {
+                Some(header) => Self::parse_next_header(header, reader, password, opts)
+                    .and_then(|archive| Self::finish_archive(archive, reader_len, opts))?,
+                // Not inside the window: only when the start header is not at
+                // the start of the file, which the one caller rules out.
+                None => Self::init_archive(
+                    reader,
+                    StartHeader {
+                        next_header_offset,
+                        next_header_size,
+                        next_header_crc: 0,
+                    },
+                    password,
+                    false,
+                    opts,
+                )?,
+            };
+            if !result.files.is_empty() {
+                return Ok(result);
+            }
+        }
+
+        // Below the window, a candidate's header would be over the limit.
+        let mut chunk = [0u8; 4096];
+        let mut end = window_start.min(reader_len - 1);
+        while end > min_pos {
+            let begin = end.saturating_sub(chunk.len() as u64).max(min_pos);
+            let chunk = &mut chunk[..(end - begin) as usize];
+            reader.seek(SeekFrom::Start(begin))?;
+            reader.read_exact(chunk)?;
+            for (i, &nid) in chunk.iter().enumerate().rev() {
+                let pos = begin + i as u64;
+                if (nid == K_ENCODED_HEADER || nid == K_HEADER) && pos >= prev_data_size {
+                    return Err(Error::EndHeaderTooLarge {
+                        limit_bytes: opts.limits.max_end_header_bytes,
+                        declared_bytes: reader_len - pos,
+                    });
+                }
+            }
+            end = begin;
+        }
+        Err(corrupt())
+    }
+
+    /// The scan [`Self::try_to_locale_end_header`] replaced, which reads each
+    /// candidate's header out of the file again; kept to compare against.
+    #[cfg(all(test, feature = "compress"))]
+    fn try_to_locale_end_header_reference<R: Read + Seek>(
         reader: &mut R,
         reader_len: u64,
         password: &Password,
@@ -1361,8 +1463,27 @@ impl Archive {
             return Ok(Archive::default());
         }
 
+        let archive = Self::parse_next_header(&buf, reader, password, opts)?;
+        // Like CDbEx::FillLinks, stream maps depend only on parsed metadata.
+        // Release the plain header before allocating those final maps, rather
+        // than keeping both complete representations live (a decoded header
+        // is released as the parse returns).
+        drop(buf);
+        Self::finish_archive(archive, reader_len, opts)
+    }
+
+    /// Parses a next header of `next_header.len()` bytes, decoding it first if
+    /// it is a compressed one, whose packed stream is read from `reader`.
+    fn parse_next_header<R: Read + Seek>(
+        next_header: &[u8],
+        reader: &mut R,
+        password: &Password,
+        opts: &DecodeOptions<'_>,
+    ) -> Result<Self, Error> {
+        let next_header_size_int = next_header.len();
+        let decoded;
         let mut archive = Archive::default();
-        let mut buf_reader = buf.as_slice();
+        let mut buf_reader = next_header;
         let mut nid = buf_reader.read_u8()?;
         let mut header = if nid == K_ENCODED_HEADER {
             // A compressed header is one level of nesting: this header, plus the
@@ -1385,9 +1506,9 @@ impl Archive {
             // The header's own chain says whether it decrypts, as a block's
             // does: a damaged plain header is damage under any password.
             let encrypted = archive.blocks.first().is_some_and(Block::is_encrypted);
-            buf = read_decoded_header(&mut out_reader, buf_size, encrypted)?;
+            decoded = read_decoded_header(&mut out_reader, buf_size, encrypted)?;
             archive = Archive::default();
-            buf_reader = buf.as_slice();
+            buf_reader = decoded.as_slice();
             nid = buf_reader.read_u8()?;
             buf_reader
         } else {
@@ -1417,12 +1538,16 @@ impl Archive {
         } else {
             return Err(Error::corrupted("Broken or unsupported archive: no Header"));
         }
+        Ok(archive)
+    }
 
-        // Like CDbEx::FillLinks, stream maps depend only on parsed metadata.
-        // Release the decoded or plain header before allocating those final
-        // maps, rather than keeping both complete representations live.
+    /// Checks a parsed header against the file and `opts`, and completes it.
+    fn finish_archive(
+        mut archive: Archive,
+        reader_len: u64,
+        opts: &DecodeOptions<'_>,
+    ) -> Result<Self, Error> {
         // This also validates blocks in headers without a FilesInfo section.
-        drop(buf);
         Self::calculate_stream_map(&mut archive)?;
 
         // Every packed byte the header describes has to be inside the file. The
@@ -1467,15 +1592,18 @@ impl Archive {
             }
             // A ratio needs something to divide by: an archive of nothing but
             // empty files packs to nothing and is not a bomb.
-            if opts.limits.max_unpack_ratio < u64::MAX && packed_total > 0 {
-                let ratio = unpacked_total / packed_total;
-                if ratio > opts.limits.max_unpack_ratio {
-                    return Err(Error::limit(
-                        Limit::UnpackRatio,
-                        opts.limits.max_unpack_ratio,
-                        ratio,
-                    ));
-                }
+            if opts.limits.max_unpack_ratio < u64::MAX
+                && crate::container::unpack_ratio_exceeds(
+                    unpacked_total,
+                    packed_total,
+                    opts.limits.max_unpack_ratio,
+                )
+            {
+                return Err(Error::limit(
+                    Limit::UnpackRatio,
+                    opts.limits.max_unpack_ratio,
+                    crate::container::unpack_ratio(unpacked_total, packed_total),
+                ));
             }
         }
 
@@ -2319,13 +2447,7 @@ impl Archive {
         }
         let mut packed_streams = SmallSlice::with_len(num_packed_streams);
         if num_packed_streams == 1 {
-            let mut index = u64::MAX;
-            for i in 0..total_in_streams {
-                if !bind_pairs.iter().any(|pair| pair.in_index == i as u64) {
-                    index = i as u64;
-                    break;
-                }
-            }
+            let index = first_unbound_input(&bind_pairs, total_in_streams);
             if index == u64::MAX {
                 return Err(Error::corrupted("Couldn't find stream's bind pair index"));
             }
@@ -2381,6 +2503,9 @@ impl Archive {
 
         let mut in_bound = vec![false; total_in];
         let mut out_bound = vec![false; total_out];
+        // The output stream each input stream is bound to, if any: the walk
+        // below looks it up here instead of searching the bind pairs.
+        let mut out_of_in = vec![None; total_in];
         for bp in block.bind_pairs() {
             // Ranges were checked as the pairs were read; this is the duplicate check.
             let (i, o) = (bp.in_index as usize, bp.out_index as usize);
@@ -2389,6 +2514,7 @@ impl Archive {
             }
             in_bound[i] = true;
             out_bound[o] = true;
+            out_of_in[i] = Some(o);
         }
 
         for &ps in block.packed_streams() {
@@ -2422,7 +2548,10 @@ impl Archive {
         // bounded as the coders were read.
         let mut coder_of_in = Vec::with_capacity(total_in);
         let mut coder_of_out = Vec::with_capacity(total_out);
+        // Each coder's first input stream index, for the walk below.
+        let mut first_in_of = Vec::with_capacity(block.coders.len());
         for (ci, coder) in block.coders.iter().enumerate() {
+            first_in_of.push(coder_of_in.len());
             for _ in 0..coder.num_in_streams() {
                 coder_of_in.push(ci);
             }
@@ -2454,15 +2583,12 @@ impl Archive {
                 }
             }
             // This coder's input streams, in order; `step` is how many have been walked.
-            let first_in = block.coders[..coder_index]
-                .iter()
-                .map(|c| c.num_in_streams() as usize)
-                .sum::<usize>();
+            let first_in = first_in_of[coder_index];
             let num_in = block.coders[coder_index].num_in_streams() as usize;
             if step < num_in {
                 stack.push((coder_index, step + 1));
-                if let Some(bp) = block.find_bind_pair_for_in_stream((first_in + step) as u64) {
-                    stack.push((coder_of_out[bp.out_index as usize], 0));
+                if let Some(out) = out_of_in[first_in + step] {
+                    stack.push((coder_of_out[out], 0));
                 }
             } else {
                 state[coder_index] = DONE;
@@ -4317,7 +4443,9 @@ impl<R: Read + Seek> ArchiveReader<R> {
     ///
     /// # Notice
     /// This function is very inefficient when used with solid archives, since
-    /// it needs to decode all data before the actual file.
+    /// it needs to decode all data before the actual file. Each call on a
+    /// solid archive decodes the file's block from its start again; to read
+    /// every member, [`ArchiveReader::for_each_entries`] does it in one pass.
     pub fn read_file(&mut self, name: &str) -> Result<Vec<u8>, Error> {
         let index_entry = *self.index().get(name).ok_or(Error::FileNotFound)?;
         let file = &self.archive.files[index_entry.file_index];
@@ -4334,6 +4462,8 @@ impl<R: Read + Seek> ArchiveReader<R> {
             true => {
                 let mut result = None;
                 let target_file_ptr = file as *const _;
+                // Allocated by the first member read past, and only then.
+                let mut drain = Vec::new();
 
                 BlockDecoder {
                     thread_count: self.thread_count,
@@ -4352,14 +4482,17 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     }),
                 }
                 .for_each_entries(&mut |archive_entry, reader| {
-                    let mut data =
-                        Vec::with_capacity((archive_entry.size as usize).min(MAX_PREALLOC_BYTES));
-                    reader.read_to_end(&mut data)?;
-
                     if std::ptr::eq(archive_entry, target_file_ptr) {
+                        let mut data = Vec::with_capacity(
+                            (archive_entry.size as usize).min(MAX_PREALLOC_BYTES),
+                        );
+                        reader.read_to_end(&mut data)?;
                         result = Some(data);
                         Ok(false)
                     } else {
+                        // An earlier member of the block is read to its end,
+                        // so its checksum is still verified, and kept nowhere.
+                        drain_to_end(reader, &mut drain)?;
                         Ok(true)
                     }
                 })?;
@@ -6219,6 +6352,41 @@ impl ReplayEntry<'_, '_> {
     }
 }
 
+/// The first of a block's `total_in` input streams that no bind pair binds,
+/// or `u64::MAX` when every one is bound.
+///
+/// One mask of the bound streams: `read_block` has bounded `total_in` to
+/// `MAX_BLOCK_CODERS_AND_STREAMS` (64) and range-checked every pair's index.
+fn first_unbound_input(bind_pairs: &[BindPair], total_in: usize) -> u64 {
+    debug_assert!(total_in as u64 <= MAX_BLOCK_CODERS_AND_STREAMS);
+    let bound = bind_pairs
+        .iter()
+        .fold(0u64, |mask, pair| mask | (1u64 << pair.in_index));
+    (0..total_in as u64)
+        .find(|i| bound & (1u64 << i) == 0)
+        .unwrap_or(u64::MAX)
+}
+
+/// The size of the buffer [`drain_to_end`] reads through.
+const DRAIN_BUFFER_BYTES: usize = 64 << 10;
+
+/// Reads `reader` to its end and keeps none of it, through `buf`, which is
+/// sized to [`DRAIN_BUFFER_BYTES`] on first use. A member's checksum is
+/// checked at its end, so it is checked here exactly as by `read_to_end`.
+fn drain_to_end(reader: &mut dyn Read, buf: &mut Vec<u8>) -> io::Result<()> {
+    if buf.is_empty() {
+        buf.resize(DRAIN_BUFFER_BYTES, 0);
+    }
+    loop {
+        match reader.read(buf) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Reads a decoded header of exactly `declared` bytes into a buffer that never
 /// grows past it.
 ///
@@ -7602,5 +7770,582 @@ mod wide_shared_reader_tests {
             assert_eq!(bytes, [0x5a; 8]);
             assert_eq!(reader.cur, 25);
         }
+    }
+}
+
+#[cfg(test)]
+mod unpack_ratio_tests {
+    use crate::container::{unpack_ratio, unpack_ratio_exceeds};
+
+    #[test]
+    fn a_remainder_over_the_limit_is_refused() {
+        // 3 / 2 truncates to 1, which used to pass a limit of 1.
+        assert!(unpack_ratio_exceeds(3, 2, 1));
+        assert_eq!(unpack_ratio(3, 2), 2);
+        assert!(unpack_ratio_exceeds(5, 2, 2));
+    }
+
+    #[test]
+    fn exactly_the_limit_is_accepted() {
+        assert!(!unpack_ratio_exceeds(2, 2, 1));
+        assert!(!unpack_ratio_exceeds(4, 2, 2));
+        assert!(!unpack_ratio_exceeds(1, 2, 1));
+        assert!(!unpack_ratio_exceeds(0, 2, 0));
+        assert!(unpack_ratio_exceeds(1, 2, 0));
+    }
+
+    #[test]
+    fn nothing_packed_never_exceeds() {
+        for (unpacked, limit) in [(0, 0), (1, 0), (u64::MAX, 0), (u64::MAX, 1)] {
+            assert!(!unpack_ratio_exceeds(unpacked, 0, limit));
+        }
+        assert_eq!(unpack_ratio(7, 0), 0);
+    }
+
+    #[test]
+    fn the_largest_totals_do_not_overflow() {
+        assert!(!unpack_ratio_exceeds(u64::MAX, u64::MAX, 1));
+        assert!(!unpack_ratio_exceeds(u64::MAX, u64::MAX, u64::MAX));
+        assert!(!unpack_ratio_exceeds(u64::MAX, 1, u64::MAX));
+        assert!(unpack_ratio_exceeds(u64::MAX, 1, u64::MAX - 1));
+        assert!(unpack_ratio_exceeds(u64::MAX, u64::MAX - 1, 1));
+        assert!(unpack_ratio_exceeds(u64::MAX - 1, u64::MAX, 0));
+        assert_eq!(unpack_ratio(u64::MAX, 1), u64::MAX);
+        assert_eq!(unpack_ratio(u64::MAX, u64::MAX), 1);
+        assert_eq!(unpack_ratio(u64::MAX, u64::MAX - 1), 2);
+    }
+}
+
+#[cfg(all(test, feature = "compress"))]
+mod silent_hardening_tests {
+    use super::*;
+    use crate::encoder_options::Lzma2Options;
+    use crate::{ArchiveWriter, EncoderConfiguration, SourceReader};
+    use std::io::Cursor;
+
+    /// Compressible bytes, different for every seed.
+    fn payload(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut out = Vec::with_capacity(len);
+        while out.len() < len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let word = b'a' + (x >> 40) as u8 % 26;
+            out.extend(std::iter::repeat_n(word, 1 + (x % 7) as usize));
+            out.push(b' ');
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// One solid LZMA2 block of `files`, named `f0`, `f1`, ... (or `names`).
+    fn solid(files: &[Vec<u8>], names: Option<&[String]>) -> Vec<u8> {
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).expect("writer");
+        writer.set_encrypt_header(false);
+        writer.set_content_methods(vec![EncoderConfiguration::from(Lzma2Options::from_level(
+            1,
+        ))]);
+        let entries = (0..files.len())
+            .map(|i| match names {
+                Some(names) => crate::ArchiveEntry::new_file(&names[i]),
+                None => crate::ArchiveEntry::new_file(&format!("f{i}")),
+            })
+            .collect();
+        let readers = files
+            .iter()
+            .map(|file| SourceReader::new(Cursor::new(file.clone())))
+            .collect();
+        writer.push_archive_entries(entries, readers).expect("push");
+        writer.finish().expect("finish").into_inner()
+    }
+
+    // Item 1: the archive-wide ratio check.
+
+    #[test]
+    fn archive_ratio_with_a_remainder_is_refused_at_the_truncated_ratio() {
+        let bytes = solid(&[payload(256 << 10, 1)], None);
+        let archive = Archive::read_with_limits(
+            &mut Cursor::new(bytes.as_slice()),
+            &Password::empty(),
+            &ArchiveLimits::unlimited(),
+        )
+        .unwrap();
+        let packed: u64 = archive.pack_sizes.iter().sum();
+        let unpacked: u64 = archive.blocks.iter().map(Block::get_unpack_size).sum();
+        assert_ne!(unpacked % packed, 0, "the fixture needs a remainder");
+        let truncated = unpacked / packed;
+        let read = |ratio: u64| {
+            Archive::read_with_limits(
+                &mut Cursor::new(bytes.as_slice()),
+                &Password::empty(),
+                &ArchiveLimits {
+                    max_unpack_ratio: ratio,
+                    ..ArchiveLimits::default()
+                },
+            )
+        };
+        match read(truncated) {
+            Err(Error::LimitExceeded {
+                what: Limit::UnpackRatio,
+                requested,
+                limit,
+            }) => {
+                assert_eq!(requested, unpacked.div_ceil(packed));
+                assert_eq!(limit, truncated);
+            }
+            other => panic!("expected an unpack ratio refusal, got {other:?}"),
+        }
+        read(unpacked.div_ceil(packed)).unwrap();
+    }
+
+    // Item 2: `read_file` on a solid block.
+
+    fn read_all(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let mut reader = ArchiveReader::new(Cursor::new(bytes), Password::empty()).unwrap();
+        let mut out = Vec::new();
+        reader
+            .for_each_entries(|entry, reader| {
+                let mut data = Vec::new();
+                reader.read_to_end(&mut data)?;
+                out.push((entry.name.clone(), data));
+                Ok(true)
+            })
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn small_member_behind_a_large_solid_predecessor() {
+        let files = vec![payload(6 << 20, 2), b"small".to_vec(), payload(70_000, 3)];
+        let bytes = solid(&files, None);
+        let mut reader =
+            ArchiveReader::new(Cursor::new(bytes.as_slice()), Password::empty()).unwrap();
+        assert!(reader.archive().is_solid);
+        assert_eq!(reader.read_file("f1").unwrap(), b"small");
+        // Every member, in and out of order, matches a one-pass read of the
+        // block and the bytes written.
+        let all = read_all(&bytes);
+        for index in [2usize, 0, 1, 2] {
+            let name = format!("f{index}");
+            let data = reader.read_file(&name).unwrap();
+            assert_eq!(data, files[index]);
+            assert_eq!(all[index], (name, data));
+        }
+    }
+
+    #[test]
+    fn a_member_read_past_still_has_its_checksum_checked() {
+        let files = vec![payload(300_000, 4), b"after".to_vec()];
+        let bytes = solid(&files, None);
+        let mut archive =
+            Archive::read(&mut Cursor::new(bytes.as_slice()), &Password::empty()).unwrap();
+        archive.files[0].crc ^= 1;
+        // What reading every member up to the target to its end reports.
+        let mut whole = ArchiveReader::from_archive(
+            archive.clone(),
+            Cursor::new(bytes.as_slice()),
+            Password::empty(),
+        );
+        let expected = whole
+            .for_each_entries(|entry, reader| {
+                let mut data = Vec::new();
+                reader.read_to_end(&mut data)?;
+                Ok(entry.name != "f1")
+            })
+            .unwrap_err();
+        let mut reader =
+            ArchiveReader::from_archive(archive, Cursor::new(bytes.as_slice()), Password::empty());
+        let err = reader.read_file("f1").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::BlockDecode {
+                kind: crate::error::BlockErrorKind::ChecksumMismatch,
+                ..
+            }
+        ));
+        assert!(format!("{err:?}") == format!("{expected:?}"));
+    }
+
+    // Item 3: finding the end header behind a zeroed start header.
+
+    /// `bytes` with its start header CRC and start header zeroed.
+    fn zeroed(mut bytes: Vec<u8>) -> Vec<u8> {
+        bytes[8..32].fill(0);
+        bytes
+    }
+
+    fn recover_both(bytes: &[u8], limits: &ArchiveLimits) -> (String, String) {
+        let run = |reference: bool| {
+            let mut cursor = Cursor::new(bytes);
+            cursor.seek(SeekFrom::Start(12)).unwrap();
+            let len = bytes.len() as u64;
+            let opts = DecodeOptions::header(limits);
+            let result = if reference {
+                Archive::try_to_locale_end_header_reference(
+                    &mut cursor,
+                    len,
+                    &Password::empty(),
+                    &opts,
+                )
+            } else {
+                Archive::try_to_locale_end_header(&mut cursor, len, &Password::empty(), &opts)
+            };
+            format!("{result:?}")
+        };
+        (run(false), run(true))
+    }
+
+    #[test]
+    fn end_header_search_matches_the_reference_scan() {
+        let plain = solid(&[payload(4000, 5), payload(100, 6)], None);
+        let names: Vec<String> = (0..80)
+            .map(|i| format!("directory/file_number_{i:03}.txt"))
+            .collect();
+        let many: Vec<Vec<u8>> = (0..80).map(|i| payload(50, i)).collect();
+        let encoded = solid(&many, Some(&names));
+        let big = solid(&[payload(3 << 20, 7), b"tail".to_vec()], None);
+        let mut trailing = plain.clone();
+        trailing.extend_from_slice(&[0, 0, 0, K_END, K_HEADER, 0]);
+        let mut truncated = plain.clone();
+        truncated.truncate(plain.len() - 3);
+        let mut alternating = SEVEN_Z_SIGNATURE.to_vec();
+        alternating.extend_from_slice(&[0, 4]);
+        alternating.resize(32, 0);
+        for _ in 0..(32 << 10) {
+            alternating.extend_from_slice(&[K_HEADER, K_END]);
+        }
+        let mut garbage = plain[..32].to_vec();
+        garbage.extend((0..5000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8));
+        let mut empty_files = SEVEN_Z_SIGNATURE.to_vec();
+        empty_files.extend_from_slice(&[0, 4]);
+        empty_files.resize(32, 0);
+        empty_files.extend_from_slice(&[K_HEADER, K_END]);
+        // A header the scan can find: nine streamless entries, `a` to `i`,
+        // whose only candidate byte is its first. The search tries the last
+        // candidate first and gives up on the first that fails to parse, so
+        // the headers this crate writes, which hold candidate bytes after
+        // their start, are not found.
+        let mut found = vec![K_HEADER, K_FILES_INFO, 9, K_EMPTY_STREAM, 2, 0xFF, 0x80];
+        found.extend_from_slice(&[K_NAME, 37, 0]);
+        for name in b'a'..=b'i' {
+            found.extend_from_slice(&[name, 0, 0, 0]);
+        }
+        found.extend_from_slice(&[K_END, K_END]);
+        let findable = |filler: usize| {
+            let mut bytes = SEVEN_Z_SIGNATURE.to_vec();
+            bytes.extend_from_slice(&[0, 4]);
+            bytes.resize(32, 0);
+            bytes.resize(32 + filler, 0x33);
+            // Candidates far enough down to be outside the search.
+            if filler > 2 << 20 {
+                bytes[40] = K_HEADER;
+                bytes[41] = K_ENCODED_HEADER;
+            }
+            bytes.extend_from_slice(&found);
+            bytes
+        };
+
+        let fixtures = [
+            ("findable", findable(0), true),
+            ("findable after data", findable(1000), true),
+            ("findable past a megabyte", findable(3 << 20), true),
+            ("plain", zeroed(plain.clone()), false),
+            ("encoded", zeroed(encoded.clone()), false),
+            ("big", zeroed(big), false),
+            ("trailing", zeroed(trailing), false),
+            ("truncated", zeroed(truncated), false),
+            ("alternating", alternating, false),
+            ("garbage", zeroed(garbage), false),
+            ("empty files", empty_files, false),
+            ("tiny", zeroed(plain[..34].to_vec()), false),
+        ];
+        let header_len = |bytes: &[u8]| {
+            let mut cursor = Cursor::new(bytes);
+            cursor.seek(SeekFrom::Start(12)).unwrap();
+            Archive::read_start_header(&mut cursor, crc32(&bytes[12..32]))
+                .unwrap()
+                .next_header_size
+        };
+        let plain_header = header_len(&plain);
+        let encoded_header = header_len(&encoded);
+        assert_eq!(plain[plain.len() - plain_header as usize], K_HEADER);
+        assert_eq!(
+            encoded[encoded.len() - encoded_header as usize],
+            K_ENCODED_HEADER
+        );
+
+        let mut limits = vec![ArchiveLimits::default(), ArchiveLimits::unlimited()];
+        for bound in [
+            0,
+            1,
+            2,
+            16,
+            plain_header - 1,
+            plain_header,
+            plain_header + 1,
+            encoded_header - 1,
+            encoded_header,
+            found.len() as u64 - 1,
+            found.len() as u64,
+            4096,
+        ] {
+            limits.push(ArchiveLimits {
+                max_end_header_bytes: bound,
+                ..ArchiveLimits::default()
+            });
+        }
+        limits.push(ArchiveLimits {
+            max_header_depth: 1,
+            ..ArchiveLimits::default()
+        });
+        for (name, bytes, recoverable) in &fixtures {
+            for limits in &limits {
+                let (new, reference) = recover_both(bytes, limits);
+                assert_eq!(new, reference, "{name} under {limits:?}");
+            }
+            let recovered = Archive::read(&mut Cursor::new(bytes.as_slice()), &Password::empty());
+            let shown = format!("{:?}", recovered.as_ref().map(|a| a.files.len()));
+            assert_eq!(
+                recovered.is_ok_and(|archive| !archive.files.is_empty()),
+                *recoverable,
+                "{name}: {shown}"
+            );
+        }
+    }
+
+    /// Times both scans over a megabyte of alternating `K_HEADER`, `K_END`
+    /// bytes, each of which the old scan read the rest of the file again for.
+    /// A measurement, not a check: run by hand with `--ignored` in release.
+    #[test]
+    #[ignore = "a timing, run by hand"]
+    fn end_header_search_timing() {
+        let mut bytes = SEVEN_Z_SIGNATURE.to_vec();
+        bytes.extend_from_slice(&[0, 4]);
+        bytes.resize(32, 0);
+        for _ in 0..(512 << 10) {
+            bytes.extend_from_slice(&[K_HEADER, K_END]);
+        }
+        let limits = ArchiveLimits::default();
+        for reference in [false, true] {
+            let started = std::time::Instant::now();
+            let mut cursor = Cursor::new(bytes.as_slice());
+            cursor.seek(SeekFrom::Start(12)).unwrap();
+            let opts = DecodeOptions::header(&limits);
+            let len = bytes.len() as u64;
+            let result = if reference {
+                Archive::try_to_locale_end_header_reference(
+                    &mut cursor,
+                    len,
+                    &Password::empty(),
+                    &opts,
+                )
+            } else {
+                Archive::try_to_locale_end_header(&mut cursor, len, &Password::empty(), &opts)
+            };
+            assert!(result.is_err());
+            eprintln!(
+                "{}: {:?}",
+                if reference { "reference" } else { "new" },
+                started.elapsed()
+            );
+        }
+    }
+
+    // Item 5: the coder-graph check.
+
+    /// The check as it was, searching the bind pairs and summing the
+    /// earlier coders' inputs at every step.
+    fn validate_coder_graph_reference(block: &Block) -> Result<(), Error> {
+        let total_in = block.total_input_streams();
+        let total_out = block.total_output_streams();
+        if total_in == 1
+            && total_out == 1
+            && block.bind_pairs().is_empty()
+            && block.packed_streams()[..] == [0]
+            && let [coder] = block.coders.as_slice()
+            && coder.num_in_streams() == 1
+            && coder.num_out_streams() == 1
+        {
+            return Ok(());
+        }
+        let mut in_bound = vec![false; total_in];
+        let mut out_bound = vec![false; total_out];
+        for bp in block.bind_pairs() {
+            let (i, o) = (bp.in_index as usize, bp.out_index as usize);
+            if in_bound[i] || out_bound[o] {
+                return Err(Error::corrupted("bind pairs bind a stream twice"));
+            }
+            in_bound[i] = true;
+            out_bound[o] = true;
+        }
+        for &ps in block.packed_streams() {
+            let i = usize::try_from(ps)
+                .ok()
+                .filter(|i| *i < total_in)
+                .ok_or_else(|| {
+                    Error::corrupted("packed stream references an out-of-range stream")
+                })?;
+            if in_bound[i] {
+                return Err(Error::corrupted(
+                    "packed stream is also bound by a bind pair",
+                ));
+            }
+            in_bound[i] = true;
+        }
+        if in_bound.iter().any(|bound| !bound) {
+            return Err(Error::corrupted(
+                "block leaves an input stream unaccounted for",
+            ));
+        }
+        let unbound_outputs = out_bound.iter().filter(|bound| !**bound).count();
+        if unbound_outputs != 1 {
+            return Err(Error::corrupted(
+                "block must have exactly one unbound output stream",
+            ));
+        }
+        let mut coder_of_out = Vec::with_capacity(total_out);
+        for (ci, coder) in block.coders.iter().enumerate() {
+            for _ in 0..coder.num_out_streams() {
+                coder_of_out.push(ci);
+            }
+        }
+        const UNSEEN: u8 = 0;
+        const ON_PATH: u8 = 1;
+        const DONE: u8 = 2;
+        let mut state = vec![UNSEEN; block.coders.len()];
+        let final_out = out_bound.iter().position(|bound| !*bound).unwrap();
+        let mut stack = vec![(coder_of_out[final_out], 0usize)];
+        while let Some((coder_index, step)) = stack.pop() {
+            if step == 0 {
+                match state[coder_index] {
+                    ON_PATH => return Err(Error::corrupted("block's coders form a cycle")),
+                    DONE => continue,
+                    _ => state[coder_index] = ON_PATH,
+                }
+            }
+            let first_in = block.coders[..coder_index]
+                .iter()
+                .map(|c| c.num_in_streams() as usize)
+                .sum::<usize>();
+            let num_in = block.coders[coder_index].num_in_streams() as usize;
+            if step < num_in {
+                stack.push((coder_index, step + 1));
+                if let Some(bp) = block.find_bind_pair_for_in_stream((first_in + step) as u64) {
+                    stack.push((coder_of_out[bp.out_index as usize], 0));
+                }
+            } else {
+                state[coder_index] = DONE;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every way of filling `slots` with values below `base`.
+    fn tuples(slots: usize, base: u64) -> Vec<Vec<u64>> {
+        let mut out = vec![Vec::new()];
+        for _ in 0..slots {
+            out = out
+                .into_iter()
+                .flat_map(|prefix| {
+                    (0..base).map(move |v| {
+                        let mut next = prefix.clone();
+                        next.push(v);
+                        next
+                    })
+                })
+                .collect();
+        }
+        out
+    }
+
+    #[test]
+    fn coder_graph_check_matches_the_reference_over_small_graphs() {
+        let (mut accepted, mut refused) = (0usize, 0usize);
+        // Up to three coders of one or two inputs each, one output each, as
+        // `read_block` allows.
+        let mut shapes: Vec<Vec<u64>> = Vec::new();
+        for coders in 1..=3 {
+            shapes.extend(
+                tuples(coders, 2)
+                    .into_iter()
+                    .map(|ins| ins.into_iter().map(|i| i + 1).collect::<Vec<_>>())
+                    .filter(|ins| ins.iter().sum::<u64>() <= 4),
+            );
+        }
+        for ins in shapes {
+            let total_in = ins.iter().sum::<u64>() as usize;
+            let total_out = ins.len();
+            let num_pairs = total_out - 1;
+            if total_in < num_pairs {
+                continue;
+            }
+            let num_packed = total_in - num_pairs;
+            // Every bind pair in range, duplicates included.
+            for pairs in tuples(num_pairs * 2, (total_in.max(total_out)) as u64) {
+                let pairs: Vec<BindPair> = pairs
+                    .chunks(2)
+                    .map(|p| BindPair {
+                        in_index: p[0],
+                        out_index: p[1],
+                    })
+                    .collect();
+                if pairs
+                    .iter()
+                    .any(|p| p.in_index >= total_in as u64 || p.out_index >= total_out as u64)
+                {
+                    continue;
+                }
+                let first_free = first_unbound_input(&pairs, total_in);
+                let reference_free = (0..total_in as u64)
+                    .find(|i| !pairs.iter().any(|pair| pair.in_index == *i))
+                    .unwrap_or(u64::MAX);
+                assert_eq!(first_free, reference_free);
+                // Packed streams as `read_block` derives one, and every list
+                // of several, out-of-range indices included.
+                let packed_lists = if num_packed == 1 {
+                    if first_free == u64::MAX {
+                        continue;
+                    }
+                    vec![vec![first_free]]
+                } else {
+                    tuples(num_packed, total_in as u64 + 1)
+                };
+                for packed in packed_lists {
+                    let coders = ins
+                        .iter()
+                        .map(|&n| {
+                            let mut coder = Coder::default();
+                            coder.set_stream_counts(n, 1);
+                            coder
+                        })
+                        .collect();
+                    let mut block = Block::with_coders(coders);
+                    block.set_streams(
+                        total_in,
+                        total_out,
+                        pairs.clone().into_boxed_slice(),
+                        SmallSlice::from(packed.clone()),
+                        SmallSlice::default(),
+                    );
+                    let new = Archive::validate_coder_graph(&block);
+                    let reference = validate_coder_graph_reference(&block);
+                    assert_eq!(
+                        format!("{new:?}"),
+                        format!("{reference:?}"),
+                        "inputs {ins:?}, pairs {pairs:?}, packed {packed:?}"
+                    );
+                    if new.is_ok() {
+                        accepted += 1;
+                    } else {
+                        refused += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            accepted > 0 && refused > 0,
+            "{accepted} accepted, {refused} refused"
+        );
     }
 }

@@ -14,10 +14,23 @@ use crate::*;
 /// * `src` - Uint8Array containing the compressed archive data
 /// * `pwd` - Password string for encrypted archives (use empty string for unencrypted)
 /// * `f` - JavaScript callback function to handle extracted entries
+///
+/// The archive's declared output is bounded to [`DECOMPRESS_MAX_UNPACK_BYTES`];
+/// [`decompress_with_limits`] takes the caller's own limits as given.
 #[wasm_bindgen]
 pub fn decompress(src: Uint8Array, pwd: &str, f: &Function) -> Result<(), String> {
-    decompress_with_limits(src, pwd, f, ArchiveLimits::default())
+    decompress_with_limits(
+        src,
+        pwd,
+        f,
+        ArchiveLimits::default().with_max_unpack_bytes(DECOMPRESS_MAX_UNPACK_BYTES),
+    )
 }
+
+/// The declared output [`decompress`] accepts: 1 GiB. Each member is held
+/// twice while it is handed over, as a `Vec` and as the `Uint8Array` copied
+/// out of it, and a wasm32 guest has 4 GiB of memory in all.
+const DECOMPRESS_MAX_UNPACK_BYTES: u64 = 1 << 30;
 
 /// Returns the default limits, with mutable fields for JavaScript callers.
 #[wasm_bindgen]
@@ -38,6 +51,7 @@ pub fn decompress_with_limits(
     src_reader
         .seek(SeekFrom::Start(pos))
         .map_err(|e| e.to_string())?;
+    let max_unpack_bytes = limits.max_unpack_bytes;
     let mut seven = ArchiveReader::with_limits(src_reader, Password::from(pwd), limits)
         .map_err(|e| e.to_string())?;
     seven
@@ -46,19 +60,38 @@ pub fn decompress_with_limits(
                 let path = sanitize_entry_name(entry.name()).map_err(std::io::Error::other)?;
 
                 if entry.size() > 0 {
-                    let mut writer = Vec::new();
-                    std::io::copy(reader, &mut writer)?;
-                    let _ = f.call2(
+                    // Refused before any of it is buffered.
+                    let len =
+                        crate::util::wasm_rules::member_buffer_len(entry.size(), max_unpack_bytes)
+                            .map_err(std::io::Error::other)?;
+                    let mut writer = Vec::with_capacity(len.min(crate::reader::MAX_PREALLOC_BYTES));
+                    reader.take(entry.size()).read_to_end(&mut writer)?;
+                    // A callback that throws ends the extraction: no later
+                    // member is decoded, and the call fails with what it threw.
+                    f.call2(
                         &JsValue::NULL,
                         &JsValue::from(path),
                         &Uint8Array::from(&writer[..]),
-                    );
+                    )
+                    .map_err(|thrown| {
+                        crate::util::wasm_rules::callback_failure(js_error_string(&thrown))
+                    })?;
                 }
             }
             Ok(true)
         })
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// The string form of a thrown JavaScript value: a thrown string as it is, an
+/// `Error` as its `toString()`, anything else none.
+fn js_error_string(thrown: &JsValue) -> Option<String> {
+    thrown.as_string().or_else(|| {
+        thrown
+            .dyn_ref::<js_sys::Error>()
+            .map(|error| String::from(error.to_string()))
+    })
 }
 
 /// Validates an untrusted archive entry name and returns a safe *relative* path.

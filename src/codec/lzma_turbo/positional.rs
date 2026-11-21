@@ -183,10 +183,10 @@ impl PositionalLzma2Folder {
                 limit: limits.max_unpack_bytes,
             });
         }
-        if size != 0 && output_len.div_ceil(size) > limits.max_unpack_ratio {
+        if crate::container::unpack_ratio_exceeds(output_len, size, limits.max_unpack_ratio) {
             return Err(Error::LimitExceeded {
                 what: Limit::UnpackRatio,
-                requested: output_len.div_ceil(size),
+                requested: crate::container::unpack_ratio(output_len, size),
                 limit: limits.max_unpack_ratio,
             });
         }

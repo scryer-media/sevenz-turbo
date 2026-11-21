@@ -495,6 +495,42 @@ arm, and this crate can add a variant without a breaking release.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.30.4
+
+### Fixed
+
+- `ArchiveLimits::max_unpack_ratio` is checked exactly. The archive-wide
+  check truncated the ratio, so 3 bytes out of 2 packed passed a limit of 1;
+  it is now refused. The archive-wide and positional LZMA2 checks share one
+  rule, and the error still reports the ratio rounded up.
+- `ArchiveReader::read_file` on a solid archive no longer keeps the members
+  before the one asked for. They are read through a 64 KiB buffer and their
+  checksums are still checked.
+- Finding the end header of an archive whose start header is zeroed reads
+  the last megabyte once instead of again for every candidate byte. A crafted
+  megabyte of candidates took 4.5 s and takes 17 ms. The same archives are
+  found and the same errors returned.
+- Checking a block's coder graph looks up bind pairs and stream offsets in
+  tables built once per block instead of searching them for every coder.
+- WASM: when the callback passed to `decompress` or `decompress_with_limits`
+  throws, the call now fails with the thrown string or `Error`'s text
+  ("extraction callback failed" when it has none), and no later member is
+  decoded. Before, the throw was ignored and extraction went on.
+- WASM: `decompress_with_limits` refuses a member whose declared size is over
+  the caller's finite `max_unpack_bytes`, or does not fit in memory, before
+  buffering any of it, and reads at most the declared size.
+
+### Changed
+
+- WASM: `decompress` now refuses an archive that declares more than 1 GiB
+  of output in all, as `max_unpack_bytes`. Before, it had no output limit.
+  `decompress_with_limits` and `default_archive_limits` are unchanged: the
+  caller's limits are used as given.
+
+- The `ArchiveReader::read_file` documentation says that each call on a solid
+  archive decodes the block from its start, and that `for_each_entries` reads
+  every member in one pass.
+
 ## 0.30.3
 
 ### Fixed
