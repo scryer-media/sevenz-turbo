@@ -1361,7 +1361,7 @@ impl Archive {
 
     /// The scan [`Self::try_to_locale_end_header`] replaced, which reads each
     /// candidate's header out of the file again; kept to compare against.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "compress"))]
     fn try_to_locale_end_header_reference<R: Read + Seek>(
         reader: &mut R,
         reader_len: u64,
@@ -7957,17 +7957,14 @@ mod silent_hardening_tests {
         let mut reader =
             ArchiveReader::from_archive(archive, Cursor::new(bytes.as_slice()), Password::empty());
         let err = reader.read_file("f1").unwrap_err();
-        assert!(
-            matches!(
-                err,
-                Error::BlockDecode {
-                    kind: crate::error::BlockErrorKind::ChecksumMismatch,
-                    ..
-                }
-            ),
-            "{err:?}"
-        );
-        assert_eq!(format!("{err:?}"), format!("{expected:?}"));
+        assert!(matches!(
+            err,
+            Error::BlockDecode {
+                kind: crate::error::BlockErrorKind::ChecksumMismatch,
+                ..
+            }
+        ));
+        assert!(format!("{err:?}") == format!("{expected:?}"));
     }
 
     // Item 3: finding the end header behind a zeroed start header.
