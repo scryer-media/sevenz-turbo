@@ -512,8 +512,20 @@ arm, and this crate can add a variant without a breaking release.
   found and the same errors returned.
 - Checking a block's coder graph looks up bind pairs and stream offsets in
   tables built once per block instead of searching them for every coder.
+- WASM: when the callback passed to `decompress` or `decompress_with_limits`
+  throws, the call now fails with the thrown string or `Error`'s text
+  ("extraction callback failed" when it has none), and no later member is
+  decoded. Before, the throw was ignored and extraction went on.
+- WASM: `decompress_with_limits` refuses a member whose declared size is over
+  the caller's finite `max_unpack_bytes`, or does not fit in memory, before
+  buffering any of it, and reads at most the declared size.
 
 ### Changed
+
+- WASM: `decompress` now refuses an archive that declares more than 1 GiB
+  of output in all, as `max_unpack_bytes`. Before, it had no output limit.
+  `decompress_with_limits` and `default_archive_limits` are unchanged: the
+  caller's limits are used as given.
 
 - The `ArchiveReader::read_file` documentation says that each call on a solid
   archive decodes the block from its start, and that `for_each_entries` reads
