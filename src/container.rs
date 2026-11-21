@@ -343,6 +343,26 @@ impl Default for ArchiveLimits {
 /// dictionary, rounded up as the decoder rounds it.
 const DEFAULT_MAX_LENT_WINDOW_BYTES: u64 = 1 << 32;
 
+/// Whether `unpacked` output bytes from `packed` packed bytes is a ratio past
+/// [`ArchiveLimits::max_unpack_ratio`]'s `limit`.
+///
+/// Exact: the products are taken in `u128`, so neither a remainder nor an
+/// overflow lets a stream through. Nothing packed is no ratio and never
+/// exceeds.
+pub(crate) fn unpack_ratio_exceeds(unpacked: u64, packed: u64, limit: u64) -> bool {
+    packed != 0 && u128::from(unpacked) > u128::from(limit) * u128::from(packed)
+}
+
+/// The ratio an [`Limit::UnpackRatio`](crate::Limit::UnpackRatio) error
+/// reports: output bytes per packed byte, rounded up.
+pub(crate) fn unpack_ratio(unpacked: u64, packed: u64) -> u64 {
+    if packed == 0 {
+        0
+    } else {
+        unpacked.div_ceil(packed)
+    }
+}
+
 impl ArchiveLimits {
     /// Both of the caller-affordability limits at once, with every structural
     /// limit left at its default.

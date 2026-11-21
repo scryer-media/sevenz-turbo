@@ -495,6 +495,30 @@ arm, and this crate can add a variant without a breaking release.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.30.4
+
+### Fixed
+
+- `ArchiveLimits::max_unpack_ratio` is checked exactly. The archive-wide
+  check truncated the ratio, so 3 bytes out of 2 packed passed a limit of 1;
+  it is now refused. The archive-wide and positional LZMA2 checks share one
+  rule, and the error still reports the ratio rounded up.
+- `ArchiveReader::read_file` on a solid archive no longer keeps the members
+  before the one asked for. They are read through a 64 KiB buffer and their
+  checksums are still checked.
+- Finding the end header of an archive whose start header is zeroed reads
+  the last megabyte once instead of again for every candidate byte. A crafted
+  megabyte of candidates took 4.5 s and takes 17 ms. The same archives are
+  found and the same errors returned.
+- Checking a block's coder graph looks up bind pairs and stream offsets in
+  tables built once per block instead of searching them for every coder.
+
+### Changed
+
+- The `ArchiveReader::read_file` documentation says that each call on a solid
+  archive decodes the block from its start, and that `for_each_entries` reads
+  every member in one pass.
+
 ## 0.30.3
 
 ### Fixed
