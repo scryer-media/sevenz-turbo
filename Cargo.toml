@@ -108,7 +108,7 @@ lzma-turbo = { version = "0.12.0", default-features = false, features = ["std", 
 ppmd-turbo = { version = "0.2.2", optional = true }
 lz4_flex = { version = "0.14", optional = true }
 nt-time = { version = "0.15", optional = true }
-zstd = { version = "0.14.3", optional = true }
+zstd = { version = "0.14.5", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cap-std = { version = "4.0.3", optional = true }
