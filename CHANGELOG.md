@@ -495,6 +495,13 @@ arm, and this crate can add a variant without a breaking release.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.30.5
+
+### Fixed
+
+- The optional Zstandard codec now requires zstd 0.14.5 or later, which
+  bundles C Zstandard 1.6.0 and fixes CVE-2026-124851.
+
 ## 0.30.4
 
 ### Fixed
