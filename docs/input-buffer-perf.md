@@ -75,7 +75,8 @@ uses 256 MiB and nine repetitions per arm/thread count. The nonzero guard
 uses a deterministic 8 MiB pseudorandom pattern repeated to 64 MiB and
 three repetitions, still crossing multiple 32 MiB blocks.
 
-Matched settings are level 5, 8 MiB dictionary, 32 fast bytes, BT4, 32 match
+Matched settings are the xz-style level 5 (`Lzma2Options::from_xz_level(5)`,
+the level 5 default before 0.31.0): 8 MiB dictionary, 32 fast bytes, BT4, 32 match
 cycles, the default literal/position bits, 32 MiB LZMA2 blocks, and T2/T4.
 The library operation's dictionary and block-size fields are asserted on
 every measured invocation. The official reference is 7zz 26.03.

@@ -162,7 +162,9 @@ sevenz_turbo::compress_to_path_encrypted("examples/data/sample", "examples/data/
 ```
 
 LZMA and LZMA2 are compressed by `lzma-turbo`'s port of 7-Zip's encoder.
-Level 0 uses a 256 KiB dictionary and level 9 a 64 MiB one.
+LZMA2 levels follow the 7-Zip SDK: level 0 uses a 64 KiB dictionary and
+level 9 a 256 MiB one on 64-bit targets (64 MiB on 32-bit targets).
+`Lzma2Options::from_xz_level` keeps the xz-style presets.
 
 ### Solid archives
 
