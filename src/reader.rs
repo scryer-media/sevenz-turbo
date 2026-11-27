@@ -3872,18 +3872,24 @@ impl<R: Read + Seek> ArchiveReader<R> {
         }
         for phase in self.folder_phases() {
             match phase {
-                FolderPhase::Alone { block } => self.decode_block_alone(block, &mut each)?,
+                FolderPhase::Alone { block } => self.decode_block_alone(block, &mut each, None)?,
                 #[cfg(not(target_arch = "wasm32"))]
                 FolderPhase::Parallel {
                     blocks,
                     workers,
                     threads_per_folder,
-                } => self.decode_blocks_parallel(blocks, workers, threads_per_folder, &mut each)?,
+                } => self.decode_blocks_parallel(
+                    blocks,
+                    workers,
+                    threads_per_folder,
+                    &mut each,
+                    None,
+                )?,
                 // Never planned without threads; walked in order if it were.
                 #[cfg(target_arch = "wasm32")]
                 FolderPhase::Parallel { blocks, .. } => {
                     for block in blocks {
-                        self.decode_block_alone(block, &mut each)?;
+                        self.decode_block_alone(block, &mut each, None)?;
                     }
                 }
             }
@@ -3942,7 +3948,15 @@ impl<R: Read + Seek> ArchiveReader<R> {
 
     /// One folder, decoded on the calling thread with the reader's own thread
     /// count: the sequential path, unchanged.
-    fn decode_block_alone<F>(&mut self, block_index: usize, each: &mut F) -> Result<(), Error>
+    ///
+    /// `checked` hears each file with bytes and a CRC once its comparison has
+    /// matched (see [`ends_after_check`]).
+    fn decode_block_alone<F>(
+        &mut self,
+        block_index: usize,
+        each: &mut F,
+        checked: Checked<'_, '_>,
+    ) -> Result<(), Error>
     where
         F: FnMut(&ArchiveEntry, &mut dyn EntryRead) -> Result<bool, Error>,
     {
@@ -3963,7 +3977,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                 .as_mut()
                 .map(|hook| &mut **hook as &mut (dyn FnMut(SubStreamCompletion) + Send + '_)),
         };
-        let outcome = block_decoder.walk_entries(each)?;
+        let outcome = block_decoder.walk_entries(each, checked)?;
         // Upstream moves on to the next block when a callback returns
         // `false`, and consumers rely on that; only the hook treats it as
         // "this block was not decoded in full".
@@ -4017,13 +4031,14 @@ impl<R: Read + Seek> ArchiveReader<R> {
         workers: u32,
         threads_per_folder: u32,
         each: &mut F,
+        mut checked: Checked<'_, '_>,
     ) -> Result<(), Error>
     where
         F: FnMut(&ArchiveEntry, &mut dyn EntryRead) -> Result<bool, Error>,
     {
         let Some(source) = self.positional.clone() else {
             for block in blocks {
-                self.decode_block_alone(block, each)?;
+                self.decode_block_alone(block, each, checked.as_deref_mut())?;
             }
             return Ok(());
         };
@@ -4068,6 +4083,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
                     on_sub
                         .as_mut()
                         .map(|hook| &mut **hook as &mut (dyn FnMut(SubStreamCompletion) + Send)),
+                    checked.as_deref_mut(),
                 )?;
                 Self::block_completed(
                     archive,
@@ -4085,7 +4101,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
             // Not one worker could be started: decode the run here instead.
             None => {
                 for block in blocks {
-                    self.decode_block_alone(block, each)?;
+                    self.decode_block_alone(block, each, checked.as_deref_mut())?;
                 }
                 Ok(())
             }
@@ -4130,15 +4146,20 @@ impl<R: Read + Seek> ArchiveReader<R> {
     /// `each` runs on the calling thread and is handed, for every entry in
     /// [`ArchiveReader::entry_order`], an [`UnorderedEntry::Begin`], the
     /// entry's bytes in order as [`UnorderedEntry::Data`], and an
-    /// [`UnorderedEntry::End`]. One folder's entries come one after another;
-    /// the entries of folders decoding side by side interleave. Returning
-    /// `false` stops the decode, and returns `Ok`.
+    /// [`UnorderedEntry::End`]. One folder's entries begin one after another
+    /// and their bytes come in order; the entries of folders decoding side by
+    /// side interleave. Returning `false` stops the decode, and returns `Ok`,
+    /// also when it is the answer to an end that came late.
     ///
     /// - **Checks.** Every checksum the ordered walk verifies is verified. An
-    ///   entry of a folder decoded beside others ends once the folder's decode
-    ///   has finished and every checksum over it matched; an entry decoded on
-    ///   the calling thread ends as its reader does there, and a checksum its
-    ///   coder reports after that fails the call.
+    ///   entry with a CRC ends only after its CRC matched, and an entry whose
+    ///   CRC does not match never ends. An entry of a folder decoded beside
+    ///   others ends once the folder's decode has finished and every checksum
+    ///   over it matched. An entry decoded on the calling thread ends when its
+    ///   CRC is compared, which is at its last byte or, when its coder reports
+    ///   checksums only at the end of the folder's stream, at that end; later
+    ///   entries of the folder may begin, take bytes and end before it. An
+    ///   entry with no CRC ends after its last byte.
     /// - **Errors.** The error is the one the ordered walk would have
     ///   returned: the first failed folder in archive order, located in it.
     ///   Once a folder fails no folder after it starts, those after it that
@@ -4257,7 +4278,20 @@ impl<R: Read + Seek> ArchiveReader<R> {
         let base = self.archive.files.as_ptr() as usize;
         let count = self.archive.files.len();
         let size = std::mem::size_of::<ArchiveEntry>().max(1);
-        let mut stopped = false;
+        let verify = self.verify_checksums;
+        // The walk calls the adapter and the notifier below one at a time,
+        // never one inside the other, so each borrow of `each` is alone.
+        let each = RefCell::new(each);
+        let stopped = Cell::new(false);
+        let end = |file_index: usize| match (*each.borrow_mut())(UnorderedEntry::End { file_index })
+        {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                stopped.set(true);
+                Err(Error::Cancelled)
+            }
+            Err(error) => Err(error),
+        };
         let mut adapter = |entry: &ArchiveEntry, read: &mut dyn EntryRead| {
             // Every entry the ordered walk hands over is one of the
             // archive's own, so its index is where it lies among them.
@@ -4265,45 +4299,58 @@ impl<R: Read + Seek> ArchiveReader<R> {
             if file_index >= count {
                 return Err(Error::internal("an entry the archive does not hold"));
             }
-            if !each(UnorderedEntry::Begin { file_index, entry })? {
-                stopped = true;
-                return Err(Error::Cancelled);
+            {
+                let mut each = each.borrow_mut();
+                if !(*each)(UnorderedEntry::Begin { file_index, entry })? {
+                    stopped.set(true);
+                    return Err(Error::Cancelled);
+                }
+                let mut out = EventWriter {
+                    each: &mut **each,
+                    file_index,
+                    offset: 0,
+                    stopped: false,
+                    error: None,
+                };
+                let written = read.write_rest(&mut out);
+                if out.stopped {
+                    stopped.set(true);
+                    return Err(Error::Cancelled);
+                }
+                if let Some(error) = out.error.take() {
+                    return Err(error);
+                }
+                written?;
             }
-            let mut out = EventWriter {
-                each: &mut *each,
-                file_index,
-                offset: 0,
-                stopped: false,
-                error: None,
-            };
-            let written = read.write_rest(&mut out);
-            if out.stopped {
-                stopped = true;
-                return Err(Error::Cancelled);
-            }
-            if let Some(error) = out.error.take() {
-                return Err(error);
-            }
-            written?;
-            if !each(UnorderedEntry::End { file_index })? {
-                stopped = true;
-                return Err(Error::Cancelled);
+            // A file with a CRC ends when the walk has compared it, which
+            // may be after later files have begun.
+            if !ends_after_check(entry, verify) {
+                end(file_index)?;
             }
             Ok(true)
         };
+        let mut checked = |file_index: usize| end(file_index);
         let result = match phase {
-            FolderPhase::Alone { block } => self.decode_block_alone(block, &mut adapter),
+            FolderPhase::Alone { block } => {
+                self.decode_block_alone(block, &mut adapter, Some(&mut checked))
+            }
             #[cfg(not(target_arch = "wasm32"))]
             FolderPhase::Parallel {
                 blocks,
                 workers,
                 threads_per_folder,
-            } => self.decode_blocks_parallel(blocks, workers, threads_per_folder, &mut adapter),
+            } => self.decode_blocks_parallel(
+                blocks,
+                workers,
+                threads_per_folder,
+                &mut adapter,
+                Some(&mut checked),
+            ),
             #[cfg(target_arch = "wasm32")]
             FolderPhase::Parallel { blocks, .. } => {
                 let mut result = Ok(());
                 for block in blocks {
-                    result = self.decode_block_alone(block, &mut adapter);
+                    result = self.decode_block_alone(block, &mut adapter, Some(&mut checked));
                     if result.is_err() {
                         break;
                     }
@@ -4313,7 +4360,7 @@ impl<R: Read + Seek> ArchiveReader<R> {
         };
         match result {
             Ok(()) => Ok(true),
-            Err(_) if stopped => Ok(false),
+            Err(_) if stopped.get() => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -4607,6 +4654,18 @@ impl<R: Read + Seek> ArchiveReader<R> {
     }
 }
 
+/// Told the index of each file whose [`ends_after_check`] comparison has
+/// matched, as the walk makes it. An error stops the walk and is returned as
+/// it is.
+type Checked<'c, 'f> = Option<&'c mut (dyn FnMut(usize) -> Result<(), Error> + 'f)>;
+
+/// Whether `file` has bytes and a CRC the walk compares them with, so that
+/// [`ArchiveReader::for_each_entries_unordered`] ends it only once that
+/// comparison has matched.
+fn ends_after_check(file: &ArchiveEntry, verify_checksums: bool) -> bool {
+    verify_checksums && file.has_crc && file.has_stream && file.size > 0
+}
+
 /// A file whose bytes were handed over before the parallel LZMA2 coder had
 /// reported their checksum.
 ///
@@ -4640,7 +4699,12 @@ impl OwedCompletions<'_> {
     /// `at_end` says the stream has been read to its end, after which a
     /// checksum that is missing will never arrive. A file with a CRC to
     /// compare is then an error, never a file passed unchecked.
-    fn settle<H>(&mut self, at_end: bool, mut hook: Option<&mut H>) -> Result<(), Error>
+    fn settle<H>(
+        &mut self,
+        at_end: bool,
+        mut hook: Option<&mut H>,
+        checked: &mut Checked<'_, '_>,
+    ) -> Result<(), Error>
     where
         H: FnMut(SubStreamCompletion) + ?Sized,
     {
@@ -4661,6 +4725,11 @@ impl OwedCompletions<'_> {
                             len: next.len,
                             crc32,
                         });
+                    }
+                    if file.has_crc
+                        && let Some(checked) = checked.as_deref_mut()
+                    {
+                        checked(next.file_index)?;
                     }
                 }
                 None if !at_end => break,
@@ -4979,13 +5048,22 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
     where
         F: FnMut(&ArchiveEntry, &mut dyn EntryRead) -> Result<bool, Error>,
     {
-        self.walk_entries(each).map(|outcome| outcome.finished)
+        self.walk_entries(each, None)
+            .map(|outcome| outcome.finished)
     }
 
     /// [`BlockDecoder::for_each_entries_direct`], saying also whether every
     /// byte of the block went through the callbacks' readers, which is what
     /// the block hook needs to know before it calls the block checked.
-    fn walk_entries<F>(self, each: &mut F) -> Result<BlockOutcome, Error>
+    ///
+    /// `checked` hears each file of [`ends_after_check`] once its CRC has
+    /// matched: after its callback returned, or later, when the coder reports
+    /// a checksum it still owed.
+    fn walk_entries<F>(
+        self,
+        each: &mut F,
+        mut checked: Checked<'_, '_>,
+    ) -> Result<BlockOutcome, Error>
     where
         F: FnMut(&ArchiveEntry, &mut dyn EntryRead) -> Result<bool, Error>,
     {
@@ -5149,7 +5227,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                 if folding {
                     // The files before this one first, so completions are
                     // heard in file order.
-                    owed.settle(false, on_sub_stream_complete.as_deref_mut())?;
+                    owed.settle(false, on_sub_stream_complete.as_deref_mut(), &mut checked)?;
                     // The workers checksummed this file's bytes as they
                     // produced them; folding the pieces is a few multiplies
                     // over GF(2), and reads none of them back.
@@ -5178,8 +5256,10 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                     // covers the range, which is not a checksum failure and is
                     // not reported as one.
                 }
-                if let (Some(hook), Some(crc32)) =
-                    (on_sub_stream_complete.as_deref_mut(), crc_report.take())
+                // Set only once this file's bytes were all compared, here or by
+                // its verifying reader, and matched.
+                let matched = crc_report.take();
+                if let (Some(hook), Some(crc32)) = (on_sub_stream_complete.as_deref_mut(), matched)
                 {
                     hook(SubStreamCompletion {
                         block_index,
@@ -5189,6 +5269,11 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                         len: file.size,
                         crc32,
                     });
+                }
+                if let (Some(checked), Some(_), true) =
+                    (checked.as_deref_mut(), matched, file.has_crc)
+                {
+                    checked(file_index)?;
                 }
                 unpacked_offset += file.size;
                 sub_stream += 1;
@@ -5201,7 +5286,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
                     read_to_stream_end(&mut block_reader, 0)
                         .map_err(|e| Error::from(e).in_block(block_index, packed_offset))?;
                     stream_ended = true;
-                    owed.settle(true, on_sub_stream_complete.as_deref_mut())?;
+                    owed.settle(true, on_sub_stream_complete.as_deref_mut(), &mut checked)?;
                 }
                 if !outcome {
                     finished = false;
@@ -5233,7 +5318,7 @@ impl<'a, R: Read + Seek> BlockDecoder<'a, R> {
             read_to_stream_end(&mut block_reader, unpack_size.saturating_sub(consumed))
                 .map_err(|e| Error::from(e).in_block(block_index, packed_offset))?;
             stream_ended = true;
-            owed.settle(true, on_sub_stream_complete)?;
+            owed.settle(true, on_sub_stream_complete, &mut checked)?;
         }
         // Every byte of the block went to the callbacks, so its own checksum is
         // owed whether or not the last of them then asked to stop: the
@@ -5524,7 +5609,16 @@ pub enum UnorderedEntry<'a> {
         /// The bytes.
         bytes: &'a [u8],
     },
-    /// The entry at `file_index` has been handed over in full.
+    /// The entry at `file_index` has been handed over in full and, when the
+    /// archive states a CRC for it and checksums are verified, its CRC
+    /// matched. An entry whose CRC does not match is never ended: the call
+    /// returns the located [`crate::BlockErrorKind::ChecksumMismatch`] instead.
+    ///
+    /// Each entry ends once, after all of its [`UnorderedEntry::Data`]. The
+    /// end of an entry with a CRC can come late, after later entries of its
+    /// folder began, took bytes or ended, when its coder reports the
+    /// checksum only at the end of the folder's stream. The order of ends
+    /// across entries is not promised.
     End {
         /// Where the entry is in [`Archive::files`].
         file_index: usize,
@@ -6027,7 +6121,12 @@ impl FolderWorker<'_> {
 /// [`BlockDecoder::for_each_entries`] would have: the same files, the same
 /// bytes, the same errors in the same places, and the sub-stream hook after
 /// each file. Returns whether the callback let the folder run to its end.
+///
+/// `checked` hears each file of [`ends_after_check`] when the worker's
+/// completion for it arrives, which the worker sends only once the file's CRC
+/// has matched.
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
 fn replay_folder<F>(
     archive: &Archive,
     encrypted: bool,
@@ -6036,6 +6135,7 @@ fn replay_folder<F>(
     rx: &mut crate::ordered::Receiver<'_, FolderMessage>,
     each: &mut F,
     mut on_sub_stream_complete: Option<&mut (dyn FnMut(SubStreamCompletion) + Send)>,
+    mut checked: Checked<'_, '_>,
 ) -> Result<BlockOutcome, Error>
 where
     F: FnMut(&ArchiveEntry, &mut dyn EntryRead) -> Result<bool, Error>,
@@ -6193,8 +6293,17 @@ where
                 }
             }
             Some(FolderMessage::Completion(completion)) => {
+                let file_index = completion.file_index;
                 if let Some(hook) = on_sub_stream_complete.as_deref_mut() {
                     hook(completion);
+                }
+                if let Some(checked) = checked.as_deref_mut()
+                    && archive
+                        .files
+                        .get(file_index)
+                        .is_some_and(|file| ends_after_check(file, verify_checksums))
+                {
+                    checked(file_index)?;
                 }
             }
             Some(FolderMessage::Done(FolderEnd::Finished)) => return Ok(ended(true, delivered)),

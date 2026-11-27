@@ -515,6 +515,13 @@ arm, and this crate can add a variant without a breaking release.
   Applications regenerating archive hashes or recovery volumes can select
   `Lzma2Options::from_xz_level` or `from_xz_level_mt` with their previous
   settings. Both preset families write standard LZMA2.
+- `ArchiveReader::for_each_entries_unordered` now hands over
+  `UnorderedEntry::End` for an entry with a CRC only after that CRC matched,
+  on every path. An entry whose CRC does not match is never ended; the call
+  returns the located `ChecksumMismatch`. When a folder's coder reports
+  checksums only at the end of its stream, an entry's end can come after
+  later entries of the folder began, took bytes or ended. Each entry still
+  ends once, after all of its data. Entries with no CRC end as before.
 
 ### Fixed
 
