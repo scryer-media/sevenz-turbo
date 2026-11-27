@@ -8,7 +8,10 @@ use std::{fs::File, path::PathBuf};
 
 fn directory() -> PathBuf {
     std::env::var_os("SEVENZ_INTEROP_DIR")
-        .expect("test exchange directory")
+        .expect(
+            "set SEVENZ_INTEROP_DIR to an existing directory shared by the \
+             writing and the reading provider builds",
+        )
         .into()
 }
 
