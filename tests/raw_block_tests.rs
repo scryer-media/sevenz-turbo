@@ -10,10 +10,9 @@ use std::{
     process::Command,
 };
 
-use sevenz_turbo::{
-    encoder_options::{AesEncoderOptions, Lzma2Options},
-    *,
-};
+#[cfg(feature = "aes256")]
+use sevenz_turbo::encoder_options::AesEncoderOptions;
+use sevenz_turbo::{encoder_options::Lzma2Options, *};
 
 /// Distinct, compressible contents, so a mix-up between entries shows.
 fn content(name: &str) -> Vec<u8> {

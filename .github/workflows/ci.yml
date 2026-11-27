@@ -142,6 +142,19 @@ jobs:
         uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
       - name: Test ${{ matrix.configuration.name }}
         run: cargo nextest run --locked --no-fail-fast ${{ matrix.configuration.args }}
+      - name: Exercise the pointer-based LZ4 kernels
+        if: matrix.configuration.name == 'all-features'
+        run: cargo nextest run --locked --no-default-features --features lz4,compress,util --test compress_tests --test decompression_tests --no-fail-fast -E 'test(lz4)'
+      - name: Cross-read Brotli and Zstandard providers
+        if: matrix.platform.name == 'linux-x86_64' && matrix.configuration.name == 'all-features'
+        shell: bash
+        run: |
+          export SEVENZ_INTEROP_DIR="$(mktemp -d)"
+          for pair in 'zstd,brotli mzstd,mbrotli' 'mzstd,mbrotli zstd,brotli'; do
+            read -r writer reader <<< "$pair"
+            cargo nextest run --locked --no-default-features --features "$writer,compress" --test codec_provider_interop --run-ignored only -E 'test(write_archives)'
+            cargo nextest run --locked --no-default-features --features "$reader" --test codec_provider_interop --run-ignored only -E 'test(read_archives)'
+          done
       - name: Run doctests
         run: cargo test --doc --locked --no-fail-fast ${{ matrix.configuration.args }}
 

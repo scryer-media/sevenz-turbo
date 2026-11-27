@@ -192,7 +192,7 @@ fn decompress_bzip2_file() {
 
 /// zstdmt (which 7zip ZS uses), does encapsulate brotli data in a special frames,
 /// for which we need to have custom logic to decode and encode to.
-#[cfg(all(feature = "util", feature = "brotli"))]
+#[cfg(all(feature = "util", any(feature = "brotli", feature = "mbrotli")))]
 #[test]
 fn decompress_zstdmt_brotli_file() {
     let mut source_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

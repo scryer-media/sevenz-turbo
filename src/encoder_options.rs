@@ -352,12 +352,12 @@ impl Default for Bzip2Options {
     }
 }
 
-#[cfg(any(feature = "brotli", feature = "lz4"))]
+#[cfg(any(feature = "brotli", feature = "mbrotli", feature = "lz4"))]
 const MINIMAL_SKIPPABLE_FRAME_SIZE: u32 = 64 * 1024;
-#[cfg(feature = "brotli")]
+#[cfg(any(feature = "brotli", feature = "mbrotli"))]
 const DEFAULT_SKIPPABLE_FRAME_SIZE: u32 = 128 * 1024;
 
-#[cfg(feature = "brotli")]
+#[cfg(any(feature = "brotli", feature = "mbrotli"))]
 #[derive(Debug, Copy, Clone)]
 /// Options for Brotli compression.
 pub struct BrotliOptions {
@@ -366,7 +366,7 @@ pub struct BrotliOptions {
     pub(crate) skippable_frame_size: u32,
 }
 
-#[cfg(feature = "brotli")]
+#[cfg(any(feature = "brotli", feature = "mbrotli"))]
 impl BrotliOptions {
     /// Creates Brotli options with the specified quality and window size.
     ///
@@ -402,7 +402,7 @@ impl BrotliOptions {
     }
 }
 
-#[cfg(feature = "brotli")]
+#[cfg(any(feature = "brotli", feature = "mbrotli"))]
 impl Default for BrotliOptions {
     fn default() -> Self {
         Self {
@@ -543,12 +543,12 @@ impl Default for PpmdOptions {
     }
 }
 
-#[cfg(feature = "zstd")]
+#[cfg(any(feature = "zstd", feature = "mzstd"))]
 #[derive(Debug, Copy, Clone)]
 /// Options for Zstandard compression.
 pub struct ZstandardOptions(pub(crate) u32);
 
-#[cfg(feature = "zstd")]
+#[cfg(any(feature = "zstd", feature = "mzstd"))]
 impl ZstandardOptions {
     /// Creates Zstandard options with the specified compression level.
     ///
@@ -560,7 +560,7 @@ impl ZstandardOptions {
     }
 }
 
-#[cfg(feature = "zstd")]
+#[cfg(any(feature = "zstd", feature = "mzstd"))]
 impl Default for ZstandardOptions {
     fn default() -> Self {
         Self(3)
@@ -688,7 +688,7 @@ pub enum EncoderOptions {
     #[cfg(feature = "compress")]
     /// LZMA2 compression options.
     Lzma2(Lzma2Options),
-    #[cfg(feature = "brotli")]
+    #[cfg(any(feature = "brotli", feature = "mbrotli"))]
     /// Brotli compression options.
     Brotli(BrotliOptions),
     #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
@@ -703,7 +703,7 @@ pub enum EncoderOptions {
     #[cfg(feature = "ppmd")]
     /// PPMD compression options.
     Ppmd(PpmdOptions),
-    #[cfg(feature = "zstd")]
+    #[cfg(any(feature = "zstd", feature = "mzstd"))]
     /// Zstandard compression options.
     Zstd(ZstandardOptions),
     #[cfg(feature = "aes256")]
@@ -753,7 +753,7 @@ impl From<Bzip2Options> for EncoderConfiguration {
     }
 }
 
-#[cfg(feature = "brotli")]
+#[cfg(any(feature = "brotli", feature = "mbrotli"))]
 impl From<BrotliOptions> for EncoderConfiguration {
     fn from(options: BrotliOptions) -> Self {
         Self::new(crate::EncoderMethod::BROTLI).with_options(EncoderOptions::Brotli(options))
@@ -781,7 +781,7 @@ impl From<PpmdOptions> for EncoderConfiguration {
     }
 }
 
-#[cfg(feature = "zstd")]
+#[cfg(any(feature = "zstd", feature = "mzstd"))]
 impl From<ZstandardOptions> for EncoderConfiguration {
     fn from(options: ZstandardOptions) -> Self {
         Self::new(crate::EncoderMethod::ZSTD).with_options(EncoderOptions::Zstd(options))
@@ -809,7 +809,7 @@ impl From<Bzip2Options> for EncoderOptions {
     }
 }
 
-#[cfg(feature = "brotli")]
+#[cfg(any(feature = "brotli", feature = "mbrotli"))]
 impl From<BrotliOptions> for EncoderOptions {
     fn from(o: BrotliOptions) -> Self {
         Self::Brotli(o)
@@ -837,7 +837,7 @@ impl From<PpmdOptions> for EncoderOptions {
     }
 }
 
-#[cfg(feature = "zstd")]
+#[cfg(any(feature = "zstd", feature = "mzstd"))]
 impl From<ZstandardOptions> for EncoderOptions {
     fn from(o: ZstandardOptions) -> Self {
         Self::Zstd(o)

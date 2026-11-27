@@ -24,7 +24,7 @@ use ppmd_turbo::{
     Arena as PpmdArena, Params as PpmdParams, SevenZDecoder as PpmdDecoder, io::SevenZReader,
 };
 
-#[cfg(feature = "brotli")]
+#[cfg(any(feature = "brotli", feature = "mbrotli"))]
 use crate::codec::brotli::BrotliDecoder;
 #[cfg(feature = "lz4")]
 use crate::codec::lz4::Lz4Decoder;
@@ -99,7 +99,7 @@ pub(crate) struct DecodeOptions<'a> {
     /// [`check_chain_memory`]; a coder that fits itself to what is left
     /// (Zstandard's window) subtracts it, so that the chain stays within the
     /// limit as a whole rather than each coder within it alone.
-    #[cfg_attr(not(feature = "zstd"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "zstd", feature = "mzstd")), allow(dead_code))]
     pub(crate) reserved_kb: usize,
     /// Kilobytes the memory model holds for the coders of this chain that
     /// [`check_chain_memory`] does not size, the filters and the fixed-size
@@ -402,7 +402,7 @@ pub enum Decoder<R: Read> {
     Bcj(BcjReader<R>),
     // Boxed: the filter's history (260 bytes on wasm32) would size every variant.
     Delta(Box<DeltaReader<R>>),
-    #[cfg(feature = "brotli")]
+    #[cfg(any(feature = "brotli", feature = "mbrotli"))]
     Brotli(Box<BrotliDecoder<R>>),
     #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
     Bzip2(Box<Bzip2Decoder<R>>),
@@ -410,8 +410,8 @@ pub enum Decoder<R: Read> {
     Deflate(DeflateDecoder<std::io::BufReader<R>>),
     #[cfg(feature = "lz4")]
     Lz4(Lz4Decoder<R>),
-    #[cfg(feature = "zstd")]
-    Zstd(zstd::Decoder<'static, std::io::BufReader<R>>),
+    #[cfg(any(feature = "zstd", feature = "mzstd"))]
+    Zstd(crate::codec::zstandard::Decoder<R>),
     #[cfg(feature = "aes256")]
     Aes256Sha256(Box<Aes256Sha256Decoder<R>>),
 }
@@ -426,7 +426,7 @@ impl<R: Read> Read for Decoder<R> {
             Decoder::Ppmd(r) => r.read(buf),
             Decoder::Bcj(r) => r.read(buf),
             Decoder::Delta(r) => r.read(buf),
-            #[cfg(feature = "brotli")]
+            #[cfg(any(feature = "brotli", feature = "mbrotli"))]
             Decoder::Brotli(r) => r.read(buf),
             #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
             Decoder::Bzip2(r) => r.read(buf),
@@ -434,7 +434,7 @@ impl<R: Read> Read for Decoder<R> {
             Decoder::Deflate(r) => r.read(buf),
             #[cfg(feature = "lz4")]
             Decoder::Lz4(r) => r.read(buf),
-            #[cfg(feature = "zstd")]
+            #[cfg(any(feature = "zstd", feature = "mzstd"))]
             Decoder::Zstd(r) => r.read(buf),
             #[cfg(feature = "aes256")]
             Decoder::Aes256Sha256(r) => r.read(buf),
@@ -913,7 +913,7 @@ pub fn add_decoder<I: Read>(
                 input, decoder,
             ))))
         }
-        #[cfg(feature = "brotli")]
+        #[cfg(any(feature = "brotli", feature = "mbrotli"))]
         EncoderMethod::ID_BROTLI => {
             let de = BrotliDecoder::new(input, INPUT_BUF_SIZE)?;
             Ok(Decoder::Brotli(Box::new(de)))
@@ -983,9 +983,8 @@ pub fn add_decoder<I: Read>(
             let de = Lz4Decoder::new(input)?;
             Ok(Decoder::Lz4(de))
         }
-        #[cfg(feature = "zstd")]
+        #[cfg(any(feature = "zstd", feature = "mzstd"))]
         EncoderMethod::ID_ZSTD => {
-            let mut zs = zstd::Decoder::new(input)?;
             // A zstd frame declares its own back-reference window, and the
             // decoder allocates it. The format allows windows far larger than
             // any 7z encoder writes, so the window is bounded here: by the
@@ -1003,8 +1002,9 @@ pub fn add_decoder<I: Read>(
                 // the default and never below the 1 KiB floor the format has.
                 (63 - bytes.leading_zeros()).clamp(10, ZSTD_DEFAULT_WINDOW_LOG)
             };
-            zs.window_log_max(window_log)?;
-            Ok(Decoder::Zstd(zs))
+            Ok(Decoder::Zstd(crate::codec::zstandard::decoder(
+                input, window_log,
+            )?))
         }
         EncoderMethod::ID_BCJ_X86 => {
             let de = BcjReader::new_x86(input, 0);

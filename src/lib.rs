@@ -178,7 +178,7 @@ pub use writer::*;
 trait ByteReader {
     fn read_u8(&mut self) -> std::io::Result<u8>;
 
-    #[cfg(feature = "brotli")]
+    #[cfg(any(feature = "brotli", feature = "mbrotli"))]
     fn read_u16(&mut self) -> std::io::Result<u16>;
 
     fn read_u32(&mut self) -> std::io::Result<u32>;
@@ -207,7 +207,7 @@ impl<T: Read> ByteReader for T {
         Ok(buf[0])
     }
 
-    #[cfg(feature = "brotli")]
+    #[cfg(any(feature = "brotli", feature = "mbrotli"))]
     #[inline(always)]
     fn read_u16(&mut self) -> std::io::Result<u16> {
         let mut buf = [0; 2];
