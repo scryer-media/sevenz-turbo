@@ -41,11 +41,13 @@ case "$(uname -s)-$(uname -m)" in
     ;;
   MINGW*-x86_64 | MSYS*-x86_64)
     # The installer is a 7z archive behind a stub; 7zr unpacks 7z.exe and
-    # 7z.dll from it without running it.
+    # 7z.dll from it without running it. The tests run `7zz`, the name the
+    # other platforms' releases use, so 7z.exe is also there under it.
     fetch 7zr.exe ad4c82fadcbdf93c03b4fc440f300509c7d60c5c2f4d183e35d9d70d6957037d
     fetch 7z2603-x64.exe 0859c524b8a63551848f0c246abddcb1d0b7b656b0fbfe879f8d85e61a9e6edd
     (cd "$bin" && "$root/7zr.exe" x -y -bso0 -bsp0 "$root/7z2603-x64.exe" 7z.exe 7z.dll)
-    tool=7z
+    cp "$bin/7z.exe" "$bin/7zz.exe"
+    tool=7zz
     ;;
   *)
     echo "no pinned 7-Zip for $(uname -s)-$(uname -m)" >&2
