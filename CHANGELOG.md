@@ -497,6 +497,13 @@ arm, and this crate can add a variant without a breaking release.
 
 ## 0.31.0
 
+### Added
+
+- Added optional `mbrotli` and `mzstd` providers for the Brotli and Zstandard
+  methods. Each supports decode-only builds and encoding with `compress`.
+- The optional `lz4` feature now selects the pointer-based `lz4_flex` kernels.
+  Select `lz4-safe` for the previous safe encoder and decoder.
+
 ### Changed
 
 - LZMA2 writers now use the 7-Zip SDK presets for levels 0–9. The default
@@ -514,23 +521,10 @@ arm, and this crate can add a variant without a breaking release.
 - The Brotli writer ends its stream, and writes the last skippable frame,
   at the entry's end-of-stream write. Before, a plain stream ended when the
   writer was dropped and a framed stream's last frame was written only by a
-  flush. A sink
-  error while ending the stream is returned with either provider; before,
-  the `brotli` provider dropped it.
+  flush. A sink error while ending the stream is returned with either
+  provider; before, the `brotli` provider dropped it.
 - Flushing a framed Brotli stream with no input since the last frame writes
   nothing, as finishing it does. Before, each such flush wrote an empty frame.
-
-## 0.30.5
-
-### Added
-
-- Added optional `mbrotli` and `mzstd` providers for the Brotli and Zstandard
-  methods. Each supports decode-only builds and encoding with `compress`.
-- The optional `lz4` feature now selects the pointer-based `lz4_flex` kernels.
-  Select `lz4-safe` for the previous safe encoder and decoder.
-
-### Fixed
-
 - The optional Zstandard codec now requires zstd 0.14.5 or later, which
   bundles C Zstandard 1.6.0 and fixes CVE-2026-124851.
 
