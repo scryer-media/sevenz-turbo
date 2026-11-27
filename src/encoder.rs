@@ -952,6 +952,15 @@ pub(crate) fn add_encoder<W: Write>(
     }
 }
 
+/// The Zstandard version written into an `mzstd` coder's properties.
+///
+/// `mzstd` exposes no version of its own. Its encoder ports zstd 1.6.0, and
+/// its stated contract is byte identity with that release, which is also the
+/// C library the `zstd` provider bundles (`zstd` 0.14.5 and later) and writes
+/// through `zstd_safe::VERSION_MAJOR` and `VERSION_MINOR`.
+#[cfg(all(feature = "mzstd", not(feature = "zstd")))]
+const MZSTD_CODER_VERSION: (u32, u32) = (1, 6);
+
 pub(crate) fn get_options_as_properties<'a>(
     method: EncoderMethod,
     options: Option<&EncoderOptions>,
@@ -1031,10 +1040,8 @@ pub(crate) fn get_options_as_properties<'a>(
                 zstd::zstd_safe::VERSION_MAJOR,
                 zstd::zstd_safe::VERSION_MINOR,
             );
-            // `mzstd` exposes no version, so its streams carry a fixed 1.5.
-            // The `zstd` provider writes the bundled C library's version.
             #[cfg(not(feature = "zstd"))]
-            let (version_major, version_minor) = (1u32, 5u32);
+            let (version_major, version_minor) = MZSTD_CODER_VERSION;
             let options = match options {
                 Some(EncoderOptions::Zstd(options)) => *options,
                 _ => ZstandardOptions::default(),
@@ -1060,6 +1067,19 @@ pub(crate) fn get_options_as_properties<'a>(
 
 #[cfg(test)]
 mod tests {
+    /// Both Zstandard providers tag the coder with the same version, so an
+    /// archive's coder properties do not depend on which one wrote it.
+    #[cfg(any(feature = "zstd", feature = "mzstd"))]
+    #[test]
+    fn every_zstandard_provider_writes_the_same_coder_properties() {
+        use super::{EncoderMethod, EncoderOptions, get_options_as_properties};
+        use crate::encoder_options::ZstandardOptions;
+        let options = EncoderOptions::Zstd(ZstandardOptions::from_level(7));
+        let mut out = [0u8; 16];
+        let written = get_options_as_properties(EncoderMethod::ZSTD, Some(&options), &mut out);
+        assert_eq!(written, [1, 6, 7]);
+    }
+
     use super::lzma2_block_plan;
     use super::lzma2_property_for;
     use crate::codec::lzma_turbo::lzma2_dictionary_size;

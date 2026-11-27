@@ -81,6 +81,20 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo clippy --locked --all-targets --no-default-features --features aes256,native-crypto,bzip2-permissive,compress,deflate,ppmd,util -- -D warnings
       - run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      # Each codec provider alone, with and without `compress`, so code and
+      # test helpers gated on a provider stay clean when it is the only one.
+      - name: clippy (one codec provider each)
+        run: |
+          for features in \
+            brotli mbrotli zstd mzstd lz4 deflate bzip2 bzip2-permissive ppmd \
+            compress compress,brotli compress,mbrotli compress,zstd compress,mzstd \
+            compress,lz4 compress,lz4-safe compress,deflate compress,bzip2 \
+            compress,bzip2-permissive compress,ppmd
+          do
+            echo "::group::$features"
+            cargo clippy --locked --all-targets --no-default-features --features "$features" -- -D warnings
+            echo "::endgroup::"
+          done
 
   docs:
     name: docs

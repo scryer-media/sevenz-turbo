@@ -154,15 +154,21 @@ fn a_missing_block_is_an_error() {
     );
 }
 
-/// 7-Zip reads what the copy wrote. Skipped when no 7-Zip is installed.
+/// 7-Zip reads what the copy wrote. Skipped when no 7-Zip is installed,
+/// unless `SEVENZ_TURBO_7ZZ_REQUIRED` is set, which fails it instead.
 #[test]
 fn seven_zip_tests_the_copy_ok() {
-    let Some(seven_zip) = ["7zz", "7z"].into_iter().find(|name| {
+    let found = ["7zz", "7z"].into_iter().find(|name| {
         Command::new(name)
             .arg("i")
             .output()
             .is_ok_and(|output| output.status.success())
-    }) else {
+    });
+    assert!(
+        found.is_some() || std::env::var_os("SEVENZ_TURBO_7ZZ_REQUIRED").is_none(),
+        "SEVENZ_TURBO_7ZZ_REQUIRED is set but neither 7zz nor 7z runs"
+    );
+    let Some(seven_zip) = found else {
         eprintln!("no 7-Zip installed, skipping");
         return;
     };
