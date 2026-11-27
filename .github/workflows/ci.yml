@@ -181,12 +181,12 @@ jobs:
         if: matrix.platform.name == 'windows-x86_64' && (matrix.configuration.name == 'aws-lc' || matrix.configuration.name == 'all-features')
         uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
       # The 7-Zip interop tests compare with the 7-Zip on PATH, and the
-      # runner images carry different releases (macos-15 has 17.05). Linux
-      # and macOS build the pinned one, and the tests then fail without it
-      # instead of skipping. Windows uses the 7-Zip its image carries.
-      - name: Build the pinned 7-Zip
-        if: runner.os != 'Windows'
-        run: bash .github/scripts/build-7zz.sh
+      # runner images carry different releases (macos-15 has 17.05). Every
+      # lane installs the pinned release, and the tests then fail without
+      # it instead of skipping.
+      - name: Install the pinned 7-Zip
+        shell: bash
+        run: bash .github/scripts/install-7zip.sh
       - name: Test ${{ matrix.configuration.name }}
         run: cargo nextest run --locked --no-fail-fast ${{ matrix.configuration.args }}
       - name: Exercise the pointer-based LZ4 kernels
