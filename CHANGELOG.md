@@ -522,7 +522,8 @@ arm, and this crate can add a variant without a breaking release.
   at the entry's end-of-stream write. Before, a plain stream ended when the
   writer was dropped and a framed stream's last frame was written only by a
   flush. A sink error while ending the stream is returned with either
-  provider; before, the `brotli` provider dropped it.
+  provider, and so is a failure of the `brotli` provider's own encoder,
+  as `InvalidData`; before, the `brotli` provider dropped both.
 - Flushing a framed Brotli stream with no input since the last frame writes
   nothing, as finishing it does. Before, each such flush wrote an empty frame.
 - The Brotli reader reads its stream header until it holds 16 bytes or the
