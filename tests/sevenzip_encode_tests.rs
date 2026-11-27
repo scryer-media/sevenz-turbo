@@ -35,6 +35,23 @@ fn seven_zip() -> Option<&'static str> {
     found
 }
 
+/// The release `bin` names in its banner, as (major, minor): `26.01` in
+/// `7-Zip (z) 26.01 (arm64)`, `17.05` in p7zip's `7-Zip [64] 17.05`.
+fn seven_zip_version(bin: &str) -> Option<(u32, u32)> {
+    let banner = Command::new(bin).output().ok()?.stdout;
+    let banner = String::from_utf8_lossy(&banner);
+    let line = banner.lines().find(|line| line.contains("7-Zip"))?;
+    line.split_whitespace().find_map(|word| {
+        let (major, minor) = word.split_once('.')?;
+        Some((major.parse().ok()?, minor.parse().ok()?))
+    })
+}
+
+/// The oldest 7-Zip whose LZMA2 payload the SDK presets are compared with.
+/// An older encoder, such as p7zip 17.05, writes other bytes for the same
+/// level.
+const SDK_PRESET_7ZIP: (u32, u32) = (26, 0);
+
 /// Text-like bytes that every coder compresses, and some that none does.
 fn inputs() -> Vec<(String, Vec<u8>)> {
     let mut x = 0x9E37_79B9_7F4A_7C15u64;
@@ -119,6 +136,15 @@ fn sdk_lzma2_presets_write_the_same_payload_as_7zip() {
         eprintln!("skipping: neither 7zz nor 7z is on PATH");
         return;
     };
+    let version = seven_zip_version(bin);
+    if version.is_none_or(|version| version < SDK_PRESET_7ZIP) {
+        assert!(
+            std::env::var_os("SEVENZ_TURBO_7ZZ_REQUIRED").is_none(),
+            "SEVENZ_TURBO_7ZZ_REQUIRED is set but `{bin}` is {version:?}, older than {SDK_PRESET_7ZIP:?}"
+        );
+        eprintln!("skipping: `{bin}` is {version:?}, older than {SDK_PRESET_7ZIP:?}");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let files = inputs();
     let (name, data) = &files[0];
