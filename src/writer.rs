@@ -1826,6 +1826,8 @@ fn encode_pulled<const CHECKSUM: bool, W: Write>(
 
 /// Codes an entry's folder, retaining a pulled coder for the next folder
 /// when possible. Both input and packed CRCs are computed on this worker.
+/// Only the threaded non-solid path calls it, which wasm32 does not build.
+#[cfg(not(target_arch = "wasm32"))]
 fn encode_entry<R: Read, O: Write>(
     content_methods: &Arc<Vec<EncoderConfiguration>>,
     entry: ArchiveEntry,
