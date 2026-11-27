@@ -509,6 +509,17 @@ arm, and this crate can add a variant without a breaking release.
   `Lzma2Options::from_xz_level` or `from_xz_level_mt` with their previous
   settings. Both preset families write standard LZMA2.
 
+### Fixed
+
+- The Brotli writer ends its stream, and writes the last skippable frame,
+  at the entry's end-of-stream write. Before, a plain stream ended when the
+  writer was dropped and a framed stream's last frame was written only by a
+  flush. A sink
+  error while ending the stream is returned with either provider; before,
+  the `brotli` provider dropped it.
+- Flushing a framed Brotli stream with no input since the last frame writes
+  nothing, as finishing it does. Before, each such flush wrote an empty frame.
+
 ## 0.30.5
 
 ### Added
