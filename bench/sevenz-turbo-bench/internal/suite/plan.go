@@ -591,27 +591,24 @@ type encodeOpts struct {
 	note string
 }
 
-// The crate's encoder levels (src/encoder_options.rs, LzmaSettings): xz's
-// table, not 7-Zip's. 7zz's own -mx<L> picks a different dictionary, match
-// finder and fast-bytes (-mx1 is a 256 KiB dictionary where this crate's level
-// 1 is 1 MiB; -mx5 is 16 MiB where the crate's is 8 MiB, so the multi-threaded
-// block, four dictionaries, differs too). The oracle is given the crate's
-// settings outright so the time and size ratios compare the same work. Keep
-// this in step with LzmaSettings.
+// The crate's encoder levels (src/encoder_options.rs, LzmaSettings::sdk) are
+// the 7-Zip SDK's 64-bit presets (LzmaEncProps_Normalize), the same ones 7zz's
+// -mx<L> picks. The oracle is still given them outright so the time and size
+// ratios compare the same work if either side's defaults move. Keep this in
+// step with LzmaSettings::sdk.
 var (
-	levelDictMiB  = [10]string{"256k", "1m", "2m", "4m", "4m", "8m", "8m", "16m", "32m", "64m"}
-	levelNiceLen  = [10]int{128, 128, 273, 273, 16, 32, 64, 64, 64, 64}
-	levelHC4Depth = [4]int{4, 8, 24, 48}
+	levelDictMiB = [10]string{"64k", "256k", "1m", "4m", "16m", "32m", "64m", "128m", "256m", "256m"}
+	levelNiceLen = [10]int{32, 32, 32, 32, 32, 32, 32, 64, 64, 64}
 )
 
-// OracleLZMA2Method is 7zz's -m0 switch for the crate's level: levels 0-3 are
-// the fast parser over HC4 with an explicit depth, the rest the optimal
-// parser over BT4 with the encoder's default depth, as in LzmaSettings.
+// OracleLZMA2Method is 7zz's -m0 switch for the crate's level: levels 0-4 are
+// the fast parser over HC5 with 16 match cycles, the rest the optimal parser
+// over BT4 with the encoder's default cycles, as in LzmaSettings::sdk.
 func OracleLZMA2Method(level int) string {
 	level = max(0, min(level, 9))
 	method := fmt.Sprintf("-m0=lzma2:d=%s:fb=%d", levelDictMiB[level], levelNiceLen[level])
-	if level <= 3 {
-		return method + fmt.Sprintf(":mf=hc4:a=0:mc=%d", levelHC4Depth[level])
+	if level <= 4 {
+		return method + ":mf=hc5:a=0:mc=16"
 	}
 	return method + ":mf=bt4:a=1"
 }

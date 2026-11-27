@@ -21,15 +21,17 @@ pub(crate) struct BrotliDecoder<R: Read> {
 impl<R: Read> BrotliDecoder<R> {
     pub(crate) fn new(mut input: R, buffer_size: usize) -> Result<Self, Error> {
         let mut header = [0u8; 16];
-        let header_read = match Read::read(&mut input, &mut header) {
-            Ok(n) if n >= 4 => n,
-            Ok(_) => return Err(Error::corrupted("Input too short")),
-            Err(e) => return Err(e.into()),
-        };
+        let header_read = fill(&mut input, &mut header)?;
 
-        let magic_value = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        // A frame header is 16 bytes and opens with the skippable-frame
+        // magic. Anything shorter, a valid Brotli stream of 1 to 3 bytes
+        // among it, is a standard stream: its bytes are replayed into the
+        // decoder, which refuses them if they are not one.
+        let framed = header_read == header.len()
+            && u32::from_le_bytes([header[0], header[1], header[2], header[3]])
+                == SKIPPABLE_FRAME_MAGIC;
 
-        let inner_reader = if magic_value == SKIPPABLE_FRAME_MAGIC && header_read >= 16 {
+        let inner_reader = if framed {
             let skippable_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
             if skippable_size != 8 {
                 return Err(Error::corrupted("Invalid brotli skippable frame size"));
@@ -55,6 +57,23 @@ impl<R: Read> BrotliDecoder<R> {
             buffer_size,
         })
     }
+}
+
+/// Reads into `buf` until it is full or `input` ends, retrying an
+/// interrupted read, and returns how many bytes it holds. A source may hand
+/// out fewer bytes per read than asked, so one read can stop short of a
+/// header that is there.
+fn fill<R: Read>(input: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match input.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n.min(buf.len() - filled),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
 }
 
 impl<R: Read> Read for BrotliDecoder<R> {
@@ -382,17 +401,16 @@ impl<W: Write> Write for BrotliEncoder<W> {
                 uncompressed_bytes_in_frame,
                 ..
             } => {
-                let mut comp = compressor.take().expect("no compressor set");
-                comp.flush()?;
-                let mut data = finish_encoder(comp)?;
-
-                if !data.is_empty() {
+                // As in `finish`: a frame with no input is not written.
+                if *uncompressed_bytes_in_frame != 0 {
+                    let mut comp = compressor.take().expect("no compressor set");
+                    comp.flush()?;
+                    let mut data = finish_encoder(comp)?;
                     Self::write_frame(writer, &data, *uncompressed_bytes_in_frame)?;
                     data.clear();
                     *uncompressed_bytes_in_frame = 0;
+                    *compressor = Some(encoder(data, self.buffer_size, self.quality, self.window)?);
                 }
-
-                *compressor = Some(encoder(data, self.buffer_size, self.quality, self.window)?);
 
                 writer.flush()
             }
@@ -424,7 +442,135 @@ fn decoder<R: Read>(reader: R, buffer_size: usize) -> io::Result<RawDecoder<R>> 
 }
 
 #[cfg(all(feature = "compress", feature = "brotli"))]
-type RawEncoder<W> = brotli::CompressorWriter<W>;
+type RawEncoder<W> = StreamEncoder<W>;
+
+#[cfg(all(feature = "compress", feature = "brotli"))]
+use brotli::enc::{
+    StandardAlloc,
+    encode::{
+        BrotliEncoderDestroyInstance, BrotliEncoderOperation, BrotliEncoderParameter,
+        BrotliEncoderStateStruct,
+    },
+};
+
+/// The `brotli` provider's encoder state, released when it is dropped.
+#[cfg(all(feature = "compress", feature = "brotli"))]
+struct EncoderState(BrotliEncoderStateStruct<StandardAlloc>);
+
+#[cfg(all(feature = "compress", feature = "brotli"))]
+impl Drop for EncoderState {
+    fn drop(&mut self) {
+        BrotliEncoderDestroyInstance(&mut self.0);
+    }
+}
+
+/// A `brotli` stream written through the encoder state's own
+/// `compress_stream`, as `brotli::CompressorWriter` writes one, except that
+/// finishing the stream returns what failed. `CompressorWriter::into_inner`
+/// drops both a sink error and the encoder's own failure.
+#[cfg(all(feature = "compress", feature = "brotli"))]
+struct StreamEncoder<W> {
+    sink: W,
+    state: EncoderState,
+    out: Vec<u8>,
+    total_out: Option<usize>,
+}
+
+#[cfg(all(feature = "compress", feature = "brotli"))]
+impl<W: Write> StreamEncoder<W> {
+    fn new(sink: W, buffer_size: usize, quality: u32, window: u32) -> Self {
+        let mut state = BrotliEncoderStateStruct::new(StandardAlloc::default());
+        state.set_parameter(BrotliEncoderParameter::BROTLI_PARAM_QUALITY, quality);
+        state.set_parameter(BrotliEncoderParameter::BROTLI_PARAM_LGWIN, window);
+        Self {
+            sink,
+            state: EncoderState(state),
+            out: vec![0; if buffer_size == 0 { 4096 } else { buffer_size }],
+            total_out: Some(0),
+        }
+    }
+
+    /// Runs `op` over `input`, writing what it produces to the sink, until
+    /// the input is taken (process), the output is drained (flush) or the
+    /// stream is finished (finish).
+    fn run(&mut self, op: BrotliEncoderOperation, input: &[u8]) -> io::Result<()> {
+        let mut no_callback = |_: &mut brotli::enc::interface::PredictionModeContextMap<
+            brotli::InputReferenceMut,
+        >,
+                               _: &mut [brotli::enc::interface::StaticCommand],
+                               _: brotli::InputPair,
+                               _: &mut StandardAlloc| ();
+        let mut avail_in = input.len();
+        let mut in_offset = 0;
+        loop {
+            let mut avail_out = self.out.len();
+            let mut out_offset = 0;
+            let done = self.state.0.compress_stream(
+                op,
+                &mut avail_in,
+                input,
+                &mut in_offset,
+                &mut avail_out,
+                &mut self.out,
+                &mut out_offset,
+                &mut self.total_out,
+                &mut no_callback,
+            );
+            write_all(&mut self.sink, &self.out[..out_offset])?;
+            if !done {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the Brotli encoder failed",
+                ));
+            }
+            let settled = match op {
+                BrotliEncoderOperation::BROTLI_OPERATION_PROCESS => avail_in == 0,
+                BrotliEncoderOperation::BROTLI_OPERATION_FLUSH => !self.state.0.has_more_output(),
+                _ => self.state.0.is_finished(),
+            };
+            if settled {
+                return Ok(());
+            }
+        }
+    }
+
+    fn finish(mut self) -> io::Result<W> {
+        self.run(BrotliEncoderOperation::BROTLI_OPERATION_FINISH, &[])?;
+        Ok(self.sink)
+    }
+}
+
+/// Writes all of `bytes` to `sink`, retrying an interrupted write. A sink
+/// that takes nothing is a [`io::ErrorKind::WriteZero`] error.
+#[cfg(all(feature = "compress", feature = "brotli"))]
+fn write_all<W: Write>(sink: &mut W, mut bytes: &[u8]) -> io::Result<()> {
+    while !bytes.is_empty() {
+        match sink.write(bytes) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(written) => bytes = bytes.get(written..).unwrap_or_default(),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "compress", feature = "brotli"))]
+impl<W: Write> Write for StreamEncoder<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.run(BrotliEncoderOperation::BROTLI_OPERATION_PROCESS, buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.run(BrotliEncoderOperation::BROTLI_OPERATION_FLUSH, &[])?;
+        self.sink.flush()
+    }
+}
+
 #[cfg(all(feature = "compress", not(feature = "brotli")))]
 type RawEncoder<W> = super::owned_io::Writer<W, mbrotli::EncoderSessionOwned>;
 
@@ -437,12 +583,7 @@ fn encoder<W: Write>(
 ) -> io::Result<RawEncoder<W>> {
     #[cfg(feature = "brotli")]
     {
-        Ok(brotli::CompressorWriter::new(
-            sink,
-            buffer_size,
-            quality,
-            window,
-        ))
+        Ok(StreamEncoder::new(sink, buffer_size, quality, window))
     }
     #[cfg(not(feature = "brotli"))]
     {
@@ -462,12 +603,262 @@ fn encoder<W: Write>(
 
 #[cfg(feature = "compress")]
 fn finish_encoder<W: Write>(encoder: RawEncoder<W>) -> io::Result<W> {
-    #[cfg(feature = "brotli")]
-    {
-        Ok(encoder.into_inner())
+    encoder.finish()
+}
+
+#[cfg(all(test, feature = "compress"))]
+mod tests {
+    use std::{
+        cell::Cell,
+        io::{self, Write},
+        rc::Rc,
+    };
+
+    use super::BrotliEncoder;
+
+    /// Records what reaches the archive and fails every write once told to.
+    struct Sink {
+        bytes: Vec<u8>,
+        fail: Rc<Cell<bool>>,
     }
-    #[cfg(not(feature = "brotli"))]
-    {
-        encoder.finish()
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.fail.get() {
+                return Err(io::Error::other("sink is full"));
+            }
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn sink() -> (Sink, Rc<Cell<bool>>) {
+        let fail = Rc::new(Cell::new(false));
+        let sink = Sink {
+            bytes: Vec::new(),
+            fail: fail.clone(),
+        };
+        (sink, fail)
+    }
+
+    #[test]
+    fn flushing_an_empty_framed_stream_writes_nothing() {
+        let (sink, _) = sink();
+        let mut encoder = BrotliEncoder::new(sink, 11, 22, 1 << 16).unwrap();
+        encoder.flush().unwrap();
+        encoder.flush().unwrap();
+        assert!(encoder.finish().unwrap().bytes.is_empty());
+    }
+
+    #[test]
+    fn flushing_a_framed_stream_writes_its_open_frame_once() {
+        let (sink, _) = sink();
+        let mut encoder = BrotliEncoder::new(sink, 11, 22, 1 << 16).unwrap();
+        encoder.write_all(b"hello").unwrap();
+        encoder.flush().unwrap();
+        let framed = match &encoder.inner {
+            super::InnerWriter::Framed { writer, .. } => writer.bytes.len(),
+            super::InnerWriter::Standard(_) => unreachable!("frame size is set"),
+        };
+        assert_ne!(framed, 0);
+        encoder.flush().unwrap();
+        assert_eq!(encoder.finish().unwrap().bytes.len(), framed);
+    }
+
+    #[test]
+    fn a_sink_failure_while_finishing_is_returned() {
+        for frame_size in [0, 1 << 16] {
+            let (sink, fail) = sink();
+            let mut encoder = BrotliEncoder::new(sink, 11, 22, frame_size).unwrap();
+            encoder.write_all(b"hello").unwrap();
+            fail.set(true);
+            let error = encoder
+                .finish()
+                .err()
+                .expect("the stream end was not written");
+            assert_eq!(error.to_string(), "sink is full", "frame size {frame_size}");
+        }
+    }
+
+    /// The stream is the one `brotli::CompressorWriter` writes for the same
+    /// writes, flushes and settings.
+    #[cfg(feature = "brotli")]
+    #[test]
+    fn the_stream_matches_the_brotli_writer() {
+        let input: Vec<u8> = (0..300_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        for (quality, window) in [(0, 18), (1, 20), (5, 22), (11, 22)] {
+            let mut ours = super::StreamEncoder::new(Vec::new(), 8192, quality, window);
+            let mut theirs = brotli::CompressorWriter::new(Vec::new(), 8192, quality, window);
+            for piece in input.chunks(70_000) {
+                ours.write_all(piece).unwrap();
+                theirs.write_all(piece).unwrap();
+                ours.flush().unwrap();
+                theirs.flush().unwrap();
+            }
+            assert!(
+                ours.finish().unwrap() == theirs.into_inner(),
+                "quality {quality}, window {window}"
+            );
+        }
+    }
+
+    /// The encoder's own failure while finishing is returned, not dropped.
+    /// A metadata block left open puts the state where `compress_stream`
+    /// refuses to finish.
+    #[cfg(feature = "brotli")]
+    #[test]
+    fn an_encoder_failure_while_finishing_is_returned() {
+        use brotli::enc::encode::BrotliEncoderOperation;
+        let (sink, _) = sink();
+        let mut encoder = super::StreamEncoder::new(sink, 4096, 11, 22);
+        let (mut avail_in, mut in_offset, mut avail_out, mut out_offset) = (4, 0, 0, 0);
+        let mut no_out = [0u8; 0];
+        let mut no_callback = |_: &mut brotli::enc::interface::PredictionModeContextMap<
+            brotli::InputReferenceMut,
+        >,
+                               _: &mut [brotli::enc::interface::StaticCommand],
+                               _: brotli::InputPair,
+                               _: &mut brotli::enc::StandardAlloc| ();
+        assert!(encoder.state.0.compress_stream(
+            BrotliEncoderOperation::BROTLI_OPERATION_EMIT_METADATA,
+            &mut avail_in,
+            b"meta",
+            &mut in_offset,
+            &mut avail_out,
+            &mut no_out,
+            &mut out_offset,
+            &mut encoder.total_out,
+            &mut no_callback,
+        ));
+        let error = encoder.finish().err().expect("the stream did not finish");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "the Brotli encoder failed");
+    }
+
+    /// The encoder's own failure while taking input is returned.
+    #[cfg(feature = "brotli")]
+    #[test]
+    fn an_encoder_failure_while_writing_is_returned() {
+        use brotli::enc::encode::BrotliEncoderOperation;
+        let (sink, _) = sink();
+        let mut encoder = super::StreamEncoder::new(sink, 4096, 11, 22);
+        encoder
+            .run(BrotliEncoderOperation::BROTLI_OPERATION_FINISH, &[])
+            .unwrap();
+        let error = encoder
+            .write(b"after the end")
+            .expect_err("input after the end");
+        assert_eq!(error.to_string(), "the Brotli encoder failed");
+    }
+
+    /// Hands out one byte per read, after an interrupted read before each.
+    struct Trickle {
+        bytes: Vec<u8>,
+        at: usize,
+        interrupt: bool,
+    }
+
+    impl io::Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.interrupt = !self.interrupt;
+            if self.interrupt {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let Some(&byte) = self.bytes.get(self.at) else {
+                return Ok(0);
+            };
+            let Some(first) = buf.first_mut() else {
+                return Ok(0);
+            };
+            *first = byte;
+            self.at += 1;
+            Ok(1)
+        }
+    }
+
+    fn encoded(frame_size: usize) -> Vec<u8> {
+        let (sink, _) = sink();
+        let mut encoder = BrotliEncoder::new(sink, 11, 22, frame_size).unwrap();
+        encoder.write_all(b"one byte at a time").unwrap();
+        encoder.finish().unwrap().bytes
+    }
+
+    #[test]
+    fn a_source_that_reads_one_byte_at_a_time_decodes() {
+        for frame_size in [0, 1 << 16] {
+            let source = Trickle {
+                bytes: encoded(frame_size),
+                at: 0,
+                interrupt: false,
+            };
+            let mut decoder = super::BrotliDecoder::new(source, 4096).unwrap();
+            let mut out = Vec::new();
+            io::Read::read_to_end(&mut decoder, &mut out).unwrap();
+            assert_eq!(out, b"one byte at a time", "frame size {frame_size}");
+        }
+    }
+
+    /// Decodes `bytes` whole and one byte per read, and returns both results.
+    fn decode_both_ways(bytes: &[u8]) -> [io::Result<Vec<u8>>; 2] {
+        let whole = |source: Box<dyn io::Read>| {
+            let mut decoder = super::BrotliDecoder::new(source, 4096).map_err(io::Error::other)?;
+            let mut out = Vec::new();
+            io::Read::read_to_end(&mut decoder, &mut out)?;
+            Ok(out)
+        };
+        [
+            whole(Box::new(io::Cursor::new(bytes.to_vec()))),
+            whole(Box::new(Trickle {
+                bytes: bytes.to_vec(),
+                at: 0,
+                interrupt: false,
+            })),
+        ]
+    }
+
+    /// A standard stream shorter than a frame header's 4-byte magic decodes:
+    /// the empty stream the encoder writes (1 byte for a window of 16 or 18
+    /// to 24, 2 bytes for 10 to 15 and 17), and streams of an empty metadata
+    /// block before the last, empty, meta-block.
+    #[test]
+    fn a_valid_stream_shorter_than_the_frame_magic_decodes() {
+        let mut streams: Vec<Vec<u8>> = (10..=24)
+            .map(|window| {
+                let (sink, _) = sink();
+                let encoder = BrotliEncoder::new(sink, 11, window, 0).unwrap();
+                encoder.finish().unwrap().bytes
+            })
+            .collect();
+        // Window 16 (WBITS `0`), then ISLAST 0, MNIBBLES `11` (metadata),
+        // reserved 0, MSKIPBYTES 0, padding; then ISLAST 1, ISLASTEMPTY 1.
+        streams.push(vec![0b0000_1100, 0b0000_0011]);
+        // The same with window 17 (WBITS `1000000`), which pushes the
+        // metadata header into the second byte.
+        streams.push(vec![0b0000_0001, 0b0000_0011, 0b0000_0011]);
+        for stream in &streams {
+            assert!((1..4).contains(&stream.len()), "{stream:02x?}");
+            for result in decode_both_ways(stream) {
+                assert_eq!(result.unwrap(), b"", "{stream:02x?}");
+            }
+        }
+        assert!(streams.iter().any(|s| s.len() == 1));
+        assert!(streams.iter().any(|s| s.len() == 2));
+        assert!(streams.iter().any(|s| s.len() == 3));
+    }
+
+    /// A framed stream cut inside its 16-byte frame header is not a valid
+    /// standard stream either, and the decoder refuses it.
+    #[test]
+    fn a_framed_header_cut_short_fails() {
+        let bytes = encoded(1 << 16);
+        for len in 0..16 {
+            for result in decode_both_ways(&bytes[..len]) {
+                assert!(result.is_err(), "{len} bytes decoded");
+            }
+        }
     }
 }

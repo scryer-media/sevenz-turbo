@@ -125,7 +125,10 @@ What no lane above runs, so that a pass is not read as more than it is:
   checksum and the archive's CRC-32 come from `crc-turbo`, the first through
   `bzip2-turbo` and the second through `lzma-turbo`.
 - Deflate, Zstandard, Brotli and LZ4 are not under any sanitizer or guard
-  lane; the Zstandard C library is not instrumented by those lanes.
+  lane; the Zstandard C library is not instrumented by those lanes. This
+  includes the `lz4` feature's default pointer-based `lz4_flex` kernels
+  (`lz4-safe` selects the safe ones) and the `mbrotli` and `mzstd`
+  providers.
 - AWS-LC's AES and SHA-256 are under the guard lane only; the sanitizer lanes
   use RustCrypto. `lzma-turbo`'s assembly kernels run under the guards and
   Memcheck but cannot be instrumented by the sanitizers.

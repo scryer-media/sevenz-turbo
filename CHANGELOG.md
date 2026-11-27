@@ -495,7 +495,7 @@ arm, and this crate can add a variant without a breaking release.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
-## 0.30.5
+## 0.31.0
 
 ### Added
 
@@ -504,8 +504,47 @@ arm, and this crate can add a variant without a breaking release.
 - The optional `lz4` feature now selects the pointer-based `lz4_flex` kernels.
   Select `lz4-safe` for the previous safe encoder and decoder.
 
+### Changed
+
+- LZMA2 writers now use the 7-Zip SDK presets for levels 0–9. The default
+  moves from xz-style level 6 (8 MiB dictionary) to SDK level 5 (32 MiB).
+  Level 4 now uses the fast hash-chain finder. Levels 8 and 9 can request a
+  256 MiB dictionary on 64-bit targets. On 32-bit targets levels 7 to 9 use
+  64 MiB, as the SDK does there, so every level encodes on those targets.
+  Larger dictionaries can increase encoder and decoder memory use.
+  Applications regenerating archive hashes or recovery volumes can select
+  `Lzma2Options::from_xz_level` or `from_xz_level_mt` with their previous
+  settings. Both preset families write standard LZMA2.
+- `ArchiveReader::for_each_entries_unordered` now hands over
+  `UnorderedEntry::End` for an entry with a CRC only after that CRC matched,
+  on every path. An entry whose CRC does not match is never ended; the call
+  returns the located `ChecksumMismatch`. When a folder's coder reports
+  checksums only at the end of its stream, an entry's end can come after
+  later entries of the folder began, took bytes or ended. Each entry still
+  ends once, after all of its data. Entries with no CRC end as before.
+
 ### Fixed
 
+- The Brotli writer ends its stream, and writes the last skippable frame,
+  at the entry's end-of-stream write. Before, a plain stream ended when the
+  writer was dropped and a framed stream's last frame was written only by a
+  flush. A sink error while ending the stream is returned with either
+  provider, and so is a failure of the `brotli` provider's own encoder,
+  as `InvalidData`; before, the `brotli` provider dropped both.
+- Flushing a framed Brotli stream with no input since the last frame writes
+  nothing, as finishing it does. Before, each such flush wrote an empty frame.
+- The Brotli reader reads its stream header until it holds 16 bytes or the
+  entry ends, and retries an interrupted read. Before, a source that handed
+  out fewer than 4 bytes in its first read failed with "Input too short", and
+  one that handed out fewer than 16 could miss the skippable frame header.
+- A Brotli entry whose stream is shorter than 4 bytes, such as the 1- or
+  2-byte stream of empty input, now decodes. Before, it failed with "Input
+  too short". Bytes that are not a valid stream fail with the decoder's error.
+- Archives written through the `mzstd` provider tag their Zstandard coder
+  as version 1.6, as the `zstd` provider does. Both providers now write the
+  same coder properties.
+- The optional `brotli` provider now requires brotli 8.0.4 or later, for the
+  encoder-state API it uses to finish a stream.
 - The optional Zstandard codec now requires zstd 0.14.5 or later, which
   bundles C Zstandard 1.6.0 and fixes CVE-2026-124851.
 

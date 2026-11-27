@@ -35,6 +35,23 @@ fn seven_zip() -> Option<&'static str> {
     found
 }
 
+/// The release `bin` names in its banner, as (major, minor): `26.01` in
+/// `7-Zip (z) 26.01 (arm64)`, `17.05` in p7zip's `7-Zip [64] 17.05`.
+fn seven_zip_version(bin: &str) -> Option<(u32, u32)> {
+    let banner = Command::new(bin).output().ok()?.stdout;
+    let banner = String::from_utf8_lossy(&banner);
+    let line = banner.lines().find(|line| line.contains("7-Zip"))?;
+    line.split_whitespace().find_map(|word| {
+        let (major, minor) = word.split_once('.')?;
+        Some((major.parse().ok()?, minor.parse().ok()?))
+    })
+}
+
+/// The oldest 7-Zip whose LZMA2 payload the SDK presets are compared with.
+/// An older encoder, such as p7zip 17.05, writes other bytes for the same
+/// level.
+const SDK_PRESET_7ZIP: (u32, u32) = (26, 0);
+
 /// Text-like bytes that every coder compresses, and some that none does.
 fn inputs() -> Vec<(String, Vec<u8>)> {
     let mut x = 0x9E37_79B9_7F4A_7C15u64;
@@ -109,6 +126,80 @@ fn check_with_7zip(bin: &str, dir: &Path, label: &str, archive: &[u8], password:
     for (name, data) in inputs() {
         let got = std::fs::read(out.join(&name)).expect("extracted file");
         assert!(got == data, "{label}: {name} extracted differently");
+    }
+}
+
+/// The container metadata can differ. Compare the single LZMA2 pack stream itself.
+#[test]
+fn sdk_lzma2_presets_write_the_same_payload_as_7zip() {
+    let Some(bin) = seven_zip() else {
+        eprintln!("skipping: neither 7zz nor 7z is on PATH");
+        return;
+    };
+    let version = seven_zip_version(bin);
+    if version.is_none_or(|version| version < SDK_PRESET_7ZIP) {
+        assert!(
+            std::env::var_os("SEVENZ_TURBO_7ZZ_REQUIRED").is_none(),
+            "SEVENZ_TURBO_7ZZ_REQUIRED is set but `{bin}` is {version:?}, older than {SDK_PRESET_7ZIP:?}"
+        );
+        eprintln!("skipping: `{bin}` is {version:?}, older than {SDK_PRESET_7ZIP:?}");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let files = inputs();
+    let (name, data) = &files[0];
+    std::fs::write(dir.path().join(name), data).unwrap();
+
+    fn payload(bytes: &[u8]) -> &[u8] {
+        let archive = Archive::read(&mut Cursor::new(bytes), &Password::empty()).unwrap();
+        let [size] = archive.pack_sizes() else {
+            panic!("expected one pack stream")
+        };
+        let start = 32 + archive.pack_pos() as usize;
+        &bytes[start..start + *size as usize]
+    }
+
+    for (level, small_dictionary) in [
+        (1, false),
+        (3, false),
+        (3, true),
+        (4, false),
+        (5, false),
+        (7, false),
+        (9, false),
+    ] {
+        let mut options = Lzma2Options::from_level(level);
+        let method = if small_dictionary {
+            options.set_dictionary_size(64 << 10);
+            "-m0=LZMA2:d=64k"
+        } else {
+            "-m0=LZMA2"
+        };
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        writer.set_content_methods(vec![options.into()]);
+        let mut entry = ArchiveEntry::new_file(name);
+        entry.size = data.len() as u64;
+        writer
+            .push_archive_entry(entry, Some(data.as_slice()))
+            .unwrap();
+        let ours = writer.finish().unwrap().into_inner();
+        let output = format!("sdk-{level}-{small_dictionary}.7z");
+        let reference = Command::new(bin)
+            .current_dir(dir.path())
+            .args([
+                "a",
+                "-t7z",
+                "-mmt1",
+                &format!("-mx={level}"),
+                method,
+                &output,
+                name,
+            ])
+            .output()
+            .unwrap();
+        assert!(reference.status.success(), "{:?}", reference);
+        let theirs = std::fs::read(dir.path().join(output)).unwrap();
+        assert!(payload(&ours) == payload(&theirs), "SDK level {level}");
     }
 }
 

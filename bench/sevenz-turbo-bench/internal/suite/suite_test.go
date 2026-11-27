@@ -366,7 +366,7 @@ func TestPlanEncodeArgsMatch7zz(t *testing.T) {
 				t.Errorf("ours %q lacks %q", ours, want)
 			}
 		}
-		for _, want := range []string{"-mx=5", "-mmt=" + all, "-ms=off", "-m0=lzma2:d=8m:fb=32:mf=bt4:a=1"} {
+		for _, want := range []string{"-mx=5", "-mmt=" + all, "-ms=off", "-m0=lzma2:d=32m:fb=32:mf=bt4:a=1"} {
 			if !strings.Contains(oracle, want) {
 				t.Errorf("7zz %q lacks %q", oracle, want)
 			}
@@ -374,6 +374,24 @@ func TestPlanEncodeArgsMatch7zz(t *testing.T) {
 		return
 	}
 	t.Fatal("scenario not planned")
+}
+
+func TestOracleLZMA2MethodFollowsSDKPresets(t *testing.T) {
+	want := map[int]string{
+		0:  "-m0=lzma2:d=64k:fb=32:mf=hc5:a=0:mc=16",
+		1:  "-m0=lzma2:d=256k:fb=32:mf=hc5:a=0:mc=16",
+		3:  "-m0=lzma2:d=4m:fb=32:mf=hc5:a=0:mc=16",
+		4:  "-m0=lzma2:d=16m:fb=32:mf=hc5:a=0:mc=16",
+		5:  "-m0=lzma2:d=32m:fb=32:mf=bt4:a=1",
+		7:  "-m0=lzma2:d=128m:fb=64:mf=bt4:a=1",
+		9:  "-m0=lzma2:d=256m:fb=64:mf=bt4:a=1",
+		12: "-m0=lzma2:d=256m:fb=64:mf=bt4:a=1",
+	}
+	for level, method := range want {
+		if got := OracleLZMA2Method(level); got != method {
+			t.Errorf("level %d: got %q, want %q", level, got, method)
+		}
+	}
 }
 
 func TestOrderForAlternates(t *testing.T) {
