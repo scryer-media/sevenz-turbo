@@ -870,11 +870,16 @@ fn from_path_records_the_file_length() {
 #[cfg(all(feature = "compress", feature = "util", feature = "aes256"))]
 #[test]
 fn sevenzip_tests_archives_with_per_folder_dictionaries() {
+    // With `SEVENZ_TURBO_7ZZ_REQUIRED` set, a missing `7zz` fails the test
+    // instead of skipping it.
     let have_7zz = std::process::Command::new("7zz")
         .arg("i")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .is_ok_and(|o| o.status.success());
+    assert!(
+        have_7zz || std::env::var_os("SEVENZ_TURBO_7ZZ_REQUIRED").is_none(),
+        "SEVENZ_TURBO_7ZZ_REQUIRED is set but 7zz does not run"
+    );
     if !have_7zz {
         eprintln!("skipping: 7zz is not on PATH");
         return;

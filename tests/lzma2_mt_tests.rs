@@ -18,12 +18,18 @@ use std::process::Command;
 
 use sevenz_turbo::{ArchiveLimits, ArchiveReader, Password};
 
+/// Is the oracle available? With `SEVENZ_TURBO_7ZZ_REQUIRED` set, a missing
+/// `7zz` fails the test instead of skipping it.
 fn have_7zz() -> bool {
-    Command::new("7zz")
+    let found = Command::new("7zz")
         .arg("i")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success());
+    assert!(
+        found || std::env::var_os("SEVENZ_TURBO_7ZZ_REQUIRED").is_none(),
+        "SEVENZ_TURBO_7ZZ_REQUIRED is set but 7zz does not run"
+    );
+    found
 }
 
 /// Compressible bytes with enough structure that `7zz` chunks them.
