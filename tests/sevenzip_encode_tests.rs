@@ -112,6 +112,68 @@ fn check_with_7zip(bin: &str, dir: &Path, label: &str, archive: &[u8], password:
     }
 }
 
+/// The container metadata can differ. Compare the single LZMA2 pack stream itself.
+#[test]
+fn sdk_lzma2_presets_write_the_same_payload_as_7zip() {
+    let Some(bin) = seven_zip() else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let files = inputs();
+    let (name, data) = &files[0];
+    std::fs::write(dir.path().join(name), data).unwrap();
+
+    fn payload(bytes: &[u8]) -> &[u8] {
+        let archive = Archive::read(&mut Cursor::new(bytes), &Password::empty()).unwrap();
+        let [size] = archive.pack_sizes() else {
+            panic!("expected one pack stream")
+        };
+        let start = 32 + archive.pack_pos() as usize;
+        &bytes[start..start + *size as usize]
+    }
+
+    for (level, small_dictionary) in [
+        (1, false),
+        (3, false),
+        (3, true),
+        (4, false),
+        (5, false),
+        (7, false),
+        (9, false),
+    ] {
+        let mut options = Lzma2Options::from_level(level);
+        let method = if small_dictionary {
+            options.set_dictionary_size(64 << 10);
+            "-m0=LZMA2:d=64k"
+        } else {
+            "-m0=LZMA2"
+        };
+        let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        writer.set_content_methods(vec![options.into()]);
+        let mut entry = ArchiveEntry::new_file(name);
+        entry.size = data.len() as u64;
+        writer
+            .push_archive_entry(entry, Some(data.as_slice()))
+            .unwrap();
+        let ours = writer.finish().unwrap().into_inner();
+        let output = format!("sdk-{level}-{small_dictionary}.7z");
+        let reference = Command::new(bin)
+            .current_dir(dir.path())
+            .args([
+                "a",
+                "-t7z",
+                "-mmt1",
+                &format!("-mx={level}"),
+                method,
+                &output,
+                name,
+            ])
+            .output()
+            .unwrap();
+        assert!(reference.status.success(), "{:?}", reference);
+        let theirs = std::fs::read(dir.path().join(output)).unwrap();
+        assert!(payload(&ours) == payload(&theirs), "SDK level {level}");
+    }
+}
+
 /// Every method, solid and not, with and without AES.
 #[test]
 fn seven_zip_tests_and_extracts_every_encode_method() {

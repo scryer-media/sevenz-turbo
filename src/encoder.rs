@@ -29,7 +29,7 @@ use crate::encryption::Aes256Sha256Encoder;
 use crate::{
     Error,
     archive::{EncoderConfiguration, EncoderMethod},
-    encoder_options::{DeltaOptions, EncoderOptions, Lzma2Options, LzmaOptions, LzmaSettings},
+    encoder_options::{DeltaOptions, EncoderOptions, Lzma2Options, LzmaOptions},
     writer::CountingWriter,
 };
 
@@ -393,36 +393,72 @@ fn lzma2_property_for(dict_size: u32) -> u8 {
         .unwrap_or(40)
 }
 
-/// The `lzma-turbo` setting for a coder of `settings` that the caller allowed
-/// `threads` threads.
-///
-/// More than one engages the threaded match finder, as 7-Zip does
-/// (C++: `numThreads = (algo == 0 || btMode == 0) ? 1 : 2`): the
-/// binary-tree finder of the normal mode gets a thread of its own, the
-/// fast mode's hash chain does not. The output is the same bytes either
-/// way.
-///
-/// Here and not with the settings: the option types name no encoder, so that
-/// which one codes them is decided in this file alone.
-fn turbo_props(settings: &LzmaSettings, threads: u32) -> lzma_turbo::LzmaEncProps {
-    use lzma_turbo::MatchFinderKind;
+/// The folder planner and the coder both resolve presets through the SDK.
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct LzmaSettings {
+    props: lzma_turbo::LzmaEncProps,
+    input_size: Option<u64>,
+}
 
-    let fast = settings.fast();
-    let mut props = lzma_turbo::LzmaEncProps::new()
-        .with_level(settings.level())
-        .with_dict_size(settings.requested_dict_size())
-        .with_fast_bytes(settings.nice_len())
-        .with_fast_mode(fast)
-        .with_match_finder(if fast {
-            MatchFinderKind::Hc4
-        } else {
-            MatchFinderKind::Bt4
-        });
-    if let Some(depth) = settings.hash_chain_depth() {
-        props = props.with_match_cycles(depth);
-    } else if settings.match_finder_threads(threads) > 1 {
-        props = props.with_num_threads(2);
+impl LzmaSettings {
+    pub(crate) const DICT_SIZE_MIN: u32 = 4096;
+
+    pub(crate) fn sdk(level: u32) -> Self {
+        Self {
+            props: lzma_turbo::LzmaEncProps::new().with_level(level.min(9)),
+            input_size: None,
+        }
     }
+
+    pub(crate) fn xz(level: u32) -> Self {
+        let level = level.min(9);
+        let mut props = lzma_turbo::LzmaEncProps::xz_preset(level, false).expect("clamped preset");
+        if level >= 4 {
+            // 0.30 derives BT search depth from the final nice length, including overrides.
+            props = props.with_match_cycles(0);
+        }
+        Self {
+            props,
+            input_size: None,
+        }
+    }
+
+    pub(crate) fn set_dict_size(&mut self, bytes: u32) {
+        self.props = self
+            .props
+            .with_dict_size(bytes.clamp(Self::DICT_SIZE_MIN, 4_294_967_280));
+    }
+
+    pub(crate) fn set_nice_len(&mut self, bytes: u32) {
+        self.props = self.props.with_fast_bytes(bytes.clamp(8, 273));
+    }
+
+    pub(crate) fn dict_size(&self) -> u32 {
+        turbo_props(self, 1).dict_size()
+    }
+
+    pub(crate) fn set_input_size(&mut self, size: u64) {
+        self.input_size = Some(size);
+    }
+
+    pub(crate) fn match_finder_threads(&self, threads: u32) -> u32 {
+        if threads > 1 && self.props.normalized().bt_mode != 0 {
+            2
+        } else {
+            1
+        }
+    }
+
+    pub(crate) const fn props_byte() -> u8 {
+        // The public options use lc=3, lp=0, pb=2 throughout.
+        (2 * 5) * 9 + 3
+    }
+}
+
+fn turbo_props(settings: &LzmaSettings, threads: u32) -> lzma_turbo::LzmaEncProps {
+    let mut props = settings
+        .props
+        .with_num_threads(settings.match_finder_threads(threads));
     // C: `props.reduceSize`. Only where it shrinks the dictionary, so an
     // input at least the dictionary's size is coded exactly as before.
     //
@@ -430,8 +466,8 @@ fn turbo_props(settings: &LzmaSettings, threads: u32) -> lzma_turbo::LzmaEncProp
     // nothing further: the coder is the same, and so are the settings, which
     // is what lets one kept coder serve every folder under the floor (see
     // `FolderCoder`). The size is read nowhere else on this path.
-    if let Some(size) = settings.input_size()
-        && size < u64::from(settings.requested_dict_size())
+    if let Some(size) = settings.input_size
+        && size < u64::from(settings.props.dict_size())
     {
         props = props.with_reduce_size(size.max(REDUCE_SIZE_FLOOR));
     }
@@ -608,7 +644,7 @@ fn lzma2_fits_one_block(options: &Lzma2Options) -> bool {
     options.block_size().is_some_and(|block_size| {
         options
             .settings
-            .input_size()
+            .input_size
             .is_some_and(|size| size <= block_size)
     })
 }
@@ -631,7 +667,7 @@ fn lzma2_block_plan(options: &Lzma2Options) -> (u64, usize) {
         (threads, Some(block_size)) => {
             let per_block = options.settings.match_finder_threads(threads);
             let mut blocks = u64::from((threads / per_block).max(1));
-            if let Some(size) = options.settings.input_size() {
+            if let Some(size) = options.settings.input_size {
                 // C: Lzma2Enc_Encode2 reduces block threads to the input's
                 // block count. Keep the hash-size hint unchanged: only the
                 // number of workers changes, not how each block is coded.
@@ -1223,6 +1259,46 @@ mod tests {
                 "size {size}"
             );
         }
+    }
+
+    #[test]
+    fn lzma2_presets_match_sdk_properties_across_levels_and_overrides() {
+        use crate::encoder_options::{Lzma2Options, LzmaOptions};
+        use lzma_turbo::LzmaEncProps;
+
+        for level in 0..=10 {
+            let sdk = LzmaEncProps::new().with_level(level.min(9));
+            let xz = LzmaEncProps::xz_preset(level.min(9), false).unwrap();
+            let mut current = Lzma2Options::from_level(level);
+            let legacy = Lzma2Options::from_xz_level_mt(level, 4, 1 << 20);
+            assert_eq!(
+                super::turbo_props(&current.settings, 1).normalized(),
+                sdk.normalized()
+            );
+            assert_eq!(
+                super::turbo_props(&legacy.settings, 1).normalized(),
+                xz.normalized()
+            );
+            assert_eq!(
+                super::turbo_props(&LzmaOptions::from_level(level).0, 1).normalized(),
+                xz.normalized()
+            );
+            current.set_dictionary_size(8 << 20);
+            current.set_nice_len(125);
+            assert_eq!(
+                super::turbo_props(&current.settings, 1).normalized(),
+                sdk.with_dict_size(8 << 20)
+                    .with_fast_bytes(125)
+                    .normalized()
+            );
+        }
+        assert_eq!(
+            super::turbo_props(&Lzma2Options::default().settings, 1).normalized(),
+            LzmaEncProps::new().normalized()
+        );
+        let mut legacy = Lzma2Options::from_xz_level(6);
+        legacy.set_nice_len(80);
+        assert_eq!(super::turbo_props(&legacy.settings, 1).normalized().mc, 56);
     }
 
     #[test]

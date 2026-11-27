@@ -495,6 +495,18 @@ arm, and this crate can add a variant without a breaking release.
   reading the binary fixtures `lzma-rust2` keeps in its repository, which are
   not ours to vendor.
 
+## 0.31.0
+
+### Changed
+
+- LZMA2 writers now use the 7-Zip SDK presets for levels 0–9. The default
+  moves from xz-style level 6 (8 MiB dictionary) to SDK level 5 (32 MiB).
+  Level 4 now uses the fast hash-chain finder. Level 9 can request a 256 MiB
+  dictionary. Larger dictionaries can increase encoder and decoder memory use.
+  Applications regenerating archive hashes or recovery volumes can select
+  `Lzma2Options::from_xz_level` or `from_xz_level_mt` with their previous
+  settings. Both preset families write standard LZMA2.
+
 ## 0.30.5
 
 ### Added

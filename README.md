@@ -11,7 +11,7 @@ and can use several threads.
 
 ```toml
 [dependencies]
-sevenz-turbo = "0.30"
+sevenz-turbo = "0.31"
 ```
 
 It needs Rust 1.97.1 or newer. The default build needs a C compiler, for
@@ -291,7 +291,7 @@ use them.
 Without a C compiler:
 
 ```toml
-sevenz-turbo = { version = "0.30", default-features = false, features = [
+sevenz-turbo = { version = "0.31", default-features = false, features = [
     "aes256", "native-crypto", "bzip2", "compress", "ppmd", "util",
 ] }
 ```
@@ -299,7 +299,7 @@ sevenz-turbo = { version = "0.30", default-features = false, features = [
 Without LGPL code:
 
 ```toml
-sevenz-turbo = { version = "0.30", default-features = false, features = [
+sevenz-turbo = { version = "0.31", default-features = false, features = [
     "aes256", "aws-lc-crypto", "bzip2-permissive", "compress", "ppmd", "util",
 ] }
 ```
