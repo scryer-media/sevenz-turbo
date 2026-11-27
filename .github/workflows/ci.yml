@@ -180,6 +180,13 @@ jobs:
       - name: Install NASM (Windows, for aws-lc-rs)
         if: matrix.platform.name == 'windows-x86_64' && (matrix.configuration.name == 'aws-lc' || matrix.configuration.name == 'all-features')
         uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+      # The 7-Zip interop tests compare with the 7-Zip on PATH, and the
+      # runner images carry different releases (macos-15 has 17.05). Linux
+      # and macOS build the pinned one, and the tests then fail without it
+      # instead of skipping. Windows uses the 7-Zip its image carries.
+      - name: Build the pinned 7-Zip
+        if: runner.os != 'Windows'
+        run: bash .github/scripts/build-7zz.sh
       - name: Test ${{ matrix.configuration.name }}
         run: cargo nextest run --locked --no-fail-fast ${{ matrix.configuration.args }}
       - name: Exercise the pointer-based LZ4 kernels
@@ -657,44 +664,6 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - run: cargo check --locked --all-features
-
-  # Prepared, not enabled. The 7-Zip interop tests (sevenzip_encode_tests,
-  # the 7zz half of bcj2_compress_tests, differential_7zz_tests) skip
-  # themselves where no 7-Zip is on PATH. ubuntu-26.04 preinstalls apt's
-  # `7zip`, so the Linux lanes run them against whatever 7-Zip the image
-  # carries; this job would pin that. With SEVENZ_TURBO_7ZZ_REQUIRED set they
-  # fail instead of skipping. Enabling this job needs the operator's approval
-  # of the install source, one of:
-  #   - apt's `7zip` package, preinstalled on ubuntu-26.04 (provides `7zz`):
-  #       sudo apt-get update && sudo apt-get install -y --no-install-recommends 7zip
-  #   - `7zz` built from the pinned 7-Zip tree that
-  #     .github/scripts/build-sdk-oracle.sh already fetches
-  #     (CPP/7zip/Bundles/Alone2, makefile.gcc).
-  # The job is commented out rather than gated on `if: false`, which
-  # actionlint rejects as a constant condition. To enable it, uncomment it,
-  # replace the placeholder install step and add it to ci-complete's needs.
-  # sevenzip-interop:
-  #   name: sevenzip-interop
-  #   runs-on: ubuntu-26.04
-  #   timeout-minutes: 30
-  #   env:
-  #     SEVENZ_TURBO_7ZZ_REQUIRED: "1"
-  #   steps:
-  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-  #       with:
-  #         persist-credentials: false
-  #     - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-  #       with:
-  #         toolchain: ${{ env.RUST_TOOLCHAIN }}
-  #     - uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
-  #       with:
-  #         tool: cargo-nextest@0.9.143
-  #     - name: Install 7-Zip (source pending the operator's approval)
-  #       run: |
-  #         echo "choose and approve a 7-Zip install source before enabling this job" >&2
-  #         exit 1
-  #     - name: Check 7-Zip interop with the tool required
-  #       run: cargo nextest run --locked --all-features --test sevenzip_encode_tests --test bcj2_compress_tests --test differential_7zz_tests --test lzma2_mt_tests --no-fail-fast
 
   package:
     name: package
