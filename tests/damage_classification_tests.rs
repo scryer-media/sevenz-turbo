@@ -201,6 +201,7 @@ fn ended_early(result: Result<(), Error>, block: usize, run: Run) {
     );
 }
 
+#[cfg(feature = "aes256")]
 #[track_caller]
 fn password_question(result: Result<(), Error>, block: usize, run: Run) {
     match result {
