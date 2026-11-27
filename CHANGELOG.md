@@ -536,6 +536,8 @@ arm, and this crate can add a variant without a breaking release.
 - Archives written through the `mzstd` provider tag their Zstandard coder
   as version 1.6, as the `zstd` provider does. Both providers now write the
   same coder properties.
+- The optional `brotli` provider now requires brotli 8.0.4 or later, for the
+  encoder-state API it uses to finish a stream.
 - The optional Zstandard codec now requires zstd 0.14.5 or later, which
   bundles C Zstandard 1.6.0 and fixes CVE-2026-124851.
 
