@@ -497,6 +497,13 @@ arm, and this crate can add a variant without a breaking release.
 
 ## 0.30.5
 
+### Added
+
+- Added optional `mbrotli` and `mzstd` providers for the Brotli and Zstandard
+  methods. Each supports decode-only builds and encoding with `compress`.
+- The optional `lz4` feature now selects the pointer-based `lz4_flex` kernels.
+  Select `lz4-safe` for the previous safe encoder and decoder.
+
 ### Fixed
 
 - The optional Zstandard codec now requires zstd 0.14.5 or later, which

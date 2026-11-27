@@ -275,7 +275,9 @@ On by default: `aes256`, `aws-lc-crypto`, `bzip2`, `compress`, `ppmd` and
 - `ppmd`: PPMd, through `ppmd-turbo`.
 - `util`: `decompress_file`, `compress_to_path` and the other one-call
   helpers.
-- `brotli`, `deflate`, `lz4`, `zstd`: those codecs. `zstd` builds C code.
+- `brotli`, `deflate`, `lz4`, and `zstd` enable the corresponding methods. `zstd` builds C code.
+- `lz4` uses the pointer-based `lz4_flex` kernels by default. `lz4-safe` enables LZ4 and selects both safe implementations. A consumer enabling `lz4_flex/safe-encode` or `lz4_flex/safe-decode` selects the safe implementation for that direction across the shared dependency.
+- `mbrotli` and `mzstd` independently enable Rust providers for the Brotli and Zstandard methods. Encoding also requires `compress`. When both providers for a method are enabled, `brotli` or `zstd` takes precedence.
 - `nt-time`: converts `NtTime` to and from `nt_time::FileTime`.
 - `default_wasm`, `aes256_wasm`, `crypto-host`, `crc-host`: see
   [WebAssembly](#webassembly).

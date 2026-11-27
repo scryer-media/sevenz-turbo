@@ -1,17 +1,24 @@
-#[cfg(feature = "brotli")]
+#[cfg(any(feature = "brotli", feature = "mbrotli"))]
 pub mod brotli;
 pub(crate) mod filter;
 #[cfg(feature = "lz4")]
 pub mod lz4;
 pub(crate) mod lzma_turbo;
 
-#[cfg(all(feature = "compress", any(feature = "brotli", feature = "lz4")))]
+#[cfg(all(
+    feature = "compress",
+    any(feature = "brotli", feature = "mbrotli", feature = "lz4")
+))]
 fn packed_frame_size(size: usize) -> std::io::Result<u32> {
     u32::try_from(size)
         .map_err(|_| std::io::Error::other("compressed frame exceeds its 32-bit size field"))
 }
 
-#[cfg(all(test, feature = "compress", any(feature = "brotli", feature = "lz4")))]
+#[cfg(all(
+    test,
+    feature = "compress",
+    any(feature = "brotli", feature = "mbrotli", feature = "lz4")
+))]
 mod frame_size_tests {
     #[test]
     fn wire_size_is_checked_without_allocating_a_frame() {
@@ -23,3 +30,11 @@ mod frame_size_tests {
         assert!(super::packed_frame_size(u32::MAX as usize + 1).is_err());
     }
 }
+
+#[cfg(any(
+    all(feature = "mzstd", not(feature = "zstd")),
+    all(feature = "mbrotli", not(feature = "brotli"))
+))]
+pub(crate) mod owned_io;
+#[cfg(any(feature = "mzstd", feature = "zstd"))]
+pub(crate) mod zstandard;

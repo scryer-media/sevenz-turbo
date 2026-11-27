@@ -8,11 +8,11 @@ use crate::codec::filter::{
     delta::DeltaWriter,
 };
 
-#[cfg(feature = "brotli")]
+#[cfg(any(feature = "brotli", feature = "mbrotli"))]
 use crate::codec::brotli::BrotliEncoder;
 #[cfg(feature = "lz4")]
 use crate::codec::lz4::Lz4Encoder;
-#[cfg(feature = "brotli")]
+#[cfg(any(feature = "brotli", feature = "mbrotli"))]
 use crate::encoder_options::BrotliOptions;
 #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
 use crate::encoder_options::Bzip2Options;
@@ -22,7 +22,7 @@ use crate::encoder_options::DeflateOptions;
 use crate::encoder_options::Lz4Options;
 #[cfg(feature = "ppmd")]
 use crate::encoder_options::PpmdOptions;
-#[cfg(feature = "zstd")]
+#[cfg(any(feature = "zstd", feature = "mzstd"))]
 use crate::encoder_options::ZstandardOptions;
 #[cfg(feature = "aes256")]
 use crate::encryption::Aes256Sha256Encoder;
@@ -57,16 +57,16 @@ pub(crate) enum Encoder<W: Write> {
     Lzma2(Option<LzmaTurboWriter<CountingWriter<W>>>),
     #[cfg(feature = "ppmd")]
     Ppmd(Option<Box<ppmd_turbo::io::SevenZWriter<CountingWriter<W>>>>),
-    #[cfg(feature = "brotli")]
-    Brotli(BrotliEncoder<CountingWriter<W>>),
+    #[cfg(any(feature = "brotli", feature = "mbrotli"))]
+    Brotli(Option<BrotliEncoder<CountingWriter<W>>>),
     #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
     Bzip2(Option<Bzip2Writer<CountingWriter<W>>>),
     #[cfg(feature = "deflate")]
     Deflate(Option<flate2::write::DeflateEncoder<CountingWriter<W>>>),
     #[cfg(feature = "lz4")]
     Lz4(Option<Lz4Encoder<CountingWriter<W>>>),
-    #[cfg(feature = "zstd")]
-    Zstd(Option<zstd::Encoder<'static, CountingWriter<W>>>),
+    #[cfg(any(feature = "zstd", feature = "mzstd"))]
+    Zstd(Option<crate::codec::zstandard::Encoder<CountingWriter<W>>>),
     #[cfg(feature = "aes256")]
     Aes(Aes256Sha256Encoder<CountingWriter<W>>),
 }
@@ -152,9 +152,10 @@ impl<W: Write> Write for Encoder<W> {
                 }
                 false => w.as_mut().unwrap().write(buf),
             },
-            // TODO: Also add a proper "finish" method here.
-            #[cfg(feature = "brotli")]
-            Encoder::Brotli(w) => w.write(buf),
+            #[cfg(any(feature = "brotli", feature = "mbrotli"))]
+            Encoder::Brotli(w) if buf.is_empty() => w.take().unwrap().finish()?.write(buf),
+            #[cfg(any(feature = "brotli", feature = "mbrotli"))]
+            Encoder::Brotli(w) => w.as_mut().unwrap().write(buf),
             #[cfg(any(feature = "bzip2", feature = "bzip2-permissive"))]
             Encoder::Bzip2(w) => match buf.is_empty() {
                 true => {
@@ -185,7 +186,7 @@ impl<W: Write> Write for Encoder<W> {
                 }
                 false => w.as_mut().unwrap().write(buf),
             },
-            #[cfg(feature = "zstd")]
+            #[cfg(any(feature = "zstd", feature = "mzstd"))]
             Encoder::Zstd(w) => match buf.is_empty() {
                 true => {
                     let writer = w.take().unwrap();
@@ -208,8 +209,8 @@ impl<W: Write> Write for Encoder<W> {
             Encoder::Delta(w) => w.flush(),
             Encoder::Lzma(w) => w.as_mut().unwrap().flush(),
             Encoder::Lzma2(w) => w.as_mut().unwrap().flush(),
-            #[cfg(feature = "brotli")]
-            Encoder::Brotli(w) => w.flush(),
+            #[cfg(any(feature = "brotli", feature = "mbrotli"))]
+            Encoder::Brotli(w) => w.as_mut().unwrap().flush(),
             // Only passes down to the sink: the writer's flush never ends the
             // range coder, so the stream's tail is written once, by finish,
             // and `7zz t` accepts it.
@@ -221,7 +222,7 @@ impl<W: Write> Write for Encoder<W> {
             Encoder::Deflate(w) => w.as_mut().unwrap().flush(),
             #[cfg(feature = "lz4")]
             Encoder::Lz4(w) => w.as_mut().unwrap().flush(),
-            #[cfg(feature = "zstd")]
+            #[cfg(any(feature = "zstd", feature = "mzstd"))]
             Encoder::Zstd(w) => w.as_mut().unwrap().flush(),
             #[cfg(feature = "aes256")]
             Encoder::Aes(w) => w.flush(),
@@ -812,7 +813,7 @@ pub(crate) fn add_encoder<W: Write>(
 
             Ok(Encoder::Ppmd(Some(Box::new(ppmd_encoder))))
         }
-        #[cfg(feature = "brotli")]
+        #[cfg(any(feature = "brotli", feature = "mbrotli"))]
         EncoderMethod::ID_BROTLI => {
             let options = match method_config.options {
                 Some(EncoderOptions::Brotli(options)) => options,
@@ -826,7 +827,7 @@ pub(crate) fn add_encoder<W: Write>(
                 options.skippable_frame_size as usize,
             )?;
 
-            Ok(Encoder::Brotli(brotli_encoder))
+            Ok(Encoder::Brotli(Some(brotli_encoder)))
         }
         #[cfg(feature = "bzip2")]
         EncoderMethod::ID_BZIP2 => {
@@ -881,14 +882,14 @@ pub(crate) fn add_encoder<W: Write>(
 
             Ok(Encoder::Lz4(Some(lz4_encoder)))
         }
-        #[cfg(feature = "zstd")]
+        #[cfg(any(feature = "zstd", feature = "mzstd"))]
         EncoderMethod::ID_ZSTD => {
             let options = match method_config.options.as_ref() {
                 Some(EncoderOptions::Zstd(options)) => *options,
                 _ => ZstandardOptions::default(),
             };
 
-            let zstd_encoder = zstd::Encoder::new(input, options.0 as i32)?;
+            let zstd_encoder = crate::codec::zstandard::encoder(input, options.0 as i32)?;
 
             Ok(Encoder::Zstd(Some(zstd_encoder)))
         }
@@ -950,9 +951,12 @@ pub(crate) fn get_options_as_properties<'a>(
             out[1..5].copy_from_slice(&options.memory_size.to_le_bytes());
             &out[0..5]
         }
-        #[cfg(feature = "brotli")]
+        #[cfg(any(feature = "brotli", feature = "mbrotli"))]
         EncoderMethod::ID_BROTLI => {
+            #[cfg(feature = "brotli")]
             let version_major = brotli::VERSION;
+            #[cfg(not(feature = "brotli"))]
+            let version_major = 1;
             let version_minor = 0;
             let options = match options {
                 Some(EncoderOptions::Brotli(options)) => *options,
@@ -973,10 +977,15 @@ pub(crate) fn get_options_as_properties<'a>(
             out[2] = 3; // Fast compression
             &out[0..3]
         }
-        #[cfg(feature = "zstd")]
+        #[cfg(any(feature = "zstd", feature = "mzstd"))]
         EncoderMethod::ID_ZSTD => {
-            let version_major = zstd::zstd_safe::VERSION_MAJOR;
-            let version_minor = zstd::zstd_safe::VERSION_MINOR;
+            #[cfg(feature = "zstd")]
+            let (version_major, version_minor) = (
+                zstd::zstd_safe::VERSION_MAJOR,
+                zstd::zstd_safe::VERSION_MINOR,
+            );
+            #[cfg(not(feature = "zstd"))]
+            let (version_major, version_minor) = (1u32, 5u32);
             let options = match options {
                 Some(EncoderOptions::Zstd(options)) => *options,
                 _ => ZstandardOptions::default(),
@@ -1037,7 +1046,7 @@ mod tests {
             EncoderMethod::DEFLATE,
             #[cfg(feature = "lz4")]
             EncoderMethod::LZ4,
-            #[cfg(feature = "zstd")]
+            #[cfg(any(feature = "zstd", feature = "mzstd"))]
             EncoderMethod::ZSTD,
         ];
         for method in methods {

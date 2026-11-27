@@ -14,7 +14,7 @@ const HINT_UNIT_SIZE: usize = 65536;
 /// Custom decoder to support the custom format first implemented by zstdmt, which allows to have
 /// optional skippable frames.
 pub(crate) struct BrotliDecoder<R: Read> {
-    inner: Option<brotli::Decompressor<InnerReader<R>>>,
+    inner: Option<RawDecoder<InnerReader<R>>>,
     buffer_size: usize,
 }
 
@@ -48,7 +48,7 @@ impl<R: Read> BrotliDecoder<R> {
             InnerReader::new_standard(input, header[..header_read].to_vec())
         };
 
-        let decompressor = brotli::Decompressor::new(inner_reader, buffer_size);
+        let decompressor = decoder(inner_reader, buffer_size)?;
 
         Ok(BrotliDecoder {
             inner: Some(decompressor),
@@ -59,6 +59,9 @@ impl<R: Read> BrotliDecoder<R> {
 
 impl<R: Read> Read for BrotliDecoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         if let Some(inner) = &mut self.inner {
             match inner.read(buf) {
                 Ok(0) => {
@@ -66,7 +69,7 @@ impl<R: Read> Read for BrotliDecoder<R> {
 
                     if inner_reader.read_next_frame_header()? {
                         let reader = std::mem::replace(inner_reader, InnerReader::empty());
-                        let mut decompressor = brotli::Decompressor::new(reader, self.buffer_size);
+                        let mut decompressor = decoder(reader, self.buffer_size)?;
                         let result = decompressor.read(buf);
                         self.inner = Some(decompressor);
                         result
@@ -222,10 +225,10 @@ pub(crate) struct BrotliEncoder<W: Write> {
 
 #[cfg(feature = "compress")]
 enum InnerWriter<W: Write> {
-    Standard(brotli::CompressorWriter<W>),
+    Standard(RawEncoder<W>),
     Framed {
         writer: W,
-        compressor: Option<brotli::CompressorWriter<Vec<u8>>>,
+        compressor: Option<RawEncoder<Vec<u8>>>,
         frame_size: usize,
         uncompressed_bytes_in_frame: usize,
     },
@@ -242,15 +245,15 @@ impl<W: Write> BrotliEncoder<W> {
         let buffer_size = 8192;
 
         let inner = if frame_size == 0 {
-            let compressor = brotli::CompressorWriter::new(writer, buffer_size, quality, window);
+            let compressor = encoder(writer, buffer_size, quality, window)?;
             InnerWriter::Standard(compressor)
         } else {
-            let compressor = Some(brotli::CompressorWriter::new(
+            let compressor = Some(encoder(
                 Vec::with_capacity(frame_size),
                 buffer_size,
                 quality,
                 window,
-            ));
+            )?);
             InnerWriter::Framed {
                 writer,
                 compressor,
@@ -267,7 +270,24 @@ impl<W: Write> BrotliEncoder<W> {
         })
     }
 
-    #[cfg(feature = "compress")]
+    pub(crate) fn finish(self) -> io::Result<W> {
+        match self.inner {
+            InnerWriter::Standard(encoder) => finish_encoder(encoder),
+            InnerWriter::Framed {
+                mut writer,
+                compressor,
+                uncompressed_bytes_in_frame,
+                ..
+            } => {
+                if uncompressed_bytes_in_frame != 0 {
+                    let data = finish_encoder(compressor.expect("open frame"))?;
+                    Self::write_frame(&mut writer, &data, uncompressed_bytes_in_frame)?;
+                }
+                Ok(writer)
+            }
+        }
+    }
+
     fn write_frame(
         writer: &mut W,
         compressed_data: &[u8],
@@ -336,17 +356,13 @@ impl<W: Write> Write for BrotliEncoder<W> {
                     if *uncompressed_bytes_in_frame >= *frame_size {
                         let mut comp = compressor.take().expect("no compressor set");
                         comp.flush()?;
-                        let mut data = comp.into_inner();
+                        let mut data = finish_encoder(comp)?;
 
                         Self::write_frame(writer, &data, *uncompressed_bytes_in_frame)?;
                         data.clear();
 
-                        *compressor = Some(brotli::CompressorWriter::new(
-                            data,
-                            self.buffer_size,
-                            self.quality,
-                            self.window,
-                        ));
+                        *compressor =
+                            Some(encoder(data, self.buffer_size, self.quality, self.window)?);
 
                         *uncompressed_bytes_in_frame = 0;
                     }
@@ -368,7 +384,7 @@ impl<W: Write> Write for BrotliEncoder<W> {
             } => {
                 let mut comp = compressor.take().expect("no compressor set");
                 comp.flush()?;
-                let mut data = comp.into_inner();
+                let mut data = finish_encoder(comp)?;
 
                 if !data.is_empty() {
                     Self::write_frame(writer, &data, *uncompressed_bytes_in_frame)?;
@@ -376,15 +392,82 @@ impl<W: Write> Write for BrotliEncoder<W> {
                     *uncompressed_bytes_in_frame = 0;
                 }
 
-                *compressor = Some(brotli::CompressorWriter::new(
-                    data,
-                    self.buffer_size,
-                    self.quality,
-                    self.window,
-                ));
+                *compressor = Some(encoder(data, self.buffer_size, self.quality, self.window)?);
 
                 writer.flush()
             }
         }
+    }
+}
+
+#[cfg(feature = "brotli")]
+type RawDecoder<R> = brotli::Decompressor<R>;
+#[cfg(not(feature = "brotli"))]
+type RawDecoder<R> = super::owned_io::Reader<R, mbrotli::DecoderSessionOwned>;
+
+fn decoder<R: Read>(reader: R, buffer_size: usize) -> io::Result<RawDecoder<R>> {
+    #[cfg(feature = "brotli")]
+    {
+        Ok(brotli::Decompressor::new(reader, buffer_size))
+    }
+    #[cfg(not(feature = "brotli"))]
+    {
+        let _ = buffer_size;
+        let limit = mbrotli::WindowLimit::standard(24).map_err(io::Error::other)?;
+        let config = mbrotli::DecoderConfig::new().with_window_limit(limit);
+        let session = mbrotli::Decompressor::new(config)
+            .map_err(io::Error::other)?
+            .into_session(Default::default())
+            .map_err(io::Error::other)?;
+        Ok(RawDecoder::new(reader, session))
+    }
+}
+
+#[cfg(all(feature = "compress", feature = "brotli"))]
+type RawEncoder<W> = brotli::CompressorWriter<W>;
+#[cfg(all(feature = "compress", not(feature = "brotli")))]
+type RawEncoder<W> = super::owned_io::Writer<W, mbrotli::EncoderSessionOwned>;
+
+#[cfg(feature = "compress")]
+fn encoder<W: Write>(
+    sink: W,
+    buffer_size: usize,
+    quality: u32,
+    window: u32,
+) -> io::Result<RawEncoder<W>> {
+    #[cfg(feature = "brotli")]
+    {
+        Ok(brotli::CompressorWriter::new(
+            sink,
+            buffer_size,
+            quality,
+            window,
+        ))
+    }
+    #[cfg(not(feature = "brotli"))]
+    {
+        let _ = buffer_size;
+        let quality = mbrotli::Quality::try_from(quality as u8).map_err(io::Error::other)?;
+        let window = mbrotli::Window::standard(window.max(10) as u8).map_err(io::Error::other)?;
+        let config = mbrotli::EncoderConfig::default()
+            .with_quality(quality)
+            .with_window(window);
+        let session = mbrotli::Compressor::new(config)
+            .map_err(io::Error::other)?
+            .into_session(Default::default())
+            .map_err(io::Error::other)?;
+        Ok(RawEncoder::new(sink, session))
+    }
+}
+
+#[cfg(feature = "compress")]
+fn finish_encoder<W: Write>(encoder: RawEncoder<W>) -> io::Result<W> {
+    #[cfg(feature = "brotli")]
+    {
+        Ok(encoder.into_inner())
+    }
+    #[cfg(not(feature = "brotli"))]
+    {
+        encoder.finish()
     }
 }

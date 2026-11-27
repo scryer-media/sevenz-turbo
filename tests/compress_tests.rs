@@ -359,13 +359,21 @@ fn compress_with_ppmd_algorithm() {
     test_compression_method(&[EncoderMethod::PPMD.into()]);
 }
 
-#[cfg(all(feature = "compress", feature = "util", feature = "brotli"))]
+#[cfg(all(
+    feature = "compress",
+    feature = "util",
+    any(feature = "brotli", feature = "mbrotli")
+))]
 #[test]
 fn compress_with_brotli_standard_algorithm() {
     test_compression_method(&[BrotliOptions::default().with_skippable_frame_size(0).into()]);
 }
 
-#[cfg(all(feature = "compress", feature = "util", feature = "brotli"))]
+#[cfg(all(
+    feature = "compress",
+    feature = "util",
+    any(feature = "brotli", feature = "mbrotli")
+))]
 #[test]
 fn compress_with_brotli_skippable_algorithm() {
     test_compression_method(&[BrotliOptions::default()
@@ -403,7 +411,11 @@ fn compress_with_lz4_skippable_algorithm() {
         .into()]);
 }
 
-#[cfg(all(feature = "compress", feature = "util", feature = "lz4"))]
+#[cfg(all(
+    feature = "compress",
+    feature = "util",
+    any(feature = "zstd", feature = "mzstd")
+))]
 #[test]
 fn compress_with_zstd_algorithm() {
     test_compression_method(&[EncoderMethod::ZSTD.into()]);

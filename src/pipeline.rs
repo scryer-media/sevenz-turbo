@@ -1550,13 +1550,16 @@ mod tests {
             include_bytes!("../tests/resources/bzip2_file.7z"),
             "",
         ));
-        #[cfg(all(feature = "zstd", feature = "brotli"))]
+        #[cfg(all(
+            any(feature = "zstd", feature = "mzstd"),
+            any(feature = "brotli", feature = "mbrotli")
+        ))]
         fixtures.push((
             "zstd_brotli",
             include_bytes!("../tests/resources/zstdmt-brotli.7z"),
             "",
         ));
-        #[cfg(all(feature = "zstd", feature = "lz4"))]
+        #[cfg(all(any(feature = "zstd", feature = "mzstd"), feature = "lz4"))]
         fixtures.push((
             "zstd_lz4",
             include_bytes!("../tests/resources/zstdmt-lz4.7z"),

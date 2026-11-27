@@ -61,6 +61,8 @@ crypto-host = ["lzma-turbo/crypto-host"]
 # own and stay in the guest.
 crc-host = ["lzma-turbo/crc-host"]
 brotli = ["dep:brotli"]
+mbrotli = ["dep:mbrotli"]
+mzstd = ["dep:mzstd"]
 bzip2 = ["dep:bzip2-turbo"]
 # BZip2 through the `bzip2` crate and its pure-Rust port of libbzip2
 # (`libbz2-rs-sys`, under the BSD-style bzip2-1.0.6 license), for a build that
@@ -79,9 +81,10 @@ bzip2-permissive = ["dep:libbzip2"]
 # `native-crypto`, AWS-LC otherwise). `crypto-host` delegates decryption only,
 # so a wasm `crypto-host` build with `compress` and `aes256` also needs
 # `native-crypto`; without it the build is a compile error.
-compress = ["lzma-turbo/enc", "bzip2-turbo?/compress"]
+compress = ["lzma-turbo/enc", "bzip2-turbo?/compress", "mbrotli?/compression", "mzstd?/compression"]
 deflate = ["dep:flate2"]
 lz4 = ["dep:lz4_flex"]
+lz4-safe = ["lz4", "lz4_flex/safe-encode", "lz4_flex/safe-decode"]
 # PPMd decodes and encodes through `ppmd-turbo`.
 ppmd = ["dep:ppmd-turbo"]
 util = ["dep:cap-std"]
@@ -94,6 +97,8 @@ aes = { version = "0.9", features = ["zeroize"], optional = true }
 # crates resolves one copy of AWS-LC. AES-256-CBC is this crate's own (7z
 # cryptography is not `lzma-turbo`'s job), so the dependency is direct.
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
+mbrotli = { version = "0.5.23", optional = true, default-features = false, features = ["std", "decompression"] }
+mzstd = { version = "0.2.17", optional = true, default-features = false, features = ["std", "decompression"] }
 brotli = { version = ">= 7, < 10", default-features = false, optional = true, features = ["std"] }
 bzip2-turbo = { version = "0.2.1", default-features = false, optional = true }
 # Renamed so the crate's path never collides with this crate's `bzip2` modules.
@@ -106,7 +111,7 @@ getrandom = { version = "0.4", optional = true }
 # `--locked`.
 lzma-turbo = { version = "0.12.0", default-features = false, features = ["std", "asm", "crc", "filters"] }
 ppmd-turbo = { version = "0.2.2", optional = true }
-lz4_flex = { version = "0.14", optional = true }
+lz4_flex = { version = "0.14", optional = true, default-features = false, features = ["frame", "checked-decode"] }
 nt-time = { version = "0.15", optional = true }
 zstd = { version = "0.14.5", optional = true }
 
