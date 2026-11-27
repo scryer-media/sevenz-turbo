@@ -480,18 +480,18 @@ jobs:
       - name: Check the wasm feature set
         run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features default_wasm
         env:
-          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+          RUSTFLAGS: -D warnings --cfg getrandom_backend="wasm_js"
       # The browser set with the permissive BZip2 backend in place of bzip2-turbo.
       - name: Check the wasm feature set with the permissive BZip2 backend
         run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features aes256_wasm,native-crypto,bzip2-permissive,compress,ppmd,util
         env:
-          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+          RUSTFLAGS: -D warnings --cfg getrandom_backend="wasm_js"
       # The same set plus `crypto-host`, which moves the bulk AES-256-CBC
       # decrypt out to the embedding host.
       - name: Check the wasm feature set with the host-delegated AES
         run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features aes256_wasm,crypto-host,native-crypto,bzip2,compress,ppmd,util
         env:
-          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+          RUSTFLAGS: -D warnings --cfg getrandom_backend="wasm_js"
       # Decode-only and delegating: the configuration a wasm embedder actually
       # ships, which carries no in-guest block cipher at all and hands the
       # CRC-32 to the host as well. Without `util`, so the crate is proven to
@@ -499,14 +499,14 @@ jobs:
       - name: Check the delegating wasm guest without an in-guest AES
         run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features aes256_wasm,crc-host,crypto-host,bzip2,ppmd
         env:
-          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+          RUSTFLAGS: -D warnings --cfg getrandom_backend="wasm_js"
       # The same set with `util`: the `wasm-bindgen` surface compiles without
       # `compress`, exporting `decompress` alone. This lane is why the `compress`
       # half of `src/util/wasm.rs` is feature-gated.
       - name: Check the delegating wasm guest with the decode-only util bindings
         run: cargo check --locked --target wasm32-unknown-unknown --no-default-features --features aes256_wasm,crypto-host,bzip2,ppmd,util
         env:
-          RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+          RUSTFLAGS: -D warnings --cfg getrandom_backend="wasm_js"
       # The conformance harness builds the wasm32-wasip1 guest example itself
       # and runs it under `wasmtime` with a reference host AES, SHA-256 and
       # CRC-32, comparing the guest's extraction with the native decoder's.
