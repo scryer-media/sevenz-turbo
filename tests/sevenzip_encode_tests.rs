@@ -115,7 +115,10 @@ fn check_with_7zip(bin: &str, dir: &Path, label: &str, archive: &[u8], password:
 /// The container metadata can differ. Compare the single LZMA2 pack stream itself.
 #[test]
 fn sdk_lzma2_presets_write_the_same_payload_as_7zip() {
-    let Some(bin) = seven_zip() else { return };
+    let Some(bin) = seven_zip() else {
+        eprintln!("skipping: neither 7zz nor 7z is on PATH");
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let files = inputs();
     let (name, data) = &files[0];

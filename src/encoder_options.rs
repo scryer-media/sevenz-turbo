@@ -68,6 +68,11 @@ impl Lzma2Options {
     /// Creates LZMA2 options with the specified 7-Zip SDK compression level.
     /// Encoded using a single thread.
     ///
+    /// The dictionary is 64 KiB at level 0, 256 KiB at 1, 1 MiB at 2, 4 MiB
+    /// at 3, 16 MiB at 4, 32 MiB at 5 and 64 MiB at 6. Levels 7, 8 and 9 take
+    /// 128, 256 and 256 MiB on a 64-bit target and 64 MiB on a 32-bit one, as
+    /// the SDK does.
+    ///
     /// # Arguments
     /// * `level` - Compression level (0-9, clamped to this range)
     pub fn from_level(level: u32) -> Self {
@@ -79,7 +84,8 @@ impl Lzma2Options {
     }
 
     /// Creates LZMA2 options with the specified 7-Zip SDK compression level.
-    /// Encoded using a multi-threading.
+    /// Encoded using a multi-threading. The dictionary is as for
+    /// [`Self::from_level`].
     ///
     /// # Arguments
     /// * `level` - Compression level (0-9, clamped to this range)

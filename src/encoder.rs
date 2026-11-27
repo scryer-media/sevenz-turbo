@@ -404,8 +404,17 @@ impl LzmaSettings {
     pub(crate) const DICT_SIZE_MIN: u32 = 4096;
 
     pub(crate) fn sdk(level: u32) -> Self {
+        let level = level.min(9);
+        let mut props = lzma_turbo::LzmaEncProps::new().with_level(level);
+        // C: `LzmaEncProps_Normalize` gives levels 7 to 9 a 64 MiB dictionary
+        // on a 32-bit build (`1 << (sizeof(size_t) / 2 + 24)`). `lzma-turbo`
+        // pins the 64-bit terms, and their 256 MiB at levels 8 and 9 is past
+        // the largest dictionary a 32-bit target encodes with.
+        if cfg!(target_pointer_width = "32") && level > 6 {
+            props = props.with_dict_size(1 << 26);
+        }
         Self {
-            props: lzma_turbo::LzmaEncProps::new().with_level(level.min(9)),
+            props,
             input_size: None,
         }
     }
@@ -1261,44 +1270,103 @@ mod tests {
         }
     }
 
+    /// `LzmaEncProps_Normalize` in 7-Zip 26.04 `C/LzmaEnc.c`, per level:
+    /// dictionary, fast bytes, binary-tree mode (the SDK sets it from
+    /// `algo`, so it is `algo` too), hash bytes and match cycles. lc 3, lp 0
+    /// and pb 2 at every level.
+    #[cfg(target_pointer_width = "64")]
+    const SDK_LEVELS: [(u32, u32, u32, u32, u32); 10] = [
+        (64 << 10, 32, 0, 5, 16),
+        (256 << 10, 32, 0, 5, 16),
+        (1 << 20, 32, 0, 5, 16),
+        (4 << 20, 32, 0, 5, 16),
+        (16 << 20, 32, 0, 5, 16),
+        (32 << 20, 32, 1, 4, 32),
+        (64 << 20, 32, 1, 4, 32),
+        (128 << 20, 64, 1, 4, 48),
+        (256 << 20, 64, 1, 4, 48),
+        (256 << 20, 64, 1, 4, 48),
+    ];
+
+    /// The same on a 32-bit build, where levels 7 to 9 take 64 MiB.
+    #[cfg(target_pointer_width = "32")]
+    const SDK_LEVELS: [(u32, u32, u32, u32, u32); 10] = [
+        (64 << 10, 32, 0, 5, 16),
+        (256 << 10, 32, 0, 5, 16),
+        (1 << 20, 32, 0, 5, 16),
+        (4 << 20, 32, 0, 5, 16),
+        (16 << 20, 32, 0, 5, 16),
+        (32 << 20, 32, 1, 4, 32),
+        (64 << 20, 32, 1, 4, 32),
+        (64 << 20, 64, 1, 4, 48),
+        (64 << 20, 64, 1, 4, 48),
+        (64 << 20, 64, 1, 4, 48),
+    ];
+
+    /// sevenz-turbo 0.30's xz-style table: dictionary, fast bytes,
+    /// binary-tree mode, hash bytes and match cycles.
+    const XZ_LEVELS: [(u32, u32, u32, u32, u32); 10] = [
+        (256 << 10, 128, 0, 4, 4),
+        (1 << 20, 128, 0, 4, 8),
+        (2 << 20, 273, 0, 4, 24),
+        (4 << 20, 273, 0, 4, 48),
+        (4 << 20, 16, 1, 4, 24),
+        (8 << 20, 32, 1, 4, 32),
+        (8 << 20, 64, 1, 4, 48),
+        (16 << 20, 64, 1, 4, 48),
+        (32 << 20, 64, 1, 4, 48),
+        (64 << 20, 64, 1, 4, 48),
+    ];
+
+    fn preset(settings: &super::LzmaSettings) -> (u32, u32, u32, u32, u32) {
+        let p = super::turbo_props(settings, 1).normalized();
+        assert_eq!((p.lc, p.lp, p.pb), (3, 0, 2));
+        (p.dict_size, p.fb, p.bt_mode, p.num_hash_bytes, p.mc)
+    }
+
     #[test]
     fn lzma2_presets_match_sdk_properties_across_levels_and_overrides() {
         use crate::encoder_options::{Lzma2Options, LzmaOptions};
-        use lzma_turbo::LzmaEncProps;
 
-        for level in 0..=10 {
-            let sdk = LzmaEncProps::new().with_level(level.min(9));
-            let xz = LzmaEncProps::xz_preset(level.min(9), false).unwrap();
+        for level in 0..=10u32 {
+            let at = level.min(9) as usize;
             let mut current = Lzma2Options::from_level(level);
-            let legacy = Lzma2Options::from_xz_level_mt(level, 4, 1 << 20);
             assert_eq!(
-                super::turbo_props(&current.settings, 1).normalized(),
-                sdk.normalized()
+                preset(&current.settings),
+                SDK_LEVELS[at],
+                "SDK level {level}"
+            );
+            // Every level's default dictionary is one this target encodes with.
+            super::validate_lzma_dictionary_size(SDK_LEVELS[at].0).unwrap();
+            assert_eq!(
+                preset(&Lzma2Options::from_level_mt(level, 4, 1 << 20).settings),
+                SDK_LEVELS[at],
+                "SDK level {level}, threaded"
             );
             assert_eq!(
-                super::turbo_props(&legacy.settings, 1).normalized(),
-                xz.normalized()
+                preset(&Lzma2Options::from_xz_level_mt(level, 4, 1 << 20).settings),
+                XZ_LEVELS[at],
+                "xz level {level}"
             );
             assert_eq!(
-                super::turbo_props(&LzmaOptions::from_level(level).0, 1).normalized(),
-                xz.normalized()
+                preset(&LzmaOptions::from_level(level).0),
+                XZ_LEVELS[at],
+                "LZMA level {level}"
             );
             current.set_dictionary_size(8 << 20);
             current.set_nice_len(125);
+            let (_, _, bt, hash, _) = SDK_LEVELS[at];
+            let mc = (16 + 125 / 2) >> u32::from(bt == 0);
             assert_eq!(
-                super::turbo_props(&current.settings, 1).normalized(),
-                sdk.with_dict_size(8 << 20)
-                    .with_fast_bytes(125)
-                    .normalized()
+                preset(&current.settings),
+                (8 << 20, 125, bt, hash, mc),
+                "SDK level {level}, overridden"
             );
         }
-        assert_eq!(
-            super::turbo_props(&Lzma2Options::default().settings, 1).normalized(),
-            LzmaEncProps::new().normalized()
-        );
+        assert_eq!(preset(&Lzma2Options::default().settings), SDK_LEVELS[5]);
         let mut legacy = Lzma2Options::from_xz_level(6);
         legacy.set_nice_len(80);
-        assert_eq!(super::turbo_props(&legacy.settings, 1).normalized().mc, 56);
+        assert_eq!(preset(&legacy.settings).4, 56);
     }
 
     #[test]
