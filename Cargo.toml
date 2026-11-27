@@ -99,7 +99,7 @@ aes = { version = "0.9", features = ["zeroize"], optional = true }
 aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"], optional = true }
 mbrotli = { version = "0.5.23", optional = true, default-features = false, features = ["std", "decompression"] }
 mzstd = { version = "0.2.17", optional = true, default-features = false, features = ["std", "decompression"] }
-brotli = { version = ">= 7, < 10", default-features = false, optional = true, features = ["std"] }
+brotli = { version = ">= 8.0.4, < 10", default-features = false, optional = true, features = ["std"] }
 bzip2-turbo = { version = "0.2.1", default-features = false, optional = true }
 # Renamed so the crate's path never collides with this crate's `bzip2` modules.
 libbzip2 = { package = "bzip2", version = "0.6.1", optional = true }
