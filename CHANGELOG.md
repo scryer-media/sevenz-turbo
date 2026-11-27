@@ -530,6 +530,9 @@ arm, and this crate can add a variant without a breaking release.
   entry ends, and retries an interrupted read. Before, a source that handed
   out fewer than 4 bytes in its first read failed with "Input too short", and
   one that handed out fewer than 16 could miss the skippable frame header.
+- A Brotli entry whose stream is shorter than 4 bytes, such as the 1- or
+  2-byte stream of empty input, now decodes. Before, it failed with "Input
+  too short". Bytes that are not a valid stream fail with the decoder's error.
 - Archives written through the `mzstd` provider tag their Zstandard coder
   as version 1.6, as the `zstd` provider does. Both providers now write the
   same coder properties.

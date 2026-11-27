@@ -22,13 +22,16 @@ impl<R: Read> BrotliDecoder<R> {
     pub(crate) fn new(mut input: R, buffer_size: usize) -> Result<Self, Error> {
         let mut header = [0u8; 16];
         let header_read = fill(&mut input, &mut header)?;
-        if header_read < 4 {
-            return Err(Error::corrupted("Input too short"));
-        }
 
-        let magic_value = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        // A frame header is 16 bytes and opens with the skippable-frame
+        // magic. Anything shorter, a valid Brotli stream of 1 to 3 bytes
+        // among it, is a standard stream: its bytes are replayed into the
+        // decoder, which refuses them if they are not one.
+        let framed = header_read == header.len()
+            && u32::from_le_bytes([header[0], header[1], header[2], header[3]])
+                == SKIPPABLE_FRAME_MAGIC;
 
-        let inner_reader = if magic_value == SKIPPABLE_FRAME_MAGIC && header_read >= 16 {
+        let inner_reader = if framed {
             let skippable_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
             if skippable_size != 8 {
                 return Err(Error::corrupted("Invalid brotli skippable frame size"));
@@ -799,22 +802,63 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_source_that_ends_inside_the_header_is_too_short() {
-        let bytes = encoded(1 << 16);
-        for len in 0..4 {
-            let source = Trickle {
-                bytes: bytes[..len].to_vec(),
+    /// Decodes `bytes` whole and one byte per read, and returns both results.
+    fn decode_both_ways(bytes: &[u8]) -> [io::Result<Vec<u8>>; 2] {
+        let whole = |source: Box<dyn io::Read>| {
+            let mut decoder = super::BrotliDecoder::new(source, 4096).map_err(io::Error::other)?;
+            let mut out = Vec::new();
+            io::Read::read_to_end(&mut decoder, &mut out)?;
+            Ok(out)
+        };
+        [
+            whole(Box::new(io::Cursor::new(bytes.to_vec()))),
+            whole(Box::new(Trickle {
+                bytes: bytes.to_vec(),
                 at: 0,
                 interrupt: false,
-            };
-            let error = super::BrotliDecoder::new(source, 4096)
-                .err()
-                .expect("the header is cut short");
-            assert!(
-                matches!(error, crate::Error::Corrupted(ref why) if why.contains("too short")),
-                "{len} bytes: {error:?}"
-            );
+            })),
+        ]
+    }
+
+    /// A standard stream shorter than a frame header's 4-byte magic decodes:
+    /// the empty stream the encoder writes (1 byte for a window of 16 or 18
+    /// to 24, 2 bytes for 10 to 15 and 17), and streams of an empty metadata
+    /// block before the last, empty, meta-block.
+    #[test]
+    fn a_valid_stream_shorter_than_the_frame_magic_decodes() {
+        let mut streams: Vec<Vec<u8>> = (10..=24)
+            .map(|window| {
+                let (sink, _) = sink();
+                let encoder = BrotliEncoder::new(sink, 11, window, 0).unwrap();
+                encoder.finish().unwrap().bytes
+            })
+            .collect();
+        // Window 16 (WBITS `0`), then ISLAST 0, MNIBBLES `11` (metadata),
+        // reserved 0, MSKIPBYTES 0, padding; then ISLAST 1, ISLASTEMPTY 1.
+        streams.push(vec![0b0000_1100, 0b0000_0011]);
+        // The same with window 17 (WBITS `1000000`), which pushes the
+        // metadata header into the second byte.
+        streams.push(vec![0b0000_0001, 0b0000_0011, 0b0000_0011]);
+        for stream in &streams {
+            assert!((1..4).contains(&stream.len()), "{stream:02x?}");
+            for result in decode_both_ways(stream) {
+                assert_eq!(result.unwrap(), b"", "{stream:02x?}");
+            }
+        }
+        assert!(streams.iter().any(|s| s.len() == 1));
+        assert!(streams.iter().any(|s| s.len() == 2));
+        assert!(streams.iter().any(|s| s.len() == 3));
+    }
+
+    /// A framed stream cut inside its 16-byte frame header is not a valid
+    /// standard stream either, and the decoder refuses it.
+    #[test]
+    fn a_framed_header_cut_short_fails() {
+        let bytes = encoded(1 << 16);
+        for len in 0..16 {
+            for result in decode_both_ways(&bytes[..len]) {
+                assert!(result.is_err(), "{len} bytes decoded");
+            }
         }
     }
 }
