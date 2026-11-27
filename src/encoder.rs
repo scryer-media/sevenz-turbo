@@ -1000,6 +1000,8 @@ pub(crate) fn get_options_as_properties<'a>(
         EncoderMethod::ID_BROTLI => {
             #[cfg(feature = "brotli")]
             let version_major = brotli::VERSION;
+            // `mbrotli` exposes no version, so its streams are tagged 1.0,
+            // the value the `brotli` provider writes (`brotli::VERSION` is 1).
             #[cfg(not(feature = "brotli"))]
             let version_major = 1;
             let version_minor = 0;
@@ -1029,6 +1031,8 @@ pub(crate) fn get_options_as_properties<'a>(
                 zstd::zstd_safe::VERSION_MAJOR,
                 zstd::zstd_safe::VERSION_MINOR,
             );
+            // `mzstd` exposes no version, so its streams carry a fixed 1.5.
+            // The `zstd` provider writes the bundled C library's version.
             #[cfg(not(feature = "zstd"))]
             let (version_major, version_minor) = (1u32, 5u32);
             let options = match options {
