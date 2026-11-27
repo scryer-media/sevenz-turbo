@@ -21,11 +21,10 @@ pub(crate) struct BrotliDecoder<R: Read> {
 impl<R: Read> BrotliDecoder<R> {
     pub(crate) fn new(mut input: R, buffer_size: usize) -> Result<Self, Error> {
         let mut header = [0u8; 16];
-        let header_read = match Read::read(&mut input, &mut header) {
-            Ok(n) if n >= 4 => n,
-            Ok(_) => return Err(Error::corrupted("Input too short")),
-            Err(e) => return Err(e.into()),
-        };
+        let header_read = fill(&mut input, &mut header)?;
+        if header_read < 4 {
+            return Err(Error::corrupted("Input too short"));
+        }
 
         let magic_value = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
 
@@ -55,6 +54,23 @@ impl<R: Read> BrotliDecoder<R> {
             buffer_size,
         })
     }
+}
+
+/// Reads into `buf` until it is full or `input` ends, retrying an
+/// interrupted read, and returns how many bytes it holds. A source may hand
+/// out fewer bytes per read than asked, so one read can stop short of a
+/// header that is there.
+fn fill<R: Read>(input: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match input.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n.min(buf.len() - filled),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
 }
 
 impl<R: Read> Read for BrotliDecoder<R> {
@@ -603,6 +619,72 @@ mod tests {
                 .err()
                 .expect("the stream end was not written");
             assert_eq!(error.to_string(), "sink is full", "frame size {frame_size}");
+        }
+    }
+
+    /// Hands out one byte per read, after an interrupted read before each.
+    struct Trickle {
+        bytes: Vec<u8>,
+        at: usize,
+        interrupt: bool,
+    }
+
+    impl io::Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.interrupt = !self.interrupt;
+            if self.interrupt {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let Some(&byte) = self.bytes.get(self.at) else {
+                return Ok(0);
+            };
+            let Some(first) = buf.first_mut() else {
+                return Ok(0);
+            };
+            *first = byte;
+            self.at += 1;
+            Ok(1)
+        }
+    }
+
+    fn encoded(frame_size: usize) -> Vec<u8> {
+        let (sink, _) = sink();
+        let mut encoder = BrotliEncoder::new(sink, 11, 22, frame_size).unwrap();
+        encoder.write_all(b"one byte at a time").unwrap();
+        encoder.finish().unwrap().bytes
+    }
+
+    #[test]
+    fn a_source_that_reads_one_byte_at_a_time_decodes() {
+        for frame_size in [0, 1 << 16] {
+            let source = Trickle {
+                bytes: encoded(frame_size),
+                at: 0,
+                interrupt: false,
+            };
+            let mut decoder = super::BrotliDecoder::new(source, 4096).unwrap();
+            let mut out = Vec::new();
+            io::Read::read_to_end(&mut decoder, &mut out).unwrap();
+            assert_eq!(out, b"one byte at a time", "frame size {frame_size}");
+        }
+    }
+
+    #[test]
+    fn a_source_that_ends_inside_the_header_is_too_short() {
+        let bytes = encoded(1 << 16);
+        for len in 0..4 {
+            let source = Trickle {
+                bytes: bytes[..len].to_vec(),
+                at: 0,
+                interrupt: false,
+            };
+            let error = super::BrotliDecoder::new(source, 4096)
+                .err()
+                .expect("the header is cut short");
+            assert!(
+                matches!(error, crate::Error::Corrupted(ref why) if why.contains("too short")),
+                "{len} bytes: {error:?}"
+            );
         }
     }
 }

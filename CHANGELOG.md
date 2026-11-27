@@ -525,6 +525,10 @@ arm, and this crate can add a variant without a breaking release.
   provider; before, the `brotli` provider dropped it.
 - Flushing a framed Brotli stream with no input since the last frame writes
   nothing, as finishing it does. Before, each such flush wrote an empty frame.
+- The Brotli reader reads its stream header until it holds 16 bytes or the
+  entry ends, and retries an interrupted read. Before, a source that handed
+  out fewer than 4 bytes in its first read failed with "Input too short", and
+  one that handed out fewer than 16 could miss the skippable frame header.
 - The optional Zstandard codec now requires zstd 0.14.5 or later, which
   bundles C Zstandard 1.6.0 and fixes CVE-2026-124851.
 
